@@ -150,10 +150,11 @@ pub enum Msg {
     /// code if I am redeeming one, a change to its place in my device
     /// list (`meet::EVENT_*`), and the relays I give it (`grant`).
     MeetHi { name: String, home: String, token: Option<[u8; 8]>, event: u8, grant: Option<String> },
-    /// The answer: the other side knows me. Anything after `home` on the
-    /// wire other than a grant (an older version's door sent more) is left
-    /// unread.
-    MeetWelcome { name: String, home: String, grant: Option<String> },
+    /// The answer: the other side knows me, and where I stand in its device
+    /// list (`meet::EVENT_*`, as in a hello; 0 from an older version).
+    /// Anything after `home` on the wire other than a grant and that event
+    /// (an older version's door sent more) is left unread.
+    MeetWelcome { name: String, home: String, grant: Option<String>, event: u8 },
     /// The answer: it does not (`meet::REFUSE_*`).
     MeetRefuse { reason: u8 },
     /// Host -> viewer, on connect and whenever the displays or the streamed one
@@ -227,6 +228,8 @@ impl W {
 /// Starts a grant at the end of a meet message. Not 0, which an older
 /// version's welcome had there.
 const GRANT_MARK: u8 = 0xA7;
+/// Starts the event at the end of a welcome, after the grant.
+const EVENT_MARK: u8 = 0xA8;
 
 struct R<'a>(&'a [u8]);
 
@@ -364,8 +367,11 @@ impl Msg {
                 }
                 w.grant(grant);
             }
-            Msg::MeetWelcome { name, home, grant } => {
+            Msg::MeetWelcome { name, home, grant, event } => {
                 w.str(name).long_str(home).grant(grant);
+                if *event != 0 {
+                    w.u8(EVENT_MARK).u8(*event);
+                }
             }
             Msg::MeetRefuse { reason } => {
                 w.u8(*reason);
@@ -475,7 +481,9 @@ impl Msg {
             }
             61 => {
                 let (name, home) = (r.str()?, r.long_str()?);
-                Msg::MeetWelcome { name, home, grant: r.grant()? }
+                let grant = r.grant()?;
+                let event = if r.0.first() == Some(&EVENT_MARK) && r.0.len() >= 2 { r.0[1] } else { 0 };
+                Msg::MeetWelcome { name, home, grant, event }
             }
             62 => Msg::MeetRefuse { reason: r.u8()? },
             70 => {
@@ -550,8 +558,10 @@ mod tests {
             Msg::MeetHi { name: "书房".into(), home: "https://aps1-1.relay.n0.iroh.link./".into(), token: None, event: 0, grant: None },
             Msg::MeetHi { name: "x".repeat(200), home: String::new(), token: Some([7; 8]), event: 2, grant: Some(String::new()) },
             Msg::MeetHi { name: "y".into(), home: String::new(), token: None, event: 0, grant: Some("https://a/,https://b/ https://c/".into()) },
-            Msg::MeetWelcome { name: "laptop".into(), home: String::new(), grant: None },
-            Msg::MeetWelcome { name: "书房".into(), home: "https://a/,https://b/".into(), grant: Some("https://a/".into()) },
+            Msg::MeetWelcome { name: "laptop".into(), home: String::new(), grant: None, event: 0 },
+            Msg::MeetWelcome { name: "书房".into(), home: "https://a/,https://b/".into(), grant: Some("https://a/".into()), event: 0 },
+            Msg::MeetWelcome { name: "书房".into(), home: String::new(), grant: Some(String::new()), event: 3 },
+            Msg::MeetWelcome { name: "x".into(), home: String::new(), grant: None, event: 1 },
             Msg::Hint { what: HINT_LOCKED },
             Msg::MeetRefuse { reason: 3 },
             Msg::Monitors {
@@ -573,18 +583,18 @@ mod tests {
 
     #[test]
     fn long_names_are_cut_on_a_character_boundary() {
-        let e = Msg::MeetWelcome { name: "设".repeat(100), home: String::new(), grant: None }.encode();
+        let e = Msg::MeetWelcome { name: "设".repeat(100), home: String::new(), grant: None, event: 0 }.encode();
         let Msg::MeetWelcome { name, .. } = Msg::decode(&e[4..]).unwrap() else { panic!() };
         assert_eq!(name, "设".repeat(66));
     }
 
     #[test]
     fn a_welcome_with_more_after_home_still_reads() {
-        let mut e = Msg::MeetWelcome { name: "书房".into(), home: "https://a/".into(), grant: None }.encode();
+        let mut e = Msg::MeetWelcome { name: "书房".into(), home: "https://a/".into(), grant: None, event: 0 }.encode();
         e.extend_from_slice(&[0, 0, 0, 3, b'r', b'c', b'd']);
         let len = (e.len() - 4) as u32;
         e[..4].copy_from_slice(&len.to_be_bytes());
-        assert_eq!(Msg::decode(&e[4..]).unwrap(), Msg::MeetWelcome { name: "书房".into(), home: "https://a/".into(), grant: None });
+        assert_eq!(Msg::decode(&e[4..]).unwrap(), Msg::MeetWelcome { name: "书房".into(), home: "https://a/".into(), grant: None, event: 0 });
     }
 
     #[test]

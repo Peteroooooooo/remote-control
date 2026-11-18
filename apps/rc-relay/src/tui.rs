@@ -68,7 +68,6 @@ enum Modal {
 enum Undo {
     Code { code: Code, owners: Vec<Owner>, guests: BTreeMap<EndpointId, Vec<Guest>> },
     Owner { owner: Owner, guests: Vec<Guest> },
-    Guest { owner: EndpointId, guest: Guest },
 }
 
 struct App {
@@ -272,10 +271,8 @@ impl App {
                         Modal::KickGuest => {
                             if let Some(DeviceRow::Guest { owner, guest }) = self.rows().get(self.dsel).cloned() {
                                 self.store.kick(owner, guest.id)?;
-                                let name = shown_name(&guest.name, guest.id);
-                                self.undo.push(Undo::Guest { owner, guest });
                                 self.reload()?;
-                                self.toast(format!("已移除 {name}（按 u 撤回）"), true);
+                                self.toast(format!("已移除 {}", shown_name(&guest.name, guest.id)), true);
                             }
                         }
                         Modal::Rename(_) => {}
@@ -367,16 +364,6 @@ impl App {
                 self.store.restore_owner(&owner, &guests)?;
                 self.reload()?;
                 self.toast(format!("已撤回移除 {}", shown_name(&owner.name, owner.id)), true);
-            }
-            Undo::Guest { owner, guest } => {
-                let still_pending = self.store.unkick(&owner, &guest.id)?;
-                self.store.restore_guest(&owner, &guest, true)?;
-                self.reload()?;
-                if still_pending {
-                    self.toast(format!("已撤回移除访客 {}", shown_name(&guest.name, guest.id)), true);
-                } else {
-                    self.toast(format!("已撤回（若电脑端已同步移除请重新用连接码连接）"), true);
-                }
             }
         }
         Ok(())
@@ -689,8 +676,8 @@ impl App {
                     format!("移除访客 {name}？"),
                     RED,
                     vec![
-                        Line::styled("中转立即停止为它转发，并通知成员电脑同步从列表里删除。", Style::new().fg(FG)),
-                        Line::styled("如果删错了，按 u 可以撤回上一步；以后要再连重新贴连接码即可。", Style::new().fg(DIM)),
+                        Line::styled("中转立即停止为它转发，1 秒内通知成员电脑删除它，两台电脑都会忘掉对方。", Style::new().fg(FG)),
+                        Line::styled("删除后不能撤回；以后要再连，重新发连接码即可。", Style::new().fg(DIM)),
                     ],
                     vec![("y", "移除"), ("n", "取消")],
                 )

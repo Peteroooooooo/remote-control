@@ -12,6 +12,11 @@
 //! - `POST /rc/meet`: a device with one of those codes, signed by that
 //!   device: the relay uses the invite up and lets the device and the owner
 //!   reach each other for [`MEET_KEEP`], until the owner lists it as a guest.
+//! - `POST /rc/watch`: an owner, signed: the answer stays open, a line
+//!   `sync` at once and whenever something on the relay changes for that
+//!   owner (a guest kicked or the kick undone, the owner deleted), and an
+//!   empty line every [`WATCH_BEAT`] seconds otherwise. On `sync` the owner
+//!   sends its guest list, and the answer to that says what changed.
 //!
 //! Guests and invites are signed by the owner with a time and a
 //! random nonce; the relay takes such a request only within [`MAX_SKEW`] of
@@ -26,6 +31,7 @@ pub const CLAIM_PATH: &str = "/rc/claim";
 pub const GUESTS_PATH: &str = "/rc/guests";
 pub const INVITES_PATH: &str = "/rc/invites";
 pub const MEET_PATH: &str = "/rc/meet";
+pub const WATCH_PATH: &str = "/rc/watch";
 pub const HEADER: &str = "x-rc-request";
 /// How far the time in a signed request may be from the relay's clock (seconds).
 pub const MAX_SKEW: u64 = 300;
@@ -36,16 +42,20 @@ pub const MAX_INVITES: usize = 64;
 /// How long a device that brought an invite and the owner may reach each
 /// other through the relay without the owner listing it (seconds).
 pub const MEET_KEEP: u64 = 600;
+/// How often an open watch says it is still there (seconds).
+pub const WATCH_BEAT: u64 = 20;
 
 const CLAIM_PREFIX: &str = "rcqc1";
 const GUESTS_PREFIX: &str = "rcqg1";
 const INVITES_PREFIX: &str = "rcqi1";
 const MEET_PREFIX: &str = "rcqm1";
+const WATCH_PREFIX: &str = "rcqw1";
 const VERSION: u8 = 1;
 const CLAIM_DOMAIN: &[u8] = b"remote-control relay claim v1\0";
 const GUESTS_DOMAIN: &[u8] = b"remote-control relay guests v1\0";
 const INVITES_DOMAIN: &[u8] = b"remote-control relay invites v1\0";
 const MEET_DOMAIN: &[u8] = b"remote-control relay meet v1\0";
+const WATCH_DOMAIN: &[u8] = b"remote-control relay watch v1\0";
 
 /// A random claim key or nonce.
 pub fn random_key() -> [u8; 16] {
@@ -539,6 +549,51 @@ impl MeetRequest {
     }
 }
 
+/// An owner opening its watch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WatchRequest {
+    pub device: PublicKey,
+    /// Unix seconds.
+    pub time: u64,
+    pub nonce: [u8; 16],
+    pub signature: Signature,
+}
+
+fn watch_signed(device: &PublicKey, time: u64, nonce: &[u8; 16]) -> Vec<u8> {
+    [WATCH_DOMAIN, &[VERSION], device.as_bytes(), &time.to_be_bytes(), nonce].concat()
+}
+
+impl WatchRequest {
+    pub fn new(device: &SecretKey, time: u64) -> WatchRequest {
+        let nonce = random_key();
+        let signature = device.sign(&watch_signed(&device.public(), time, &nonce));
+        WatchRequest { device: device.public(), time, nonce, signature }
+    }
+
+    pub fn encode(&self) -> String {
+        let v = [&[VERSION][..], self.device.as_bytes(), &self.time.to_be_bytes(), &self.nonce, &self.signature.to_bytes()]
+            .concat();
+        text::encode(WATCH_PREFIX, &v)
+    }
+
+    /// Decodes and checks the signature (not the time).
+    pub fn decode(s: &str) -> Result<WatchRequest, Error> {
+        let p = text::decode(WATCH_PREFIX, s)?;
+        let mut r = Reader::new(&p);
+        match r.u8()? {
+            VERSION => {}
+            v => return Err(Error::Version(v)),
+        }
+        let device = PublicKey::from_bytes(&r.array()?).map_err(|_| Error::Field("device key"))?;
+        let time = r.u64()?;
+        let nonce = r.array()?;
+        let signature = Signature::from_bytes(&r.array()?);
+        r.finish()?;
+        device.verify(&watch_signed(&device, time, &nonce), &signature).map_err(|_| Error::Signature)?;
+        Ok(WatchRequest { device, time, nonce, signature })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -661,6 +716,19 @@ mod tests {
         let mut f = r.clone();
         f.name = "other".into();
         assert_eq!(MeetRequest::decode(&f.encode()), Err(Error::Signature));
+    }
+
+    #[test]
+    fn watch_round_trip_and_forgery() {
+        let r = WatchRequest::new(&key(1), 1_000);
+        assert_eq!(WatchRequest::decode(&r.encode()).unwrap(), r);
+        let mut f = WatchRequest::new(&key(2), 1_000);
+        f.device = key(1).public();
+        assert_eq!(WatchRequest::decode(&f.encode()), Err(Error::Signature));
+        let mut f = r.clone();
+        f.time = 2_000;
+        assert_eq!(WatchRequest::decode(&f.encode()), Err(Error::Signature));
+        assert_eq!(WatchRequest::decode(&GuestsRequest::new(&key(1), 1_000, &[]).encode()), Err(Error::WrongPrefix));
     }
 
     #[test]

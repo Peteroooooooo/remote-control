@@ -71,6 +71,17 @@ pub enum Met {
     Code,
 }
 
+/// A request to remember each other (`devices-and-relay.md` 3.3), until
+/// the other side answers or one of the two windows closes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Ask {
+    None,
+    /// This computer asked; waiting for the other side.
+    Out,
+    /// The other side asked; waiting for this computer's user.
+    In,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Status {
     Checking,
@@ -104,6 +115,9 @@ struct Peer {
     conn: Option<Connection>,
     wake: Arc<Notify>,
     running: bool,
+    ask: Ask,
+    /// Its request was refused here; the next hello or welcome says so.
+    say_no: bool,
 }
 
 impl Peer {
@@ -122,6 +136,8 @@ impl Peer {
             conn: None,
             wake: Arc::new(Notify::new()),
             running: false,
+            ask: Ask::None,
+            say_no: false,
         }
     }
 
@@ -208,6 +224,14 @@ struct Shared {
     leaving: std::sync::atomic::AtomicBool,
     /// One guest list on its way to the relay at a time, in order.
     sending_guests: tokio::sync::Mutex<()>,
+    /// Something changed: `guests_loop` looks at once.
+    guests_wake: Notify,
+    /// The own relays whose watch asked for the guest list (`guests_loop`
+    /// sends it even when unchanged).
+    resync: Mutex<BTreeSet<Vec<RelayUrl>>>,
+    /// The own relays with a watch open: they say when to send the guest
+    /// list; the others get it every `GUEST_SYNC_EVERY` to hear of kicks.
+    watching: Mutex<BTreeSet<Vec<RelayUrl>>>,
     /// No own relay answers: the public relays are in the endpoint's map.
     fallback: std::sync::atomic::AtomicBool,
 }
@@ -222,6 +246,8 @@ const DISCOVERY_EVERY: Duration = Duration::from_secs(2);
 const LAN_FORGET: Duration = Duration::from_secs(10);
 /// How often the status of a connected device is refreshed.
 const STATUS_EVERY: Duration = Duration::from_secs(2);
+/// A connected device is said hello to again every this many `STATUS_EVERY`.
+const HELLO_AGAIN: u32 = 5;
 /// How often a device that is not connected is tried again (`target-plan` 2.2).
 const REFIND_EVERY: Duration = Duration::from_secs(15);
 const CONNECT_WAIT: Duration = Duration::from_secs(10);
@@ -342,6 +368,7 @@ impl Shared {
     }
 
     fn changed(&self) {
+        self.guests_wake.notify_one();
         if let Some(f) = self.repaint.lock().unwrap().as_ref() {
             f();
         }
@@ -508,6 +535,8 @@ impl Shared {
                 p.met = None;
                 p.token = None;
                 p.invite = None;
+                p.ask = Ask::None;
+                p.say_no = false;
                 // A connection it opened: closed now, so it calls again, is
                 // refused and drops its card. Over this computer's own
                 // connection the woken task tells it instead.
@@ -647,14 +676,94 @@ impl Shared {
         (addrs, relays)
     }
 
-    fn hello(&self, st: &St, id: &EndpointId) -> (Msg, u8) {
-        let event = if st.store.is_forgotten(id) {
+    /// Where `id` stands in this computer's device list, for its hello or
+    /// welcome (`meet::EVENT_*`).
+    fn wish(&self, st: &St, id: &EndpointId) -> u8 {
+        let p = st.peers.get(id);
+        if st.store.is_forgotten(id) {
             meet::EVENT_FORGET
         } else if st.store.get(id).is_some_and(|d| d.tell) {
             meet::EVENT_REMEMBER
+        } else if st.store.get(id).is_some() {
+            meet::EVENT_NONE
+        } else if p.is_some_and(|p| p.say_no) {
+            meet::EVENT_NO
+        } else if p.is_some_and(|p| p.ask == Ask::Out) {
+            meet::EVENT_ASK
         } else {
             meet::EVENT_NONE
-        };
+        }
+    }
+
+    /// `id` and this computer remember each other now: in the device list as
+    /// a trusted device. `tell`: it does not list this computer yet.
+    fn befriend(self: &Arc<Self>, st: &mut St, id: EndpointId, tell: bool) {
+        let name = st.peers.get(&id).map(|p| p.name.clone()).unwrap_or_default();
+        let d = st.store.add(id);
+        if d.name.is_empty() {
+            d.name = name;
+        }
+        d.tell = tell;
+        if let Some(p) = st.peers.get_mut(&id) {
+            p.ask = Ask::None;
+            p.say_no = false;
+        }
+        self.save(st);
+        log!("{} and this computer remember each other now (trusted)", id.fmt_short());
+        self.ensure(st, id);
+    }
+
+    /// What `from` said of this computer's place in its list, in a hello or
+    /// a welcome: remembering takes both sides (`devices-and-relay.md` 3.3).
+    fn heard(self: &Arc<Self>, st: &mut St, from: EndpointId, event: u8) {
+        let listed = st.store.get(&from).is_some();
+        let ask = st.peers.get(&from).map_or(Ask::None, |p| p.ask);
+        let refusing = st.peers.get(&from).is_some_and(|p| p.say_no);
+        let name = self.shown_name(st, &from);
+        match event {
+            // Asked again before it heard the refusal (which goes back now).
+            meet::EVENT_ASK | meet::EVENT_REMEMBER if !listed && refusing => {}
+            // It asks though this computer lists it: it lost this one; it is told again.
+            meet::EVENT_ASK if listed => {
+                if let Some(d) = st.store.get_mut(&from)
+                    && !d.tell
+                {
+                    d.tell = true;
+                    self.save(st);
+                    self.ensure(st, from);
+                }
+            }
+            meet::EVENT_ASK | meet::EVENT_REMEMBER if !listed && ask == Ask::Out => {
+                self.befriend(st, from, event == meet::EVENT_ASK);
+                let text = if event == meet::EVENT_ASK { format!("已和「{name}」互相记住") } else { format!("「{name}」同意了，已互相记住") };
+                self.notice(st, text);
+            }
+            // Listing this computer without being asked (an older version, or
+            // a request that lapsed here) counts as a request.
+            meet::EVENT_ASK | meet::EVENT_REMEMBER if !listed && ask == Ask::None => {
+                if let Some(p) = st.peers.get_mut(&from) {
+                    p.ask = Ask::In;
+                    log!("{} ({name}) asks to remember each other", from.fmt_short());
+                }
+            }
+            meet::EVENT_NO => {
+                if let Some(p) = st.peers.get_mut(&from) {
+                    p.ask = Ask::None;
+                }
+                if ask == Ask::Out || listed {
+                    log!("{} ({name}) did not agree to remember each other", from.fmt_short());
+                    if listed && st.store.remove(&from) {
+                        self.save(st);
+                    }
+                    self.notice(st, format!("「{name}」没有同意"));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn hello(&self, st: &St, id: &EndpointId) -> (Msg, u8) {
+        let event = self.wish(st, id);
         let home = url_list(&self.home_list(st));
         let token = st.peers.get(id).and_then(|p| p.token);
         (Msg::MeetHi { name: st.settings.shown_name(), home, token, event, grant: Some(String::new()) }, event)
@@ -685,7 +794,9 @@ impl Shared {
         }
     }
 
-    fn welcomed(&self, st: &mut St, id: &EndpointId, conn: &Connection, name: String, home: String, sent: u8) {
+    /// `event`: where this computer stands in its list (see `heard`).
+    #[allow(clippy::too_many_arguments)]
+    fn welcomed(self: &Arc<Self>, st: &mut St, id: &EndpointId, conn: &Connection, name: String, home: String, sent: u8, event: u8) {
         let name = clean(&name);
         let home = relay_urls(&home);
         if let Some(p) = st.peers.get_mut(id) {
@@ -716,8 +827,14 @@ impl Shared {
                 }
                 self.save(st);
             }
+            meet::EVENT_NO => {
+                if let Some(p) = st.peers.get_mut(id) {
+                    p.say_no = false;
+                }
+            }
             _ => {}
         }
+        self.heard(st, *id, event);
         if let Some(d) = st.store.get_mut(id) {
             let mut dirty = false;
             if d.name.is_empty() && !name.is_empty() {
@@ -746,7 +863,7 @@ impl Shared {
             meet::REFUSE_FORGOTTEN => {
                 if st.store.remove(id) {
                     self.save(st);
-                    self.notice(st, format!("「{name}」把这台电脑从它的设备列表里删除了，这里也已删除"));
+                    self.notice(st, format!("「{name}」把这台电脑删除了"));
                 }
                 if let Some(p) = st.peers.get_mut(id) {
                     p.met = None;
@@ -786,24 +903,33 @@ impl Shared {
     /// The answer to a hello from `from` (see `meet`).
     fn on_hi(self: &Arc<Self>, from: EndpointId, conn: &Connection, name: String, home: String, token: Option<[u8; 8]>, event: u8) -> Msg {
         let mut st = self.st.lock().unwrap();
-        let welcome = |st: &St| Msg::MeetWelcome {
+        let welcome = |st: &St, event: u8| Msg::MeetWelcome {
             name: st.settings.shown_name(),
             home: url_list(&self.home_list(st)),
             grant: Some(String::new()),
+            event,
         };
         let name = clean(&name);
         if event == meet::EVENT_FORGET {
             log!("{} deleted this computer: deleting it too", from.fmt_short());
+            let shown = self.shown_name(&st, &from);
+            let mut had = st.store.get(&from).is_some();
             if st.store.devices.iter().any(|d| d.id == from) {
                 st.store.remove(&from);
                 self.save(&mut st);
             }
             if let Some(p) = st.peers.get_mut(&from) {
+                had |= p.met.is_some();
                 p.met = None;
+                p.ask = Ask::None;
+                p.say_no = false;
                 // Its own connection ends now, not at its next status round.
                 p.wake.notify_one();
             }
-            let w = welcome(&st);
+            if had {
+                self.notice(&mut st, format!("「{shown}」把这台电脑删除了"));
+            }
+            let w = welcome(&st, meet::EVENT_NONE);
             drop(st);
             self.changed();
             return w;
@@ -845,12 +971,6 @@ impl Shared {
             }
             st.peers.entry(from).or_insert_with(Peer::new).met = Some(Met::Lan);
         }
-        if event == meet::EVENT_REMEMBER && st.store.get(&from).is_none() {
-            log!("{} ({name}) put this computer in its device list: listing it here too (trusted)", from.fmt_short());
-            let d = st.store.add(from);
-            d.name = name.clone();
-            self.save(&mut st);
-        }
         {
             let p = st.peers.entry(from).or_insert_with(Peer::new);
             if !name.is_empty() {
@@ -861,12 +981,19 @@ impl Shared {
                 p.home = h;
             }
         }
+        self.heard(&mut st, from, event);
         // Waking a connected peer task here would make the two sides' hellos wake
         // each other forever; only an idle one (not connected) needs it.
         if st.peers.get(&from).is_none_or(|p| !p.running || p.conn.is_none()) {
             self.ensure(&mut st, from);
         }
-        let w = welcome(&st);
+        let mine = self.wish(&st, &from);
+        if mine == meet::EVENT_NO
+            && let Some(p) = st.peers.get_mut(&from)
+        {
+            p.say_no = false;
+        }
+        let w = welcome(&st, mine);
         drop(st);
         self.changed();
         w
@@ -944,6 +1071,9 @@ impl Node {
             stopped: Default::default(),
             leaving: Default::default(),
             sending_guests: Default::default(),
+            guests_wake: Notify::new(),
+            resync: Mutex::default(),
+            watching: Mutex::default(),
             fallback: Default::default(),
         });
         {
@@ -1026,6 +1156,9 @@ impl Node {
             "rename" => id(1).ok_or_else(|| anyhow!("bad id")).map(|i| self.rename(i, f.get(2).copied().unwrap_or(""))),
             "remove" => id(1).ok_or_else(|| anyhow!("bad id")).map(|i| self.remove(i)),
             "auto" => id(1).ok_or_else(|| anyhow!("bad id")).map(|i| self.set_auto(i, f.get(2) == Some(&"1"))),
+            "remember" => id(1).ok_or_else(|| anyhow!("bad id")).and_then(|i| self.remember(i)),
+            "agree" => id(1).ok_or_else(|| anyhow!("bad id")).and_then(|i| self.agree(i)),
+            "refuse" => id(1).ok_or_else(|| anyhow!("bad id")).map(|i| self.refuse(i)),
             "retry" => id(1).ok_or_else(|| anyhow!("bad id")).map(|i| self.retry(i)),
             "proof" => id(1).ok_or_else(|| anyhow!("bad id")).map(|i| ident::issue(&self.sh.secret, i)),
             "dial" => id(1).ok_or_else(|| anyhow!("bad id")).map(|i| self.dial(i)),
@@ -1035,8 +1168,6 @@ impl Node {
                 match key {
                     "public" => Ok(self.settings(|s| s.public_relays = on)),
                     "lan" => Ok(self.settings(|s| s.lan_visible = on)),
-                    "accept_new" => Ok(self.settings(|s| s.accept_new = on)),
-                    "clipboard" => Ok(self.settings(|s| s.clipboard = on)),
                     "boot" => Ok(self.settings(|s| s.boot_online = on)),
                     "lock" => Ok(self.settings(|s| s.lock_control = on)),
                     "awake" => Ok(self.settings(|s| s.stay_awake = on)),
@@ -1122,13 +1253,11 @@ impl Node {
         out += &format!("me\t{}\t{}\n", sh.me, sh.opts.service as u8);
         let s = &st.settings;
         out += &format!(
-            "settings\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            "settings\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
             s.shown_name(),
             s.name,
             s.public_relays as u8,
             s.lan_visible as u8,
-            s.accept_new as u8,
-            s.clipboard as u8,
             s.boot_online as u8,
             s.lock_control as u8,
             s.stay_awake as u8,
@@ -1326,11 +1455,54 @@ impl Node {
         self.sh.settings_changed(&mut st, before);
     }
 
+    /// 我的电脑 (`on`) or 信任设备: only what this computer lets it do.
     fn set_auto(&self, id: EndpointId, on: bool) -> String {
         let mut st = self.sh.st.lock().unwrap();
         if let Some(d) = st.store.get_mut(&id) {
             d.auto_accept = on;
             self.sh.save(&mut st);
+            if on && !self.sh.opts.service && crate::install::service_running().is_none() {
+                st.suggest = Some(self.sh.shown_name(&st, &id));
+            }
+            self.sh.ensure(&mut st, id);
+        }
+        String::new()
+    }
+
+    /// 「记住」 on a temporary device: asks it; the two remember each other
+    /// once it agrees (or asked too). "both" when that is now.
+    fn remember(&self, id: EndpointId) -> Result<String> {
+        let mut st = self.sh.st.lock().unwrap();
+        if st.store.get(&id).is_some() {
+            return Ok("both".into());
+        }
+        let Some(p) = st.peers.get_mut(&id) else { return Err(anyhow!("对方已经不在了")) };
+        if p.ask == Ask::In {
+            self.sh.befriend(&mut st, id, true);
+            return Ok("both".into());
+        }
+        p.ask = Ask::Out;
+        p.say_no = false;
+        log!("asked {} to remember each other", id.fmt_short());
+        self.sh.ensure(&mut st, id);
+        Ok(String::new())
+    }
+
+    fn agree(&self, id: EndpointId) -> Result<String> {
+        let mut st = self.sh.st.lock().unwrap();
+        if st.peers.get(&id).is_none_or(|p| p.ask != Ask::In) {
+            return Err(anyhow!("对方的请求已经没了"));
+        }
+        self.sh.befriend(&mut st, id, true);
+        Ok(String::new())
+    }
+
+    fn refuse(&self, id: EndpointId) -> String {
+        let mut st = self.sh.st.lock().unwrap();
+        if let Some(p) = st.peers.get_mut(&id).filter(|p| p.ask == Ask::In) {
+            p.ask = Ask::None;
+            p.say_no = true;
+            log!("did not agree to remember {}", id.fmt_short());
             self.sh.ensure(&mut st, id);
         }
         String::new()
@@ -1444,7 +1616,12 @@ fn row(st: &St, id: &EndpointId, listed: bool, auto: bool, name: &str) -> String
         None => "-",
     };
     let lan = p.is_some_and(|p| p.on_lan()) as u8;
-    format!("dev\t{id}\t{}\t{}\t{met}\t{status}\t{rtt:.1}\t{path}\t{lan}\t{name}\n", listed as u8, auto as u8)
+    let ask = match p.map_or(Ask::None, |p| p.ask) {
+        Ask::Out => "out",
+        Ask::In => "in",
+        Ask::None => "-",
+    };
+    format!("dev\t{id}\t{}\t{}\t{met}\t{status}\t{rtt:.1}\t{path}\t{lan}\t{name}\t{ask}\n", listed as u8, auto as u8)
 }
 
 /// Keeps a meet connection to `id` while it should have a card (see the module comment).
@@ -1548,8 +1725,9 @@ async fn peer_loop(sh: Arc<Shared>, id: EndpointId, wake: Arc<Notify>) {
     }
 }
 
-/// Says hello on `conn` (again whenever woken), keeping the status fresh,
-/// until the connection ends. Returns whether the other side refused.
+/// Says hello on `conn` (again whenever woken, and every `HELLO_AGAIN`
+/// status rounds), keeping the status fresh, until the connection ends.
+/// Returns whether the other side refused.
 async fn talk(sh: &Arc<Shared>, id: EndpointId, conn: &Connection, wake: &Notify) -> bool {
     loop {
         let (hi, sent) = {
@@ -1560,11 +1738,11 @@ async fn talk(sh: &Arc<Shared>, id: EndpointId, conn: &Connection, wake: &Notify
             sh.hello(&st, &id)
         };
         match meet::ask(conn, &hi).await {
-            Ok(Msg::MeetWelcome { name, home, .. }) => {
+            Ok(Msg::MeetWelcome { name, home, event, .. }) => {
                 let first = {
                     let mut st = sh.st.lock().unwrap();
                     let first = st.peers.get(&id).is_none_or(|p| p.conn.is_none());
-                    sh.welcomed(&mut st, &id, conn, name.clone(), home, sent);
+                    sh.welcomed(&mut st, &id, conn, name.clone(), home, sent, event);
                     first
                 };
                 if first {
@@ -1586,6 +1764,9 @@ async fn talk(sh: &Arc<Shared>, id: EndpointId, conn: &Connection, wake: &Notify
                 return false;
             }
         }
+        // Hello again now and then: when only this side can call, the other
+        // side's news (a request to remember) comes back in the welcome.
+        let mut rounds = 0u32;
         loop {
             tokio::select! {
                 _ = tokio::time::sleep(STATUS_EVERY) => {
@@ -1596,6 +1777,10 @@ async fn talk(sh: &Arc<Shared>, id: EndpointId, conn: &Connection, wake: &Notify
                     sh.path_status(&mut st, &id);
                     drop(st);
                     sh.changed();
+                    rounds += 1;
+                    if rounds >= HELLO_AGAIN {
+                        break;
+                    }
                 }
                 _ = wake.notified() => break,
                 _ = conn.closed() => return false,
@@ -1756,8 +1941,7 @@ async fn serve_desktop(sh: Arc<Shared>, conn: Connection) {
     };
     log!("{name} ({}) controls this computer now", device.fmt_short());
     sh.changed();
-    let clipboard = sh.st.lock().unwrap().settings.clipboard;
-    let r = host::session(conn, send, recv, hello.0, sh.opts.pipe, clipboard).await;
+    let r = host::session(conn, send, recv, hello.0, sh.opts.pipe).await;
     match r {
         Ok(()) => log!("{name} left"),
         Err(e) => log!("session with {name} ended: {e:#}"),
@@ -1836,9 +2020,6 @@ async fn admit(sh: &Arc<Shared>, device: EndpointId, conn: &Connection, send: &m
             start_hosting(sh, &mut st, device, &name);
             return Ok(name);
         }
-        if !st.settings.accept_new && listed.is_none() {
-            return Err(net::CLOSE_DENIED);
-        }
         if !desktop::user_desktop_shown() {
             return Err(net::CLOSE_LOCKED);
         }
@@ -1875,24 +2056,7 @@ async fn admit(sh: &Arc<Shared>, device: EndpointId, conn: &Connection, send: &m
     match answer {
         Answer::Deny => return Err(net::CLOSE_DENIED),
         Answer::NoAnswer | Answer::Cancelled => return Err(net::CLOSE_NO_ANSWER),
-        Answer::Once => {}
-        Answer::Trust | Answer::Mine => {
-            let new = st.store.get(&device).is_none();
-            let peer_name = st.peers.get(&device).map(|p| p.name.clone()).unwrap_or_default();
-            let d = st.store.add(device);
-            if new {
-                d.name = peer_name;
-                d.tell = true;
-            }
-            if answer == Answer::Mine {
-                d.auto_accept = true;
-            }
-            sh.save(&mut st);
-            if answer == Answer::Mine && !sh.opts.service && crate::install::service_running().is_none() {
-                st.suggest = Some(name.clone());
-            }
-            sh.ensure(&mut st, device);
-        }
+        Answer::Allow => {}
     }
     if conn.close_reason().is_some() {
         return Err(net::CLOSE_NO_ANSWER);
@@ -2006,7 +2170,8 @@ async fn housekeeping(sh: Arc<Shared>) {
         let mut st = sh.st.lock().unwrap();
         st.codes.retain(|c| c.by.is_some() || c.made.elapsed() < CODE_KEEP);
         let over = hosting_over(&mut st);
-        if sh.lobby_check(&mut st) || over {
+        let lapsed = lapse_asks(&sh, &mut st);
+        if sh.lobby_check(&mut st) || over || lapsed {
             drop(st);
             sh.changed();
         }
@@ -2037,8 +2202,39 @@ fn lobby_closed(st: &mut St) {
         p.met = None;
         p.token = None;
         p.invite = None;
+        p.ask = Ask::None;
+        p.say_no = false;
         p.wake.notify_one();
     }
+}
+
+/// Requests to remember each other that are over: the two remember each
+/// other now, or the other side went away without answering (its window
+/// closed), which this computer's user is told.
+fn lapse_asks(sh: &Shared, st: &mut St) -> bool {
+    let open = sh.lobby_open(st);
+    let mut unanswered = Vec::new();
+    let mut any = false;
+    for (id, p) in st.peers.iter_mut() {
+        if p.ask == Ask::None && !p.say_no {
+            continue;
+        }
+        let listed = st.store.get(id).is_some();
+        if listed || p.met.is_none() || !open {
+            if p.ask == Ask::Out && !listed && open {
+                unanswered.push(*id);
+            }
+            p.ask = Ask::None;
+            p.say_no = false;
+            any = true;
+        }
+    }
+    for id in unanswered {
+        let name = sh.shown_name(st, &id);
+        log!("{} ({name}) went away without answering the request to remember each other", id.fmt_short());
+        sh.notice(st, format!("「{name}」没有回应"));
+    }
+    any
 }
 
 /// One list `guests_loop` keeps on one relay.
@@ -2096,14 +2292,21 @@ struct RelayTrack {
 
 /// Keeps this computer's guest list and connection codes on every own
 /// relay: each whole list goes out at start (the codes only once there are
-/// any), whenever it changes (checked every 2 s), and every 15 s for guests
-/// so relay-side kicks sync back immediately; again 30 s after a failure.
+/// any), as soon as it changes, and when the relay's watch (`watch_relay`)
+/// asks, which it does at once when a guest is kicked there: the answer
+/// names the kicked guests, they are dropped here and the shorter list goes
+/// to every relay. A relay too old for a watch gets the list every
+/// `GUEST_SYNC_EVERY` instead. Again 30 s after a failure.
 async fn guests_loop(sh: Arc<Shared>) {
+    /// Looked at again this long after the last change at the latest.
     const EVERY: Duration = Duration::from_secs(2);
-    const GUEST_SYNC_EVERY: Duration = Duration::from_secs(15);
     let mut tracked: BTreeMap<Vec<RelayUrl>, RelayTrack> = BTreeMap::new();
+    let mut watches: BTreeMap<Vec<RelayUrl>, tokio::task::JoinHandle<()>> = BTreeMap::new();
     loop {
         if sh.is_stopped() || sh.leaving.load(std::sync::atomic::Ordering::SeqCst) {
+            for (_, w) in watches {
+                w.abort();
+            }
             return;
         }
         let (relays, mut guests, invites) = {
@@ -2119,9 +2322,22 @@ async fn guests_loop(sh: Arc<Shared>) {
             tracked.remove(&old);
             sh.st.lock().unwrap().relay_ok.remove(&old[0].to_string());
         }
+        watches.retain(|r, w| {
+            let keep = relays.contains(r);
+            if !keep {
+                w.abort();
+                sh.watching.lock().unwrap().remove(r);
+            }
+            keep
+        });
+        for relay in &relays {
+            watches.entry(relay.clone()).or_insert_with(|| tokio::spawn(watch_relay(sh.clone(), relay.clone())));
+        }
         for relay in &relays {
             let RelayTrack { guests: g, invites: i } = tracked.entry(relay.clone()).or_insert_with(|| RelayTrack { guests: Track::new(None), invites: Track::new(Some(Vec::new())) });
-            if g.due(&guests, Some(GUEST_SYNC_EVERY)) {
+            let asked = sh.resync.lock().unwrap().remove(relay);
+            let refresh = (!sh.watching.lock().unwrap().contains(relay)).then_some(GUEST_SYNC_EVERY);
+            if asked || g.due(&guests, refresh) {
                 let r = sh.send_guests(relay, &guests).await;
                 let dropped = r.as_ref().ok().cloned().unwrap_or_default();
                 let ok = g.note(r.map(|_| ()).map_err(relay_error), relay, "guest list", &guests);
@@ -2131,6 +2347,8 @@ async fn guests_loop(sh: Arc<Shared>) {
                     for id in dropped {
                         changed |= sh.drop_guest(id, "kicked on relay");
                     }
+                    // The relays before this one in the list get the shorter list too.
+                    sh.guests_wake.notify_one();
                     if changed {
                         guests = {
                             let st = sh.st.lock().unwrap();
@@ -2147,7 +2365,60 @@ async fn guests_loop(sh: Arc<Shared>) {
                 i.note(sh.send_invites(relay, &invites).await, relay, "connection codes", &invites);
             }
         }
-        tokio::time::sleep(EVERY).await;
+        let _ = tokio::time::timeout(EVERY, sh.guests_wake.notified()).await;
+    }
+}
+
+/// Without a watch, how often the guest list goes to a relay to hear of kicks.
+const GUEST_SYNC_EVERY: Duration = Duration::from_secs(15);
+
+/// Keeps this computer's watch open on one own relay (see `rc_relay::api`):
+/// each `sync` from it has `guests_loop` send the guest list now. Opened
+/// again a second after it ends, more slowly while that keeps failing; on a
+/// relay too old for it, tried again every 10 minutes.
+async fn watch_relay(sh: Arc<Shared>, relay: Vec<RelayUrl>) {
+    const NO_WATCH_RETRY: Duration = Duration::from_secs(600);
+    let mut wait = Duration::from_secs(1);
+    let mut last_err = String::new();
+    loop {
+        if sh.is_stopped() {
+            return;
+        }
+        let opened = Instant::now();
+        let sync = {
+            let (sh, relay) = (sh.clone(), relay.clone());
+            move || {
+                sh.watching.lock().unwrap().insert(relay.clone());
+                sh.resync.lock().unwrap().insert(relay.clone());
+                sh.guests_wake.notify_one();
+            }
+        };
+        let r = rc_relay::client::watch(&relay, &sh.secret, &rc_relay::tls::ca(), sync).await;
+        sh.watching.lock().unwrap().remove(&relay);
+        if opened.elapsed() > Duration::from_secs(60) {
+            wait = Duration::from_secs(1);
+            last_err.clear();
+        }
+        match r {
+            Err(e) if e.downcast_ref::<rc_relay::client::NoWatch>().is_some() => {
+                if last_err != "no watch" {
+                    log!("{}: {e}; sending the guest list every {} s", relay[0], GUEST_SYNC_EVERY.as_secs());
+                    last_err = "no watch".into();
+                }
+                tokio::time::sleep(NO_WATCH_RETRY).await;
+                continue;
+            }
+            Err(e) => {
+                let e = format!("{:#}", relay_error(e));
+                if e != last_err {
+                    log!("watch on {}: {e}; opening it again", relay[0]);
+                    last_err = e;
+                }
+            }
+            Ok(()) => {}
+        }
+        tokio::time::sleep(wait).await;
+        wait = (wait * 2).min(Duration::from_secs(30));
     }
 }
 
@@ -2837,5 +3108,150 @@ mod live {
     fn deleting_over_the_other_sides_connection() {
         let took = meet_then_forget("delete1", true, delete);
         assert!(took < Duration::from_secs(4), "the other side took {took:?}");
+    }
+
+    /// On this computer, no relay: B meets A with A's code and asks to
+    /// remember each other. A refuses, B asks again, A agrees: both list the
+    /// other. Then B asks a new stranger C, which goes away without an
+    /// answer. `one_way`: A's own calls never get through, so A's answers
+    /// reach B only in welcomes.
+    fn remembering_takes_both_sides(name: &str, one_way: bool) {
+        let dir = std::env::temp_dir().join(format!("rc-{name}-{}", std::process::id()));
+        let (a, b, c) = (dir.join("a"), dir.join("b"), dir.join("c"));
+        for d in [&a, &b, &c] {
+            std::fs::create_dir_all(d).unwrap();
+            std::fs::write(d.join("settings.txt"), "public_relays=0\nlan_visible=0\n").unwrap();
+        }
+        let opts = |d: &std::path::Path| {
+            let mut o = host::HostArgs::defaults().node_options(false);
+            o.key = d.join("device.key");
+            o.lan = false;
+            o
+        };
+        let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+        let na = rt.block_on(Node::start(opts(&a))).unwrap();
+        let nb = rt.block_on(Node::start(opts(&b))).unwrap();
+        let nc = rt.block_on(Node::start(opts(&c))).unwrap();
+        let (ida, idb, idc) = (na.sh.me, nb.sh.me, nc.sh.me);
+        if one_way {
+            NO_DIAL.lock().unwrap().insert(ida);
+        }
+        let ask = |n: &Node, req: &str| {
+            let r = n.request(req);
+            r.strip_prefix("ok\t").unwrap_or_else(|| panic!("{req}: {r}")).to_string()
+        };
+        // (listed, ask) of `id`'s row on `n`.
+        let row = |n: &Node, id: EndpointId| {
+            let s = ask(n, "snapshot");
+            let l = s.lines().find(|l| l.starts_with(&format!("dev\t{id}\t")))?.to_string();
+            let f: Vec<&str> = l.split('\t').collect();
+            Some((f[2] == "1", f[10].to_string()))
+        };
+        let notice = |n: &Node| ask(n, "snapshot").lines().find_map(|l| l.strip_prefix("notice\t").map(str::to_string)).unwrap_or_default();
+        let wait = |what: &str, ok: &dyn Fn() -> bool| {
+            let t = Instant::now();
+            while !ok() {
+                assert!(t.elapsed() < Duration::from_secs(30), "{what}");
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        };
+        let is = |n: &Node, id: EndpointId, listed: bool, a: &str| row(n, id) == Some((listed, a.to_string()));
+        wait("a code with addresses", &|| ConnCode::find(&ask(&na, "code")).is_some_and(|(c, _)| !c.addrs.is_empty()));
+        ask(&nb, &format!("paste\t{}", ask(&na, "code")));
+        wait("B meets A", &|| is(&nb, ida, false, "-"));
+        wait("A meets B", &|| is(&na, idb, false, "-"));
+
+        assert_eq!(ask(&nb, &format!("remember\t{ida}")), "");
+        assert!(is(&nb, ida, false, "out"));
+        wait("A is asked", &|| is(&na, idb, false, "in"));
+        ask(&na, &format!("refuse\t{idb}"));
+        wait("B hears no", &|| is(&nb, ida, false, "-") && notice(&nb).contains("没有同意"));
+        assert!(is(&na, idb, false, "-"));
+
+        ask(&nb, &format!("remember\t{ida}"));
+        wait("A is asked again", &|| is(&na, idb, false, "in"));
+        ask(&na, &format!("agree\t{idb}"));
+        assert!(is(&na, idb, true, "-"), "A lists B at once");
+        wait("B lists A", &|| is(&nb, ida, true, "-") && notice(&nb).contains("同意了"));
+        std::thread::sleep(Duration::from_secs(3));
+        assert!(is(&na, idb, true, "-") && is(&nb, ida, true, "-"), "a side changed its mind");
+        assert!(!na.sh.st.lock().unwrap().store.get(&idb).unwrap().auto_accept, "trusted, not 我的电脑");
+
+        wait("a code from C", &|| ConnCode::find(&ask(&nc, "code")).is_some_and(|(c, _)| !c.addrs.is_empty()));
+        ask(&nb, &format!("paste\t{}", ask(&nc, "code")));
+        wait("B meets C", &|| is(&nb, idc, false, "-"));
+        ask(&nb, &format!("remember\t{idc}"));
+        wait("C is asked", &|| is(&nc, idb, false, "in"));
+        rt.block_on(nc.stop());
+        wait("B hears nothing back", &|| notice(&nb).contains("没有回应"));
+        assert!(row(&nb, idc).is_none_or(|(l, a)| !l && a == "-"));
+
+        NO_DIAL.lock().unwrap().remove(&ida);
+        rt.block_on(async {
+            na.goodbye(0).await;
+            nb.goodbye(0).await;
+            nc.goodbye(0).await;
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn remembering_asks_the_other_side() {
+        remembering_takes_both_sides("remember", false);
+    }
+
+    #[test]
+    fn remembering_over_the_other_sides_connection() {
+        remembering_takes_both_sides("remember1", true);
+    }
+
+    /// Both click 记住 at the same moment: they remember each other.
+    #[test]
+    fn both_asking_remember_each_other() {
+        let dir = std::env::temp_dir().join(format!("rc-both-{}", std::process::id()));
+        let (a, b) = (dir.join("a"), dir.join("b"));
+        for d in [&a, &b] {
+            std::fs::create_dir_all(d).unwrap();
+            std::fs::write(d.join("settings.txt"), "public_relays=0\nlan_visible=0\n").unwrap();
+        }
+        let opts = |d: &std::path::Path| {
+            let mut o = host::HostArgs::defaults().node_options(false);
+            o.key = d.join("device.key");
+            o.lan = false;
+            o
+        };
+        let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+        let na = rt.block_on(Node::start(opts(&a))).unwrap();
+        let nb = rt.block_on(Node::start(opts(&b))).unwrap();
+        let (ida, idb) = (na.sh.me, nb.sh.me);
+        let ask = |n: &Node, req: &str| {
+            let r = n.request(req);
+            r.strip_prefix("ok\t").unwrap_or_else(|| panic!("{req}: {r}")).to_string()
+        };
+        let listed = |n: &Node, id: EndpointId| n.sh.st.lock().unwrap().store.get(&id).is_some();
+        let online = |n: &Node, id: EndpointId| {
+            ask(n, "snapshot").lines().any(|l| l.starts_with(&format!("dev\t{id}\t")) && l.contains("\tonline\t"))
+        };
+        let wait = |what: &str, ok: &dyn Fn() -> bool| {
+            let t = Instant::now();
+            while !ok() {
+                assert!(t.elapsed() < Duration::from_secs(20), "{what}");
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        };
+        wait("a code with addresses", &|| ConnCode::find(&ask(&na, "code")).is_some_and(|(c, _)| !c.addrs.is_empty()));
+        ask(&nb, &format!("paste\t{}", ask(&na, "code")));
+        wait("B sees A", &|| online(&nb, ida));
+        wait("A sees B", &|| online(&na, idb));
+        ask(&na, &format!("remember\t{idb}"));
+        ask(&nb, &format!("remember\t{ida}"));
+        wait("both remember", &|| listed(&na, idb) && listed(&nb, ida));
+        std::thread::sleep(Duration::from_secs(3));
+        assert!(listed(&na, idb) && listed(&nb, ida));
+        rt.block_on(async {
+            na.goodbye(0).await;
+            nb.goodbye(0).await;
+        });
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

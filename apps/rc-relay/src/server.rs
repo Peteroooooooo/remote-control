@@ -1,19 +1,20 @@
 //! Runs the relay: iroh-relay with [`Policy`] as its access control and the
-//! claim / guests / invites / meet routes, and keeps the policy's roster in
+//! claim / guests / invites / meet / watch routes, and keeps the policy's roster in
 //! step with `owners.txt` (which the management screen may change while it
 //! runs). It also writes `status.txt` every few seconds: when it started
 //! and which devices are connected, for the management screen to show.
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     sync::{Arc, Mutex},
     time::{Duration, SystemTime},
+    convert::Infallible,
 };
 
 use anyhow::{Result, anyhow};
 use bytes::Bytes;
 use http::{Method, Request, Response, StatusCode, response::Builder};
-use http_body_util::Full;
+use http_body_util::{Full, channel::Channel};
 use hyper::body::Incoming;
 use iroh_base::{EndpointId, RelayUrl};
 use iroh_relay::server::{
@@ -24,7 +25,7 @@ use rc_ident::{proof::unix_now, relay_code::RelayCode};
 use tracing::{info, warn};
 
 use crate::{
-    api::{self, ClaimRequest, GuestsRequest, InvitesRequest, MeetRequest, Refusal},
+    api::{self, ClaimRequest, GuestsRequest, InvitesRequest, MeetRequest, Refusal, WatchRequest},
     config::{Config, Resolved},
     policy::Policy,
     state::{ActiveMeet, Code, Status, Store},
@@ -38,6 +39,8 @@ struct Shared {
     seen: Mutex<HashMap<(EndpointId, [u8; 16]), u64>>,
     /// One change to the state files at a time within this process.
     writing: Mutex<()>,
+    /// Bumped on every roster reload: the open watches look again.
+    roster: tokio::sync::watch::Sender<()>,
 }
 
 impl Shared {
@@ -45,8 +48,56 @@ impl Shared {
         let owners = self.store.owners()?;
         let guests = guest_ids(self.store.guests()?);
         let kicked = self.store.kicked()?.into_iter().map(|k| (k.owner, k.guest));
-        self.policy.set_roster(owners.iter().map(|o| o.id), guests, kicked);
+        self.policy.set_roster(owners.iter().map(|o| (o.id, o.code)), guests, kicked);
+        self.roster.send_replace(());
         Ok(())
+    }
+
+    /// The guests kicked under `owner` and not dropped by it yet.
+    fn kicks_of(&self, owner: &EndpointId) -> BTreeSet<EndpointId> {
+        self.store.kicked().unwrap_or_default().into_iter().filter(|k| k.owner == *owner).map(|k| k.guest).collect()
+    }
+
+    /// An owner's watch (see `api`): `sync` at once and whenever a guest is
+    /// newly kicked under it, an empty line every `WATCH_BEAT` otherwise. It
+    /// ends when the owner is deleted or goes away.
+    fn watch(self: &Arc<Self>, header: &str) -> Result<BytesBody, Refusal> {
+        let req = WatchRequest::decode(header).map_err(|_| Refusal::BadRequest)?;
+        self.signed_by_owner("watch", &req.device, req.time, req.nonce)?;
+        let owner = req.device;
+        let (mut tx, body) = Channel::<Bytes, Infallible>::new(4);
+        let sh = self.clone();
+        tokio::spawn(async move {
+            let mut roster = sh.roster.subscribe();
+            let mut kicks = sh.kicks_of(&owner);
+            let mut line: &'static [u8] = b"sync\n";
+            loop {
+                if tx.send_data(Bytes::from_static(line)).await.is_err() {
+                    return;
+                }
+                line = b"\n";
+                let beat = tokio::time::sleep(Duration::from_secs(api::WATCH_BEAT));
+                tokio::pin!(beat);
+                loop {
+                    tokio::select! {
+                        r = roster.changed() => if r.is_err() { return },
+                        _ = &mut beat => break,
+                    }
+                    if !sh.policy.owners().contains(&owner) {
+                        info!("watch of {}: no longer an owner", owner.fmt_short());
+                        return;
+                    }
+                    let now = sh.kicks_of(&owner);
+                    let new = now.difference(&kicks).next().is_some();
+                    kicks = now;
+                    if new {
+                        line = b"sync\n";
+                        break;
+                    }
+                }
+            }
+        });
+        Ok(Box::new(body))
     }
 
     /// The checks every signed owner request goes through: time, owner, once.
@@ -161,6 +212,24 @@ fn reply(res: Builder, r: Result<String, Refusal>) -> HyperResult<Response<Bytes
     Ok(res.status(status).header("content-type", "text/plain; charset=utf-8").body(body)?)
 }
 
+fn watch_route(sh: &Arc<Shared>) -> HyperHandler {
+    let sh = sh.clone();
+    Box::new(move |req: Request<Incoming>, res: Builder| {
+        let r = match req.headers().get(api::HEADER).and_then(|v| v.to_str().ok()) {
+            Some(h) => sh.watch(h),
+            None => Err(Refusal::BadRequest),
+        };
+        match r {
+            Ok(body) => Ok(res
+                .status(StatusCode::OK)
+                .header("content-type", "text/plain; charset=utf-8")
+                .header("cache-control", "no-store")
+                .body(body)?),
+            Err(e) => reply(res, Err(e)),
+        }
+    })
+}
+
 fn route(sh: &Arc<Shared>, f: fn(&Shared, &str) -> Result<String, Refusal>) -> HyperHandler {
     let sh = sh.clone();
     Box::new(move |req: Request<Incoming>, res: Builder| {
@@ -184,7 +253,7 @@ impl Relay {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let store = Store::new(&cfg.state_dir);
         store.upgrade()?;
-        let owners: Vec<EndpointId> = store.owners()?.iter().map(|o| o.id).collect();
+        let owners: Vec<(EndpointId, u32)> = store.owners()?.iter().map(|o| (o.id, o.code)).collect();
         let guests = guest_ids(store.guests()?);
         let kicked = store.kicked()?.into_iter().map(|k| (k.owner, k.guest));
         let policy = Arc::new(Policy::new(owners, guests, kicked));
@@ -194,6 +263,7 @@ impl Relay {
             urls: resolved.urls,
             seen: Mutex::default(),
             writing: Mutex::default(),
+            roster: tokio::sync::watch::Sender::new(()),
         });
         let tls = resolved.server_tls;
         let mut rc = RelayConfig::new(cfg.http_bind_addr);
@@ -204,6 +274,7 @@ impl Relay {
             (Method::POST, api::GUESTS_PATH, route(&shared, Shared::set_guests)),
             (Method::POST, api::INVITES_PATH, route(&shared, Shared::set_invites)),
             (Method::POST, api::MEET_PATH, route(&shared, Shared::meet)),
+            (Method::POST, api::WATCH_PATH, watch_route(&shared)),
         ];
         let mut sc = ServerConfig::default();
         sc.relay = Some(rc);
@@ -248,8 +319,10 @@ fn guest_ids(m: BTreeMap<EndpointId, Vec<crate::api::Guest>>) -> BTreeMap<Endpoi
     m.into_iter().map(|(o, gs)| (o, gs.into_iter().map(|g| g.id).collect())).collect()
 }
 
-/// Picks up changes other processes make to `owners.txt` and `kicked.txt`,
-/// and writes `status.txt` (connected devices and temporary guests) when they change.
+/// Picks up changes other processes make to `owners.txt` and `kicked.txt`
+/// within a quarter second (a kick on the management screen reaches the
+/// owner's watch at once), and writes `status.txt` (connected devices and
+/// temporary guests) when they change, looked at every 2 s.
 async fn watch_owners(sh: Arc<Shared>, started: u64) {
     let op = sh.store.owners_path();
     let kp = sh.store.kicked_path();
@@ -262,8 +335,21 @@ async fn watch_owners(sh: Arc<Shared>, started: u64) {
     let mut last: (Option<SystemTime>, Option<SystemTime>) = stamps();
     let mut shown: Option<(Vec<EndpointId>, Vec<ActiveMeet>)> = None;
     let mut written = 0;
+    let mut tick = 0u32;
     loop {
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        tick = tick.wrapping_add(1);
+        let now = stamps();
+        if now != last {
+            last = now;
+            match sh.reload() {
+                Ok(()) => info!("roster changed: {} owner(s)", sh.policy.owners().len()),
+                Err(e) => warn!("roster reload: {e:#}; keeping the previous list"),
+            }
+        }
+        if !tick.is_multiple_of(8) {
+            continue;
+        }
         let mut online: Vec<EndpointId> = sh.policy.online().into_iter().collect();
         online.sort();
         let meets: Vec<ActiveMeet> = sh
@@ -289,15 +375,6 @@ async fn watch_owners(sh: Arc<Shared>, started: u64) {
                 }
                 Err(e) => warn!("status.txt: {e:#}"),
             }
-        }
-        let now = stamps();
-        if now == last {
-            continue;
-        }
-        last = now;
-        match sh.reload() {
-            Ok(()) => info!("roster changed: {} owner(s)", sh.policy.owners().len()),
-            Err(e) => warn!("roster reload: {e:#}; keeping the previous list"),
         }
     }
 }

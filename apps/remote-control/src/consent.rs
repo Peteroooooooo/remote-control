@@ -39,15 +39,12 @@ pub enum Kind {
     Trusted,
 }
 
+/// Only allow or deny: the popup never changes what the device is to this
+/// computer (`devices-and-relay.md` 3.2).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Answer {
+    Allow,
     Deny,
-    /// Allowed; a new device stays temporary.
-    Once,
-    /// Allowed; trusted from now on (asks each time).
-    Trust,
-    /// Allowed; "my computer" from now on (never asks again).
-    Mine,
     NoAnswer,
     /// Closed by the program (the viewer gave up).
     Cancelled,
@@ -72,8 +69,6 @@ impl Asking {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Hit {
-    Choice(Answer),
-    Check,
     Allow,
     Deny,
 }
@@ -81,41 +76,25 @@ enum Hit {
 struct Popup {
     name: String,
     kind: Kind,
-    /// For a new device: Once, Trust or Mine.
-    choice: Answer,
-    /// For a trusted device: "from now on without asking".
-    checked: bool,
     hover: Option<Hit>,
     left_s: u32,
+    wait_s: u32,
     tx: Option<oneshot::Sender<Answer>>,
 }
 
-/// Width of the client area in window units.
-const WIDTH: i32 = 500;
+/// The client area in window units.
+const WIDTH: i32 = 440;
+const HEIGHT: i32 = 164;
+/// The countdown bar.
+const AMBER: windows::Win32::Foundation::COLORREF = gdi::rgb(0xd29922);
 
 impl Popup {
-    fn height(&self) -> i32 {
-        match self.kind {
-            Kind::New { .. } => 196,
-            Kind::Trusted => 164,
-        }
-    }
-
-    /// Where everything goes, in window units.
+    /// Where the buttons go, in window units: 拒绝, then 允许 on the right.
     fn layout(&self) -> Vec<(Hit, RECT)> {
-        let by = self.height() - 24 - 36;
-        let mut v = Vec::new();
-        if let Kind::New { .. } = self.kind {
-            for (i, a) in [Answer::Once, Answer::Trust, Answer::Mine].into_iter().enumerate() {
-                let x = 74 + 112 * i as i32;
-                v.push((Hit::Choice(a), rect(x, 86, x + 104, 114)));
-            }
-        } else {
-            v.push((Hit::Check, rect(24, 60, WIDTH - 24, 88)));
-        }
-        v.push((Hit::Allow, rect(WIDTH - 24 - 96 - 12 - 124, by, WIDTH - 24 - 96 - 12, by + 36)));
-        v.push((Hit::Deny, rect(WIDTH - 24 - 96, by, WIDTH - 24, by + 36)));
-        v
+        let by = HEIGHT - 20 - 36;
+        let allow = rect(WIDTH - 24 - 100, by, WIDTH - 24, by + 36);
+        let deny = rect(allow.left - 10 - 92, by, allow.left - 10, by + 36);
+        vec![(Hit::Deny, deny), (Hit::Allow, allow)]
     }
 
     fn hit(&self, hwnd: HWND, x: i32, y: i32) -> Option<Hit> {
@@ -128,15 +107,8 @@ impl Popup {
 pub fn ask(name: &str, kind: Kind, wait: Duration) -> Asking {
     let hwnd = Arc::new(AtomicIsize::new(0));
     let (tx, rx) = oneshot::channel();
-    let popup = Popup {
-        name: name.to_string(),
-        kind,
-        choice: Answer::Once,
-        checked: false,
-        hover: None,
-        left_s: wait.as_secs().max(1) as u32,
-        tx: Some(tx),
-    };
+    let wait_s = wait.as_secs().max(1) as u32;
+    let popup = Popup { name: name.to_string(), kind, hover: None, left_s: wait_s, wait_s, tx: Some(tx) };
     let h = hwnd.clone();
     let r = std::thread::Builder::new().name("consent".into()).spawn(move || {
         if let Err(e) = crate::desktop::follow() {
@@ -167,7 +139,7 @@ fn run(popup: Popup, hwnd_out: &AtomicIsize) -> windows::core::Result<()> {
             ..Default::default()
         };
         RegisterClassW(&wc);
-        let height = popup.height();
+        let height = HEIGHT;
         let ptr = Box::into_raw(Box::new(popup));
         let style = WS_CAPTION | WS_SYSMENU;
         let hwnd = CreateWindowExW(
@@ -281,24 +253,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 let (x, y) = xy(lp);
                 let Some(p) = popup(hwnd) else { return LRESULT(0) };
                 match p.hit(hwnd, x, y) {
-                    Some(Hit::Choice(a)) => p.choice = a,
-                    Some(Hit::Check) => p.checked = !p.checked,
-                    Some(Hit::Allow) => {
-                        let a = match p.kind {
-                            Kind::New { .. } => p.choice,
-                            Kind::Trusted if p.checked => Answer::Mine,
-                            Kind::Trusted => Answer::Trust,
-                        };
-                        finish(hwnd, a);
-                        return LRESULT(0);
-                    }
-                    Some(Hit::Deny) => {
-                        finish(hwnd, Answer::Deny);
-                        return LRESULT(0);
-                    }
+                    Some(Hit::Allow) => finish(hwnd, Answer::Allow),
+                    Some(Hit::Deny) => finish(hwnd, Answer::Deny),
                     None => {}
                 }
-                let _ = InvalidateRect(Some(hwnd), None, false);
                 LRESULT(0)
             }
             WM_KEYDOWN if wp.0 == VK_ESCAPE.0 as usize => {
@@ -343,54 +301,34 @@ fn paint(hwnd: HWND, p: &Popup) {
     let r = |l: i32, t: i32, rr: i32, b: i32| rect(px(l), px(t), px(rr), px(b));
     let mut c = Canvas::begin(hwnd, gdi::BG);
     let (title, body, bold, small) = (c.font(px(17), true), c.font(px(14), false), c.font(px(14), true), c.font(px(12), false));
-    let head = match p.kind {
-        Kind::Trusted => format!("「{}」请求控制你的电脑（信任设备）", p.name),
-        Kind::New { .. } => format!("「{}」请求控制你的电脑", p.name),
+    c.text(&r(24, 20, WIDTH - 24, 48), &format!("「{}」想控制这台电脑", p.name), title, gdi::TEXT, false);
+    let what = match p.kind {
+        Kind::Trusted => "信任设备",
+        Kind::New { via_code: true } => "临时设备 · 经连接码",
+        Kind::New { via_code: false } => "临时设备 · 来自局域网",
     };
-    c.text(&r(24, 18, WIDTH - 24, 46), &head, title, gdi::TEXT, false);
-    if let Kind::New { via_code } = p.kind {
-        let from = if via_code { "新设备（通过连接码）" } else { "新设备（来自局域网）" };
-        c.text(&r(24, 46, WIDTH - 24, 68), from, body, gdi::DIM, false);
-        c.text(&r(24, 86, 74, 114), "以后：", body, gdi::TEXT, false);
+    c.text(&r(24, 50, WIDTH - 24, 72), what, body, gdi::DIM, false);
+    // How long until it counts as refused.
+    let (bl, br) = (24, WIDTH - 24);
+    c.round(&r(bl, 86, br, 89), px(2), Some(gdi::BUTTON_EDGE), None);
+    let left = bl + (br - bl) * p.left_s as i32 / p.wait_s.max(1) as i32;
+    if left > bl {
+        c.round(&r(bl, 86, left, 89), px(2), Some(AMBER), None);
     }
     for (hit, a) in p.layout() {
         let hovered = p.hover == Some(hit);
-        let cy = (px(a.top) + px(a.bottom)) / 2;
+        let b = r(a.left, a.top, a.right, a.bottom);
         match hit {
-            Hit::Choice(choice) => {
-                let on = p.choice == choice;
-                let ring = if on { gdi::ACCENT } else if hovered { gdi::TEXT } else { gdi::DIM };
-                c.circle(px(a.left + 8), cy, px(7), None, Some((ring, px(2).max(1))));
-                if on {
-                    c.circle(px(a.left + 8), cy, px(4), Some(gdi::ACCENT), None);
-                }
-                let label = match choice {
-                    Answer::Trust => "信任设备",
-                    Answer::Mine => "我的电脑",
-                    _ => "只这一次",
-                };
-                c.text(&r(a.left + 22, a.top, a.right, a.bottom), label, body, gdi::TEXT, false);
-            }
-            Hit::Check => {
-                let b = rect(px(a.left), cy - px(8), px(a.left + 16), cy + px(8));
-                let (fill, ring) = if p.checked { (Some(gdi::ACCENT), gdi::ACCENT) } else { (None, if hovered { gdi::TEXT } else { gdi::DIM }) };
-                c.round(&b, px(4), fill, Some((ring, px(2).max(1))));
-                if p.checked {
-                    c.text(&b, "✓", bold, gdi::TEXT, true);
-                }
-                c.text(&r(a.left + 26, a.top, a.right, a.bottom), "以后它控制我时免确认（改为我的电脑）", body, gdi::TEXT, false);
-            }
             Hit::Allow => {
-                c.round(&r(a.left, a.top, a.right, a.bottom), px(6), Some(if hovered { gdi::ACCENT_HOVER } else { gdi::ACCENT }), None);
-                c.text(&r(a.left, a.top, a.right, a.bottom), "允许控制", bold, gdi::TEXT, true);
+                c.round(&b, px(6), Some(if hovered { gdi::ACCENT_HOVER } else { gdi::ACCENT }), None);
+                c.text(&b, "允许", bold, gdi::TEXT, true);
             }
             Hit::Deny => {
-                let fill = if hovered { gdi::BUTTON_HOVER } else { gdi::BUTTON };
-                c.round(&r(a.left, a.top, a.right, a.bottom), px(6), Some(fill), Some((gdi::BUTTON_EDGE, 1)));
-                c.text(&r(a.left, a.top, a.right, a.bottom), "拒绝", bold, gdi::TEXT, true);
+                c.round(&b, px(6), Some(if hovered { gdi::BUTTON_HOVER } else { gdi::BUTTON }), Some((gdi::BUTTON_EDGE, 1)));
+                c.text(&b, "拒绝", bold, gdi::TEXT, true);
             }
         }
     }
-    let by = p.height() - 24 - 36;
-    c.text(&r(24, by, 220, by + 36), &format!("{} 秒后自动拒绝", p.left_s), small, gdi::DIM, false);
+    let by = HEIGHT - 20 - 36;
+    c.text(&r(24, by, 220, by + 36), &format!("{} 秒没人点就算拒绝", p.left_s), small, gdi::DIM, false);
 }

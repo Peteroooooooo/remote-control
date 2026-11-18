@@ -26,8 +26,6 @@ pub struct Snap {
     pub set_name: String,
     pub public: bool,
     pub lan: bool,
-    pub accept_new: bool,
-    pub clipboard: bool,
     /// The service's options.
     pub boot: bool,
     pub lock: bool,
@@ -89,6 +87,17 @@ pub struct Dev {
     pub status: Status,
     pub on_lan: bool,
     pub name: String,
+    pub ask: Ask,
+}
+
+/// A request to remember each other, while it waits for an answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Ask {
+    None,
+    /// This computer asked.
+    Out,
+    /// The other side asked.
+    In,
 }
 
 fn parse(text: &str) -> Snap {
@@ -105,8 +114,8 @@ fn parse(text: &str) -> Snap {
                 s.name = g(1);
                 s.set_name = g(2);
                 let on = |i: usize| g(i) == "1";
-                (s.public, s.lan, s.accept_new, s.clipboard) = (on(3), on(4), on(5), on(6));
-                (s.boot, s.lock, s.awake) = (on(7), on(8), on(9));
+                (s.public, s.lan) = (on(3), on(4));
+                (s.boot, s.lock, s.awake) = (on(5), on(6), on(7));
             }
             "relay" => s.relays.push(Relay { url: g(1), state: g(2) }),
             "hosting" => s.hosting = Some(g(2)),
@@ -135,6 +144,11 @@ fn parse(text: &str) -> Snap {
                     status,
                     on_lan: g(8) == "1",
                     name: g(9),
+                    ask: match g(10).as_str() {
+                        "out" => Ask::Out,
+                        "in" => Ask::In,
+                        _ => Ask::None,
+                    },
                 });
             }
             _ => {}
@@ -766,36 +780,4 @@ fn run_elevated(install: bool, key: &Path) -> Result<String> {
     } else {
         "后台服务已卸载".into()
     })
-}
-
-/// The text on the clipboard, if any.
-pub fn clipboard_text() -> Option<String> {
-    use windows::Win32::{
-        Foundation::{HANDLE, HGLOBAL},
-        System::{
-            DataExchange::{CloseClipboard, GetClipboardData, OpenClipboard},
-            Memory::{GlobalLock, GlobalUnlock},
-        },
-    };
-    const CF_UNICODETEXT: u32 = 13;
-    unsafe {
-        OpenClipboard(None).ok()?;
-        let r = (|| {
-            let h: HANDLE = GetClipboardData(CF_UNICODETEXT).ok()?;
-            let g = HGLOBAL(h.0);
-            let p = GlobalLock(g) as *const u16;
-            if p.is_null() {
-                return None;
-            }
-            let mut n = 0usize;
-            while *p.add(n) != 0 && n < 1 << 20 {
-                n += 1;
-            }
-            let s = String::from_utf16_lossy(std::slice::from_raw_parts(p, n));
-            let _ = GlobalUnlock(g);
-            Some(s)
-        })();
-        let _ = CloseClipboard();
-        r
-    }
 }

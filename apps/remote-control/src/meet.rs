@@ -3,8 +3,9 @@
 //! connection to each device it shows a card for and says hello on it
 //! (`Msg::MeetHi`); the answer says whether the other side knows it
 //! (`MeetWelcome`) or not (`MeetRefuse`). A hello also redeems a connection
-//! code (its token) and carries changes to the device lists: "I added you"
-//! (the other side then lists this computer too) and "I deleted you" (it
+//! code (its token) and carries changes to the device lists, as does a
+//! welcome: "let us remember each other" (asked, then agreed or refused on
+//! the other side), "I added you" and "I deleted you" (the other side
 //! deletes this computer too).
 
 use std::time::Duration;
@@ -21,6 +22,10 @@ pub const EVENT_NONE: u8 = 0;
 pub const EVENT_REMEMBER: u8 = 1;
 /// I deleted you from my device list.
 pub const EVENT_FORGET: u8 = 2;
+/// I want us to remember each other (you are not in my list yet).
+pub const EVENT_ASK: u8 = 3;
+/// I did not agree to remember each other.
+pub const EVENT_NO: u8 = 4;
 
 /// I have not met you (no code, not on my LAN, not in my list).
 pub const REFUSE_UNKNOWN: u8 = 1;

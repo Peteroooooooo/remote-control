@@ -209,10 +209,6 @@ pub struct Settings {
     pub public_relays: bool,
     /// Answer LAN discovery for strangers and accept incoming LAN connections from them.
     pub lan_visible: bool,
-    /// Accept connections from new devices not yet in the device list.
-    pub accept_new: bool,
-    /// Sync clipboard during sessions.
-    pub clipboard: bool,
     /// Automatically start service when Windows boots.
     pub boot_online: bool,
     /// Allow remote control while the computer is locked.
@@ -228,8 +224,6 @@ impl Default for Settings {
             relays: Vec::new(),
             public_relays: true,
             lan_visible: true,
-            accept_new: true,
-            clipboard: true,
             boot_online: true,
             lock_control: true,
             stay_awake: true,
@@ -256,8 +250,6 @@ impl Settings {
                     Some(("granted", v)) => given.push(relay_urls(v.split_once(' ').map_or(v, |(u, _)| u))),
                     Some(("public_relays", v)) => s.public_relays = v.trim() != "0",
                     Some(("lan_visible", v)) => s.lan_visible = v.trim() != "0",
-                    Some(("accept_new", v)) => s.accept_new = v.trim() != "0",
-                    Some(("clipboard", v)) => s.clipboard = v.trim() != "0",
                     Some(("boot_online", v)) => s.boot_online = v.trim() != "0",
                     Some(("lock_control", v)) => s.lock_control = v.trim() != "0",
                     Some(("stay_awake", v)) => s.stay_awake = v.trim() != "0",
@@ -278,11 +270,9 @@ impl Settings {
             text += &format!("relay={}\n", url_list(r));
         }
         text += &format!(
-            "public_relays={}\nlan_visible={}\naccept_new={}\nclipboard={}\nboot_online={}\nlock_control={}\nstay_awake={}\n",
+            "public_relays={}\nlan_visible={}\nboot_online={}\nlock_control={}\nstay_awake={}\n",
             self.public_relays as u8,
             self.lan_visible as u8,
-            self.accept_new as u8,
-            self.clipboard as u8,
             self.boot_online as u8,
             self.lock_control as u8,
             self.stay_awake as u8,
@@ -409,13 +399,11 @@ mod tests {
         assert_eq!(Settings::load(&p), Settings::default());
         assert!(Settings::default().public_relays);
         assert!(Settings::default().lan_visible);
-        assert!(Settings::default().accept_new);
-        assert!(Settings::default().clipboard);
         assert!(Settings::default().boot_online);
         assert!(Settings::default().lock_control);
         assert!(Settings::default().stay_awake);
-        // A phase 1 file.
-        std::fs::write(&p, "name=客厅\nallow_control=1\n").unwrap();
+        // A phase 1 file, and switches that are gone.
+        std::fs::write(&p, "name=客厅\nallow_control=1\naccept_new=0\nclipboard=0\n").unwrap();
         assert_eq!(Settings::load(&p), Settings { name: "客厅".into(), ..Settings::default() });
         let s = Settings {
             name: "客厅".into(),
@@ -425,8 +413,6 @@ mod tests {
             ],
             public_relays: false,
             lan_visible: false,
-            accept_new: true,
-            clipboard: false,
             boot_online: true,
             lock_control: false,
             stay_awake: true,

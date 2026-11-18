@@ -158,15 +158,15 @@ pub struct Hello {
 }
 
 /// Streams to an admitted viewer until either side ends the session.
-pub async fn session(conn: Connection, send: SendStream, mut recv: RecvStream, hello: Hello, cfg: PipeConfig, clipboard: bool) -> Result<()> {
+pub async fn session(conn: Connection, send: SendStream, mut recv: RecvStream, hello: Hello, cfg: PipeConfig) -> Result<()> {
     SESSIONS.lock().unwrap().push(conn.clone());
     let id = conn.stable_id();
-    let r = stream(&conn, send, &mut recv, hello, cfg, clipboard).await;
+    let r = stream(&conn, send, &mut recv, hello, cfg).await;
     SESSIONS.lock().unwrap().retain(|c| c.stable_id() != id);
     r
 }
 
-async fn stream(conn: &Connection, mut send: SendStream, recv: &mut RecvStream, hello: Hello, cfg: PipeConfig, clipboard: bool) -> Result<()> {
+async fn stream(conn: &Connection, mut send: SendStream, recv: &mut RecvStream, hello: Hello, cfg: PipeConfig) -> Result<()> {
     let cfg = PipeConfig {
         fps: cfg.fps.min(hello.fps.max(1) as u32),
         max_bps: cfg.max_bps.min(hello.max_kbps.saturating_mul(1000).max(1_000_000)),
@@ -191,16 +191,12 @@ async fn stream(conn: &Connection, mut send: SendStream, recv: &mut RecvStream, 
         let (out, sh) = (wtx.clone(), sh.clone());
         std::thread::Builder::new().name("cursor".into()).spawn(move || cursor::watch(out, sh, cfg.max_width))?;
     }
-    let clip = if clipboard {
-        match ClipSync::start(conn, wtx.clone(), true) {
-            Ok(c) => Some(c),
-            Err(e) => {
-                log!("clipboard sharing off: {e:#}");
-                None
-            }
+    let clip = match ClipSync::start(conn, wtx.clone(), true) {
+        Ok(c) => Some(c),
+        Err(e) => {
+            log!("clipboard sharing off: {e:#}");
+            None
         }
-    } else {
-        None
     };
     {
         let (tx, wtx, conn) = (tx.clone(), wtx.clone(), conn.clone());

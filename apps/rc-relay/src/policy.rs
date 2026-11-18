@@ -1,6 +1,7 @@
 //! Who the relay forwards for:
 //! - Members (the devices in `owners.txt`, which joined with one of the
-//!   relay's codes) may reach one another and their own guests.
+//!   relay's codes) may reach the members that joined with the same code,
+//!   and their own guests. Members of different codes never reach each other.
 //! - A guest (a device in an owner's `guests.txt`, or one that brought one
 //!   of an owner's connection codes via `POST /rc/meet` within [`crate::api::MEET_KEEP`])
 //!   may reach only the owner(s) that listed or admitted it — never another
@@ -25,7 +26,8 @@ use tracing::info;
 
 #[derive(Debug, Default)]
 struct Roster {
-    owners: HashSet<EndpointId>,
+    /// Each owner and the code it joined with.
+    owners: HashMap<EndpointId, u32>,
     /// Each owner's guests, as the owner sent them.
     guests: BTreeMap<EndpointId, HashSet<EndpointId>>,
     /// Guests kicked on the relay (`kicked.txt`), waiting for the owner's
@@ -38,12 +40,6 @@ struct Peer {
     conns: Vec<(ConnectionId, Option<EndpointId>)>,
 }
 
-impl Peer {
-    /// The devices an endpoint may count as: itself and what its proofs speak for.
-    fn any(&self, id: &EndpointId, set: &HashSet<EndpointId>) -> bool {
-        set.contains(id) || self.conns.iter().any(|(_, s)| s.is_some_and(|d| set.contains(&d)))
-    }
-}
 
 #[derive(Debug)]
 pub struct Policy {
@@ -62,16 +58,10 @@ fn devices(peers: &HashMap<EndpointId, Peer>, id: &EndpointId) -> Vec<EndpointId
     v
 }
 
-fn counts_in(peers: &HashMap<EndpointId, Peer>, id: &EndpointId, set: &HashSet<EndpointId>) -> bool {
-    match peers.get(id) {
-        Some(p) => p.any(id, set),
-        None => set.contains(id),
-    }
-}
 
 impl Policy {
     pub fn new(
-        owners: impl IntoIterator<Item = EndpointId>,
+        owners: impl IntoIterator<Item = (EndpointId, u32)>,
         guests: BTreeMap<EndpointId, Vec<EndpointId>>,
         kicked: impl IntoIterator<Item = (EndpointId, EndpointId)>,
     ) -> Policy {
@@ -85,7 +75,7 @@ impl Policy {
 
     pub fn set_roster(
         &self,
-        owners: impl IntoIterator<Item = EndpointId>,
+        owners: impl IntoIterator<Item = (EndpointId, u32)>,
         guests: BTreeMap<EndpointId, Vec<EndpointId>>,
         kicked: impl IntoIterator<Item = (EndpointId, EndpointId)>,
     ) {
@@ -133,7 +123,7 @@ impl Policy {
         m.retain(|_, (t, _)| *t > now);
         let mut v: Vec<_> = m
             .iter()
-            .filter(|((o, d), _)| r.owners.contains(o) && !r.kicked.contains(&(*o, *d)))
+            .filter(|((o, d), _)| r.owners.contains_key(o) && !r.kicked.contains(&(*o, *d)))
             .map(|((o, d), (_, n))| (*o, *d, n.clone()))
             .collect();
         v.sort_by_key(|(o, d, _)| (*o, *d));
@@ -145,7 +135,7 @@ impl Policy {
     }
 
     pub fn owners(&self) -> HashSet<EndpointId> {
-        self.roster.read().unwrap().owners.clone()
+        self.roster.read().unwrap().owners.keys().copied().collect()
     }
 
     /// The devices connected now (by key, and by what their proofs speak for).
@@ -171,10 +161,10 @@ impl AccessControl for Policy {
         let what = {
             let r = self.roster.read().unwrap();
             let dev = speaks.unwrap_or(id);
-            let kind = if r.owners.contains(&id) || r.owners.contains(&dev) {
+            let kind = if r.owners.contains_key(&id) || r.owners.contains_key(&dev) {
                 "an owner"
             } else if r.guests.iter().any(|(o, gs)| {
-                r.owners.contains(o)
+                r.owners.contains_key(o)
                     && ((gs.contains(&id) && !r.kicked.contains(&(*o, id)))
                         || (gs.contains(&dev) && !r.kicked.contains(&(*o, dev))))
             }) {
@@ -206,14 +196,15 @@ impl AccessControl for Policy {
     fn allow_forward(&self, src: EndpointId, dst: EndpointId, _len: usize) -> bool {
         let r = self.roster.read().unwrap();
         let peers = self.peers.lock().unwrap();
-        if counts_in(&peers, &src, &r.owners) && counts_in(&peers, &dst, &r.owners) {
+        let (a, b) = (devices(&peers, &src), devices(&peers, &dst));
+        let same_code = |x: &EndpointId, y: &EndpointId| r.owners.get(x).is_some_and(|c| r.owners.get(y) == Some(c));
+        if a.iter().any(|x| b.iter().any(|y| same_code(x, y))) {
             return true;
         }
         let met = self.met.lock().unwrap();
         let now = unix_now();
-        let (a, b) = (devices(&peers, &src), devices(&peers, &dst));
         let pair = |o: &EndpointId, g: &EndpointId| {
-            r.owners.contains(o)
+            r.owners.contains_key(o)
                 && !r.kicked.contains(&(*o, *g))
                 && (r.guests.get(o).is_some_and(|gs| gs.contains(g))
                     || met.get(&(*o, *g)).is_some_and(|(t, _)| *t > now))
@@ -234,7 +225,7 @@ mod tests {
     #[test]
     fn an_invite_holds_until_the_owner_lists_the_device_then_the_list_decides() {
         let (owner, stranger, other) = (id(1), id(2), id(3));
-        let p = Policy::new([owner], BTreeMap::new(), []);
+        let p = Policy::new([(owner, 1)], BTreeMap::new(), []);
         assert!(!p.allow_forward(stranger, owner, 0));
         p.admit(owner, stranger, "friend", unix_now() + 600);
         assert!(p.allow_forward(stranger, owner, 0));
@@ -252,8 +243,8 @@ mod tests {
 
     #[test]
     fn guests_reach_only_their_own_owner_and_kicked_stops_at_once() {
-        let p = Policy::new([id(1), id(2)], BTreeMap::new(), []);
-        assert!(p.allow_forward(id(1), id(2), 0), "owner ↔ owner");
+        let p = Policy::new([(id(1), 1), (id(2), 1)], BTreeMap::new(), []);
+        assert!(p.allow_forward(id(1), id(2), 0), "owner ↔ owner of the same code");
         p.set_guests(id(1), vec![id(3)]);
         assert!(p.allow_forward(id(3), id(1), 0), "guest → its own owner");
         assert!(!p.allow_forward(id(3), id(2), 0), "guest cannot cross over to another owner");
@@ -265,22 +256,34 @@ mod tests {
         assert!(!p.allow_forward(id(4), id(3), 0));
         // Kicking (id(1), id(3)) stops id(3) ↔ id(1) immediately, even while listed,
         // without touching id(2) unless id(2) also kicked it.
-        p.set_roster([id(1), id(2)], BTreeMap::from([(id(1), vec![id(3)]), (id(2), vec![id(3)])]), [(id(1), id(3))]);
+        p.set_roster([(id(1), 1), (id(2), 1)], BTreeMap::from([(id(1), vec![id(3)]), (id(2), vec![id(3)])]), [(id(1), id(3))]);
         assert!(!p.allow_forward(id(3), id(1), 0), "kicked under id(1)");
         assert!(p.allow_forward(id(3), id(2), 0), "still allowed under id(2)");
         // Unkicked: works again.
-        p.set_roster([id(1), id(2)], BTreeMap::from([(id(1), vec![id(3)])]), []);
+        p.set_roster([(id(1), 1), (id(2), 1)], BTreeMap::from([(id(1), vec![id(3)])]), []);
         assert!(p.allow_forward(id(3), id(1), 0));
         // An owner removed (its code deleted on the relay): its guests are out.
-        p.set_roster([id(2)], BTreeMap::from([(id(1), vec![id(3)])]), []);
+        p.set_roster([(id(2), 1)], BTreeMap::from([(id(1), vec![id(3)])]), []);
         assert!(!p.allow_forward(id(3), id(1), 0));
         assert!(!p.allow_forward(id(1), id(2), 0));
         assert_eq!(p.owners(), HashSet::from([id(2)]));
     }
 
     #[test]
+    fn owners_of_different_codes_do_not_reach_each_other() {
+        let p = Policy::new([(id(1), 1), (id(2), 2), (id(3), 1)], BTreeMap::new(), []);
+        assert!(p.allow_forward(id(1), id(3), 0), "same code");
+        assert!(!p.allow_forward(id(1), id(2), 0), "code 1 and code 2");
+        assert!(!p.allow_forward(id(2), id(3), 0));
+        // Listing the other owner as a guest (they met with a connection code) lets them through.
+        p.set_guests(id(1), vec![id(2)]);
+        assert!(p.allow_forward(id(2), id(1), 0));
+        assert!(!p.allow_forward(id(2), id(3), 0), "only with the owner that listed it");
+    }
+
+    #[test]
     fn a_removed_owner_cannot_meet_with_its_codes() {
-        let p = Policy::new([id(1)], BTreeMap::new(), []);
+        let p = Policy::new([(id(1), 1)], BTreeMap::new(), []);
         p.admit(id(1), id(5), "tmp", unix_now() + 600);
         assert!(p.allow_forward(id(5), id(1), 0));
         p.set_roster([], BTreeMap::new(), []);

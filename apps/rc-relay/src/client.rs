@@ -179,6 +179,68 @@ pub async fn meet(relay: &[RelayUrl], device: &SecretKey, name: &str, ca: &CaTls
     Ok(())
 }
 
+/// The relay is older than `/rc/watch`: its owners learn of kicks only when
+/// they send their guest list.
+#[derive(Debug)]
+pub struct NoWatch;
+
+impl std::fmt::Display for NoWatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the relay is too old to tell of changes at once")
+    }
+}
+
+impl std::error::Error for NoWatch {}
+
+/// Keeps `device`'s watch open on the relay (see `api`): calls `sync` on
+/// every `sync` line, the first one as soon as it is open. Returns when the
+/// relay or the network ends it, or nothing came for twice the beat. The
+/// error is a [`Refusal`] or [`NoWatch`] when the relay said so.
+pub async fn watch(relay: &[RelayUrl], device: &SecretKey, ca: &CaTlsConfig, sync: impl Fn()) -> Result<()> {
+    let tls = ca.client_config(iroh_relay::tls::default_provider()).context("TLS setup")?;
+    let client = reqwest::Client::builder()
+        .tls_backend_preconfigured(tls)
+        .no_proxy()
+        .connect_timeout(TIMEOUT)
+        .read_timeout(Duration::from_secs(2 * api::WATCH_BEAT + 5))
+        .build()
+        .context("HTTP client")?;
+    let req = api::WatchRequest::new(device, unix_now()).encode();
+    let open = |u: RelayUrl| {
+        let (client, req) = (client.clone(), req.clone());
+        async move {
+            let res = client.post(api_url(&u, api::WATCH_PATH)).header(api::HEADER, req).send().await.with_context(|| format!("{u}"))?;
+            if res.status().is_success() {
+                return Ok(Ok(Some(res)));
+            }
+            if res.status() == reqwest::StatusCode::NOT_FOUND {
+                return Ok(Ok(None));
+            }
+            let body = res.text().await.with_context(|| format!("{u}"))?;
+            match Refusal::from_word(&body) {
+                Some(r) => Ok(Err(r)),
+                None => bail!("{u}: not an rc-relay (answered {})", body.chars().take(80).collect::<String>()),
+            }
+        }
+    };
+    let (url, r) = race(relay, open).await?;
+    let Some(mut res) = r? else { return Err(anyhow::Error::new(NoWatch)) };
+    let mut line = Vec::new();
+    while let Some(chunk) = res.chunk().await.with_context(|| format!("{url}"))? {
+        for &b in chunk.iter() {
+            if b != b'\n' {
+                line.push(b);
+                continue;
+            }
+            if line == b"sync" {
+                sync();
+            }
+            line.clear();
+        }
+    }
+    Ok(())
+}
+
 /// Whether the relay answers its probe (`/ping`) at one of its addresses.
 pub async fn ping(relay: &[RelayUrl], ca: &CaTlsConfig) -> Result<RelayUrl> {
     let client = http(ca)?;

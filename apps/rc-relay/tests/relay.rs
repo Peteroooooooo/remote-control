@@ -241,16 +241,22 @@ async fn a_code_works_for_every_computer_until_deleted() {
     // A second code, for another group.
     let other = s.store().new_code("爸妈").unwrap();
     assert_eq!(other.n, 2);
-    let dad = key();
+    let (dad, mom) = (key(), key());
     let other_code = RelayCode { urls: code.urls.clone(), claim_key: other.key };
     client::claim(&other_code, &dad, "DAD-PC", &s.ca()).await.unwrap();
-    let ed = s.endpoint(dad.clone(), None).await;
-    assert!(s.reaches(&ed, &ea).await);
+    client::claim(&other_code, &mom, "MOM-PC", &s.ca()).await.unwrap();
+    let (ed, em) = (s.endpoint(dad.clone(), None).await, s.endpoint(mom.clone(), None).await);
+    assert!(s.reaches(&ed, &em).await, "owners of the same code");
+    assert!(!s.reaches(&ed, &ea).await, "owners of different codes do not reach each other");
 
-    // The group deleted: its device is out at once, and the code no longer works.
-    assert_eq!(s.store().delete_code(other.n).unwrap(), [dad.public()]);
+    // The group deleted: its devices are out at once, and the code no longer works.
+    let mut gone = s.store().delete_code(other.n).unwrap();
+    gone.sort();
+    let mut want = vec![dad.public(), mom.public()];
+    want.sort();
+    assert_eq!(gone, want);
     tokio::time::sleep(Duration::from_secs(3)).await;
-    assert!(!s.reaches(&ed, &ea).await, "its code deleted");
+    assert!(!s.reaches(&ed, &em).await, "its code deleted");
     let e = client::claim(&other_code, &dad, "DAD-PC", &s.ca()).await.unwrap_err();
     assert_eq!(e.downcast_ref::<Refusal>(), Some(&Refusal::UnknownKey));
 
@@ -426,4 +432,45 @@ async fn the_status_file_shows_who_is_online() {
     let st = s.store().status().unwrap();
     assert!(st.started > 0 && st.written >= st.started);
     assert!(st.seen.contains_key(&owner.public()));
+}
+
+#[tokio::test]
+async fn a_kick_reaches_the_owners_watch_at_once() {
+    let s = Setup::new("watch").await;
+    let owner = key();
+    s.claim(&owner).await;
+    let gk = key();
+    s.set_guests(&owner, &[(&gk, "laptop")]).await;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let (url, ca, o) = (s.url.clone(), s.ca(), owner.clone());
+    let watch = tokio::spawn(async move {
+        client::watch(&[url], &o, &ca, move || {
+            let _ = tx.send(());
+        })
+        .await
+    });
+    assert!(got(&mut rx, 5).await, "sync once open");
+    assert!(!got(&mut rx, 1).await, "nothing changed for the owner");
+
+    // Kicked on the management screen (another process, the state files).
+    let t = std::time::Instant::now();
+    assert!(s.store().kick(owner.public(), gk.public()).unwrap());
+    assert!(got(&mut rx, 3).await, "sync on a kick");
+    assert!(t.elapsed() < Duration::from_secs(1), "took {:?}", t.elapsed());
+    assert_eq!(s.set_guests(&owner, &[(&gk, "laptop")]).await, vec![gk.public()]);
+    // The owner drops the guest: the kick is done, nothing to tell.
+    assert!(s.set_guests(&owner, &[]).await.is_empty());
+    assert!(!got(&mut rx, 1).await, "no sync for the owner's own change");
+
+    // Only owners may watch; a deleted owner's watch ends.
+    let e = client::watch(std::slice::from_ref(&s.url), &key(), &s.ca(), || {}).await.unwrap_err();
+    assert_eq!(e.downcast_ref::<Refusal>(), Some(&Refusal::NotOwner));
+    assert!(s.store().remove_owner(&owner.public()).unwrap());
+    let ended = tokio::time::timeout(Duration::from_secs(3), watch).await.expect("watch ended").unwrap();
+    assert!(ended.is_ok(), "{ended:?}");
+}
+
+/// Whether a sync came within `secs`.
+async fn got(rx: &mut tokio::sync::mpsc::UnboundedReceiver<()>, secs: u64) -> bool {
+    tokio::time::timeout(Duration::from_secs(secs), rx.recv()).await.ok().flatten().is_some()
 }
