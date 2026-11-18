@@ -215,6 +215,16 @@ pub fn service_running() -> Option<bool> {
     Some(svc.query_status().ok()?.current_state == ServiceState::Running)
 }
 
+/// Whether this exe is newer than the service's copy (`installed_exe`).
+/// Installing copies the exe with its modification time, so a later one
+/// here is a newer build or download.
+pub fn service_outdated() -> bool {
+    let Ok(me) = std::env::current_exe() else { return false };
+    let modified = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+    let (Some(mine), Some(theirs)) = (modified(&me), modified(&installed_exe())) else { return false };
+    mine.duration_since(theirs).is_ok_and(|d| d > Duration::from_secs(2)) && !same_file(&me, &installed_exe())
+}
+
 /// Changes the service's start type to automatic (AutoStart) or demand-start (Manual).
 pub fn set_auto_start(auto: bool) -> Result<()> {
     use windows::Win32::System::Services::{

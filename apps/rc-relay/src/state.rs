@@ -20,7 +20,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use iroh_base::EndpointId;
 use rc_ident::proof::unix_now;
 
-use crate::api::{Guest, Invite, random_key};
+use crate::api::{Guest, Invite, Kind, random_key};
 
 /// One of the relay's codes.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -339,8 +339,9 @@ impl Store {
         self.dir.join("guests.txt")
     }
 
-    /// Lines: owner id, guest id, guest name (a `mine` mark from older
-    /// files is left out). A missing file is no guests.
+    /// Lines: owner id, guest id, guest name, kind (`Kind::word`; a `mine`
+    /// mark in the name's place in the oldest files is left out). A missing
+    /// file is no guests.
     pub fn guests(&self) -> Result<BTreeMap<EndpointId, Vec<Guest>>> {
         let path = self.guests_path();
         let raw = match std::fs::read_to_string(&path) {
@@ -348,7 +349,7 @@ impl Store {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
             Err(e) => return Err(anyhow!("read {}: {e}", path.display())),
         };
-        let named = raw.lines().next().is_some_and(|l| l.starts_with("# rc-relay guests v2:"));
+        let named = raw.lines().next().is_some_and(|l| l.starts_with("# rc-relay guests v"));
         let mut m: BTreeMap<EndpointId, Vec<Guest>> = BTreeMap::new();
         for (i, line) in raw.lines().filter(|l| !l.trim().is_empty() && !l.starts_with('#')).enumerate() {
             let f: Vec<&str> = line.split('\t').collect();
@@ -360,7 +361,8 @@ impl Store {
             } else {
                 f.get(2).map(|s| clean(s)).unwrap_or_default()
             };
-            m.entry(owner).or_default().push(Guest { id, name });
+            let kind = if named { f.get(3).map_or(Kind::Unknown, |w| Kind::from_word(w)) } else { Kind::Unknown };
+            m.entry(owner).or_default().push(Guest { id, name, kind });
         }
         Ok(m)
     }
@@ -368,7 +370,7 @@ impl Store {
     /// Replaces `owner`'s guests.
     pub fn set_guests(&self, owner: &EndpointId, guests: &[Guest]) -> Result<()> {
         let mut m = self.guests()?;
-        let cleaned: Vec<Guest> = guests.iter().map(|g| Guest { id: g.id, name: clean(&g.name) }).collect();
+        let cleaned: Vec<Guest> = guests.iter().map(|g| Guest { id: g.id, name: clean(&g.name), kind: g.kind }).collect();
         let old = m.remove(owner).unwrap_or_default();
         if old == cleaned {
             return Ok(());
@@ -376,10 +378,10 @@ impl Store {
         if !cleaned.is_empty() {
             m.insert(*owner, cleaned);
         }
-        let mut text = String::from("# rc-relay guests v2: owner id, guest id, name\n");
+        let mut text = String::from("# rc-relay guests v3: owner id, guest id, name, kind\n");
         for (o, gs) in &m {
             for g in gs {
-                text += &format!("{o}\t{}\t{}\n", g.id, clean(&g.name));
+                text += &format!("{o}\t{}\t{}\t{}\n", g.id, clean(&g.name), g.kind.word());
             }
         }
         self.write(&self.guests_path(), &text)
@@ -451,7 +453,7 @@ impl Store {
         if add_to_list {
             let mut gs = self.guests()?.remove(owner).unwrap_or_default();
             if !gs.iter().any(|g| g.id == guest.id) {
-                gs.push(Guest { id: guest.id, name: clean(&guest.name) });
+                gs.push(Guest { id: guest.id, name: clean(&guest.name), kind: guest.kind });
                 self.set_guests(owner, &gs)?;
             }
         }
@@ -715,7 +717,7 @@ mod tests {
     fn guests_per_owner() {
         let s = temp("guests");
         assert!(s.guests().unwrap().is_empty());
-        let g = |n: u8, name: &str| Guest { id: id(n), name: name.into() };
+        let g = |n: u8, name: &str| Guest::new(id(n), name, Kind::Unknown);
         s.set_guests(&id(1), &[g(5, "friend\tpc"), g(6, "office")]).unwrap();
         s.set_guests(&id(2), &[Guest::from(id(6))]).unwrap();
         s.set_guests(&id(1), &[g(7, "dad")]).unwrap();
@@ -724,6 +726,12 @@ mod tests {
         assert_eq!(m[&id(2)], [Guest::from(id(6))]);
         s.set_guests(&id(2), &[]).unwrap();
         assert!(!s.guests().unwrap().contains_key(&id(2)));
+        let kinds = [Guest::new(id(5), "laptop", Kind::Mine), Guest::new(id(6), "dad", Kind::Trusted), Guest::new(id(7), "", Kind::Temp)];
+        s.set_guests(&id(3), &kinds).unwrap();
+        assert_eq!(s.guests().unwrap()[&id(3)], kinds, "kinds kept");
+        // A file from before kinds: no kind.
+        std::fs::write(s.guests_path(), format!("# rc-relay guests v2: owner id, guest id, name\n{}\t{}\tpc\n", id(1), id(5))).unwrap();
+        assert_eq!(s.guests().unwrap()[&id(1)], [g(5, "pc")]);
     }
 
     #[test]
@@ -732,7 +740,7 @@ mod tests {
         assert!(s.kicked().unwrap().is_empty());
         let c = s.new_code("group").unwrap();
         s.join(id(1), c.n, "DESKTOP").unwrap();
-        let g = |n: u8, name: &str| Guest { id: id(n), name: name.into() };
+        let g = |n: u8, name: &str| Guest::new(id(n), name, Kind::Unknown);
         s.set_guests(&id(1), &[g(5, "friend"), g(6, "laptop")]).unwrap();
 
         assert!(s.kick(id(1), id(5)).unwrap());

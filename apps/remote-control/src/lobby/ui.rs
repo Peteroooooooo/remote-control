@@ -128,6 +128,10 @@ pub struct App {
     /// The node's notice already shown.
     seen_notice: Option<String>,
     cards: Cards,
+    /// Whether the service runs an older exe than this window, and when that was looked at.
+    service_old: Option<(Instant, bool)>,
+    /// 「以后」 on the card saying so, until the window closes.
+    update_later: bool,
     renaming: Option<(EndpointId, String)>,
     /// The unreachable device whose explanation is open.
     why: Option<EndpointId>,
@@ -185,6 +189,8 @@ pub fn run(b: Backend) -> anyhow::Result<()> {
                 saved: None,
                 adding_relay: false,
                 relay_paste: String::new(),
+                service_old: None,
+                update_later: false,
             }))
         }),
     )
@@ -945,6 +951,27 @@ impl App {
                 }
             })
         });
+
+        let old = self.service_old() && !self.update_later;
+        let mut later = false;
+        reveal(ui, Id::new("card-update"), old, 10.0, |ui| {
+            card(ui, ACCENT, false, "后台服务还是旧版本，更新后才用上这一版", |ui| {
+                later = ui.button("以后").clicked();
+                if ui.add_enabled(idle, accent_button("更新")).clicked() {
+                    b.service(true);
+                }
+            })
+        });
+        self.update_later |= later;
+    }
+
+    /// `install::service_outdated`, looked at every few seconds.
+    fn service_old(&mut self) -> bool {
+        if self.service_old.is_none_or(|(t, _)| t.elapsed() >= Duration::from_secs(5)) {
+            let old = self.b.service_installed() && crate::install::service_outdated();
+            self.service_old = Some((Instant::now(), old));
+        }
+        self.service_old.is_some_and(|(_, old)| old)
     }
 
     fn devices(&mut self, ui: &mut egui::Ui, snap: &Snap) {
@@ -1202,10 +1229,12 @@ impl App {
         });
 
         ui.add_space(14.0);
+        let old = self.service_old();
         group(ui, "后台服务", |ui| {
             let installed = b.service_installed();
             let busy = b.busy().is_some();
             let (title, desc) = match (installed, snap.service) {
+                (true, true) if old => ("运行中，旧版本", "更新后才用上这一版"),
                 (true, true) => ("运行中", "关掉窗口也在线"),
                 (true, false) => ("已安装，没在运行", "装上后锁屏时也能被控制"),
                 _ => ("没装", "装上后锁屏时也能被控制"),
@@ -1217,6 +1246,9 @@ impl App {
                     }
                 } else if ui.add_enabled(!busy, egui::Button::new("卸载")).clicked() {
                     b.service(false);
+                }
+                if installed && old && ui.add_enabled(!busy, accent_button("更新")).clicked() {
+                    b.service(true);
                 }
             });
             let on = snap.service;

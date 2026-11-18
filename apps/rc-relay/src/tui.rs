@@ -26,7 +26,7 @@ use ratatui::{
 use rc_ident::{proof::unix_now, relay_code::RelayCode};
 
 use crate::{
-    api::Guest,
+    api::{Guest, Kind},
     config::Config,
     state::{Code, Kicked, Owner, Status, Store},
 };
@@ -53,7 +53,9 @@ enum Focus {
 #[derive(Clone)]
 enum DeviceRow {
     Owner(Owner),
-    Guest { owner: EndpointId, id: EndpointId, name: String, temp: bool },
+    /// A device in an owner's list; devices it met with a connection code
+    /// (listed while its window is open) are not shown.
+    Guest { owner: EndpointId, guest: Guest },
 }
 
 enum Modal {
@@ -66,7 +68,7 @@ enum Modal {
 enum Undo {
     Code { code: Code, owners: Vec<Owner>, guests: BTreeMap<EndpointId, Vec<Guest>> },
     Owner { owner: Owner, guests: Vec<Guest> },
-    Guest { owner: EndpointId, guest: Guest, temp: bool },
+    Guest { owner: EndpointId, guest: Guest },
 }
 
 struct App {
@@ -158,14 +160,9 @@ impl App {
             let mut seen_guests = HashSet::new();
             if let Some(gs) = self.guests.get(&o.id) {
                 for g in gs {
-                    if !owner_ids.contains(&g.id) && !kicked_pairs.contains(&(o.id, g.id)) && seen_guests.insert(g.id) {
-                        out.push(DeviceRow::Guest { owner: o.id, id: g.id, name: g.name.clone(), temp: false });
+                    if g.kind != Kind::Temp && !owner_ids.contains(&g.id) && !kicked_pairs.contains(&(o.id, g.id)) && seen_guests.insert(g.id) {
+                        out.push(DeviceRow::Guest { owner: o.id, guest: g.clone() });
                     }
-                }
-            }
-            for m in self.status.meets.iter().filter(|m| m.owner == o.id) {
-                if !owner_ids.contains(&m.guest) && !kicked_pairs.contains(&(o.id, m.guest)) && seen_guests.insert(m.guest) {
-                    out.push(DeviceRow::Guest { owner: o.id, id: m.guest, name: m.name.clone(), temp: true });
                 }
             }
         }
@@ -273,15 +270,12 @@ impl App {
                             }
                         }
                         Modal::KickGuest => {
-                            if let Some(DeviceRow::Guest { owner, id, name, temp }) = self.rows().get(self.dsel).cloned() {
-                                self.store.kick(owner, id)?;
-                                self.undo.push(Undo::Guest {
-                                    owner,
-                                    guest: Guest { id, name: name.clone() },
-                                    temp,
-                                });
+                            if let Some(DeviceRow::Guest { owner, guest }) = self.rows().get(self.dsel).cloned() {
+                                self.store.kick(owner, guest.id)?;
+                                let name = shown_name(&guest.name, guest.id);
+                                self.undo.push(Undo::Guest { owner, guest });
                                 self.reload()?;
-                                self.toast(format!("已移除访客 {}（按 u 撤回）", shown_name(&name, id)), true);
+                                self.toast(format!("已移除 {name}（按 u 撤回）"), true);
                             }
                         }
                         Modal::Rename(_) => {}
@@ -374,9 +368,9 @@ impl App {
                 self.reload()?;
                 self.toast(format!("已撤回移除 {}", shown_name(&owner.name, owner.id)), true);
             }
-            Undo::Guest { owner, guest, temp } => {
+            Undo::Guest { owner, guest } => {
                 let still_pending = self.store.unkick(&owner, &guest.id)?;
-                self.store.restore_guest(&owner, &guest, !temp)?;
+                self.store.restore_guest(&owner, &guest, true)?;
                 self.reload()?;
                 if still_pending {
                     self.toast(format!("已撤回移除访客 {}", shown_name(&guest.name, guest.id)), true);
@@ -522,24 +516,29 @@ impl App {
                     f.render_widget(Line::from(vec![bar, dot, Span::raw(fit(&shown_name(&o.name, o.id), name_w))]).style(style), row);
                     let tail = Line::from(vec![
                         Span::styled(format!("{id:<12}"), Style::new().fg(DIM)),
-                        Span::styled(format!("{when:>10} "), Style::new().fg(if on { GREEN } else { DIM })),
+                        Span::styled(format!("{} ", pad(&when, 10, true)), Style::new().fg(if on { GREEN } else { DIM })),
                     ])
                     .right_aligned();
                     f.render_widget(tail, row);
                 }
-                DeviceRow::Guest { id, name, temp, .. } => {
+                DeviceRow::Guest { guest, .. } => {
+                    let (id, name) = (&guest.id, &guest.name);
                     let on = online.contains(id);
-                    let tag = if *temp { "临时" } else { "访客" };
+                    let (tag, tag_fg) = match guest.kind {
+                        Kind::Mine => ("我的电脑", CYAN),
+                        Kind::Trusted => ("信任设备", GUEST_FG),
+                        Kind::Unknown | Kind::Temp => ("访客", DIM),
+                    };
                     let when = if on {
-                        format!("{tag}·在线")
+                        "在线".to_string()
                     } else {
                         match self.status.seen.get(id) {
                             Some(t) => format!("{}前", ago(unix_now().saturating_sub(*t))),
-                            None => tag.to_string(),
+                            None => String::new(),
                         }
                     };
                     let sid = id.fmt_short().to_string();
-                    let name_w = (inner.width as usize).saturating_sub(right_w + 8);
+                    let name_w = (inner.width as usize).saturating_sub(right_w + 10 + 8);
                     let dot = if on { Span::styled("● ", Style::new().fg(GREEN)) } else { Span::styled("○ ", Style::new().fg(DIM)) };
                     f.render_widget(
                         Line::from(vec![
@@ -552,8 +551,9 @@ impl App {
                         row,
                     );
                     let tail = Line::from(vec![
+                        Span::styled(pad(tag, 10, false), Style::new().fg(tag_fg)),
                         Span::styled(format!("{sid:<12}"), Style::new().fg(DIM)),
-                        Span::styled(format!("{when:>10} "), Style::new().fg(if on { GREEN } else if *temp { CYAN } else { DIM })),
+                        Span::styled(format!("{} ", pad(&when, 10, true)), Style::new().fg(if on { GREEN } else { DIM })),
                     ])
                     .right_aligned();
                     f.render_widget(tail, row);
@@ -682,7 +682,7 @@ impl App {
             }
             Modal::KickGuest => {
                 let name = match rows.get(self.dsel) {
-                    Some(DeviceRow::Guest { id, name, .. }) => shown_name(name, *id),
+                    Some(DeviceRow::Guest { guest, .. }) => shown_name(&guest.name, guest.id),
                     _ => String::new(),
                 };
                 (
@@ -801,6 +801,12 @@ fn fit(text: &str, w: usize) -> String {
     out
 }
 
+/// `text` padded with spaces to `w` columns, on the left (`right`: aligned right) or the right.
+fn pad(text: &str, w: usize, right: bool) -> String {
+    let fill = " ".repeat(w.saturating_sub(Span::raw(text).width()));
+    if right { format!("{fill}{text}") } else { format!("{text}{fill}") }
+}
+
 /// A span of seconds as people say it.
 fn ago(secs: u64) -> String {
     match secs {
@@ -829,8 +835,9 @@ fn make_demo(dir: &std::path::Path) -> Result<Store> {
     store.set_guests(
         &key(1),
         &[
-            Guest { id: key(4), name: "朋友笔记本".into() },
-            Guest { id: key(5), name: "外包测试".into() },
+            Guest::new(key(4), "朋友笔记本", Kind::Trusted),
+            Guest::new(key(5), "书房电脑", Kind::Mine),
+            Guest::new(key(6), "表弟手机", Kind::Temp),
         ],
     )?;
     let now = unix_now();

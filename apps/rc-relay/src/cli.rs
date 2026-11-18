@@ -13,7 +13,7 @@ use iroh_relay::tls::CaTlsConfig;
 use rc_ident::relay_code::RelayCode;
 use rustls::pki_types::{CertificateDer, pem::PemObject};
 
-use crate::{client, config::Config, state::Store};
+use crate::{api::Kind, client, config::Config, state::Store};
 
 #[cfg(unix)]
 const DEFAULT_CONFIG: &str = "/etc/rc-relay/config.toml";
@@ -139,7 +139,6 @@ fn codes(cfg: &Config) -> Result<()> {
     let codes = store.codes()?;
     let guests = store.guests()?;
     let kicked: HashSet<_> = store.kicked()?.into_iter().map(|k| (k.owner, k.guest)).collect();
-    let status = store.status().unwrap_or_default();
     let owner_ids: HashSet<_> = owners.iter().map(|o| o.id).collect();
     if codes.is_empty() {
         println!("没有中转码。执行 rc-relay，按 n 新建。");
@@ -151,14 +150,14 @@ fn codes(cfg: &Config) -> Result<()> {
             let mut seen = HashSet::new();
             if let Some(gs) = guests.get(&o.id) {
                 for g in gs {
-                    if !owner_ids.contains(&g.id) && !kicked.contains(&(o.id, g.id)) && seen.insert(g.id) {
-                        println!("    └ {}\t{}", if g.name.is_empty() { "（没有名字）" } else { &g.name }, g.id.fmt_short());
+                    if g.kind != Kind::Temp && !owner_ids.contains(&g.id) && !kicked.contains(&(o.id, g.id)) && seen.insert(g.id) {
+                        let tag = match g.kind {
+                            Kind::Mine => "我的电脑",
+                            Kind::Trusted => "信任设备",
+                            Kind::Unknown | Kind::Temp => "访客",
+                        };
+                        println!("    └ {}\t{}\t{tag}", if g.name.is_empty() { "（没有名字）" } else { &g.name }, g.id.fmt_short());
                     }
-                }
-            }
-            for m in status.meets.iter().filter(|m| m.owner == o.id) {
-                if !owner_ids.contains(&m.guest) && !kicked.contains(&(o.id, m.guest)) && seen.insert(m.guest) {
-                    println!("    └ {}\t{}\t临时", if m.name.is_empty() { "（没有名字）" } else { &m.name }, m.guest.fmt_short());
                 }
             }
         }

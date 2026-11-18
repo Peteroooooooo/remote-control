@@ -193,16 +193,78 @@ impl ClaimRequest {
     }
 }
 
+/// What a guest is to its owner, as the owner's app says.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Kind {
+    /// Not said (lists from older apps).
+    #[default]
+    Unknown,
+    /// 我的电脑: in the device list, may control without asking.
+    Mine,
+    /// 信任设备: in the device list.
+    Trusted,
+    /// Met with a connection code, not in the device list: listed while the
+    /// owner's window is open.
+    Temp,
+}
+
+impl Kind {
+    fn byte(self) -> u8 {
+        match self {
+            Kind::Unknown => 0,
+            Kind::Mine => 1,
+            Kind::Trusted => 2,
+            Kind::Temp => 3,
+        }
+    }
+
+    /// Unknown bytes (from newer apps) are [`Kind::Unknown`].
+    fn from_byte(b: u8) -> Kind {
+        match b {
+            1 => Kind::Mine,
+            2 => Kind::Trusted,
+            3 => Kind::Temp,
+            _ => Kind::Unknown,
+        }
+    }
+
+    /// The word in `guests.txt`.
+    pub fn word(self) -> &'static str {
+        match self {
+            Kind::Unknown => "",
+            Kind::Mine => "mine",
+            Kind::Trusted => "trusted",
+            Kind::Temp => "temp",
+        }
+    }
+
+    pub fn from_word(w: &str) -> Kind {
+        match w.trim() {
+            "mine" => Kind::Mine,
+            "trusted" => Kind::Trusted,
+            "temp" => Kind::Temp,
+            _ => Kind::Unknown,
+        }
+    }
+}
+
 /// A device an owner lets use the relay.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Guest {
     pub id: PublicKey,
     pub name: String,
+    pub kind: Kind,
+}
+
+impl Guest {
+    pub fn new(id: PublicKey, name: impl Into<String>, kind: Kind) -> Guest {
+        Guest { id, name: name.into(), kind }
+    }
 }
 
 impl From<PublicKey> for Guest {
     fn from(id: PublicKey) -> Guest {
-        Guest { id, name: String::new() }
+        Guest { id, name: String::new(), kind: Kind::Unknown }
     }
 }
 
@@ -220,9 +282,11 @@ pub struct GuestsRequest {
 
 /// Version 1 lists keys only. Version 2 (older apps) adds a byte after each
 /// key, which marked "my computer"; it is read and left unused. Version 3
-/// adds each guest's name (length byte, UTF-8).
+/// adds each guest's name (length byte, UTF-8); version 4 a [`Kind`] byte
+/// after the name.
 const GUESTS_MARKED: u8 = 2;
 const GUESTS_NAMED: u8 = 3;
+const GUESTS_KINDS: u8 = 4;
 /// Longest guest name kept (bytes, keeps the header compact).
 pub const MAX_GUEST_NAME: usize = 32;
 
@@ -232,9 +296,12 @@ fn guests_signed(version: u8, device: &PublicKey, time: u64, nonce: &[u8; 16], g
         v.extend_from_slice(g.id.as_bytes());
         match version {
             GUESTS_MARKED => v.push(marks[i]),
-            GUESTS_NAMED => {
+            GUESTS_NAMED | GUESTS_KINDS => {
                 v.push(g.name.len() as u8);
                 v.extend_from_slice(g.name.as_bytes());
+                if version == GUESTS_KINDS {
+                    v.push(g.kind.byte());
+                }
             }
             _ => {}
         }
@@ -248,7 +315,7 @@ impl GuestsRequest {
         let guests: Vec<Guest> = guests
             .iter()
             .take(MAX_GUESTS)
-            .map(|g| Guest { id: g.id, name: cut(&g.name, MAX_GUEST_NAME) })
+            .map(|g| Guest { id: g.id, name: cut(&g.name, MAX_GUEST_NAME), kind: g.kind })
             .collect();
         let nonce = random_key();
         let version = Self::version_for(&guests);
@@ -257,7 +324,13 @@ impl GuestsRequest {
     }
 
     fn version_for(guests: &[Guest]) -> u8 {
-        if guests.iter().any(|g| !g.name.is_empty()) { GUESTS_NAMED } else { VERSION }
+        if guests.iter().any(|g| g.kind != Kind::Unknown) {
+            GUESTS_KINDS
+        } else if guests.iter().any(|g| !g.name.is_empty()) {
+            GUESTS_NAMED
+        } else {
+            VERSION
+        }
     }
 
     pub fn encode(&self) -> String {
@@ -266,9 +339,12 @@ impl GuestsRequest {
             .concat();
         for g in &self.guests {
             v.extend_from_slice(g.id.as_bytes());
-            if version == GUESTS_NAMED {
+            if version >= GUESTS_NAMED {
                 v.push(g.name.len() as u8);
                 v.extend_from_slice(g.name.as_bytes());
+            }
+            if version == GUESTS_KINDS {
+                v.push(g.kind.byte());
             }
         }
         text::encode(GUESTS_PREFIX, &v)
@@ -279,7 +355,7 @@ impl GuestsRequest {
         let p = text::decode(GUESTS_PREFIX, s)?;
         let mut r = Reader::new(&p);
         let version = match r.u8()? {
-            v @ (VERSION | GUESTS_MARKED | GUESTS_NAMED) => v,
+            v @ (VERSION | GUESTS_MARKED | GUESTS_NAMED | GUESTS_KINDS) => v,
             v => return Err(Error::Version(v)),
         };
         let device = PublicKey::from_bytes(&r.array()?).map_err(|_| Error::Field("device key"))?;
@@ -292,21 +368,22 @@ impl GuestsRequest {
                 return Err(Error::Length);
             }
             let id = PublicKey::from_bytes(&g).map_err(|_| Error::Field("guest key"))?;
-            let name = match version {
-                GUESTS_MARKED => {
-                    marks.push(r.u8()?);
-                    String::new()
-                }
-                GUESTS_NAMED => {
+            let (mut name, mut kind) = (String::new(), Kind::Unknown);
+            match version {
+                GUESTS_MARKED => marks.push(r.u8()?),
+                GUESTS_NAMED | GUESTS_KINDS => {
                     let n = r.u8()? as usize;
                     if n > MAX_GUEST_NAME {
                         return Err(Error::Field("guest name"));
                     }
-                    std::str::from_utf8(r.take(n)?).map_err(|_| Error::Field("guest name"))?.to_string()
+                    name = std::str::from_utf8(r.take(n)?).map_err(|_| Error::Field("guest name"))?.to_string();
+                    if version == GUESTS_KINDS {
+                        kind = Kind::from_byte(r.u8()?);
+                    }
                 }
-                _ => String::new(),
-            };
-            guests.push(Guest { id, name });
+                _ => {}
+            }
+            guests.push(Guest { id, name, kind });
         }
         r.finish()?;
         device
@@ -502,9 +579,20 @@ mod tests {
 
     #[test]
     fn guests_round_trip_and_forgery() {
-        let guests = [Guest { id: key(2).public(), name: "friend-pc".into() }, Guest::from(key(3).public())];
+        let guests = [Guest::new(key(2).public(), "friend-pc", Kind::Unknown), Guest::from(key(3).public())];
         let r = GuestsRequest::new(&key(1), 1_000, &guests);
         assert_eq!(GuestsRequest::decode(&r.encode()).unwrap(), r);
+        assert_eq!(text::decode(GUESTS_PREFIX, &r.encode()).unwrap()[0], GUESTS_NAMED, "without kinds: version 3");
+        let kinds = [
+            Guest::new(key(2).public(), "laptop", Kind::Mine),
+            Guest::new(key(3).public(), "dad", Kind::Trusted),
+            Guest::new(key(4).public(), "", Kind::Temp),
+        ];
+        let k = GuestsRequest::new(&key(1), 1_000, &kinds);
+        assert_eq!(GuestsRequest::decode(&k.encode()).unwrap().guests, kinds);
+        let mut f = k.clone();
+        f.guests[1].kind = Kind::Mine;
+        assert_eq!(GuestsRequest::decode(&f.encode()), Err(Error::Signature), "a kind changed after signing");
         let empty = GuestsRequest::new(&key(1), 1_000, &[]);
         assert_eq!(GuestsRequest::decode(&empty.encode()).unwrap().guests, []);
         // A guest slipped in or renamed after signing.

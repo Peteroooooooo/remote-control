@@ -476,8 +476,10 @@ impl Backend {
                 // process must be offline first.
                 sh.stop_local();
             }
+            let update = install && install::service_running().is_some();
             let r = run_elevated(install, &sh.key);
             match r {
+                Ok(_) if update => sh.note(Tone::Ok, "后台服务已更新"),
                 Ok(t) => sh.note(Tone::Ok, t),
                 Err(e) => sh.note(Tone::Err, format!("{}失败：{e:#}", if install { "安装" } else { "卸载" })),
             }

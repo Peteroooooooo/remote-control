@@ -40,7 +40,7 @@ use rc_ident::{
     conn_code::{ConnCode, Find},
     relay_code::RelayCode,
 };
-use rc_relay::api::{Guest, Invite, Refusal};
+use rc_relay::api::{Guest, Invite, Kind as GuestKind, Refusal};
 use tokio::sync::Notify;
 
 use crate::{
@@ -422,21 +422,23 @@ impl Shared {
     }
 
     /// The devices this computer lets use its own relay (`target-plan` 5.2):
-    /// the device list, and the devices met with a connection code while
-    /// the lobby is open and the software is not going away.
+    /// the device list (我的电脑 or 信任设备), and the devices met with a
+    /// connection code while the lobby is open and the software is not going
+    /// away (temporary: forgotten when the window closes).
     fn guests(&self, st: &St) -> Vec<Guest> {
-        let mut m: BTreeMap<EndpointId, String> = st.store.listed().map(|d| (d.id, d.name.clone())).collect();
+        let mut m: BTreeMap<EndpointId, Guest> = st
+            .store
+            .listed()
+            .map(|d| (d.id, Guest::new(d.id, d.name.clone(), if d.auto_accept { GuestKind::Mine } else { GuestKind::Trusted })))
+            .collect();
         if self.lobby_open(st) && !self.is_stopped() && !self.leaving.load(std::sync::atomic::Ordering::SeqCst) {
             for (id, p) in &st.peers {
                 if p.met == Some(Met::Code) {
-                    let entry = m.entry(*id).or_default();
-                    if entry.is_empty() && !p.name.is_empty() {
-                        *entry = p.name.clone();
-                    }
+                    m.entry(*id).or_insert_with(|| Guest::new(*id, p.name.clone(), GuestKind::Temp));
                 }
             }
         }
-        m.into_iter().map(|(id, name)| Guest { id, name }).collect()
+        m.into_values().collect()
     }
 
     /// Settings changed in `st` (the relays were `before`): saved, every

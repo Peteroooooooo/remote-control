@@ -124,7 +124,7 @@ impl Setup {
     }
 
     async fn set_guests(&self, owner: &SecretKey, guests: &[(&SecretKey, &str)]) -> Vec<iroh::EndpointId> {
-        let ids: Vec<_> = guests.iter().map(|(g, n)| Guest { id: g.public(), name: (*n).to_string() }).collect();
+        let ids: Vec<_> = guests.iter().map(|(g, n)| Guest::new(g.public(), *n, api::Kind::Trusted)).collect();
         client::set_guests(std::slice::from_ref(&self.url), owner, &self.ca(), &ids).await.unwrap()
     }
 }
@@ -191,7 +191,7 @@ async fn claim_then_only_the_roster_gets_help() {
     s.set_guests(&owner, &[(&gk, "guest-1"), (&gk2, "guest-2")]).await;
     assert_eq!(
         s.store().guests().unwrap()[&owner.public()],
-        [Guest { id: gk.public(), name: "guest-1".into() }, Guest { id: gk2.public(), name: "guest-2".into() }]
+        [Guest::new(gk.public(), "guest-1", api::Kind::Trusted), Guest::new(gk2.public(), "guest-2", api::Kind::Trusted)]
     );
     assert!(s.reaches(&g, &o).await, "guest → owner");
     assert!(s.reaches(&o, &g).await, "owner → guest");
