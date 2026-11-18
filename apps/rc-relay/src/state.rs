@@ -20,7 +20,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use iroh_base::EndpointId;
 use rc_ident::proof::unix_now;
 
-use crate::api::{Invite, random_key};
+use crate::api::{Guest, Invite, random_key};
 
 /// One of the relay's codes.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -50,6 +50,24 @@ pub struct Owner {
     pub name: String,
 }
 
+/// A device blocked on this relay (`blocked.txt`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Blocked {
+    pub id: EndpointId,
+    /// Unix seconds.
+    pub added: u64,
+    pub name: String,
+}
+
+/// A temporary guest brought in via a connection code (`POST /rc/meet`),
+/// before the owner adds it to `guests.txt`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ActiveMeet {
+    pub owner: EndpointId,
+    pub guest: EndpointId,
+    pub name: String,
+}
+
 /// What the running relay tells the management screen (`status.txt`).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Status {
@@ -59,8 +77,10 @@ pub struct Status {
     pub written: u64,
     /// Devices connected now.
     pub online: Vec<EndpointId>,
-    /// When each owner was last connected (Unix seconds).
+    /// When each owner or guest was last connected (Unix seconds).
     pub seen: BTreeMap<EndpointId, u64>,
+    /// Guests currently admitted via connection codes.
+    pub meets: Vec<ActiveMeet>,
 }
 
 fn hex(b: &[u8]) -> String {
@@ -268,38 +288,103 @@ impl Store {
         self.dir.join("guests.txt")
     }
 
-    /// Lines: owner id, guest id (a third field from older versions is left
-    /// out). A missing file is no guests.
-    pub fn guests(&self) -> Result<BTreeMap<EndpointId, Vec<EndpointId>>> {
+    /// Lines: owner id, guest id, guest name (a `mine` mark from older
+    /// files is left out). A missing file is no guests.
+    pub fn guests(&self) -> Result<BTreeMap<EndpointId, Vec<Guest>>> {
         let path = self.guests_path();
-        let mut m: BTreeMap<EndpointId, Vec<EndpointId>> = BTreeMap::new();
-        for (i, line) in lines(&path)?.iter().enumerate() {
+        let raw = match std::fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+            Err(e) => return Err(anyhow!("read {}: {e}", path.display())),
+        };
+        let named = raw.lines().next().is_some_and(|l| l.starts_with("# rc-relay guests v2:"));
+        let mut m: BTreeMap<EndpointId, Vec<Guest>> = BTreeMap::new();
+        for (i, line) in raw.lines().filter(|l| !l.trim().is_empty() && !l.starts_with('#')).enumerate() {
             let f: Vec<&str> = line.split('\t').collect();
             let bad = || anyhow!("{}:{}: bad line", path.display(), i + 1);
             let owner: EndpointId = f[0].trim().parse().map_err(|_| bad())?;
             let id: EndpointId = f.get(1).ok_or_else(bad)?.trim().parse().map_err(|_| bad())?;
-            m.entry(owner).or_default().push(id);
+            let name = if !named && f.get(2).is_some_and(|s| s.trim() == "mine") {
+                String::new()
+            } else {
+                f.get(2).map(|s| clean(s)).unwrap_or_default()
+            };
+            m.entry(owner).or_default().push(Guest { id, name });
         }
         Ok(m)
     }
 
     /// Replaces `owner`'s guests.
-    pub fn set_guests(&self, owner: &EndpointId, guests: &[EndpointId]) -> Result<()> {
+    pub fn set_guests(&self, owner: &EndpointId, guests: &[Guest]) -> Result<()> {
         let mut m = self.guests()?;
+        let cleaned: Vec<Guest> = guests.iter().map(|g| Guest { id: g.id, name: clean(&g.name) }).collect();
         let old = m.remove(owner).unwrap_or_default();
-        if old == guests {
+        if old == cleaned {
             return Ok(());
         }
-        if !guests.is_empty() {
-            m.insert(*owner, guests.to_vec());
+        if !cleaned.is_empty() {
+            m.insert(*owner, cleaned);
         }
-        let mut text = String::from("# rc-relay guests: owner id, a device the owner lets use the relay\n");
+        let mut text = String::from("# rc-relay guests v2: owner id, guest id, name\n");
         for (o, gs) in &m {
             for g in gs {
-                text += &format!("{o}\t{g}\n");
+                text += &format!("{o}\t{}\t{}\n", g.id, clean(&g.name));
             }
         }
         self.write(&self.guests_path(), &text)
+    }
+
+    pub fn blocked_path(&self) -> PathBuf {
+        self.dir.join("blocked.txt")
+    }
+
+    /// Blocked devices (`blocked.txt`). A missing file is none blocked.
+    pub fn blocked(&self) -> Result<Vec<Blocked>> {
+        let path = self.blocked_path();
+        let mut v = Vec::new();
+        for (i, line) in lines(&path)?.iter().enumerate() {
+            let f: Vec<&str> = line.split('\t').collect();
+            let bad = || anyhow!("{}:{}: bad line", path.display(), i + 1);
+            let id = f[0].trim().parse().map_err(|_| bad())?;
+            let added = f.get(1).and_then(|s| s.trim().parse().ok()).unwrap_or(0);
+            let name = f.get(2).map(|s| clean(s)).unwrap_or_default();
+            v.push(Blocked { id, added, name });
+        }
+        Ok(v)
+    }
+
+    fn save_blocked(&self, list: &[Blocked]) -> Result<()> {
+        let mut text = String::from("# rc-relay blocked: device id, added (Unix seconds), name\n");
+        for b in list {
+            text += &format!("{}\t{}\t{}\n", b.id, b.added, clean(&b.name));
+        }
+        self.write(&self.blocked_path(), &text)
+    }
+
+    pub fn block(&self, id: EndpointId, name: &str) -> Result<bool> {
+        let mut list = self.blocked()?;
+        let name = clean(name);
+        if let Some(b) = list.iter_mut().find(|b| b.id == id) {
+            if b.name.is_empty() && !name.is_empty() {
+                b.name = name;
+                self.save_blocked(&list)?;
+            }
+            return Ok(false);
+        }
+        list.push(Blocked { id, added: unix_now(), name });
+        self.save_blocked(&list)?;
+        Ok(true)
+    }
+
+    pub fn unblock(&self, id: &EndpointId) -> Result<bool> {
+        let mut list = self.blocked()?;
+        let before = list.len();
+        list.retain(|b| b.id != *id);
+        if list.len() == before {
+            return Ok(false);
+        }
+        self.save_blocked(&list)?;
+        Ok(true)
     }
 
     fn invites_path(&self) -> PathBuf {
@@ -383,6 +468,12 @@ impl Store {
                         s.seen.insert(id, t);
                     }
                 }
+                ("meet", Some(v)) => {
+                    if let (Ok(owner), Some(Ok(guest))) = (v.parse(), f.get(2).map(|g| g.trim().parse())) {
+                        let name = f.get(3).map(|n| clean(n)).unwrap_or_default();
+                        s.meets.push(ActiveMeet { owner, guest, name });
+                    }
+                }
                 _ => {}
             }
         }
@@ -394,9 +485,16 @@ impl Store {
         for id in &s.online {
             text += &format!("online\t{id}\n");
         }
-        let owners: Vec<EndpointId> = self.owners()?.iter().map(|o| o.id).collect();
-        for (id, t) in s.seen.iter().filter(|(id, _)| owners.contains(id)) {
+        let mut known: std::collections::HashSet<EndpointId> = self.owners()?.into_iter().map(|o| o.id).collect();
+        for gs in self.guests()?.values() {
+            known.extend(gs.iter().map(|g| g.id));
+        }
+        known.extend(s.meets.iter().map(|m| m.guest));
+        for (id, t) in s.seen.iter().filter(|(id, _)| known.contains(*id)) {
             text += &format!("seen\t{id}\t{t}\n");
+        }
+        for m in &s.meets {
+            text += &format!("meet\t{}\t{}\t{}\n", m.owner, m.guest, clean(&m.name));
         }
         self.write(&self.status_path(), &text)
     }
@@ -474,7 +572,7 @@ mod tests {
         s.join(id(2), b.n, "LAPTOP").unwrap();
         let o = s.owners().unwrap();
         assert_eq!((o[1].code, o[1].name.as_str()), (b.n, "LAPTOP"), "joined with another code: moved");
-        s.set_guests(&id(3), &[id(9)]).unwrap();
+        s.set_guests(&id(3), &[Guest::from(id(9))]).unwrap();
         let mut gone = s.delete_code(b.n).unwrap();
         gone.sort();
         let mut want = vec![id(2), id(3)];
@@ -502,7 +600,7 @@ mod tests {
         let o = s.owners().unwrap();
         assert_eq!(o.iter().map(|o| (o.id, o.code, o.added)).collect::<Vec<_>>(), [(id(1), 1, 1_700_000_000), (id(2), 1, 1_700_000_001)]);
         assert!(!s.dir.join("claims.txt").exists());
-        assert_eq!(s.guests().unwrap()[&id(1)], [id(5)], "the old mark is left out");
+        assert_eq!(s.guests().unwrap()[&id(1)], [Guest::from(id(5))], "the old mark is left out");
         assert!(s.first_code().unwrap().is_some());
         s.upgrade().unwrap();
         assert_eq!(s.codes().unwrap().len(), 1, "once");
@@ -519,14 +617,28 @@ mod tests {
     fn guests_per_owner() {
         let s = temp("guests");
         assert!(s.guests().unwrap().is_empty());
-        s.set_guests(&id(1), &[id(5), id(6)]).unwrap();
-        s.set_guests(&id(2), &[id(6)]).unwrap();
-        s.set_guests(&id(1), &[id(7)]).unwrap();
+        let g = |n: u8, name: &str| Guest { id: id(n), name: name.into() };
+        s.set_guests(&id(1), &[g(5, "friend\tpc"), g(6, "office")]).unwrap();
+        s.set_guests(&id(2), &[Guest::from(id(6))]).unwrap();
+        s.set_guests(&id(1), &[g(7, "dad")]).unwrap();
         let m = s.guests().unwrap();
-        assert_eq!(m[&id(1)], [id(7)], "the new list replaces the old one");
-        assert_eq!(m[&id(2)], [id(6)]);
+        assert_eq!(m[&id(1)], [g(7, "dad")], "the new list replaces the old one");
+        assert_eq!(m[&id(2)], [Guest::from(id(6))]);
         s.set_guests(&id(2), &[]).unwrap();
         assert!(!s.guests().unwrap().contains_key(&id(2)));
+    }
+
+    #[test]
+    fn blocked_round_trip() {
+        let s = temp("blocked");
+        assert!(s.blocked().unwrap().is_empty());
+        assert!(s.block(id(5), "stranger").unwrap());
+        assert!(!s.block(id(5), "again").unwrap());
+        let b = s.blocked().unwrap();
+        assert_eq!((b.len(), b[0].id, b[0].name.as_str()), (1, id(5), "stranger"));
+        assert!(s.unblock(&id(5)).unwrap());
+        assert!(!s.unblock(&id(5)).unwrap());
+        assert!(s.blocked().unwrap().is_empty());
     }
 
     #[test]

@@ -1,12 +1,13 @@
 //! The management screen: `rc-relay` with no command, in the container's
-//! console. Left, the relay's codes; right, the devices that joined with the
-//! selected one; below, the selected code in full, to copy with the mouse.
-//! Keys: ↑↓ select, Tab / ←→ switch lists, n new code, r rename, d delete,
+//! console. Left, the relay's codes (and blocked devices if any); right, the
+//! members and their guests for the selected code; below, the selected code in
+//! full, to copy with the mouse.
+//! Keys: ↑↓ select, Tab / ←→ switch lists, n new code, r rename, d delete/block,
 //! q quit. Changes go straight into the state files, which the running
 //! relay picks up within 2 s; who is online comes from its `status.txt`.
 
 use std::{
-    collections::HashSet,
+    collections::{BTreeMap, HashSet},
     path::PathBuf,
     time::{Duration, Instant},
 };
@@ -24,8 +25,10 @@ use ratatui::{
 use rc_ident::{proof::unix_now, relay_code::RelayCode};
 
 use crate::{
+    api::Guest,
+    cli::date,
     config::Config,
-    state::{Code, Owner, Status, Store},
+    state::{Blocked, Code, Owner, Status, Store},
 };
 
 const ACCENT: Color = Color::Rgb(91, 140, 255);
@@ -33,6 +36,7 @@ const CYAN: Color = Color::Rgb(95, 215, 215);
 const GREEN: Color = Color::Rgb(74, 222, 128);
 const RED: Color = Color::Rgb(248, 113, 113);
 const FG: Color = Color::Rgb(215, 218, 224);
+const GUEST_FG: Color = Color::Rgb(180, 188, 204);
 const DIM: Color = Color::Rgb(107, 114, 128);
 const LINE: Color = Color::Rgb(52, 58, 74);
 const SEL: Color = Color::Rgb(30, 42, 74);
@@ -46,10 +50,19 @@ enum Focus {
     Devices,
 }
 
+#[derive(Clone)]
+enum DeviceRow {
+    Owner(Owner),
+    Guest { id: EndpointId, name: String, temp: bool },
+    Blocked(Blocked),
+}
+
 enum Modal {
     Rename(String),
     DeleteCode,
     DeleteDevice,
+    BlockGuest,
+    UnblockDevice,
 }
 
 struct App {
@@ -57,6 +70,8 @@ struct App {
     urls: Vec<RelayUrl>,
     codes: Vec<Code>,
     owners: Vec<Owner>,
+    guests: BTreeMap<EndpointId, Vec<Guest>>,
+    blocked: Vec<Blocked>,
     status: Status,
     sel: usize,
     dsel: usize,
@@ -84,6 +99,8 @@ pub fn run(cfg: &Config, demo: bool) -> Result<()> {
         urls,
         codes: Vec::new(),
         owners: Vec::new(),
+        guests: BTreeMap::new(),
+        blocked: Vec::new(),
         status: Status::default(),
         sel: 0,
         dsel: 0,
@@ -109,9 +126,11 @@ impl App {
     fn reload(&mut self) -> Result<()> {
         self.codes = self.store.codes()?;
         self.owners = self.store.owners()?;
+        self.guests = self.store.guests()?;
+        self.blocked = self.store.blocked()?;
         self.status = self.store.status().unwrap_or_default();
-        self.sel = self.sel.min(self.codes.len().saturating_sub(1));
-        let n = self.devices().len();
+        self.sel = self.sel.min(self.left_len().saturating_sub(1));
+        let n = self.rows().len();
         self.dsel = self.dsel.min(n.saturating_sub(1));
         if n == 0 {
             self.focus = Focus::Codes;
@@ -119,13 +138,43 @@ impl App {
         Ok(())
     }
 
+    fn left_len(&self) -> usize {
+        self.codes.len() + usize::from(!self.blocked.is_empty())
+    }
+
+    fn on_blocked_group(&self) -> bool {
+        !self.blocked.is_empty() && self.sel == self.codes.len()
+    }
+
     fn code(&self) -> Option<&Code> {
         self.codes.get(self.sel)
     }
 
-    fn devices(&self) -> Vec<&Owner> {
+    fn rows(&self) -> Vec<DeviceRow> {
+        if self.on_blocked_group() {
+            return self.blocked.iter().cloned().map(DeviceRow::Blocked).collect();
+        }
         let Some(c) = self.code() else { return Vec::new() };
-        self.owners.iter().filter(|o| o.code == c.n).collect()
+        let owner_ids: HashSet<EndpointId> = self.owners.iter().map(|o| o.id).collect();
+        let blocked_ids: HashSet<EndpointId> = self.blocked.iter().map(|b| b.id).collect();
+        let mut out = Vec::new();
+        for o in self.owners.iter().filter(|o| o.code == c.n) {
+            out.push(DeviceRow::Owner(o.clone()));
+            let mut seen_guests = HashSet::new();
+            if let Some(gs) = self.guests.get(&o.id) {
+                for g in gs {
+                    if !owner_ids.contains(&g.id) && !blocked_ids.contains(&g.id) && seen_guests.insert(g.id) {
+                        out.push(DeviceRow::Guest { id: g.id, name: g.name.clone(), temp: false });
+                    }
+                }
+            }
+            for m in self.status.meets.iter().filter(|m| m.owner == o.id) {
+                if !owner_ids.contains(&m.guest) && !blocked_ids.contains(&m.guest) && seen_guests.insert(m.guest) {
+                    out.push(DeviceRow::Guest { id: m.guest, name: m.name.clone(), temp: true });
+                }
+            }
+        }
+        out
     }
 
     fn count(&self, c: &Code) -> usize {
@@ -197,32 +246,53 @@ impl App {
                 }
                 return Ok(true);
             }
-            Some(m @ (Modal::DeleteCode | Modal::DeleteDevice)) => {
+            Some(m @ (Modal::DeleteCode | Modal::DeleteDevice | Modal::BlockGuest | Modal::UnblockDevice)) => {
                 if matches!(key, KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter) {
-                    if matches!(m, Modal::DeleteCode) {
-                        let c = self.code().cloned().expect("a code is selected");
-                        let gone = self.store.delete_code(c.n)?;
-                        self.reload()?;
-                        self.toast(
-                            if gone.is_empty() { format!("已删除「{}」", c.shown_name()) } else { format!("已删除「{}」，{} 台电脑已移出", c.shown_name(), gone.len()) },
-                            true,
-                        );
-                    } else {
-                        let o = self.devices()[self.dsel].clone();
-                        self.store.remove_owner(&o.id)?;
-                        self.reload()?;
-                        self.toast(format!("已移除 {}", shown(&o)), true);
+                    match m {
+                        Modal::DeleteCode => {
+                            let c = self.code().cloned().expect("a code is selected");
+                            let gone = self.store.delete_code(c.n)?;
+                            self.reload()?;
+                            self.toast(
+                                if gone.is_empty() { format!("已删除「{}」", c.shown_name()) } else { format!("已删除「{}」，{} 台电脑已移出", c.shown_name(), gone.len()) },
+                                true,
+                            );
+                        }
+                        Modal::DeleteDevice => {
+                            if let Some(DeviceRow::Owner(o)) = self.rows().get(self.dsel).cloned() {
+                                self.store.remove_owner(&o.id)?;
+                                self.reload()?;
+                                self.toast(format!("已移除 {}", shown_name(&o.name, o.id)), true);
+                            }
+                        }
+                        Modal::BlockGuest => {
+                            if let Some(DeviceRow::Guest { id, name, .. }) = self.rows().get(self.dsel).cloned() {
+                                self.store.block(id, &name)?;
+                                self.reload()?;
+                                self.toast(format!("已禁止 {}", shown_name(&name, id)), true);
+                            }
+                        }
+                        Modal::UnblockDevice => {
+                            if let Some(DeviceRow::Blocked(b)) = self.rows().get(self.dsel).cloned() {
+                                self.store.unblock(&b.id)?;
+                                self.reload()?;
+                                self.toast(format!("已解除禁止 {}", shown_name(&b.name, b.id)), true);
+                            }
+                        }
+                        Modal::Rename(_) => {}
                     }
                 }
                 return Ok(true);
             }
             None => {}
         }
-        let n = self.devices().len();
+        let rows = self.rows();
+        let n = rows.len();
+        let left_n = self.left_len();
         match key {
             KeyCode::Char('q') | KeyCode::Esc => return Ok(false),
             KeyCode::Down | KeyCode::Char('j') => match self.focus {
-                Focus::Codes if self.sel + 1 < self.codes.len() => {
+                Focus::Codes if self.sel + 1 < left_n => {
                     self.sel += 1;
                     self.dsel = 0;
                 }
@@ -253,8 +323,13 @@ impl App {
                 self.modal = Some(Modal::Rename(self.code().map(|c| c.name.clone()).unwrap_or_default()));
             }
             KeyCode::Char('d') | KeyCode::Delete => {
-                if self.focus == Focus::Devices && n > 0 {
-                    self.modal = Some(Modal::DeleteDevice);
+                if self.focus == Focus::Devices {
+                    match rows.get(self.dsel) {
+                        Some(DeviceRow::Owner(_)) => self.modal = Some(Modal::DeleteDevice),
+                        Some(DeviceRow::Guest { .. }) => self.modal = Some(Modal::BlockGuest),
+                        Some(DeviceRow::Blocked(_)) => self.modal = Some(Modal::UnblockDevice),
+                        None => {}
+                    }
                 } else if self.code().is_some() {
                     self.modal = Some(Modal::DeleteCode);
                 }
@@ -331,36 +406,51 @@ impl App {
         let block = self.panel("中转码".into(), focused);
         let inner = block.inner(area);
         f.render_widget(block, area);
-        if self.codes.is_empty() {
+        let total = self.left_len();
+        if total == 0 {
             let p = Paragraph::new(vec![Line::from(""), Line::from(vec![Span::styled(" 没有中转码，按 ", Style::new().fg(DIM)), Span::styled("n", Style::new().fg(FG)), Span::styled(" 新建一个", Style::new().fg(DIM))])]);
             f.render_widget(p, inner);
             return;
         }
         let top = self.sel.saturating_sub(inner.height.saturating_sub(1) as usize);
-        for (i, c) in self.codes.iter().enumerate().skip(top).take(inner.height as usize) {
+        for i in top..(top + inner.height as usize).min(total) {
             let y = inner.y + (i - top) as u16;
             let row = Rect::new(inner.x, y, inner.width, 1);
             let sel = i == self.sel;
             let style = self.row_style(sel, focused);
             f.render_widget(Block::new().style(style), row);
             let bar = if sel && focused { Span::styled("▌", Style::new().fg(ACCENT)) } else { Span::raw(" ") };
-            let count = format!("{} 台 ", self.count(c));
-            let name_w = (inner.width as usize).saturating_sub(count.len() + 3);
-            let line = Line::from(vec![bar, Span::raw(" "), Span::raw(fit(&c.shown_name(), name_w))]).style(style);
-            f.render_widget(line, row);
-            f.render_widget(Line::from(Span::styled(count, Style::new().fg(if sel && focused { Color::Rgb(159, 180, 255) } else { DIM }))).right_aligned(), row);
+            if let Some(c) = self.codes.get(i) {
+                let count = format!("{} 台 ", self.count(c));
+                let name_w = (inner.width as usize).saturating_sub(count.len() + 3);
+                let line = Line::from(vec![bar, Span::raw(" "), Span::raw(fit(&c.shown_name(), name_w))]).style(style);
+                f.render_widget(line, row);
+                f.render_widget(Line::from(Span::styled(count, Style::new().fg(if sel && focused { Color::Rgb(159, 180, 255) } else { DIM }))).right_aligned(), row);
+            } else {
+                let count = format!("{} 台 ", self.blocked.len());
+                let name_w = (inner.width as usize).saturating_sub(count.len() + 3);
+                let line = Line::from(vec![bar, Span::raw(" "), Span::styled(fit("已禁止", name_w), Style::new().fg(RED))]).style(style);
+                f.render_widget(line, row);
+                f.render_widget(Line::from(Span::styled(count, Style::new().fg(if sel && focused { RED } else { DIM }))).right_aligned(), row);
+            }
         }
     }
 
     fn draw_devices(&self, f: &mut Frame, area: Rect) {
         let focused = self.focus == Focus::Devices;
-        let title = self.code().map_or_else(|| "电脑".to_string(), |c| format!("「{}」的电脑", c.shown_name()));
+        let title = if self.on_blocked_group() {
+            "已禁止的访客".to_string()
+        } else {
+            self.code().map_or_else(|| "电脑".to_string(), |c| format!("「{}」的电脑", c.shown_name()))
+        };
         let block = self.panel(title, focused);
         let inner = block.inner(area);
         f.render_widget(block, area);
-        let Some(_) = self.code() else { return };
-        let devs = self.devices();
-        if devs.is_empty() {
+        if !self.on_blocked_group() && self.code().is_none() {
+            return;
+        }
+        let rows = self.rows();
+        if rows.is_empty() {
             let p = Paragraph::new(vec![
                 Line::from(""),
                 Line::styled(" 还没有电脑用这个码加入。", Style::new().fg(DIM)),
@@ -373,37 +463,103 @@ impl App {
         }
         let online = self.online();
         let top = self.dsel.saturating_sub(inner.height.saturating_sub(1) as usize);
-        for (i, o) in devs.iter().enumerate().skip(top).take(inner.height as usize) {
+        for (i, item) in rows.iter().enumerate().skip(top).take(inner.height as usize) {
             let y = inner.y + (i - top) as u16;
             let row = Rect::new(inner.x, y, inner.width, 1);
             let sel = focused && i == self.dsel;
             let style = self.row_style(sel, focused);
             f.render_widget(Block::new().style(style), row);
-            let on = online.contains(&o.id);
-            let when = if on {
-                "在线".to_string()
-            } else {
-                match self.status.seen.get(&o.id) {
-                    Some(t) => format!("{}前", ago(unix_now().saturating_sub(*t))),
-                    None => "离线".to_string(),
-                }
-            };
-            let id = o.id.fmt_short().to_string();
-            let right_w = 10 + 12;
-            let name_w = (inner.width as usize).saturating_sub(right_w + 4);
             let bar = if sel { Span::styled("▌", Style::new().fg(ACCENT)) } else { Span::raw(" ") };
-            let dot = if on { Span::styled("● ", Style::new().fg(GREEN)) } else { Span::styled("○ ", Style::new().fg(DIM)) };
-            f.render_widget(Line::from(vec![bar, dot, Span::raw(fit(&shown(o), name_w))]).style(style), row);
-            let tail = Line::from(vec![
-                Span::styled(format!("{id:<12}"), Style::new().fg(DIM)),
-                Span::styled(format!("{when:>8} "), Style::new().fg(if on { GREEN } else { DIM })),
-            ])
-            .right_aligned();
-            f.render_widget(tail, row);
+            let right_w = 12 + 12;
+            match item {
+                DeviceRow::Owner(o) => {
+                    let on = online.contains(&o.id);
+                    let when = if on {
+                        "在线".to_string()
+                    } else {
+                        match self.status.seen.get(&o.id) {
+                            Some(t) => format!("{}前", ago(unix_now().saturating_sub(*t))),
+                            None => "离线".to_string(),
+                        }
+                    };
+                    let id = o.id.fmt_short().to_string();
+                    let name_w = (inner.width as usize).saturating_sub(right_w + 4);
+                    let dot = if on { Span::styled("● ", Style::new().fg(GREEN)) } else { Span::styled("○ ", Style::new().fg(DIM)) };
+                    f.render_widget(Line::from(vec![bar, dot, Span::raw(fit(&shown_name(&o.name, o.id), name_w))]).style(style), row);
+                    let tail = Line::from(vec![
+                        Span::styled(format!("{id:<12}"), Style::new().fg(DIM)),
+                        Span::styled(format!("{when:>10} "), Style::new().fg(if on { GREEN } else { DIM })),
+                    ])
+                    .right_aligned();
+                    f.render_widget(tail, row);
+                }
+                DeviceRow::Guest { id, name, temp } => {
+                    let on = online.contains(id);
+                    let tag = if *temp { "临时" } else { "访客" };
+                    let when = if on {
+                        format!("{tag}·在线")
+                    } else {
+                        match self.status.seen.get(id) {
+                            Some(t) => format!("{}前", ago(unix_now().saturating_sub(*t))),
+                            None => tag.to_string(),
+                        }
+                    };
+                    let sid = id.fmt_short().to_string();
+                    let name_w = (inner.width as usize).saturating_sub(right_w + 8);
+                    let dot = if on { Span::styled("● ", Style::new().fg(GREEN)) } else { Span::styled("○ ", Style::new().fg(DIM)) };
+                    f.render_widget(
+                        Line::from(vec![
+                            bar,
+                            Span::styled("  └ ", Style::new().fg(DIM)),
+                            dot,
+                            Span::styled(fit(&shown_name(name, *id), name_w), Style::new().fg(GUEST_FG)),
+                        ])
+                        .style(style),
+                        row,
+                    );
+                    let tail = Line::from(vec![
+                        Span::styled(format!("{sid:<12}"), Style::new().fg(DIM)),
+                        Span::styled(format!("{when:>10} "), Style::new().fg(if on { GREEN } else if *temp { CYAN } else { DIM })),
+                    ])
+                    .right_aligned();
+                    f.render_widget(tail, row);
+                }
+                DeviceRow::Blocked(b) => {
+                    let sid = b.id.fmt_short().to_string();
+                    let name_w = (inner.width as usize).saturating_sub(right_w + 4);
+                    f.render_widget(
+                        Line::from(vec![
+                            bar,
+                            Span::styled("× ", Style::new().fg(RED)),
+                            Span::raw(fit(&shown_name(&b.name, b.id), name_w)),
+                        ])
+                        .style(style),
+                        row,
+                    );
+                    let tail = Line::from(vec![
+                        Span::styled(format!("{sid:<12}"), Style::new().fg(DIM)),
+                        Span::styled(format!("{:>10} ", date(b.added)), Style::new().fg(DIM)),
+                    ])
+                    .right_aligned();
+                    f.render_widget(tail, row);
+                }
+            }
         }
     }
 
     fn draw_code(&self, f: &mut Frame, area: Rect) {
+        if self.on_blocked_group() {
+            let block = self.panel("已禁止".into(), false).padding(ratatui::widgets::Padding::horizontal(1));
+            let inner = block.inner(area);
+            f.render_widget(block, area);
+            let p = Paragraph::new(vec![
+                Line::styled("这些电脑已被中转拦截，即使成员电脑还在同步列表也不会为它们转发。", Style::new().fg(DIM)),
+                Line::styled("按 → 选中某台电脑后按 d 可以解除禁止。", Style::new().fg(DIM)),
+            ])
+            .wrap(Wrap { trim: false });
+            f.render_widget(p, inner);
+            return;
+        }
         let Some(c) = self.code() else {
             let block = self.panel("完整中转码".into(), false);
             let inner = block.inner(area);
@@ -427,8 +583,28 @@ impl App {
         let key = |k: &'static str, what: &'static str| {
             vec![Span::styled(format!(" {k} "), Style::new().fg(FG).bg(KEY_BG)), Span::styled(format!(" {what}   "), Style::new().fg(DIM))]
         };
-        let line: Vec<Span> =
-            [("↑↓", "选择"), ("Tab", "切换"), ("n", "新建码"), ("r", "改名"), ("d", "删除"), ("q", "退出")].into_iter().flat_map(|(k, w)| key(k, w)).collect();
+        let rows = self.rows();
+        let d_label = if self.focus == Focus::Devices {
+            match rows.get(self.dsel) {
+                Some(DeviceRow::Guest { .. }) => Some("禁止"),
+                Some(DeviceRow::Blocked(_)) => Some("解禁"),
+                Some(DeviceRow::Owner(_)) => Some("删除"),
+                None => None,
+            }
+        } else if self.code().is_some() {
+            Some("删除")
+        } else {
+            None
+        };
+        let mut pairs = vec![("↑↓", "选择"), ("Tab", "切换"), ("n", "新建码")];
+        if self.code().is_some() {
+            pairs.push(("r", "改名"));
+        }
+        if let Some(d) = d_label {
+            pairs.push(("d", d));
+        }
+        pairs.push(("q", "退出"));
+        let line: Vec<Span> = pairs.into_iter().flat_map(|(k, w)| key(k, w)).collect();
         f.render_widget(Line::from(line), area);
         if let Some((t, _, ok)) = &self.toast {
             let text = format!(" {} {t} ", if *ok { "✓" } else { "!" });
@@ -450,6 +626,7 @@ impl App {
                 }
             }
         }
+        let rows = self.rows();
         let (title, color, body, keys): (String, Color, Vec<Line>, Vec<(&str, &str)>) = match m {
             Modal::Rename(text) => {
                 let c = self.code().map(Code::shown_name).unwrap_or_default();
@@ -478,10 +655,13 @@ impl App {
                 )
             }
             Modal::DeleteDevice => {
-                let o = self.devices()[self.dsel];
+                let name = match rows.get(self.dsel) {
+                    Some(DeviceRow::Owner(o)) => shown_name(&o.name, o.id),
+                    _ => String::new(),
+                };
                 let c = self.code().map(Code::shown_name).unwrap_or_default();
                 (
-                    format!("移除 {}？", shown(o)),
+                    format!("移除 {name}？"),
                     RED,
                     vec![
                         Line::styled("中转立即停止为它转发。", Style::new().fg(FG)),
@@ -490,8 +670,38 @@ impl App {
                     vec![("y", "移除"), ("n", "取消")],
                 )
             }
+            Modal::BlockGuest => {
+                let name = match rows.get(self.dsel) {
+                    Some(DeviceRow::Guest { id, name, .. }) => shown_name(name, *id),
+                    _ => String::new(),
+                };
+                (
+                    format!("禁止访客 {name}？"),
+                    RED,
+                    vec![
+                        Line::styled("中转立即停止为它转发。", Style::new().fg(FG)),
+                        Line::styled("即使成员电脑还在同步列表也不会恢复；可在左侧「已禁止」里解除。", Style::new().fg(DIM)),
+                    ],
+                    vec![("y", "禁止"), ("n", "取消")],
+                )
+            }
+            Modal::UnblockDevice => {
+                let name = match rows.get(self.dsel) {
+                    Some(DeviceRow::Blocked(b)) => shown_name(&b.name, b.id),
+                    _ => String::new(),
+                };
+                (
+                    format!("解除禁止 {name}？"),
+                    ACCENT,
+                    vec![
+                        Line::styled("解除后它本身不会自动连进来。", Style::new().fg(FG)),
+                        Line::styled("如果某个成员电脑仍带着它，或再贴连接码，中转才会继续转发。", Style::new().fg(DIM)),
+                    ],
+                    vec![("y", "解禁"), ("n", "取消")],
+                )
+            }
         };
-        let w = 60.min(area.width.saturating_sub(4));
+        let w = 62.min(area.width.saturating_sub(4));
         let h = (body.len() as u16 + 6).min(area.height);
         let r = Rect::new(area.x + (area.width.saturating_sub(w)) / 2, area.y + (area.height.saturating_sub(h)) / 2, w, h);
         f.render_widget(Clear, r);
@@ -510,8 +720,8 @@ impl App {
     }
 }
 
-fn shown(o: &Owner) -> String {
-    if o.name.is_empty() { format!("设备 {}", o.id.fmt_short()) } else { o.name.clone() }
+fn shown_name(name: &str, id: EndpointId) -> String {
+    if name.is_empty() { format!("设备 {}", id.fmt_short()) } else { name.to_string() }
 }
 
 /// `text` cut to `w` columns (CJK characters take two).
@@ -557,12 +767,21 @@ fn make_demo(dir: &std::path::Path) -> Result<Store> {
     store.join(key(1), mine.n, "DESKTOP")?;
     store.join(key(2), mine.n, "laptop")?;
     store.join(key(3), home.n, "DAD-PC")?;
+    store.set_guests(
+        &key(1),
+        &[
+            Guest { id: key(4), name: "朋友笔记本".into() },
+            Guest { id: key(5), name: "外包测试".into() },
+        ],
+    )?;
+    store.block(key(6), "陌生电脑")?;
     let now = unix_now();
     store.set_status(&Status {
         started: now - 3 * 86_400,
         written: now,
-        online: vec![key(1), key(3)],
-        seen: [(key(2), now - 3 * 86_400)].into_iter().collect(),
+        online: vec![key(1), key(3), key(4), key(7)],
+        seen: [(key(2), now - 3 * 86_400), (key(5), now - 7200)].into_iter().collect(),
+        meets: vec![crate::state::ActiveMeet { owner: key(3), guest: key(7), name: "表弟手机".into() }],
     })?;
     Ok(store)
 }

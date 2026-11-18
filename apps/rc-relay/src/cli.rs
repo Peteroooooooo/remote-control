@@ -131,11 +131,17 @@ fn load(path: &Option<PathBuf>) -> Result<Config> {
 }
 
 fn codes(cfg: &Config) -> Result<()> {
+    use std::collections::HashSet;
     let store = Store::new(&cfg.state_dir);
     store.upgrade()?;
     let urls = cfg.saved_urls()?;
     let owners = store.owners()?;
     let codes = store.codes()?;
+    let guests = store.guests()?;
+    let blocked = store.blocked()?;
+    let status = store.status().unwrap_or_default();
+    let owner_ids: HashSet<_> = owners.iter().map(|o| o.id).collect();
+    let blocked_ids: HashSet<_> = blocked.iter().map(|b| b.id).collect();
     if codes.is_empty() {
         println!("没有中转码。执行 rc-relay，按 n 新建。");
     }
@@ -143,6 +149,25 @@ fn codes(cfg: &Config) -> Result<()> {
         println!("{}\n  {}", c.shown_name(), RelayCode { urls: urls.clone(), claim_key: c.key }.encode());
         for o in owners.iter().filter(|o| o.code == c.n) {
             println!("  - {}\t{}\t{}", if o.name.is_empty() { "（没有名字）" } else { &o.name }, o.id.fmt_short(), date(o.added));
+            let mut seen = HashSet::new();
+            if let Some(gs) = guests.get(&o.id) {
+                for g in gs {
+                    if !owner_ids.contains(&g.id) && !blocked_ids.contains(&g.id) && seen.insert(g.id) {
+                        println!("    └ {}\t{}", if g.name.is_empty() { "（没有名字）" } else { &g.name }, g.id.fmt_short());
+                    }
+                }
+            }
+            for m in status.meets.iter().filter(|m| m.owner == o.id) {
+                if !owner_ids.contains(&m.guest) && !blocked_ids.contains(&m.guest) && seen.insert(m.guest) {
+                    println!("    └ {}\t{}\t临时", if m.name.is_empty() { "（没有名字）" } else { &m.name }, m.guest.fmt_short());
+                }
+            }
+        }
+    }
+    if !blocked.is_empty() {
+        println!("\n已禁止");
+        for b in blocked {
+            println!("  × {}\t{}\t{}", if b.name.is_empty() { "（没有名字）" } else { &b.name }, b.id.fmt_short(), date(b.added));
         }
     }
     Ok(())

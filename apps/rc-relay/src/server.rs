@@ -27,7 +27,7 @@ use crate::{
     api::{self, ClaimRequest, GuestsRequest, InvitesRequest, MeetRequest, Refusal},
     config::{Config, Resolved},
     policy::Policy,
-    state::{Code, Store, Status},
+    state::{ActiveMeet, Code, Status, Store},
 };
 
 struct Shared {
@@ -43,8 +43,9 @@ struct Shared {
 impl Shared {
     fn reload(&self) -> Result<()> {
         let owners = self.store.owners()?;
-        let guests = self.store.guests()?;
-        self.policy.set_roster(owners.iter().map(|o| o.id), guests);
+        let guests = guest_ids(self.store.guests()?);
+        let blocked = self.store.blocked()?;
+        self.policy.set_roster(owners.iter().map(|o| o.id), guests, blocked.into_iter().map(|b| b.id));
         Ok(())
     }
 
@@ -95,7 +96,7 @@ impl Shared {
             Refusal::Server
         })?;
         info!("{} lists {} guest(s)", req.device.fmt_short(), req.guests.len());
-        self.policy.set_guests(req.device, req.guests);
+        self.policy.set_guests(req.device, req.guests.into_iter().map(|g| g.id).collect());
         Ok("ok".into())
     }
 
@@ -116,6 +117,10 @@ impl Shared {
     fn meet(&self, header: &str) -> Result<String, Refusal> {
         let req = MeetRequest::decode(header).map_err(|_| Refusal::BadRequest)?;
         let (o, d) = (req.owner.fmt_short(), req.device.fmt_short());
+        if self.policy.is_blocked(&req.device) {
+            info!("{d} brought a connection code of {o}: blocked");
+            return Err(Refusal::UnknownInvite);
+        }
         if self.policy.admitted(&req.owner, &req.device) {
             return Ok("ok".into());
         }
@@ -132,8 +137,8 @@ impl Shared {
             info!("{d} brought a connection code of {o}: unknown, used or expired");
             return Err(Refusal::UnknownInvite);
         }
-        self.policy.admit(req.owner, req.device, unix_now() + api::MEET_KEEP);
-        info!("{d} brought a connection code of {o}: the two may meet here");
+        self.policy.admit(req.owner, req.device, &req.name, unix_now() + api::MEET_KEEP);
+        info!("{d} ({}) brought a connection code of {o}: the two may meet here", req.name);
         Ok("ok".into())
     }
 }
@@ -171,7 +176,9 @@ impl Relay {
         let store = Store::new(&cfg.state_dir);
         store.upgrade()?;
         let owners: Vec<EndpointId> = store.owners()?.iter().map(|o| o.id).collect();
-        let policy = Arc::new(Policy::new(owners, store.guests()?));
+        let guests = guest_ids(store.guests()?);
+        let blocked: Vec<EndpointId> = store.blocked()?.into_iter().map(|b| b.id).collect();
+        let policy = Arc::new(Policy::new(owners, guests, blocked));
         let shared = Arc::new(Shared {
             store,
             policy: policy.clone(),
@@ -228,43 +235,60 @@ impl Relay {
     }
 }
 
-/// Picks up changes other processes make to `owners.txt`, and writes
-/// `status.txt` (connected devices) when they change.
+fn guest_ids(m: BTreeMap<EndpointId, Vec<crate::api::Guest>>) -> BTreeMap<EndpointId, Vec<EndpointId>> {
+    m.into_iter().map(|(o, gs)| (o, gs.into_iter().map(|g| g.id).collect())).collect()
+}
+
+/// Picks up changes other processes make to `owners.txt` and `blocked.txt`,
+/// and writes `status.txt` (connected devices and temporary guests) when they change.
 async fn watch_owners(sh: Arc<Shared>, started: u64) {
-    let path = sh.store.owners_path();
-    let stamp = || std::fs::metadata(&path).and_then(|m| m.modified()).ok();
-    let mut last: Option<SystemTime> = stamp();
-    let mut shown: Option<Vec<EndpointId>> = None;
+    let op = sh.store.owners_path();
+    let bp = sh.store.blocked_path();
+    let stamps = || {
+        (
+            std::fs::metadata(&op).and_then(|m| m.modified()).ok(),
+            std::fs::metadata(&bp).and_then(|m| m.modified()).ok(),
+        )
+    };
+    let mut last: (Option<SystemTime>, Option<SystemTime>) = stamps();
+    let mut shown: Option<(Vec<EndpointId>, Vec<ActiveMeet>)> = None;
     let mut written = 0;
     loop {
         tokio::time::sleep(Duration::from_secs(2)).await;
         let mut online: Vec<EndpointId> = sh.policy.online().into_iter().collect();
         online.sort();
+        let meets: Vec<ActiveMeet> = sh
+            .policy
+            .admitted_list()
+            .into_iter()
+            .map(|(owner, guest, name)| ActiveMeet { owner, guest, name })
+            .collect();
+        let snap = (online, meets);
         // Again every minute even unchanged: the management screen reads its age.
-        if shown.as_ref() != Some(&online) || unix_now() >= written + 60 {
+        if shown.as_ref() != Some(&snap) || unix_now() >= written + 60 {
             let seen = sh.store.status().map(|s| s.seen).unwrap_or_default();
             let mut seen: BTreeMap<EndpointId, u64> = seen;
             let now = unix_now();
-            for id in &online {
+            for id in &snap.0 {
                 seen.insert(*id, now);
             }
-            let status = Status { started, written: now, online: online.clone(), seen };
+            let status = Status { started, written: now, online: snap.0.clone(), seen, meets: snap.1.clone() };
             match sh.store.set_status(&status) {
                 Ok(()) => {
-                    shown = Some(online);
+                    shown = Some(snap);
                     written = now;
                 }
                 Err(e) => warn!("status.txt: {e:#}"),
             }
         }
-        let now = stamp();
+        let now = stamps();
         if now == last {
             continue;
         }
         last = now;
         match sh.reload() {
-            Ok(()) => info!("owners.txt changed: {} owner(s)", sh.policy.owners().len()),
-            Err(e) => warn!("owners.txt: {e:#}; keeping the previous list"),
+            Ok(()) => info!("roster changed: {} owner(s)", sh.policy.owners().len()),
+            Err(e) => warn!("roster reload: {e:#}; keeping the previous list"),
         }
     }
 }

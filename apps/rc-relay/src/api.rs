@@ -144,9 +144,9 @@ fn claim_signed(version: u8, claim_key: &[u8; 16], device: &PublicKey, name: &st
     v
 }
 
-/// `name` cut to [`MAX_NAME`] bytes on a character boundary.
-fn cut(name: &str) -> String {
-    let mut n = name.len().min(MAX_NAME);
+/// `name` cut to `max` bytes on a character boundary.
+fn cut(name: &str, max: usize) -> String {
+    let mut n = name.len().min(max);
     while !name.is_char_boundary(n) {
         n -= 1;
     }
@@ -155,7 +155,7 @@ fn cut(name: &str) -> String {
 
 impl ClaimRequest {
     pub fn new(claim_key: [u8; 16], device: &SecretKey, name: &str) -> ClaimRequest {
-        let name = cut(name);
+        let name = cut(name, MAX_NAME);
         let signature = device.sign(&claim_signed(CLAIM_NAMED, &claim_key, &device.public(), &name));
         ClaimRequest { claim_key, device: device.public(), name, signature }
     }
@@ -193,6 +193,19 @@ impl ClaimRequest {
     }
 }
 
+/// A device an owner lets use the relay.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Guest {
+    pub id: PublicKey,
+    pub name: String,
+}
+
+impl From<PublicKey> for Guest {
+    fn from(id: PublicKey) -> Guest {
+        Guest { id, name: String::new() }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GuestsRequest {
     /// The owner.
@@ -201,20 +214,29 @@ pub struct GuestsRequest {
     pub time: u64,
     pub nonce: [u8; 16],
     /// The devices the owner lets use the relay.
-    pub guests: Vec<PublicKey>,
+    pub guests: Vec<Guest>,
     pub signature: Signature,
 }
 
 /// Version 1 lists keys only. Version 2 (older apps) adds a byte after each
-/// key, which marked "my computer"; it is read and left unused.
+/// key, which marked "my computer"; it is read and left unused. Version 3
+/// adds each guest's name (length byte, UTF-8).
 const GUESTS_MARKED: u8 = 2;
+const GUESTS_NAMED: u8 = 3;
+/// Longest guest name kept (bytes, keeps the header compact).
+pub const MAX_GUEST_NAME: usize = 32;
 
-fn guests_signed(version: u8, device: &PublicKey, time: u64, nonce: &[u8; 16], guests: &[PublicKey], marks: &[u8]) -> Vec<u8> {
+fn guests_signed(version: u8, device: &PublicKey, time: u64, nonce: &[u8; 16], guests: &[Guest], marks: &[u8]) -> Vec<u8> {
     let mut v = [GUESTS_DOMAIN, &[version], device.as_bytes(), &time.to_be_bytes(), nonce].concat();
     for (i, g) in guests.iter().enumerate() {
-        v.extend_from_slice(g.as_bytes());
-        if version == GUESTS_MARKED {
-            v.push(marks[i]);
+        v.extend_from_slice(g.id.as_bytes());
+        match version {
+            GUESTS_MARKED => v.push(marks[i]),
+            GUESTS_NAMED => {
+                v.push(g.name.len() as u8);
+                v.extend_from_slice(g.name.as_bytes());
+            }
+            _ => {}
         }
     }
     v
@@ -222,18 +244,32 @@ fn guests_signed(version: u8, device: &PublicKey, time: u64, nonce: &[u8; 16], g
 
 impl GuestsRequest {
     /// At most [`MAX_GUESTS`] of `guests` go in.
-    pub fn new(device: &SecretKey, time: u64, guests: &[PublicKey]) -> GuestsRequest {
-        let guests = guests[..guests.len().min(MAX_GUESTS)].to_vec();
+    pub fn new(device: &SecretKey, time: u64, guests: &[Guest]) -> GuestsRequest {
+        let guests: Vec<Guest> = guests
+            .iter()
+            .take(MAX_GUESTS)
+            .map(|g| Guest { id: g.id, name: cut(&g.name, MAX_GUEST_NAME) })
+            .collect();
         let nonce = random_key();
-        let signature = device.sign(&guests_signed(VERSION, &device.public(), time, &nonce, &guests, &[]));
+        let version = Self::version_for(&guests);
+        let signature = device.sign(&guests_signed(version, &device.public(), time, &nonce, &guests, &[]));
         GuestsRequest { device: device.public(), time, nonce, guests, signature }
     }
 
+    fn version_for(guests: &[Guest]) -> u8 {
+        if guests.iter().any(|g| !g.name.is_empty()) { GUESTS_NAMED } else { VERSION }
+    }
+
     pub fn encode(&self) -> String {
-        let mut v = [&[VERSION][..], self.device.as_bytes(), &self.time.to_be_bytes(), &self.nonce, &self.signature.to_bytes()]
+        let version = Self::version_for(&self.guests);
+        let mut v = [&[version][..], self.device.as_bytes(), &self.time.to_be_bytes(), &self.nonce, &self.signature.to_bytes()]
             .concat();
         for g in &self.guests {
-            v.extend_from_slice(g.as_bytes());
+            v.extend_from_slice(g.id.as_bytes());
+            if version == GUESTS_NAMED {
+                v.push(g.name.len() as u8);
+                v.extend_from_slice(g.name.as_bytes());
+            }
         }
         text::encode(GUESTS_PREFIX, &v)
     }
@@ -243,7 +279,7 @@ impl GuestsRequest {
         let p = text::decode(GUESTS_PREFIX, s)?;
         let mut r = Reader::new(&p);
         let version = match r.u8()? {
-            v @ (VERSION | GUESTS_MARKED) => v,
+            v @ (VERSION | GUESTS_MARKED | GUESTS_NAMED) => v,
             v => return Err(Error::Version(v)),
         };
         let device = PublicKey::from_bytes(&r.array()?).map_err(|_| Error::Field("device key"))?;
@@ -255,10 +291,22 @@ impl GuestsRequest {
             if guests.len() == MAX_GUESTS {
                 return Err(Error::Length);
             }
-            guests.push(PublicKey::from_bytes(&g).map_err(|_| Error::Field("guest key"))?);
-            if version == GUESTS_MARKED {
-                marks.push(r.u8()?);
-            }
+            let id = PublicKey::from_bytes(&g).map_err(|_| Error::Field("guest key"))?;
+            let name = match version {
+                GUESTS_MARKED => {
+                    marks.push(r.u8()?);
+                    String::new()
+                }
+                GUESTS_NAMED => {
+                    let n = r.u8()? as usize;
+                    if n > MAX_GUEST_NAME {
+                        return Err(Error::Field("guest name"));
+                    }
+                    std::str::from_utf8(r.take(n)?).map_err(|_| Error::Field("guest name"))?.to_string()
+                }
+                _ => String::new(),
+            };
+            guests.push(Guest { id, name });
         }
         r.finish()?;
         device
@@ -346,22 +394,42 @@ pub struct MeetRequest {
     pub device: PublicKey,
     pub owner: PublicKey,
     pub token: [u8; 8],
+    /// The guest's name, shown on the relay (empty from older versions).
+    pub name: String,
     pub signature: Signature,
 }
 
-fn meet_signed(device: &PublicKey, owner: &PublicKey, token: &[u8; 8]) -> Vec<u8> {
-    [MEET_DOMAIN, &[VERSION], device.as_bytes(), owner.as_bytes(), token].concat()
+const MEET_NAMED: u8 = 2;
+
+fn meet_signed(version: u8, device: &PublicKey, owner: &PublicKey, token: &[u8; 8], name: &str) -> Vec<u8> {
+    let mut v = [MEET_DOMAIN, &[version], device.as_bytes(), owner.as_bytes(), token].concat();
+    if version == MEET_NAMED {
+        v.push(name.len() as u8);
+        v.extend_from_slice(name.as_bytes());
+    }
+    v
 }
 
 impl MeetRequest {
-    pub fn new(device: &SecretKey, owner: PublicKey, token: [u8; 8]) -> MeetRequest {
-        let signature = device.sign(&meet_signed(&device.public(), &owner, &token));
-        MeetRequest { device: device.public(), owner, token, signature }
+    pub fn new(device: &SecretKey, owner: PublicKey, token: [u8; 8], name: &str) -> MeetRequest {
+        let name = cut(name, MAX_NAME);
+        let version = Self::version_for(&name);
+        let signature = device.sign(&meet_signed(version, &device.public(), &owner, &token, &name));
+        MeetRequest { device: device.public(), owner, token, name, signature }
+    }
+
+    fn version_for(name: &str) -> u8 {
+        if name.is_empty() { VERSION } else { MEET_NAMED }
     }
 
     pub fn encode(&self) -> String {
-        let v = [&[VERSION][..], self.device.as_bytes(), self.owner.as_bytes(), &self.token, &self.signature.to_bytes()]
+        let version = Self::version_for(&self.name);
+        let mut v = [&[version][..], self.device.as_bytes(), self.owner.as_bytes(), &self.token, &self.signature.to_bytes()]
             .concat();
+        if version == MEET_NAMED {
+            v.push(self.name.len() as u8);
+            v.extend_from_slice(self.name.as_bytes());
+        }
         text::encode(MEET_PREFIX, &v)
     }
 
@@ -369,17 +437,28 @@ impl MeetRequest {
     pub fn decode(s: &str) -> Result<MeetRequest, Error> {
         let p = text::decode(MEET_PREFIX, s)?;
         let mut r = Reader::new(&p);
-        match r.u8()? {
-            VERSION => {}
+        let version = match r.u8()? {
+            v @ (VERSION | MEET_NAMED) => v,
             v => return Err(Error::Version(v)),
-        }
+        };
         let device = PublicKey::from_bytes(&r.array()?).map_err(|_| Error::Field("device key"))?;
         let owner = PublicKey::from_bytes(&r.array()?).map_err(|_| Error::Field("owner key"))?;
         let token = r.array()?;
         let signature = Signature::from_bytes(&r.array()?);
+        let name = if version == MEET_NAMED {
+            let n = r.u8()? as usize;
+            if n > MAX_NAME {
+                return Err(Error::Field("name"));
+            }
+            std::str::from_utf8(r.take(n)?).map_err(|_| Error::Field("name"))?.to_string()
+        } else {
+            String::new()
+        };
         r.finish()?;
-        device.verify(&meet_signed(&device, &owner, &token), &signature).map_err(|_| Error::Signature)?;
-        Ok(MeetRequest { device, owner, token, signature })
+        device
+            .verify(&meet_signed(version, &device, &owner, &token, &name), &signature)
+            .map_err(|_| Error::Signature)?;
+        Ok(MeetRequest { device, owner, token, name, signature })
     }
 }
 
@@ -423,28 +502,35 @@ mod tests {
 
     #[test]
     fn guests_round_trip_and_forgery() {
-        let guests = [key(2).public(), key(3).public()];
+        let guests = [Guest { id: key(2).public(), name: "friend-pc".into() }, Guest::from(key(3).public())];
         let r = GuestsRequest::new(&key(1), 1_000, &guests);
         assert_eq!(GuestsRequest::decode(&r.encode()).unwrap(), r);
         let empty = GuestsRequest::new(&key(1), 1_000, &[]);
         assert_eq!(GuestsRequest::decode(&empty.encode()).unwrap().guests, []);
-        // A guest slipped in after signing.
+        // A guest slipped in or renamed after signing.
         let mut f = r.clone();
-        f.guests.push(key(4).public());
+        f.guests.push(Guest::from(key(4).public()));
         assert_eq!(GuestsRequest::decode(&f.encode()), Err(Error::Signature));
-        let many: Vec<PublicKey> = (0..MAX_GUESTS + 5).map(|_| SecretKey::generate().public()).collect();
+        let mut f = r.clone();
+        f.guests[0].name = "other".into();
+        assert_eq!(GuestsRequest::decode(&f.encode()), Err(Error::Signature));
+        let many: Vec<Guest> = (0..MAX_GUESTS + 5).map(|_| Guest::from(SecretKey::generate().public())).collect();
         assert_eq!(GuestsRequest::new(&key(1), 1_000, &many).guests.len(), MAX_GUESTS);
         assert_eq!(GuestsRequest::decode(&ClaimRequest::new([1; 16], &key(1), "").encode()), Err(Error::WrongPrefix));
+        // Without names, version 1 is used (compact and older-relay compatible).
+        let plain = GuestsRequest::new(&key(1), 1_000, &[Guest::from(key(2).public())]);
+        assert_eq!(text::decode(GUESTS_PREFIX, &plain.encode()).unwrap()[0], VERSION);
     }
 
     #[test]
     fn guests_from_an_older_version_with_marks() {
         let (k, nonce) = (key(1), [3; 16]);
-        let guests = [key(2).public(), key(3).public()];
+        let keys = [key(2).public(), key(3).public()];
+        let guests: Vec<Guest> = keys.into_iter().map(Guest::from).collect();
         let signed = guests_signed(GUESTS_MARKED, &k.public(), 1_000, &nonce, &guests, &[1, 0]);
         let mut v = [&[GUESTS_MARKED][..], k.public().as_bytes(), &1_000u64.to_be_bytes(), &nonce, &k.sign(&signed).to_bytes()].concat();
         for (g, m) in guests.iter().zip([1u8, 0]) {
-            v.extend_from_slice(g.as_bytes());
+            v.extend_from_slice(g.id.as_bytes());
             v.push(m);
         }
         assert_eq!(GuestsRequest::decode(&text::encode(GUESTS_PREFIX, &v)).unwrap().guests, guests);
@@ -471,14 +557,21 @@ mod tests {
 
     #[test]
     fn meet_round_trip_and_forgery() {
-        let r = MeetRequest::new(&key(2), key(1).public(), [7; 8]);
+        let r = MeetRequest::new(&key(2), key(1).public(), [7; 8], "friend-pc");
         assert_eq!(MeetRequest::decode(&r.encode()).unwrap(), r);
+        // Without a name, version 1 is used.
+        let plain = MeetRequest::new(&key(2), key(1).public(), [7; 8], "");
+        assert_eq!(MeetRequest::decode(&plain.encode()).unwrap(), plain);
+        assert_eq!(text::decode(MEET_PREFIX, &plain.encode()).unwrap()[0], VERSION);
         // Someone else's device named in a request it did not sign.
-        let mut f = MeetRequest::new(&key(3), key(1).public(), [7; 8]);
+        let mut f = MeetRequest::new(&key(3), key(1).public(), [7; 8], "friend-pc");
         f.device = key(2).public();
         assert_eq!(MeetRequest::decode(&f.encode()), Err(Error::Signature));
         let mut f = r.clone();
         f.token = [8; 8];
+        assert_eq!(MeetRequest::decode(&f.encode()), Err(Error::Signature));
+        let mut f = r.clone();
+        f.name = "other".into();
         assert_eq!(MeetRequest::decode(&f.encode()), Err(Error::Signature));
     }
 

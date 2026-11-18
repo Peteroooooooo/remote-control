@@ -14,7 +14,7 @@ use iroh_base::{PublicKey, RelayUrl, SecretKey};
 use iroh_relay::tls::CaTlsConfig;
 use rc_ident::{proof::unix_now, relay_code::RelayCode};
 
-use crate::api::{self, ClaimRequest, GuestsRequest, Invite, InvitesRequest, MeetRequest, Refusal};
+use crate::api::{self, ClaimRequest, Guest, GuestsRequest, Invite, InvitesRequest, MeetRequest, Refusal};
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 /// The head start of each address over the next one (Happy Eyeballs).
@@ -124,10 +124,23 @@ pub async fn claim(code: &RelayCode, device: &SecretKey, name: &str, ca: &CaTlsC
 
 /// Tells the relay, as its owner `device`, the whole list of devices that
 /// may use it to reach this owner (replaces the list sent before).
-pub async fn set_guests(relay: &[RelayUrl], device: &SecretKey, ca: &CaTlsConfig, guests: &[PublicKey]) -> Result<()> {
+/// An older relay that does not take guest names gets the keys alone.
+pub async fn set_guests(relay: &[RelayUrl], device: &SecretKey, ca: &CaTlsConfig, guests: &[Guest]) -> Result<()> {
     let client = http(ca)?;
-    let req = GuestsRequest::new(device, unix_now(), guests).encode();
-    race(relay, |u| call(client.clone(), u, api::GUESTS_PATH, req.clone())).await?.1?;
+    let send = |guests: &[Guest]| {
+        let req = GuestsRequest::new(device, unix_now(), guests).encode();
+        let client = client.clone();
+        async move { race(relay, |u| call(client.clone(), u, api::GUESTS_PATH, req.clone())).await }
+    };
+    match send(guests).await?.1 {
+        Err(Refusal::BadRequest) if guests.iter().any(|g| !g.name.is_empty()) => {
+            let plain: Vec<Guest> = guests.iter().map(|g| Guest::from(g.id)).collect();
+            send(&plain).await?.1?;
+        }
+        r => {
+            r?;
+        }
+    }
     Ok(())
 }
 
@@ -141,11 +154,22 @@ pub async fn set_invites(relay: &[RelayUrl], device: &SecretKey, ca: &CaTlsConfi
 }
 
 /// Brings `owner`'s connection code (its token) to the owner's relay, so
-/// that relay lets `device` and the owner reach each other.
-pub async fn meet(relay: &[RelayUrl], device: &SecretKey, ca: &CaTlsConfig, owner: PublicKey, token: [u8; 8]) -> Result<()> {
+/// that relay lets `device` (named `name`) and the owner reach each other.
+pub async fn meet(relay: &[RelayUrl], device: &SecretKey, name: &str, ca: &CaTlsConfig, owner: PublicKey, token: [u8; 8]) -> Result<()> {
     let client = http(ca)?;
-    let req = MeetRequest::new(device, owner, token).encode();
-    race(relay, |u| call(client.clone(), u, api::MEET_PATH, req.clone())).await?.1?;
+    let send = |name: &str| {
+        let req = MeetRequest::new(device, owner, token, name).encode();
+        let client = client.clone();
+        async move { race(relay, |u| call(client.clone(), u, api::MEET_PATH, req.clone())).await }
+    };
+    match send(name).await?.1 {
+        Err(Refusal::BadRequest) if !name.is_empty() => {
+            send("").await?.1?;
+        }
+        r => {
+            r?;
+        }
+    }
     Ok(())
 }
 

@@ -17,7 +17,7 @@ use rc_ident::{
     relay_code::RelayCode,
 };
 use rc_relay::{
-    api::{self, GuestsRequest, Invite, Refusal},
+    api::{self, Guest, GuestsRequest, Invite, Refusal},
     client,
     config::{Config, Tls},
     server::Relay,
@@ -123,8 +123,8 @@ impl Setup {
         tokio::time::timeout(Duration::from_secs(5), attempt).await.ok().flatten().is_some()
     }
 
-    async fn set_guests(&self, owner: &SecretKey, guests: &[&SecretKey]) {
-        let ids: Vec<_> = guests.iter().map(|g| g.public()).collect();
+    async fn set_guests(&self, owner: &SecretKey, guests: &[(&SecretKey, &str)]) {
+        let ids: Vec<_> = guests.iter().map(|(g, n)| Guest { id: g.public(), name: (*n).to_string() }).collect();
         client::set_guests(std::slice::from_ref(&self.url), owner, &self.ca(), &ids).await.unwrap();
     }
 }
@@ -188,21 +188,32 @@ async fn claim_then_only_the_roster_gets_help() {
     assert!(!s.reaches(&g, &o).await, "not listed yet");
 
     // Listed while connected: no reconnect needed.
-    s.set_guests(&owner, &[&gk, &gk2]).await;
-    assert_eq!(s.store().guests().unwrap()[&owner.public()], [gk.public(), gk2.public()]);
+    s.set_guests(&owner, &[(&gk, "guest-1"), (&gk2, "guest-2")]).await;
+    assert_eq!(
+        s.store().guests().unwrap()[&owner.public()],
+        [Guest { id: gk.public(), name: "guest-1".into() }, Guest { id: gk2.public(), name: "guest-2".into() }]
+    );
     assert!(s.reaches(&g, &o).await, "guest → owner");
     assert!(s.reaches(&o, &g).await, "owner → guest");
     assert!(!s.reaches(&g, &g2).await, "guest → guest: no owner at either end");
     assert!(!s.reaches(&g, &x).await, "guest → stranger");
     assert!(!s.reaches(&x, &g).await, "stranger → guest");
 
+    // Blocking a guest stops it even while still listed; unblocking restores it.
+    s.store().block(gk.public(), "guest-1").unwrap();
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(!s.reaches(&g, &o).await, "blocked guest");
+    assert!(s.store().unblock(&gk.public()).unwrap());
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(s.reaches(&g, &o).await, "unblocked guest");
+
     // The new list replaces the old one, at once.
-    s.set_guests(&owner, &[&gk2]).await;
+    s.set_guests(&owner, &[(&gk2, "guest-2")]).await;
     assert!(!s.reaches(&g, &o).await, "taken off the list");
     assert!(s.reaches(&g2, &o).await, "still listed");
 
     // Only an owner may send a list.
-    let e = client::set_guests(std::slice::from_ref(&s.url), &key(), &s.ca(), &[gk.public()]).await.unwrap_err();
+    let e = client::set_guests(std::slice::from_ref(&s.url), &key(), &s.ca(), &[Guest::from(gk.public())]).await.unwrap_err();
     assert_eq!(e.downcast_ref::<Refusal>(), Some(&Refusal::NotOwner));
 }
 
@@ -259,12 +270,27 @@ async fn a_code_works_for_every_computer_until_deleted() {
 }
 
 #[tokio::test]
+async fn a_guest_reaches_only_its_own_owner_not_other_members() {
+    let s = Setup::new("isolation").await;
+    let code = s.first_code();
+    let (a, b, gk) = (key(), key(), key());
+    client::claim(&code, &a, "DESKTOP", &s.ca()).await.unwrap();
+    client::claim(&code, &b, "laptop", &s.ca()).await.unwrap();
+    s.set_guests(&a, &[(&gk, "friend")]).await;
+    let (ea, eb, eg) = (s.endpoint(a, None).await, s.endpoint(b, None).await, s.endpoint(gk, None).await);
+    assert!(s.reaches(&ea, &eb).await, "owner ↔ owner");
+    assert!(s.reaches(&eg, &ea).await, "guest → its owner");
+    assert!(!s.reaches(&eg, &eb).await, "guest → other owner");
+    assert!(!s.reaches(&eb, &eg).await, "other owner → guest");
+}
+
+#[tokio::test]
 async fn a_device_with_a_connection_code_meets_its_owner() {
     let s = Setup::new("invites").await;
     let owner = key();
     s.claim(&owner).await;
     let (bk, xk, gk) = (key(), key(), key());
-    s.set_guests(&owner, &[&gk]).await;
+    s.set_guests(&owner, &[(&gk, "guest")]).await;
     let o = s.endpoint(owner.clone(), None).await;
     let (b, x, g) = (s.endpoint(bk.clone(), None).await, s.endpoint(xk.clone(), None).await, s.endpoint(gk, None).await);
     let urls = std::slice::from_ref(&s.url);
@@ -274,19 +300,24 @@ async fn a_device_with_a_connection_code_meets_its_owner() {
     assert!(!s.reaches(&b, &o).await, "before bringing the code");
 
     let refused = |e: anyhow::Error| e.downcast_ref::<Refusal>().copied();
-    let e = client::meet(urls, &bk, &s.ca(), owner.public(), [6; 8]).await.unwrap_err();
+    let e = client::meet(urls, &bk, "friend-pc", &s.ca(), owner.public(), [6; 8]).await.unwrap_err();
     assert_eq!(refused(e), Some(Refusal::UnknownInvite), "another token");
-    let e = client::meet(urls, &bk, &s.ca(), xk.public(), code.token).await.unwrap_err();
+    let e = client::meet(urls, &bk, "friend-pc", &s.ca(), xk.public(), code.token).await.unwrap_err();
     assert_eq!(refused(e), Some(Refusal::UnknownInvite), "not an owner");
-    client::meet(urls, &bk, &s.ca(), owner.public(), code.token).await.unwrap();
+    client::meet(urls, &bk, "friend-pc", &s.ca(), owner.public(), code.token).await.unwrap();
     assert!(s.reaches(&b, &o).await, "device with the code → owner");
     assert!(s.reaches(&o, &b).await, "owner → device with the code");
     assert!(!s.reaches(&b, &g).await, "only to the owner, not its guests");
     assert!(!s.reaches(&g, &b).await, "only to the owner, not its guests");
-    client::meet(urls, &bk, &s.ca(), owner.public(), code.token).await.expect("the same device again");
+    client::meet(urls, &bk, "friend-pc", &s.ca(), owner.public(), code.token).await.expect("the same device again");
+
+    // Temporary guest appears with its name in status.txt.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let st = s.store().status().unwrap();
+    assert!(st.meets.iter().any(|m| m.owner == owner.public() && m.guest == bk.public() && m.name == "friend-pc"));
 
     // Used up: another device cannot use it.
-    let e = client::meet(urls, &xk, &s.ca(), owner.public(), code.token).await.unwrap_err();
+    let e = client::meet(urls, &xk, "other", &s.ca(), owner.public(), code.token).await.unwrap_err();
     assert_eq!(refused(e), Some(Refusal::UnknownInvite));
     assert!(!s.reaches(&x, &o).await);
     assert!(!s.store().invites().unwrap().contains_key(&owner.public()));
@@ -295,7 +326,7 @@ async fn a_device_with_a_connection_code_meets_its_owner() {
     let other = Invite { token: [7; 8], expires: unix_now() + 600 };
     client::set_invites(urls, &owner, &s.ca(), &[other]).await.unwrap();
     client::set_invites(urls, &owner, &s.ca(), &[]).await.unwrap();
-    let e = client::meet(urls, &xk, &s.ca(), owner.public(), other.token).await.unwrap_err();
+    let e = client::meet(urls, &xk, "other", &s.ca(), owner.public(), other.token).await.unwrap_err();
     assert_eq!(refused(e), Some(Refusal::UnknownInvite));
 
     let e = client::set_invites(urls, &xk, &s.ca(), &[other]).await.unwrap_err();
@@ -308,7 +339,7 @@ async fn device_proofs() {
     let device = key();
     s.claim(&device).await;
     let guest = key();
-    s.set_guests(&device, &[&guest]).await;
+    s.set_guests(&device, &[(&guest, "guest")]).await;
     let stranger = key();
     let now = unix_now();
     let o = s.endpoint(device.clone(), None).await;
@@ -351,7 +382,7 @@ async fn owners_file_changes_apply_while_running() {
     let first = key();
     s.claim(&first).await;
     let guest = key();
-    s.set_guests(&first, &[&guest]).await;
+    s.set_guests(&first, &[(&guest, "guest")]).await;
     let k = key();
     let (a, b) = (s.endpoint(k.clone(), None).await, s.endpoint(first.clone(), None).await);
     let g = s.endpoint(guest, None).await;

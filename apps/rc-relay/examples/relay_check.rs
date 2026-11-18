@@ -50,7 +50,8 @@ async fn run(url: RelayUrl, owner: SecretKey, bytes: usize) -> Result<()> {
     rc_relay::tls::learn(&url);
     let ca = rc_relay::tls::ca();
     let (guest, guest2) = (SecretKey::generate(), SecretKey::generate());
-    rc_relay::client::set_guests(std::slice::from_ref(&url), &owner, &ca, &[guest.public(), guest2.public()]).await?;
+    let gs = [rc_relay::api::Guest::from(guest.public()), rc_relay::api::Guest::from(guest2.public())];
+    rc_relay::client::set_guests(std::slice::from_ref(&url), &owner, &ca, &gs).await?;
     let o = endpoint(&url, owner.clone(), None).await?;
     let g = endpoint(&url, guest.clone(), None).await?;
     let g2 = endpoint(&url, guest2, None).await?;

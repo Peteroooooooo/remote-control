@@ -40,7 +40,7 @@ use rc_ident::{
     conn_code::{ConnCode, Find},
     relay_code::RelayCode,
 };
-use rc_relay::api::{Invite, Refusal};
+use rc_relay::api::{Guest, Invite, Refusal};
 use tokio::sync::Notify;
 
 use crate::{
@@ -403,12 +403,19 @@ impl Shared {
     /// The devices this computer lets use its own relay (`target-plan` 5.2):
     /// the device list, and the devices met with a connection code while
     /// the lobby is open and the software is not going away.
-    fn guests(&self, st: &St) -> Vec<EndpointId> {
-        let mut v: BTreeSet<EndpointId> = st.store.listed().map(|d| d.id).collect();
+    fn guests(&self, st: &St) -> Vec<Guest> {
+        let mut m: BTreeMap<EndpointId, String> = st.store.listed().map(|d| (d.id, d.name.clone())).collect();
         if self.lobby_open(st) && !self.is_stopped() && !self.leaving.load(std::sync::atomic::Ordering::SeqCst) {
-            v.extend(st.peers.iter().filter(|(_, p)| p.met == Some(Met::Code)).map(|(id, _)| *id));
+            for (id, p) in &st.peers {
+                if p.met == Some(Met::Code) {
+                    let entry = m.entry(*id).or_default();
+                    if entry.is_empty() && !p.name.is_empty() {
+                        *entry = p.name.clone();
+                    }
+                }
+            }
         }
-        v.into_iter().collect()
+        m.into_iter().map(|(id, name)| Guest { id, name }).collect()
     }
 
     /// Settings changed in `st` (the relays were `before`): saved, every
@@ -447,7 +454,7 @@ impl Shared {
 
     /// Replaces this computer's guest list on `relay` (its addresses). The
     /// error is the relay's own (a `Refusal`, see `relay_error`).
-    async fn send_guests(&self, relay: &[RelayUrl], guests: &[EndpointId]) -> Result<()> {
+    async fn send_guests(&self, relay: &[RelayUrl], guests: &[Guest]) -> Result<()> {
         let _one = self.sending_guests.lock().await;
         rc_relay::client::set_guests(relay, &self.secret, &rc_relay::tls::ca(), guests).await?;
         log!("guest list on {}: {} device(s)", relay[0], guests.len());
@@ -474,7 +481,8 @@ impl Shared {
     /// Done once the relay answers; tried again with the next dial if not.
     async fn bring_code(&self, owner: EndpointId, relay: &[RelayUrl], token: [u8; 8], round: u32) {
         let ca = rc_relay::tls::ca();
-        let meet = rc_relay::client::meet(relay, &self.secret, &ca, owner, token);
+        let name = self.st.lock().unwrap().settings.shown_name();
+        let meet = rc_relay::client::meet(relay, &self.secret, &name, &ca, owner, token);
         let r = tokio::time::timeout(Duration::from_secs(5), meet).await.unwrap_or_else(|_| Err(anyhow!("no answer within 5 s")));
         let done = match r {
             Ok(()) => {
@@ -2017,7 +2025,7 @@ impl<T: Clone + PartialEq> Track<T> {
 
 /// What `guests_loop` told one own relay.
 struct RelayTrack {
-    guests: Track<Vec<EndpointId>>,
+    guests: Track<Vec<Guest>>,
     invites: Track<Vec<Invite>>,
 }
 
