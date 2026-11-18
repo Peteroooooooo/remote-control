@@ -1,0 +1,38 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run unit tests
+        run: cargo test --locked -p rc-ident -p rc-stream
+
+      - name: Build remote-control.exe
+        run: cargo build --release --locked -p remote-control
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: remote-control-windows-x86_64
+          path: target/release/remote-control.exe
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: target/release/remote-control.exe
+          generate_release_notes: true

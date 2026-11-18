@@ -1,29 +1,29 @@
-# rc-relay with Docker Compose (or as a Portainer stack).
+# rc-relay with Docker Compose (ready to paste into Portainer / 1Panel / Dockge).
 #
-# The image: built from the workspace root with
-#   docker build -f apps/rc-relay/Dockerfile -t rc-relay .
-# then loaded on the server (`docker save rc-relay | ssh server docker load`)
-# or pushed to a registry; nothing is compiled on the server.
+# Pulls the pre-built multi-arch image (`linux/amd64` and `linux/arm64`).
+# To build from source instead, run from the workspace root:
+#   docker build -f apps/rc-relay/Dockerfile -t ghcr.io/peteroooooooo/rc-relay:latest .
 #
 # First start: `docker logs rc-relay` shows the relay code to paste into
-# the app (设置 → 自建中转). Owners: `docker exec rc-relay rc-relay owners list`.
+# the app (设置 -> 自建中转). Owners: `docker exec rc-relay rc-relay owners list`.
 
 services:
   rc-relay:
-    image: rc-relay:latest
+    image: ghcr.io/peteroooooooo/rc-relay:latest
     container_name: rc-relay
     restart: unless-stopped
-    # The relay looks up the server's public IPv4 and IPv6 addresses on its
-    # interfaces; with the host's network it sees them, and both IP families work.
+    # Host network lets the relay discover the server's public IPv4 and IPv6
+    # addresses directly. If your panel disallows host mode, remove this line,
+    # map `ports: ["7843:7843/tcp", "7842:7842/udp"]`, and set RC_RELAY_PUBLIC.
     network_mode: host
     volumes:
       - rc-relay:/var/lib/rc-relay
     # environment:
-    #   # Instead of the addresses found at start (e.g. behind 1:1 NAT with
-    #   # several public IPs): one per IP family, or a host name.
+    #   # Instead of the addresses found at start (e.g. behind 1:1 NAT or bridge mode):
+    #   # one per IP family, or a domain name.
     #   RC_RELAY_PUBLIC: "203.0.113.7,2001:db8::7"
     # With a domain name and a certificate for it, mount a config file
-    # (see src/config.rs) and start with `--config`:
+    # (see deploy/config.example.toml) and start with `--config`:
     #   command: ["--config", "/etc/rc-relay/config.toml", "serve"]
     #   volumes:
     #     - ./config.toml:/etc/rc-relay/config.toml:ro

@@ -74,18 +74,15 @@ remote-control cp laptop:D:\logs .\laptop-logs
 
 如果双方网络实在无法直连，可以在一台有公网地址的服务器上部署 [apps/rc-relay/](apps/rc-relay/)：
 
-- **Docker 方式**（在仓库根目录构建镜像）：
-  ```bash
-  docker build -f apps/rc-relay/Dockerfile -t rc-relay .
-  ```
-  配合 [apps/rc-relay/deploy/docker-compose.yml](apps/rc-relay/deploy/docker-compose.yml) 启动后，在 `docker logs rc-relay` 中拿到中转码，贴到大厅 **「设置 → 自建中转」** 即可认领。
-- 详细参数与反向部署说明见 [apps/rc-relay/README.md](apps/rc-relay/README.md)。
+- **容器面板直接部署（推荐）**：支持 `amd64` / `arm64`，直接拉取预构建镜像 `ghcr.io/peteroooooooo/rc-relay:latest`。在 Portainer、1Panel、Dockge 等面板新建 Stack，粘贴 [apps/rc-relay/deploy/docker-compose.yml](apps/rc-relay/deploy/docker-compose.yml) 启动后，在容器日志（`docker logs rc-relay`）里复制中转码，贴到大厅 **「设置 → 自建中转」** 即可认领。
+- 更多参数、非 `host` 网络端口映射和原生运行方式见 [apps/rc-relay/README.md](apps/rc-relay/README.md)。
 
 ---
 
-## 自己编译
+## 获取或自己编译
 
-前置要求：Windows 10/11、Rust 工具链（`edition = 2024`）。
+- **直接下载（推荐）**：发版标签（`v*`）会自动构建 Windows 版 `remote-control.exe`，可在仓库右侧 **Releases** 页面下载（如果当前尚未发布正式版，请按下方步骤本地编译）。
+- **自己编译**（前置要求：Windows 10/11、Rust 工具链，`edition = 2024`）：
 
 ```powershell
 # 编译主程序（同时包含大厅、控制端、被控端与终端命令行）

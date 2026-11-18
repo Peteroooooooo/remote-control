@@ -21,21 +21,23 @@
 
 有域名和证书时用配置文件（`--config`，写法见 `src/config.rs` 开头的例子；仓库提供 `deploy/config.example.toml` 模板），`cert_mode = "Reloading"` 每天重读证书，续期后不用重启。
 
-## Docker
+## Docker（推荐：容器面板直接部署）
 
-镜像在工作区根目录构建（cargo 要看到所有成员），在 WSL 或者本机 Docker 里编，不在服务器上编：
+提供自动构建的 `linux/amd64` 与 `linux/arm64` 多架构镜像 `ghcr.io/peteroooooooo/rc-relay:latest`。
 
-```text
-docker build -f apps/rc-relay/Dockerfile -t rc-relay .
-docker save rc-relay | ssh <服务器> docker load        # 或推到镜像仓库
-```
+在 Portainer、1Panel、Dockge 等面板里新建 Stack，直接粘贴 [deploy/docker-compose.yml](deploy/docker-compose.yml) 即可拉取运行（或用 `docker compose up -d`）：
 
-运行方式见 `deploy/docker-compose.yml`（Portainer 里当 Stack 用同一份）：
-
-- `network_mode: host`：中转要看到服务器自己的 IPv4 和 IPv6，两种都能直接收。
+- `network_mode: host`：中转要看到服务器自己的 IPv4 和 IPv6，两种都能直接收；若所在平台限制 host 网络，可改为映射 `7843/tcp` 和 `7842/udp` 并设置环境变量 `RC_RELAY_PUBLIC`。
 - 卷挂在 `/var/lib/rc-relay`：主人、名单、认领码和那张自签证书都在里面。卷丢了证书就变了，主人们要重新贴中转码。
 - 第一次启动后 `docker logs rc-relay` 里有中转码；管理主人用 `docker exec rc-relay rc-relay owners list`。
 - 防火墙放行 7843/TCP 和 7842/UDP。
+
+如果希望从源码自己构建镜像，在工作区根目录执行：
+
+```text
+docker build -f apps/rc-relay/Dockerfile -t ghcr.io/peteroooooooo/rc-relay:latest .
+docker save ghcr.io/peteroooooooo/rc-relay:latest | ssh <服务器> docker load
+```
 
 ## 不用 Docker 时
 
