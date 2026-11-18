@@ -57,9 +57,16 @@ impl RelayCode {
         Ok(RelayCode { urls, claim_key })
     }
 
-    /// The first relay code in `text`.
+    /// The first relay code in `text`, also accepting line-wrapped or
+    /// box-border-wrapped copies from a terminal.
     pub fn find(text: &str) -> Option<RelayCode> {
-        RelayCode::decode(text::find(PREFIX, text)?).ok()
+        if let Some(s) = text::find(PREFIX, text) {
+            if let Ok(c) = RelayCode::decode(s) {
+                return Some(c);
+            }
+        }
+        let cleaned: String = text.chars().filter(|c| !c.is_whitespace() && !matches!(c, '│' | '┃' | '|')).collect();
+        RelayCode::decode(text::find(PREFIX, &cleaned)?).ok()
     }
 }
 
@@ -80,6 +87,8 @@ mod tests {
         assert!(s.starts_with(PREFIX));
         assert_eq!(RelayCode::decode(&s).unwrap(), c);
         assert_eq!(RelayCode::find(&format!("中转码：{s}")), Some(c.clone()));
+        let wrapped = format!("{} │\n │ {} │\n │ {}", &s[..30], &s[30..70], &s[70..]);
+        assert_eq!(RelayCode::find(&wrapped), Some(c.clone()));
         let one = RelayCode { urls: vec!["https://relay.example.com".parse().unwrap()], claim_key: [1; 16] };
         assert_eq!(RelayCode::decode(&one.encode()).unwrap(), one);
     }

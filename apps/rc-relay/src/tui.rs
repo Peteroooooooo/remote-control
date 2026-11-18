@@ -319,6 +319,13 @@ impl App {
                 self.focus = Focus::Codes;
                 self.toast(format!("已生成「{}」，按 r 可以改名", c.shown_name()), true);
             }
+            KeyCode::Char('c') if self.code().is_some() => {
+                if let Some(c) = self.code() {
+                    let text = RelayCode { urls: self.urls.clone(), claim_key: c.key }.encode();
+                    copy_osc52(&text);
+                    self.toast(format!("已复制「{}」中转码到剪贴板", c.shown_name()), true);
+                }
+            }
             KeyCode::Char('r') if self.code().is_some() => {
                 self.modal = Some(Modal::Rename(self.code().map(|c| c.name.clone()).unwrap_or_default()));
             }
@@ -346,7 +353,7 @@ impl App {
             Constraint::Length(1),
             Constraint::Min(6),
             Constraint::Length(1),
-            Constraint::Length(5),
+            Constraint::Length(6),
             Constraint::Length(1),
         ])
         .areas(area);
@@ -548,8 +555,14 @@ impl App {
     }
 
     fn draw_code(&self, f: &mut Frame, area: Rect) {
+        let code_block = |title: String| {
+            Block::new()
+                .borders(Borders::TOP | Borders::BOTTOM)
+                .border_style(Style::new().fg(LINE))
+                .title(Span::styled(format!(" {title} "), Style::new().fg(DIM)))
+        };
         if self.on_blocked_group() {
-            let block = self.panel("已禁止".into(), false).padding(ratatui::widgets::Padding::horizontal(1));
+            let block = code_block("已禁止".into());
             let inner = block.inner(area);
             f.render_widget(block, area);
             let p = Paragraph::new(vec![
@@ -561,19 +574,19 @@ impl App {
             return;
         }
         let Some(c) = self.code() else {
-            let block = self.panel("完整中转码".into(), false);
+            let block = code_block("完整中转码".into());
             let inner = block.inner(area);
             f.render_widget(block, area);
-            f.render_widget(Line::styled(" 按 n 新建一个中转码", Style::new().fg(DIM)), inner);
+            f.render_widget(Line::styled("按 n 新建一个中转码", Style::new().fg(DIM)), inner);
             return;
         };
-        let block = self.panel(format!("完整中转码 · 「{}」", c.shown_name()), false).padding(ratatui::widgets::Padding::horizontal(1));
+        let block = code_block(format!("完整中转码 · 「{}」", c.shown_name()));
         let inner = block.inner(area);
         f.render_widget(block, area);
         let text = RelayCode { urls: self.urls.clone(), claim_key: c.key }.encode();
         let p = Paragraph::new(vec![
             Line::styled(text, Style::new().fg(CYAN)),
-            Line::styled("鼠标拖选复制，贴到软件「设置 → 自建中转」。同一组的电脑贴同一个码。", Style::new().fg(DIM)),
+            Line::styled("按 c 一键复制，或直接拖选（没有左右边框干扰）。同一组的电脑贴同一个码。", Style::new().fg(DIM)),
         ])
         .wrap(Wrap { trim: false });
         f.render_widget(p, inner);
@@ -598,6 +611,7 @@ impl App {
         };
         let mut pairs = vec![("↑↓", "选择"), ("Tab", "切换"), ("n", "新建码")];
         if self.code().is_some() {
+            pairs.push(("c", "复制"));
             pairs.push(("r", "改名"));
         }
         if let Some(d) = d_label {
@@ -722,6 +736,27 @@ impl App {
 
 fn shown_name(name: &str, id: EndpointId) -> String {
     if name.is_empty() { format!("设备 {}", id.fmt_short()) } else { name.to_string() }
+}
+
+/// Copies `text` to the terminal's clipboard via OSC 52 (supported by Windows
+/// Terminal, xterm.js, iTerm2, etc., even over SSH / `docker exec`).
+fn copy_osc52(text: &str) {
+    use std::io::Write;
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let b = text.as_bytes();
+    let mut b64 = String::with_capacity(b.len().div_ceil(3) * 4);
+    for chunk in b.chunks(3) {
+        let n = (u32::from(chunk[0]) << 16)
+            | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8)
+            | u32::from(*chunk.get(2).unwrap_or(&0));
+        b64.push(T[((n >> 18) & 63) as usize] as char);
+        b64.push(T[((n >> 12) & 63) as usize] as char);
+        b64.push(if chunk.len() > 1 { T[((n >> 6) & 63) as usize] as char } else { '=' });
+        b64.push(if chunk.len() > 2 { T[(n & 63) as usize] as char } else { '=' });
+    }
+    let mut out = std::io::stdout().lock();
+    let _ = write!(out, "\x1b]52;c;{b64}\x07");
+    let _ = out.flush();
 }
 
 /// `text` cut to `w` columns (CJK characters take two).
