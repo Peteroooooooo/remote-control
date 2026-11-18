@@ -1,0 +1,1006 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>remote-control · 交互演示</title>
+<style>
+  :root {
+    --chrome: #1b1c20; --layer: #222428; --card: #2a2c31; --raised: #2d2f34; --border: #313338;
+    --text: #e6e7ea; --dim: #8f939b; --faint: #6b6f77;
+    --accent: #3b7fe0; --accent-hover: #4b8be6; --accent-pressed: #3471c9; --link: #8db6f0;
+    --green: #3fb950; --amber: #d29922; --amber-text: #e3b34a; --red: #e5534b; --danger: #ff8a83;
+    --gone: #5a5e66;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; min-height: 100%; background: #0f1013; color: var(--text);
+    font: 14px/1.45 "Microsoft YaHei", "PingFang SC", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+  body { display: flex; flex-direction: column; align-items: center; padding: 18px 16px 40px; gap: 14px; }
+  b { font-weight: 700; }
+  .mono { font-family: Consolas, "Cascadia Mono", "SFMono-Regular", Menlo, monospace; }
+
+  svg.ic { width: 16px; height: 16px; flex: none; display: inline-block; vertical-align: middle;
+    fill: none; stroke: currentColor; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; }
+  button svg.ic { width: 14px; height: 14px; }
+
+  /* Guide bar */
+  .guide-wrap { width: 920px; max-width: 100%; display: flex; flex-direction: column; gap: 8px; }
+  .guide-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .brand { font-size: 14px; font-weight: 700; color: var(--text); letter-spacing: .2px; }
+  .badge-pill { font-size: 11px; padding: 2px 8px; border-radius: 99px; background: rgba(59,127,224,.15); color: var(--link); }
+  .guide-head .grow { flex: 1; }
+  .steps { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  .step-btn { height: 30px; padding: 0 11px; border-radius: 99px; font-size: 12px;
+    background: rgba(255,255,255,.04); border: 1px solid rgba(255,255,255,.08); color: var(--dim);
+    display: inline-flex; align-items: center; gap: 6px; cursor: pointer; transition: all .15s; }
+  .step-btn:hover { background: rgba(255,255,255,.08); color: var(--text); }
+  .step-btn.active { background: rgba(59,127,224,.18); border-color: rgba(59,127,224,.45); color: #d6e6ff; }
+  .step-btn.done { border-color: rgba(63,185,80,.4); color: #8fe39c; }
+  .guide-tip { font-size: 12.5px; color: var(--dim); background: rgba(255,255,255,.03);
+    border: 1px solid rgba(255,255,255,.06); border-radius: 8px; padding: 8px 12px;
+    display: flex; align-items: center; gap: 10px; }
+  .guide-tip b { color: var(--text); }
+  .guide-tip .grow { flex: 1; }
+
+  @keyframes pulse-ring {
+    0% { box-shadow: 0 0 0 0 rgba(59,127,224,.65); }
+    70% { box-shadow: 0 0 0 7px rgba(59,127,224,0); }
+    100% { box-shadow: 0 0 0 0 rgba(59,127,224,0); }
+  }
+  .pulse { animation: pulse-ring 1.5s infinite; border-color: var(--accent) !important; }
+
+  /* Buttons & Inputs */
+  button { font: inherit; color: var(--text); background: rgba(255,255,255,.063); border: 1px solid rgba(255,255,255,.05);
+    border-radius: 6px; height: 32px; padding: 0 12px; cursor: pointer; white-space: nowrap;
+    display: inline-flex; align-items: center; gap: 6px; transition: background .12s, color .12s, border-color .12s; }
+  button:hover { background: rgba(255,255,255,.1); }
+  button:active { background: rgba(255,255,255,.04); }
+  button:disabled { opacity: .4; cursor: default; background: rgba(255,255,255,.063); }
+  button.primary { background: var(--accent); border-color: transparent; color: #fff; }
+  button.primary:hover { background: var(--accent-hover); }
+  button.primary:active { background: var(--accent-pressed); }
+  button.primary:disabled { background: var(--accent); }
+  button.soft { background: rgba(59,127,224,.16); border-color: transparent; color: var(--link); }
+  button.soft:hover { background: rgba(59,127,224,.26); color: #b5d0f7; }
+  button.soft:disabled { background: rgba(255,255,255,.04); color: var(--dim); }
+  button.ghost { background: none; border-color: transparent; color: var(--dim); }
+  button.ghost:hover { background: rgba(255,255,255,.063); color: var(--text); }
+  button.link { background: none; border-color: transparent; color: var(--link); padding: 0 8px; }
+  button.link:hover { background: rgba(59,127,224,.14); }
+  button.icon { width: 32px; padding: 0; justify-content: center; background: none; border-color: transparent; color: var(--dim); }
+  button.icon:hover { background: rgba(255,255,255,.063); color: var(--text); }
+  button.icon.red:hover { background: rgba(229,83,75,.16); color: var(--danger); }
+  button.danger { background: rgba(229,83,75,.16); border-color: transparent; color: var(--danger); }
+  button.danger:hover { background: rgba(229,83,75,.26); }
+
+  input.field { font: inherit; color: var(--text); background: rgba(255,255,255,.04); border: 1px solid rgba(255,255,255,.063);
+    border-radius: 6px; height: 32px; padding: 0 10px; outline: none; transition: border-color .12s; }
+  input.field:focus { border-color: var(--accent); }
+  input.field::placeholder { color: var(--faint); }
+
+  /* Switch */
+  .sw { width: 40px; height: 20px; border-radius: 10px; border: 1px solid rgba(255,255,255,.45); position: relative; cursor: pointer;
+    flex: none; transition: background .18s, border-color .18s; }
+  .sw::after { content: ""; position: absolute; top: 3px; left: 4px; width: 12px; height: 12px; border-radius: 50%; background: #c9cbd0;
+    transition: left .18s cubic-bezier(.2,.8,.2,1), background .18s; }
+  .sw:hover { border-color: rgba(255,255,255,.7); }
+  .sw.on { background: var(--accent); border-color: var(--accent); }
+  .sw.on::after { left: 23px; background: #fff; }
+  .sw.off-dis { opacity: .35; pointer-events: none; }
+
+  /* Main App Window */
+  .win { width: 920px; max-width: 100%; height: 610px; border-radius: 8px; border: 1px solid var(--border); overflow: hidden;
+    position: relative; background: var(--chrome); display: flex; flex-direction: column; box-shadow: 0 24px 70px rgba(0,0,0,.6); }
+  .titlebar { height: 32px; flex: none; display: flex; align-items: center; padding-left: 12px; font-size: 12px; color: var(--dim); user-select: none; }
+  .caps { margin-left: auto; display: flex; }
+  .caps span { width: 46px; height: 32px; display: grid; place-items: center; color: var(--dim); }
+  .caps span svg.ic { width: 12px; height: 12px; }
+  .caps span.x { cursor: pointer; }
+  .caps span.x:hover { background: #c42b1c; color: #fff; }
+  .body { flex: 1; display: flex; min-height: 0; }
+
+  /* Side pane */
+  .pane { width: 236px; flex: none; padding: 8px 12px 14px; display: flex; flex-direction: column; }
+  .me { display: flex; align-items: center; gap: 12px; padding: 6px 8px 18px; }
+  .me .nm { font-size: 16px; font-weight: 700; }
+  .me .st { font-size: 12px; color: var(--dim); display: flex; align-items: center; gap: 6px; }
+  .nav { display: flex; align-items: center; gap: 12px; height: 36px; padding: 0 12px; border-radius: 6px; cursor: pointer;
+    color: var(--text); position: relative; margin-bottom: 2px; }
+  .nav:hover { background: rgba(255,255,255,.04); }
+  .nav.on { background: rgba(255,255,255,.063); }
+  .nav.on::before { content: ""; position: absolute; left: 0; top: 10px; width: 3px; height: 16px; border-radius: 2px; background: var(--accent); }
+  .nav svg.ic { color: var(--dim); }
+  .nav.on svg.ic { color: var(--text); }
+  .nav .count { margin-left: auto; font-size: 12px; color: var(--dim); }
+  .relays { margin-top: auto; padding: 0 8px; font-size: 12px; color: var(--dim); }
+  .relays .h { margin-bottom: 4px; }
+  .relays div.r { display: flex; align-items: center; gap: 8px; height: 22px; color: var(--text); }
+  .relays div.r span:nth-child(2) { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .relays div.r span:last-child { margin-left: auto; color: var(--dim); flex: none; }
+  .pdot { width: 7px; height: 7px; border-radius: 50%; background: var(--green); flex: none; }
+  .pdot.amber { background: var(--amber); } .pdot.grey { background: var(--gone); }
+
+  .content { flex: 1; position: relative; background: var(--layer); border-top-left-radius: 8px;
+    border: 1px solid rgba(255,255,255,.047); border-right: 0; border-bottom: 0; min-width: 0; overflow: hidden; }
+  .scroll { position: absolute; inset: 0; overflow-y: auto; padding: 22px 28px 24px; }
+  .scroll::-webkit-scrollbar { width: 10px; }
+  .scroll::-webkit-scrollbar-thumb { background: rgba(255,255,255,.07); border-radius: 5px; border: 3px solid var(--layer); }
+  .head { display: flex; align-items: center; gap: 10px; margin-bottom: 14px; }
+  .head h1 { margin: 0; font-size: 22px; font-weight: 700; }
+  .head .grow { flex: 1; }
+  .copied { color: var(--green) !important; }
+
+  .connect { display: flex; align-items: center; gap: 10px; height: 42px; padding: 0 5px 0 14px; border-radius: 8px;
+    background: rgba(255,255,255,.04); border: 1px solid rgba(255,255,255,.063); transition: border-color .12s; }
+  .connect:focus-within { border-color: var(--accent); }
+  .connect svg.ic { color: var(--dim); }
+  .connect input { flex: 1; font: inherit; color: var(--text); background: none; border: 0; outline: none; min-width: 0; }
+  .connect input::placeholder { color: var(--faint); }
+  .connect kbd { font: 11px "Microsoft YaHei", sans-serif; color: var(--dim); border: 1px solid rgba(255,255,255,.09);
+    border-radius: 4px; padding: 1px 6px; margin-right: 6px; flex: none; }
+  .codes { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-top: 8px; font-size: 12px; color: var(--dim); }
+  .codes .chip { display: inline-flex; align-items: center; gap: 4px; height: 26px; padding: 0 2px 0 10px; border-radius: 13px;
+    background: rgba(255,255,255,.05); color: var(--text); }
+  .codes .chip button { height: 22px; border-radius: 11px; padding: 0 8px; font-size: 12px; }
+  .gap18 { height: 18px; }
+
+  /* Banners */
+  .banner { display: flex; align-items: center; gap: 12px; padding: 9px 9px 9px 14px; border-radius: 8px; margin-bottom: 18px; min-height: 50px; }
+  .banner.red { background: rgba(229,83,75,.12); border: 1px solid rgba(229,83,75,.25); }
+  .banner.blue { background: rgba(59,127,224,.1); border: 1px solid rgba(59,127,224,.22); }
+  .banner .grow { flex: 1; }
+  .banner > svg.ic { width: 18px; height: 18px; }
+  .banner.red > svg.ic { color: var(--danger); }
+  .banner.blue > svg.ic { color: var(--link); }
+
+  /* Sections & Rows */
+  .sec { margin-bottom: 20px; }
+  .sh { display: flex; align-items: baseline; gap: 8px; padding: 0 4px 8px; font-size: 13px; }
+  .sh b { font-size: 13px; }
+  .sh span { color: var(--dim); font-size: 12px; }
+  .group { background: var(--card); border-radius: 10px; border: 1px solid rgba(255,255,255,.03); overflow: hidden; }
+  .group > * { position: relative; }
+  .group > * + *::before { content: ""; position: absolute; top: 0; right: 0; height: 1px; background: rgba(255,255,255,.05); left: 0; }
+  .group > .row + *::before { left: 62px; }
+  .row { display: flex; align-items: center; gap: 12px; height: 62px; padding: 0 10px 0 14px; transition: background .12s; }
+  .row:hover { background: rgba(255,255,255,.025); }
+  .row.flash { animation: flash 1.1s; }
+  @keyframes flash { from { background: rgba(59,127,224,.2); } }
+  .row.asking { background: rgba(210,153,34,.07); }
+  .row.asking::after { content: ""; position: absolute; left: 0; top: 10px; bottom: 10px; width: 3px; border-radius: 2px; background: var(--amber); }
+  .why { padding: 2px 14px 14px 62px; font-size: 13px; color: var(--dim); animation: fade .2s; }
+  .why .btns { display: flex; gap: 8px; margin-top: 8px; }
+
+  .av { width: 36px; height: 36px; border-radius: 8px; display: grid; place-items: center; position: relative; flex: none;
+    background: rgba(255,255,255,.06); color: var(--dim); }
+  .av svg.ic { width: 17px; height: 17px; }
+  .av.mine { background: rgba(59,127,224,.15); color: var(--link); }
+  .av.trusted { background: rgba(63,185,80,.13); color: #6bd37a; }
+  .dot { position: absolute; right: -2px; bottom: -2px; width: 10px; height: 10px; border-radius: 50%; background: var(--gone);
+    border: 2px solid var(--card); }
+  .dot.on { background: var(--green); } .dot.amber { background: var(--amber); }
+
+  .txt { flex: 1; min-width: 0; }
+  .nm { font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .nm input.field { height: 26px; width: 190px; padding: 0 8px; font-weight: 700; }
+  .sub { font-size: 12px; color: var(--dim); display: flex; align-items: center; gap: 6px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .sub.amber { color: var(--amber-text); } .sub.blue { color: var(--link); }
+  .acts { display: flex; align-items: center; gap: 6px; }
+
+  .spin { width: 13px; height: 13px; border: 2px solid rgba(141,182,240,.25); border-top-color: var(--link); border-radius: 50%;
+    animation: spin .75s linear infinite; display: inline-block; flex: none; }
+  .spin.big { width: 16px; height: 16px; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  @keyframes fade { from { opacity: 0; } }
+
+  /* Settings items */
+  .item { display: flex; align-items: center; gap: 14px; min-height: 58px; padding: 10px 14px; }
+  .item > svg.ic { width: 17px; height: 17px; color: var(--dim); }
+  .item .txt2 { flex: 1; min-width: 0; }
+  .item .t { font-size: 14px; }
+  .item .d { font-size: 12px; color: var(--dim); }
+  .item .r { display: flex; align-items: center; gap: 8px; }
+  .item.dis { opacity: .45; }
+  .item.add { cursor: pointer; min-height: 46px; color: var(--link); }
+  .item.add svg.ic { color: var(--link); }
+  .item.add:hover { background: rgba(255,255,255,.03); }
+  .saved { font-size: 12px; color: var(--green); }
+
+  /* Menu */
+  .menu { position: absolute; z-index: 20; width: 210px; padding: 5px; border-radius: 8px; background: var(--raised);
+    border: 1px solid rgba(255,255,255,.09); box-shadow: 0 12px 32px rgba(0,0,0,.55); animation: pop .12s cubic-bezier(.2,.8,.2,1); }
+  @keyframes pop { from { opacity: 0; transform: translateY(-4px) scale(.97); } }
+  .menu .it { display: flex; align-items: center; gap: 10px; height: 34px; padding: 0 10px; border-radius: 5px; cursor: pointer; font-size: 13.5px; }
+  .menu .it:hover { background: rgba(255,255,255,.07); }
+  .menu .it svg.ic { width: 15px; height: 15px; color: var(--dim); }
+  .menu .it .sub { font-size: 12px; color: var(--dim); margin-left: 2px; }
+  .menu .it .tick { margin-left: auto; color: var(--link); }
+  .menu .it.danger { color: var(--danger); } .menu .it.danger svg.ic { color: var(--danger); }
+  .menu .it.danger:hover { background: rgba(229,83,75,.14); }
+  .menu .sep { height: 1px; background: rgba(255,255,255,.06); margin: 4px 6px; }
+  .menu .mhead { padding: 4px 10px 2px; font-size: 11.5px; color: var(--faint); }
+
+  /* Toasts */
+  .toasts { position: absolute; right: 16px; bottom: 16px; display: flex; flex-direction: column; gap: 8px; z-index: 30; pointer-events: none; }
+  .toast { pointer-events: auto; display: flex; align-items: center; gap: 10px; max-width: 390px; padding: 8px 8px 8px 12px;
+    border-radius: 8px; background: var(--raised); border: 1px solid rgba(255,255,255,.09); box-shadow: 0 8px 24px rgba(0,0,0,.5);
+    animation: slidein .18s cubic-bezier(.2,.8,.2,1); font-size: 13px; }
+  @keyframes slidein { from { opacity: 0; transform: translateY(8px); } }
+  .toast.ok > svg.ic { color: var(--green); } .toast.warn > svg.ic { color: var(--amber); }
+  .toast.err > svg.ic { color: var(--danger); } .toast.info > svg.ic { color: var(--link); }
+  .toast span { flex: 1; }
+
+  /* Modal */
+  .veil { position: absolute; inset: 0; background: rgba(0,0,0,.55); display: grid; place-items: center; z-index: 35; animation: fade .15s; }
+  .dialog { width: 390px; max-width: 92%; background: var(--raised); border: 1px solid rgba(255,255,255,.09); border-radius: 10px;
+    padding: 20px; box-shadow: 0 20px 50px rgba(0,0,0,.6); animation: pop .14s cubic-bezier(.2,.8,.2,1); }
+  .dialog .top2 { display: flex; gap: 14px; }
+  .dialog .badge { width: 40px; height: 40px; border-radius: 10px; display: grid; place-items: center; flex: none; }
+  .dialog .badge svg.ic { width: 20px; height: 20px; }
+  .dialog .badge.red { background: rgba(229,83,75,.16); color: var(--danger); }
+  .dialog .badge.amber { background: rgba(210,153,34,.16); color: var(--amber-text); }
+  .dialog h4 { margin: 0 0 4px; font-size: 16px; font-weight: 700; }
+  .dialog p { margin: 0; color: var(--dim); font-size: 13px; }
+  .dialog .bar { height: 3px; border-radius: 2px; background: rgba(255,255,255,.07); margin: 16px 0 0; overflow: hidden; }
+  .dialog .bar div { height: 100%; background: var(--amber); width: 100%; animation: drain 30s linear forwards; }
+  @keyframes drain { to { width: 0; } }
+  .dialog .btns { display: flex; justify-content: flex-end; gap: 8px; margin-top: 18px; }
+  .dialog .btns button { min-width: 84px; justify-content: center; }
+
+  .empty { text-align: center; padding: 54px 20px; color: var(--dim); }
+  .empty svg.ic { width: 30px; height: 30px; margin-bottom: 10px; opacity: .5; display: block; margin-inline: auto; }
+  .closed { position: absolute; inset: 0; background: #131417; display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 12px; color: var(--dim); z-index: 40; }
+
+  /* Simulated Remote Desktop / Terminal Overlay */
+  .overlay-modal { position: fixed; inset: 0; background: rgba(7,9,13,.76); display: grid; place-items: center; z-index: 100;
+    padding: 16px; animation: fade .18s; }
+  .rd-win { width: 880px; max-width: 100%; height: 550px; border-radius: 8px; border: 1px solid #3a3d46; overflow: hidden;
+    background: var(--chrome); display: flex; flex-direction: column; box-shadow: 0 30px 90px rgba(0,0,0,.75); animation: pop .18s cubic-bezier(.2,.8,.2,1); }
+  .rd-bar { height: 32px; background: var(--chrome); display: flex; align-items: center;
+    padding-left: 12px; gap: 6px; font-size: 12px; user-select: none; }
+  .rd-bar .badge-net { display: inline-flex; align-items: center; gap: 6px; height: 22px; padding: 0 9px; border-radius: 11px;
+    background: rgba(255,255,255,.05); color: var(--text); font-size: 12px; margin-left: 4px; }
+  .rd-bar .grow { flex: 1; }
+  .rd-bar button.tb { height: 24px; width: 28px; padding: 0; justify-content: center; background: none; border-color: transparent; color: var(--dim); border-radius: 4px; }
+  .rd-bar button.tb:hover { background: rgba(255,255,255,.08); color: var(--text); }
+  .rd-bar button.tb.on { background: rgba(210,153,34,.18); color: var(--amber-text); }
+  .rd-bar button.danger { height: 22px; padding: 0 10px; font-size: 12px; margin: 0 4px; }
+  .rd-bar .caps span { cursor: default; }
+  .rd-bar .caps span.x { cursor: pointer; }
+  .rd-screen { flex: 1; position: relative; overflow: hidden;
+    background: radial-gradient(circle at 22% 28%, #254a8a 0%, #152647 45%, #0e1424 100%); }
+  .rd-screen.mon2 { background: radial-gradient(circle at 75% 30%, #1d574c 0%, #132e35 48%, #0d161d 100%); }
+
+  /* Fake Windows desktop inside remote screen */
+  .fake-icons { position: absolute; top: 18px; left: 18px; display: flex; flex-direction: column; gap: 14px; }
+  .fake-icon { width: 68px; padding: 6px 4px; border-radius: 6px; text-align: center; cursor: pointer; font-size: 11px; color: #eef2f8;
+    text-shadow: 0 1px 3px rgba(0,0,0,.8); border: 1px solid transparent; }
+  .fake-icon:hover { background: rgba(255,255,255,.1); border-color: rgba(255,255,255,.14); }
+  .fake-icon .box { width: 32px; height: 32px; margin: 0 auto 4px; border-radius: 7px; display: grid; place-items: center;
+    background: rgba(59,127,224,.28); border: 1px solid rgba(255,255,255,.2); }
+
+  .fake-app { position: absolute; left: 120px; top: 48px; width: 540px; max-width: calc(100% - 140px); border-radius: 8px;
+    background: #1f2229; border: 1px solid rgba(255,255,255,.14); box-shadow: 0 16px 40px rgba(0,0,0,.5); overflow: hidden; }
+  .fake-app-bar { height: 30px; background: #262932; display: flex; align-items: center; padding: 0 10px; font-size: 12px; color: var(--dim); }
+  .fake-app-body { padding: 14px 16px; font-size: 13px; color: #d9dce3; line-height: 1.65; }
+  .fake-taskbar { position: absolute; left: 0; right: 0; bottom: 0; height: 38px; background: rgba(20,22,28,.9);
+    border-top: 1px solid rgba(255,255,255,.08); display: flex; align-items: center; padding: 0 14px; gap: 10px; font-size: 11.5px; color: var(--dim); }
+  .fake-taskbar .winbtn { width: 22px; height: 22px; border-radius: 4px; background: rgba(59,127,224,.24); display: grid; place-items: center; color: #8db6f0; }
+  .rd-toast { position: absolute; top: 44px; right: 14px; background: rgba(24,26,32,.92); border: 1px solid rgba(255,255,255,.12);
+    padding: 6px 12px; border-radius: 6px; font-size: 12px; color: #dbe7ff; animation: fade .15s; pointer-events: none; }
+  .hosted-pill { position: absolute; top: 0; right: 16px; background: rgba(27,29,36,.95);
+    border: 1px solid rgba(255,255,255,.1); border-top: 0; border-radius: 0 0 8px 8px; padding: 4px 10px 5px 12px; font-size: 12px; color: var(--text);
+    display: flex; align-items: center; gap: 10px; }
+  .hosted-pill .stop { color: var(--danger); font-size: 12px; }
+
+  /* Simulated Terminal (pure PowerShell) */
+  .term-win { width: 720px; max-width: 100%; height: 430px; border-radius: 8px; border: 1px solid #3a3d46; overflow: hidden;
+    background: #0c0c0c; display: flex; flex-direction: column; box-shadow: 0 30px 90px rgba(0,0,0,.75); animation: pop .18s; }
+  .term-bar { height: 32px; background: #1f1f1f; display: flex; align-items: center; padding-left: 12px; gap: 8px; font-size: 12px; color: var(--dim); }
+  .term-bar .grow { flex: 1; }
+  .term-body { flex: 1; padding: 12px 14px 4px; overflow-y: auto; font: 13px/1.55 Consolas, "Cascadia Mono", monospace; color: #cccccc; white-space: pre-wrap; }
+  .term-in { display: flex; align-items: center; gap: 6px; padding: 2px 14px 14px; background: #0c0c0c;
+    font: 13px Consolas, "Cascadia Mono", monospace; color: #cccccc; }
+  .term-in input { flex: 1; background: none; border: 0; outline: none; color: #ffffff; font: inherit; }
+
+  @media (max-width: 720px) {
+    .pane { width: 170px; }
+    .scroll { padding: 16px; }
+  }
+</style>
+</head>
+<body>
+
+<div class="guide-wrap">
+  <div class="guide-head">
+    <span class="brand">remote-control</span>
+    <span class="badge-pill">单窗口交互演示 · 全模拟数据</span>
+    <div class="grow"></div>
+    <button onclick="reset()" style="height:28px;font-size:12px">重置演示</button>
+  </div>
+  <div class="steps" id="steps"></div>
+  <div class="guide-tip" id="guide-tip"></div>
+</div>
+
+<div class="win" id="win"></div>
+<div id="overlay"></div>
+
+<script>
+const SVG = {
+  desktop: `<rect x="2" y="3" width="12" height="8" rx="1.2"/><path d="M5 13h6M8 11v2"/>`,
+  laptop: `<rect x="3" y="3" width="10" height="7" rx="1"/><path d="M1.5 12h13"/>`,
+  copy: `<rect x="5" y="5" width="8" height="8" rx="1.2"/><path d="M3 10V3.5A1.5 1.5 0 0 1 4.5 2H11"/>`,
+  link: `<path d="M6.5 9.5a3.5 3.5 0 0 0 5 0l2-2a3.5 3.5 0 0 0-5-5l-1 1"/><path d="M9.5 6.5a3.5 3.5 0 0 0-5 0l-2 2a3.5 3.5 0 0 0 5 5l1-1"/>`,
+  devices: `<rect x="1.5" y="3" width="9" height="6.5" rx="1"/><path d="M4 11.5h4"/><rect x="10" y="6.5" width="4.5" height="7" rx=".8"/>`,
+  gear: `<circle cx="8" cy="8" r="2.2"/><path d="M8 2v1.3M8 12.7V14M2 8h1.3M12.7 8H14M3.8 3.8l.9.9M11.3 11.3l.9.9M12.2 3.8l-.9.9M4.7 11.3l-.9.9"/>`,
+  more: `<circle cx="3.5" cy="8" r="1"/><circle cx="8" cy="8" r="1"/><circle cx="12.5" cy="8" r="1"/>`,
+  del: `<path d="M3 4.5h10M6 4.5V3h4v1.5M5 4.5l.5 8.5h5l.5-8.5"/>`,
+  rename: `<path d="M10.5 2.5l3 3L5.5 13.5H2.5v-3z"/>`,
+  term: `<rect x="2" y="3" width="12" height="10" rx="1.4"/><path d="M4.5 6.5L6.5 8 4.5 9.5M8 10h3"/>`,
+  check: `<path d="M3 8.5l3.2 3.2L13 4.5"/>`,
+  add: `<path d="M8 3v10M3 8h10"/>`,
+  warn: `<path d="M8 2.2L14 13H2z"/><path d="M8 6.5v3.2M8 11.5v.3"/>`,
+  info: `<circle cx="8" cy="8" r="6"/><path d="M8 7v4M8 5v.3"/>`,
+  ok: `<circle cx="8" cy="8" r="6"/><path d="M5.5 8.2L7.3 10l3.4-3.6"/>`,
+  err: `<circle cx="8" cy="8" r="6"/><path d="M5.8 5.8l4.4 4.4M10.2 5.8l-4.4 4.4"/>`,
+  shield: `<path d="M8 2l5 2.2v3.6c0 3.2-2.1 5.3-5 6.2-2.9-.9-5-3-5-6.2V4.2z"/>`,
+  min: `<path d="M3 8h10"/>`,
+  max: `<rect x="3" y="3" width="10" height="10" rx=".8"/>`,
+  close: `<path d="M3.5 3.5l9 9M12.5 3.5l-9 9"/>`,
+  globe: `<circle cx="8" cy="8" r="6"/><path d="M2.5 8h11M8 2a9 9 0 0 1 0 12M8 2a9 9 0 0 0 0 12"/>`,
+  wifi: `<path d="M2 6a8.5 8.5 0 0 1 12 0M4.5 8.5a5 5 0 0 1 7 0M7 11a1.5 1.5 0 0 1 2 0"/><circle cx="8" cy="13" r=".7" fill="currentColor"/>`,
+  server: `<rect x="2.5" y="2.5" width="11" height="4.5" rx="1"/><rect x="2.5" y="9" width="11" height="4.5" rx="1"/><circle cx="5" cy="4.7" r=".6" fill="currentColor"/><circle cx="5" cy="11.2" r=".6" fill="currentColor"/>`,
+  lock: `<rect x="3.5" y="7" width="9" height="6.5" rx="1.2"/><path d="M5.5 7V5a2.5 2.5 0 0 1 5 0v2"/>`,
+  power: `<path d="M8 2.5v5M5 4.2a5.2 5.2 0 1 0 6 0"/>`,
+  bolt: `<path d="M9 2L4.2 8.8H8L7 14l4.8-6.8H8z"/>`,
+  bot: `<rect x="3" y="4.5" width="10" height="8" rx="2"/><path d="M8 2.5v2M6 8.2v.6M10 8.2v.6M6 10.6h4"/>`,
+  service: `<circle cx="8" cy="8" r="5.8"/><path d="M6.5 5.5v5l4.2-2.5z" fill="currentColor" stroke="none"/>`,
+  monitor: `<rect x="2" y="3" width="12" height="8" rx="1.2"/><path d="M5 13h6M8 11v2"/>`,
+  cad: `<rect x="2.5" y="4" width="11" height="8" rx="1.2"/><path d="M5 7h1.5M9.5 7H11M5.5 9.5h5"/>`,
+  unlock: `<path d="M5.5 7V5a2.5 2.5 0 0 1 4.6-1.3"/><rect x="3.5" y="7" width="9" height="6.5" rx="1.2"/>`,
+};
+const ic = (k, cls = '') => `<svg class="ic ${cls}" viewBox="0 0 16 16">${SVG[k] || ''}</svg>`;
+
+const KIND = {
+  mine:    { title: '我的电脑', note: '控制本机不用问' },
+  trusted: { title: '信任设备', note: '控制本机要先问' },
+  temp:    { title: '临时设备', note: '控制本机要先问，关窗口就断开' },
+};
+
+const STEPS = [
+  { id: 'ctl', title: '1. 免确认远程桌面', tip: '点 <b>PeterBook</b>（我的电脑）的 <b>控制</b>，不用对方确认，直接打开远程桌面。', page: 'devices', target: 'ctl-pb' },
+  { id: 'term', title: '2. 远程终端', tip: '点任意设备右侧的 <b>··· → 终端</b>，打开对方 PowerShell（可输入 git status / dir / ipconfig 回车）。', page: 'devices', target: 'menu-pb' },
+  { id: 'code', title: '3. 连接码与记住', tip: '在连接码输入框按 Ctrl+V，或点右侧体验按钮连入新设备，再点 <b>记住</b> 加入信任列表。', page: 'devices', target: 'paste-demo', action: ['模拟粘贴连接码', 'pasteDemoCode()'] },
+  { id: 'set', title: '4. 设置与自建中转', tip: '在 <b>设置</b> 里管理开机后台服务（锁屏控制）、自建中转顺序，以及一键写入 AI Skill。', page: 'settings', target: 'nav-settings' },
+];
+
+let S, menu = null, modal = null, copied = 0, why = null, renaming = null, ui, codeSeq = 0;
+let stepIdx = 0, doneSteps = new Set();
+let remote = null, term = null, timerHandle = null;
+
+function reset() {
+  clearInterval(timerHandle);
+  S = {
+    name: 'Peter',
+    icon: 'desktop',
+    relays: [
+      { host: 'sg-relay.example.com:7843', state: 'home' },
+      { host: '203.0.113.7:7843', state: 'idle' },
+    ],
+    set: { public: true, lan: true, svc: 'run', boot: true, lock: true, awake: false },
+    suggest: false,
+    codes: [],
+    closed: false,
+    hosting: null,
+    controlling: null,
+    page: 'devices',
+    devs: [
+      { id: 'pb', name: 'PeterBook', icon: 'laptop', kind: 'mine', online: true, info: '在线 · 3 ms · 直连' },
+      { id: 'desk', name: '台式机', icon: 'desktop', kind: 'trusted', online: true, info: '在线 · 8 ms · 直连' },
+      { id: 'office', name: '公司电脑', icon: 'desktop', kind: 'trusted', online: false, unreach: true, info: '打不通' },
+      { id: 'friend', name: '朋友的电脑', icon: 'laptop', kind: 'temp', via: '连接码', online: true, info: '在线 · 41 ms · 经自建中转' },
+      { id: 'study', name: '书房笔记本', icon: 'laptop', kind: 'temp', via: '局域网', online: true, info: '在线 · 1 ms · 直连' },
+    ],
+  };
+  menu = null; modal = null; copied = 0; why = null; renaming = null; remote = null; term = null;
+  ui = { adding: false, busy: null, saved: 0 };
+  stepIdx = 0; doneSteps = new Set();
+  document.querySelectorAll('.toast').forEach(t => t.remove());
+  render();
+}
+
+const esc = t => String(t).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+const dev = id => S.devs.find(d => d.id === id);
+
+function markStep(id) {
+  doneSteps.add(id);
+  renderGuide();
+}
+
+function selectStep(i) {
+  stepIdx = i;
+  const st = STEPS[i];
+  if (st.page && S.page !== st.page && st.id !== 'set') {
+    S.page = st.page;
+  }
+  render();
+}
+
+function renderGuide() {
+  document.getElementById('steps').innerHTML = STEPS.map((s, i) => {
+    const cls = (i === stepIdx ? 'active ' : '') + (doneSteps.has(s.id) ? 'done' : '');
+    return `<button class="step-btn ${cls}" onclick="selectStep(${i})">${doneSteps.has(s.id) ? ic('check') : ''}${s.title}</button>`;
+  }).join('');
+  const cur = STEPS[stepIdx];
+  const act = cur.action ? `<button class="soft" style="height:26px;font-size:12px" onclick="${cur.action[1]}">${cur.action[0]}</button>` : '';
+  document.getElementById('guide-tip').innerHTML = `${ic('info')}<span>${cur.tip}</span><span class="grow"></span>${act}`;
+}
+
+function toast(text, tone = 'info', action) {
+  const box = document.querySelector('#win .toasts');
+  if (!box) return;
+  const el = document.createElement('div');
+  el.className = `toast ${tone}`;
+  el.innerHTML = ic({ ok: 'ok', warn: 'warn', err: 'err' }[tone] || 'info') + `<span>${esc(text)}</span>`;
+  let done = false;
+  const finish = () => { if (!done) { done = true; el.remove(); } };
+  if (action) {
+    const b = document.createElement('button');
+    b.className = 'link'; b.textContent = action[0];
+    b.onclick = () => { done = true; el.remove(); action[1](); };
+    el.appendChild(b);
+  }
+  const x = document.createElement('button');
+  x.className = 'icon'; x.style.height = '28px'; x.style.width = '28px';
+  x.innerHTML = ic('close');
+  x.onclick = () => { finish(); action?.[2]?.(); };
+  el.appendChild(x);
+  box.appendChild(el);
+  while (box.children.length > 3) box.firstChild.remove();
+  setTimeout(() => { if (!done) { finish(); action?.[2]?.(); } }, action ? 6000 : 3800);
+}
+
+function flash(id) {
+  requestAnimationFrame(() => document.querySelector(`.row[data-id="${id}"]`)?.classList.add('flash'));
+}
+
+/* ---------- Device Actions ---------- */
+function remember(id) {
+  const d = dev(id);
+  if (!d) return;
+  d.req = 'out';
+  render();
+  setTimeout(() => {
+    const x = dev(id);
+    if (!x || x.req !== 'out') return;
+    x.req = null;
+    x.kind = 'trusted';
+    x.via = null;
+    markStep('code');
+    render();
+    flash(id);
+    toast(`「${x.name}」同意了，已互相记住`, 'ok');
+  }, 1400);
+}
+
+function setKind(id, kind) {
+  const d = dev(id);
+  if (!d || d.kind === kind) return;
+  d.kind = kind;
+  render();
+  flash(id);
+  toast(kind === 'mine' ? `「${d.name}」以后控制本机不用问` : `「${d.name}」以后控制本机要先问`, 'ok');
+}
+
+function askDelete(id) {
+  const d = dev(id);
+  if (!d) return;
+  modal = {
+    icon: 'del', tone: 'red', title: `删除「${d.name}」？`,
+    text: '两台电脑都会忘掉对方，本机中转马上停止为它转发。以后要再连，重新发连接码。',
+    btns: [
+      ['取消', '', () => {}],
+      ['删除', 'danger', () => {
+        S.devs = S.devs.filter(x => x.id !== id);
+        if (S.controlling === id) disconnect();
+        render();
+        toast(`已删除「${d.name}」，对方那边也删掉了本机`, 'ok');
+      }],
+    ],
+  };
+  render();
+}
+
+function startRename(id) {
+  renaming = id;
+  render();
+  const e = document.querySelector('#win .nm input');
+  if (e) { e.focus(); e.select(); }
+}
+function endRename(id, val, keep) {
+  if (renaming !== id) return;
+  renaming = null;
+  const d = dev(id);
+  if (keep && val.trim() && d) d.name = val.trim();
+  render();
+}
+
+function control(id) {
+  const d = dev(id);
+  if (!d || !d.online) return;
+  if (d.kind === 'mine') {
+    markStep('ctl');
+    openRemote(d, '对方把本机设成了「我的电脑」，免确认直接连入');
+    return;
+  }
+  d.waiting = true;
+  render();
+  // Simulate the remote user's consent popup so visitors see both sides.
+  modal = {
+    icon: 'shield', tone: 'amber',
+    title: `模拟对方屏幕：「${S.name}」想控制「${d.name}」`,
+    text: `${KIND[d.kind].title}${d.via ? ' · 经' + d.via : ''}。对方电脑只会出现「允许」和「拒绝」（30 秒倒计时）。`,
+    bar: true,
+    btns: [
+      ['模拟对方拒绝', '', () => {
+        const x = dev(id); if (x) x.waiting = false;
+        render();
+        toast(`「${d.name}」拒绝了连接请求`, 'warn');
+      }],
+      ['模拟对方点允许', 'primary', () => {
+        const x = dev(id); if (x) x.waiting = false;
+        markStep('ctl');
+        openRemote(d, `「${d.name}」允许了控制`);
+      }],
+    ],
+  };
+  render();
+}
+
+function disconnect() {
+  S.controlling = null;
+  remote = null;
+  clearInterval(timerHandle);
+  render();
+  renderOverlay();
+}
+
+function openRemote(d, note) {
+  S.controlling = d.id;
+  remote = {
+    id: d.id, name: d.name, mon: 1, fps: 60, released: false,
+    ms: d.id === 'pb' ? 3 : d.id === 'desk' ? 8 : d.id === 'study' ? 1 : 41,
+    path: d.info.includes('自建中转') ? '经自建中转' : '直连',
+    toast: note,
+    notepad: 'README.md — 记事本\n\n- 画面优先走两端直连，延迟 3 ms\n- 剪贴板在会话内自动同步\n- 装上后台服务后，锁屏、登录界面与 UAC 弹窗下照常控制',
+  };
+  clearInterval(timerHandle);
+  timerHandle = setInterval(() => {
+    if (!remote) return;
+    const base = remote.path === '直连' ? 3 : 40;
+    remote.ms = Math.max(1, base + Math.round((Math.random() - 0.5) * 3));
+    const el = document.getElementById('rd-stat');
+    if (el) el.textContent = `${remote.path} · ${remote.ms} ms`;
+  }, 1100);
+  render();
+  renderOverlay();
+  setTimeout(() => { if (remote) { remote.toast = ''; renderOverlay(); } }, 2600);
+}
+
+function openTerm(id) {
+  const d = dev(id);
+  if (!d) return;
+  markStep('term');
+  term = {
+    id: d.id,
+    name: d.name,
+    cwd: 'C:\\Users\\Peter',
+    lines: [
+      `正在连接「${d.name}」……`,
+      'Windows PowerShell',
+      'Copyright (C) Microsoft Corporation. All rights reserved.',
+      '',
+    ],
+  };
+  renderOverlay();
+  setTimeout(() => document.getElementById('term-cmd')?.focus(), 50);
+}
+
+function runTermCmd(cmd) {
+  if (!term) return;
+  const c = cmd.trim();
+  if (!c) return;
+  term.lines.push(`PS ${term.cwd}> ${c}`);
+  const low = c.toLowerCase();
+  if (low === 'cls' || low === 'clear') {
+    term.lines = [];
+  } else if (low.includes('git status')) {
+    term.lines.push('On branch main', 'Your branch is up to date with \'origin/main\'.', 'nothing to commit, working tree clean');
+  } else if (low === 'dir' || low === 'ls') {
+    term.lines.push('Mode                 LastWriteTime         Length Name',
+      '----                 -------------         ------ ----',
+      'd-----        2026/11/18     21:10                Desktop',
+      'd-----        2026/11/18     19:40                Projects',
+      '-a----        2026/11/18     23:30       14281728 remote-control.exe');
+  } else if (low.includes('hostname')) {
+    term.lines.push(term.name);
+  } else if (low.includes('ipconfig')) {
+    term.lines.push('Ethernet adapter:', '   IPv4 Address . . . . . : 192.168.1.42', '   IPv6 Address . . . . . : 2001:db8::42');
+  } else {
+    term.lines.push(`[演示输出] 已在 ${term.name} 上执行：${c}`);
+  }
+  term.lines.push('');
+  renderOverlay();
+  setTimeout(() => {
+    const body = document.querySelector('.term-body');
+    if (body) body.scrollTop = body.scrollHeight;
+    document.getElementById('term-cmd')?.focus();
+  }, 20);
+}
+
+/* ---------- Codes & Paste ---------- */
+function copyCode() {
+  copied = Date.now();
+  S.codes.push({ n: ++codeSeq, t: Date.now() });
+  render();
+  setTimeout(render, 2100);
+}
+function revoke(n) {
+  const c = S.codes.find(x => x.n === n);
+  if (!c) return;
+  c.hidden = true;
+  render();
+  toast('已撤销连接码', 'info', ['撤回', () => { c.hidden = false; render(); }, () => { S.codes = S.codes.filter(x => x !== c); render(); }]);
+}
+function pasteCode(text) {
+  const v = (text || '').trim();
+  if (!v) return;
+  if (dev('guest-new')) {
+    toast('这位朋友已在临时设备里', 'info');
+    return;
+  }
+  const input = document.querySelector('.connect input');
+  if (input) input.value = '';
+  S.devs.push({
+    id: 'guest-new', name: '临时访客-笔记本', icon: 'laptop', kind: 'temp',
+    via: '连接码', online: true, info: '在线 · 26 ms · 直连',
+  });
+  markStep('code');
+  render();
+  flash('guest-new');
+  toast('已通过连接码找到「临时访客-笔记本」', 'ok');
+}
+function pasteDemoCode() {
+  const input = document.querySelector('.connect input');
+  if (input) input.value = 'rc1-demo-7K9mPq2x...';
+  setTimeout(() => pasteCode('rc1-demo-7K9mPq2x'), 280);
+}
+
+function retry(id) {
+  const d = dev(id);
+  if (!d) return;
+  d.unreach = false; d.info = '正在找…'; why = null;
+  render();
+  setTimeout(() => {
+    const x = dev(id);
+    if (x) { x.unreach = true; x.info = '打不通'; render(); }
+  }, 1300);
+}
+
+/* ---------- Settings ---------- */
+function toggle(key) { S.set[key] = !S.set[key]; render(); }
+function service(install) {
+  ui.busy = install ? '正在安装后台服务…' : '正在卸载后台服务…';
+  render();
+  setTimeout(() => {
+    ui.busy = null;
+    S.set.svc = install ? 'run' : 'none';
+    render();
+    toast(install ? '后台服务已装好，关掉窗口也在线' : '后台服务已卸载', 'ok');
+  }, 1300);
+}
+function saveName(v) {
+  v = v.trim();
+  if (!v || v === S.name) return;
+  S.name = v; ui.saved = Date.now();
+  render();
+}
+function useRelay(i) {
+  const r = S.relays.splice(i, 1)[0];
+  S.relays.forEach(x => x.state = 'idle');
+  r.state = 'home';
+  S.relays.unshift(r);
+  render();
+  toast(`已改用中转 ${r.host}`, 'ok');
+}
+function removeRelay(i) {
+  const r = S.relays[i]; r.hidden = true;
+  render();
+  toast(`已移除中转 ${r.host}`, 'info', ['撤回', () => { r.hidden = false; render(); }, () => { S.relays = S.relays.filter(x => x !== r); render(); }]);
+}
+function addRelay() {
+  const v = document.querySelector('#win .relay-in')?.value.trim();
+  if (!v) return;
+  ui.adding = 'busy';
+  render();
+  setTimeout(() => {
+    ui.adding = false;
+    S.relays.push({ host: 'relay2.example.com:7843', state: 'idle' });
+    render();
+    toast('已加上中转 relay2.example.com:7843', 'ok');
+  }, 1100);
+}
+
+/* ---------- Menu ---------- */
+function openMenu(ev, id) {
+  ev.stopPropagation();
+  const r = ev.currentTarget.getBoundingClientRect();
+  const w = document.getElementById('win').getBoundingClientRect();
+  menu = (menu && menu.id === id) ? null : { id, x: Math.max(12, r.right - w.left - 210), y: r.bottom - w.top + 4 };
+  render();
+}
+function menuHtml() {
+  const d = dev(menu.id);
+  if (!d) return '';
+  const it = (icon, label, fn, cls = '', extra = '') =>
+    `<div class="it ${cls}" onclick="event.stopPropagation();menu=null;${fn}">${icon ? ic(icon) : '<span style="width:15px"></span>'}<span>${label}</span>${extra}</div>`;
+  let h = it('term', '终端', `render();openTerm('${d.id}')`);
+  if (d.kind !== 'temp') {
+    h += it('rename', '重命名', `startRename('${d.id}')`);
+    h += `<div class="sep"></div><div class="mhead">它控制本机时</div>`;
+    for (const k of ['mine', 'trusted']) {
+      h += it('', `${KIND[k].title} <span class="sub">${k === 'mine' ? '不用问' : '先问'}</span>`, `setKind('${d.id}','${k}')`, '',
+        d.kind === k ? `<span class="tick">${ic('check')}</span>` : '');
+    }
+  }
+  h += `<div class="sep"></div>` + it('del', '删除', `askDelete('${d.id}')`, 'danger');
+  return `<div class="menu" style="left:${menu.x}px;top:${menu.y}px" onclick="event.stopPropagation()">${h}</div>`;
+}
+document.addEventListener('click', () => { if (menu) { menu = null; render(); } });
+
+/* ---------- Render Devices & Settings ---------- */
+function rowHtml(d) {
+  const target = STEPS[stepIdx]?.target;
+  let sub = `${d.kind === 'temp' && d.via ? d.via + ' · ' : ''}${esc(d.info)}`;
+  let subCls = d.unreach ? 'amber' : '', acts = '';
+  const ctl = S.controlling === d.id;
+
+  if (d.req === 'out') {
+    sub = `<span class="spin"></span>等对方同意`;
+  } else if (d.kind === 'temp') {
+    acts += `<button class="ghost" onclick="remember('${d.id}')">${ic('add')}记住</button>`;
+  }
+
+  if (ctl) { sub = '控制中'; subCls = 'blue'; }
+  if (d.waiting) sub = `<span class="spin"></span>等对方允许`;
+  if (d.info === '正在找…') sub = `<span class="spin"></span>正在找…`;
+
+  if (ctl) {
+    acts += `<button class="danger" onclick="disconnect()">断开</button>`;
+  } else if (d.unreach) {
+    acts += `<button class="ghost" onclick="why=why==='${d.id}'?null:'${d.id}';render()">为什么</button>`;
+  } else {
+    const pCls = (target === 'ctl-pb' && d.id === 'pb') ? 'pulse' : '';
+    acts += `<button class="soft ${pCls}" ${d.online && !d.waiting ? '' : 'disabled'} onclick="control('${d.id}')">控制</button>`;
+  }
+
+  const name = renaming === d.id
+    ? `<input class="field" value="${esc(d.name)}" onkeydown="if(event.key==='Enter')this.blur();if(event.key==='Escape'){renaming=null;render()}" onblur="endRename('${d.id}',this.value,true)">`
+    : `<span ${d.kind !== 'temp' ? `ondblclick="startRename('${d.id}')" title="双击改名"` : ''} style="cursor:${d.kind !== 'temp' ? 'text' : 'default'}">${esc(d.name)}</span>`;
+
+  const dot = d.online ? 'on' : d.unreach ? 'amber' : '';
+  const mCls = (target === 'menu-pb' && d.id === 'pb') ? 'pulse' : '';
+  let h = `<div class="row" data-id="${d.id}" ondblclick="if('${d.online}'==='true' && !renaming) control('${d.id}')">
+    <div class="av ${d.kind}">${ic(d.icon)}<span class="dot ${dot}"></span></div>
+    <div class="txt"><div class="nm">${name}</div><div class="sub ${subCls}">${sub}</div></div>
+    <div class="acts">${acts}<button class="icon ${mCls}" title="更多" onclick="openMenu(event,'${d.id}')">${ic('more')}</button></div>
+  </div>`;
+
+  if (why === d.id && d.unreach) {
+    h += `<div class="why">找不到直连。打开路由器的 IPv6，或者加一台自建中转。
+      <div class="btns"><button onclick="retry('${d.id}')">重试</button><button onclick="S.page='settings';why=null;render()">去设置</button></div></div>`;
+  }
+  return h;
+}
+
+function devicesHtml() {
+  const target = STEPS[stepIdx]?.target;
+  let list = '';
+  for (const k of ['mine', 'trusted', 'temp']) {
+    const ds = S.devs.filter(d => d.kind === k);
+    if (!ds.length) continue;
+    list += `<div class="sec"><div class="sh"><b>${KIND[k].title}</b><span>${KIND[k].note}</span></div>
+      <div class="group">${ds.map(rowHtml).join('')}</div></div>`;
+  }
+  if (!list) {
+    list = `<div class="empty">${ic('devices')}还没有设备<br><span style="font-size:12px">复制连接码发给对方，或把对方的连接码粘贴到上面</span></div>`;
+  }
+  let banner = '';
+  if (S.controlling) {
+    const d = dev(S.controlling);
+    banner = `<div class="banner red">${ic('desktop')}<div class="grow">正在控制 <b>${esc(d ? d.name : '')}</b></div>
+      <button class="danger" onclick="disconnect()">断开</button></div>`;
+  } else if (ui.busy) {
+    banner = `<div class="banner blue"><span class="spin big"></span><div class="grow">${ui.busy}</div></div>`;
+  }
+  const isCopied = Date.now() - copied < 2000;
+  const codes = S.codes.filter(c => !c.hidden);
+  return `
+    <div class="head"><h1>设备</h1><span class="grow"></span>
+      <button onclick="copyCode()" ${isCopied ? 'class="copied"' : ''}>${isCopied ? ic('check') + '已复制，1 小时内有效' : ic('copy') + '复制本机连接码'}</button>
+    </div>
+    <div class="connect ${target === 'paste-demo' ? 'pulse' : ''}">${ic('link')}<input id="connect-code-in" name="connect-code" placeholder="粘贴对方的连接码" onkeydown="if(event.key==='Enter')pasteCode(this.value)" onpaste="setTimeout(()=>pasteCode(this.value),10)"><kbd>Ctrl V</kbd></div>
+    ${codes.length ? `<div class="codes">还没用掉的连接码${codes.map(c => `<span class="chip">刚才复制<button class="ghost" onclick="revoke(${c.n})">撤销</button></span>`).join('')}</div>` : ''}
+    <div class="gap18"></div>
+    ${banner}${list}`;
+}
+
+const sw = (key, dis) => `<span class="sw ${S.set[key] ? 'on' : ''} ${dis ? 'off-dis' : ''}" onclick="toggle('${key}')"></span>`;
+const item = (icon, t, d, right, cls = '') =>
+  `<div class="item ${cls}">${ic(icon)}<div class="txt2"><div class="t">${t}</div>${d ? `<div class="d">${d}</div>` : ''}</div><div class="r">${right}</div></div>`;
+
+function settingsHtml() {
+  const st = S.set, busy = !!ui.busy;
+  const saved = Date.now() - ui.saved < 1800 ? `<span class="saved">✓ 已保存</span>` : '';
+  let h = `<div class="head"><h1>设置</h1></div>`;
+  h += `<div class="sec"><div class="sh"><b>本机</b></div><div class="group">
+    ${item('rename', '名字', '对方看到的名字', `${saved}<input id="device-name-in" name="device-name" class="field" style="width:200px" value="${esc(S.name)}" onkeydown="if(event.key==='Enter')this.blur()" onblur="saveName(this.value)">`)}
+  </div></div>`;
+  h += `<div class="sec"><div class="sh"><b>连接</b></div><div class="group">
+    ${item('globe', '公共节点牵线', '只交换地址，不传画面', sw('public'))}
+    ${item('wifi', '局域网可见', '同一个局域网里的电脑能看到本机', sw('lan'))}
+  </div></div>`;
+
+  const relays = S.relays.filter(r => !r.hidden);
+  const rstate = { home: ['在用', ''], idle: ['未使用，名单照常同步', 'grey'], fail: ['连不上', 'amber'] };
+  h += `<div class="sec"><div class="sh"><b>自建中转</b><span>从上往下用，第一台连不上时下一台临时顶替</span></div><div class="group">
+    ${relays.map((r, i) => `<div class="item"><span class="pdot ${rstate[r.state][1]}" style="margin:0 6px"></span>
+      <div class="txt2"><div class="t mono" style="font-size:13px">${esc(r.host)}</div><div class="d">${rstate[r.state][0]}</div></div>
+      <div class="r">${i ? `<button class="ghost" onclick="useRelay(${S.relays.indexOf(r)})">使用</button>` : ''}
+      <button class="icon red" title="移除" onclick="removeRelay(${S.relays.indexOf(r)})">${ic('del')}</button></div></div>`).join('')}
+    ${ui.adding
+      ? `<div class="item">${ic('server')}<input class="field relay-in" style="flex:1" placeholder="粘贴中转码" ${ui.adding === 'busy' ? 'disabled' : ''}
+           onkeydown="if(event.key==='Enter')addRelay();if(event.key==='Escape'){ui.adding=false;render()}">
+         <button class="ghost" onclick="ui.adding=false;render()">取消</button>
+         ${ui.adding === 'busy' ? '<button disabled><span class="spin"></span>正在添加…</button>' : `<button class="primary" onclick="addRelay()">添加</button>`}</div>`
+      : `<div class="item add" onclick="ui.adding=true;render();document.querySelector('#win .relay-in')?.focus()">${ic('add')}<div class="txt2">添加中转</div></div>`}
+  </div></div>`;
+
+  const on = st.svc === 'run';
+  const svcRight = busy ? `<button disabled><span class="spin"></span>${ui.busy.replace('正在', '').replace('后台服务…', '中…')}</button>`
+    : on ? `<button onclick="service(false)">卸载</button>` : `<button class="primary" onclick="service(true)">安装</button>`;
+  h += `<div class="sec"><div class="sh"><b>后台服务</b></div><div class="group">
+    ${item('service', on ? '运行中' : '没装', on ? '关掉窗口也在线' : '装上后锁屏时也能被控制', svcRight)}
+    ${item('power', '开机自动在线', '', sw('boot', !on), on ? '' : 'dis')}
+    ${item('lock', '锁屏时可被控制', '仅限我的电脑', sw('lock', !on), on ? '' : 'dis')}
+    ${item('bolt', '插电时不睡眠', '屏幕照常熄灭', sw('awake', !on), on ? '' : 'dis')}
+  </div></div>`;
+
+  h += `<div class="sec"><div class="sh"><b>AI</b></div><div class="group">
+    ${item('bot', '让本机的 AI 会用', 'Claude Code、Codex 学会用终端操作设备列表里的电脑',
+      `<button onclick="markStep('set');toast('已写入 ~/.claude/skills、~/.agents/skills，新开的 AI 对话就会用','ok')">写入</button>`)}
+  </div></div>`;
+  return h;
+}
+
+function render() {
+  renderGuide();
+  const w = document.getElementById('win');
+  const old = [...w.querySelectorAll('.toast')];
+  const top = w.querySelector('.scroll')?.scrollTop || 0;
+  const prevPage = w.dataset.page;
+  const val = w.querySelector('.connect input')?.value || '';
+  const relayIn = w.querySelector('.relay-in')?.value || '';
+
+  const target = STEPS[stepIdx]?.target;
+  const nav = (page, icon, label, extra = '') => {
+    const pCls = (target === 'nav-settings' && page === 'settings' && S.page !== 'settings') ? 'pulse' : '';
+    return `<div class="nav ${S.page === page ? 'on' : ''} ${pCls}" onclick="S.page='${page}';menu=null;if('${page}'==='settings')markStep('set');render()">${ic(icon)}<span>${label}</span>${extra}</div>`;
+  };
+  const rlabel = { home: '在用', temp: '临时在用', fail: '连不上', idle: '备用' };
+
+  w.innerHTML = `
+    <div class="titlebar">remote control
+      <div class="caps"><span>${ic('min')}</span><span>${ic('max')}</span><span class="x" onclick="S.closed=true;menu=null;render()" title="关闭窗口到托盘">${ic('close')}</span></div>
+    </div>
+    <div class="body">
+      <div class="pane">
+        <div class="me"><div class="av mine" style="width:40px;height:40px;border-radius:10px">${ic(S.icon)}</div>
+          <div><div class="nm">${esc(S.name)}</div><div class="st"><span class="pdot"></span>本机 · 在线</div></div>
+        </div>
+        ${nav('devices', 'devices', '设备', `<span class="count">${S.devs.length}</span>`)}
+        ${nav('settings', 'gear', '设置')}
+        <div class="relays"><div class="h">自建中转</div>${S.relays.filter(r => !r.hidden).map(r =>
+          `<div class="r"><span class="pdot ${r.state === 'home' ? '' : r.state === 'fail' ? 'amber' : 'grey'}"></span><span>${esc(shortHost(r.host))}</span><span>${rlabel[r.state] || '…'}</span></div>`).join('')}
+        </div>
+      </div>
+      <div class="content"><div class="scroll">${S.page === 'devices' ? devicesHtml() : settingsHtml()}</div></div>
+    </div>
+    ${menu ? menuHtml() : ''}
+    ${modal ? `<div class="veil"><div class="dialog"><div class="top2"><div class="badge ${modal.tone}">${ic(modal.icon)}</div>
+      <div><h4>${esc(modal.title)}</h4><p>${esc(modal.text)}</p></div></div>${modal.bar ? '<div class="bar"><div></div></div>' : ''}
+      <div class="btns">${modal.btns.map((b, i) => `<button class="${b[1]}" onclick="modalBtn(${i})">${b[0]}</button>`).join('')}</div></div></div>` : ''}
+    ${S.closed ? `<div class="closed">窗口已关闭（缩到托盘，后台服务保持在线）<button onclick="S.closed=false;render()">从托盘打开</button></div>` : ''}
+    <div class="toasts"></div>`;
+
+  w.dataset.page = S.page;
+  const box = w.querySelector('.toasts');
+  old.forEach(t => box.appendChild(t));
+  if (prevPage === S.page) w.querySelector('.scroll').scrollTop = top;
+  const c = w.querySelector('.connect input'); if (c) c.value = val;
+  const r = w.querySelector('.relay-in'); if (r) r.value = relayIn;
+}
+
+function shortHost(h) {
+  h = h.replace(/:\d+$/, '');
+  return /[a-z]/i.test(h) && !h.includes(':') ? h.split('.')[0] : h;
+}
+function modalBtn(i) {
+  const f = modal.btns[i][2];
+  modal = null;
+  render();
+  f();
+}
+
+/* ---------- Remote Screen & Terminal Overlays ---------- */
+function renderOverlay() {
+  const box = document.getElementById('overlay');
+  if (remote) {
+    box.innerHTML = `<div class="overlay-modal" onclick="if(event.target===this)disconnect()">
+      <div class="rd-win">
+        <div class="rd-bar">
+          <b>${esc(remote.name)}</b>
+          <span class="badge-net"><span class="pdot"></span><span id="rd-stat">${remote.path} · ${remote.ms} ms</span></span>
+          ${remote.released ? `<span style="color:var(--amber-text);margin-left:6px">键鼠已释放，点画面继续</span>` : ''}
+          <div class="grow"></div>
+          <button class="tb" title="显示器 ${remote.mon}/2" onclick="remote.mon=remote.mon===1?2:1;remote.toast='已切换到显示器 '+remote.mon+'/2';renderOverlay()">${ic('monitor')}</button>
+          <button class="tb" title="终端：在对方电脑上开 PowerShell" onclick="openTerm('${remote.id}')">${ic('term')}</button>
+          <button class="tb" title="发送 Ctrl+Alt+Del" onclick="remote.toast='已向 ${esc(remote.name)} 发送 Ctrl+Alt+Del';renderOverlay()">${ic('cad')}</button>
+          <button class="tb ${remote.released ? 'on' : ''}" title="释放键鼠" onclick="remote.released=!remote.released;renderOverlay()">${ic('unlock')}</button>
+          <button class="danger" onclick="disconnect()">断开</button>
+          <div class="caps"><span>${ic('min')}</span><span>${ic('max')}</span><span class="x" onclick="disconnect()">${ic('close')}</span></div>
+        </div>
+        <div class="rd-screen ${remote.mon === 2 ? 'mon2' : ''}" onclick="if(remote.released){remote.released=false;renderOverlay()}">
+          <div class="hosted-pill"><span>${esc(S.name)} 正在控制</span><span class="stop">断开</span></div>
+          <div class="fake-icons">
+            <div class="fake-icon" onclick="event.stopPropagation();remote.toast='双击打开了桌面快捷方式';renderOverlay()"><div class="box">${ic('desktop')}</div>此电脑</div>
+            <div class="fake-icon" onclick="event.stopPropagation();openTerm('${remote.id}')"><div class="box">${ic('term')}</div>PowerShell</div>
+          </div>
+          <div class="fake-app" onclick="event.stopPropagation()">
+            <div class="fake-app-bar">${remote.mon === 1 ? 'README.md — 记事本' : '工作区 — 副屏'}</div>
+            <div class="fake-app-body">
+              <div style="white-space:pre-wrap">${esc(remote.notepad)}</div>
+            </div>
+          </div>
+          ${remote.toast ? `<div class="rd-toast">${esc(remote.toast)}</div>` : ''}
+          <div class="fake-taskbar"><span class="winbtn">${ic('desktop')}</span><span>开始</span><span style="margin-left:auto">${esc(remote.name)} · 2560×1440</span></div>
+        </div>
+      </div>
+    </div>`;
+    return;
+  }
+  if (term) {
+    box.innerHTML = `<div class="overlay-modal" onclick="if(event.target===this){term=null;renderOverlay()}">
+      <div class="term-win">
+        <div class="term-bar">
+          ${ic('term')}<span>${esc(term.name)} · 终端</span>
+          <div class="grow"></div>
+          <div class="caps"><span>${ic('min')}</span><span>${ic('max')}</span><span class="x" onclick="term=null;renderOverlay()">${ic('close')}</span></div>
+        </div>
+        <div class="term-body">${esc(term.lines.join('\n'))}</div>
+        <div class="term-in">
+          <span>PS ${esc(term.cwd)}&gt;</span>
+          <input id="term-cmd" name="term-cmd" autocomplete="off" onkeydown="if(event.key==='Enter'){runTermCmd(this.value);this.value=''}">
+        </div>
+      </div>
+    </div>`;
+    return;
+  }
+  box.innerHTML = '';
+}
+
+reset();
+</script>
+</body>
+</html>

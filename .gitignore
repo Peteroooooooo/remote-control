@@ -1,7 +1,9 @@
 target/
 /rc-relay-state/
 /measurements-raw
-/docs/
+/docs/*
+!/docs/index.html
+!/docs/images/
 /scripts/
 *.csv
 *.key
