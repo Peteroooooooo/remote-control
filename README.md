@@ -54,17 +54,6 @@ remote-control cp .\report.pdf laptop:Desktop          # 传文件或文件夹�
 
 ---
 
-## 获取与编译
-
-- **直接下载**：前往仓库右侧 [**Releases 页面**](https://github.com/Peteroooooooo/remote-control/releases) 下载最新预编译的 `remote-control.exe`，免安装单文件，双击即可运行。
-- **本地编译**（Windows 10/11 + Rust）：
-  ```powershell
-  cargo build --release -p remote-control
-  ```
-  产物为单文件 `target/release/remote-control.exe`。
-
----
-
 ## 网络连通与打洞能力（能做到哪一步）
 
 软件基于 QUIC / iroh 构建，采用 **全网卡候选收集 + 并行打洞 + 动态质量选路**。
