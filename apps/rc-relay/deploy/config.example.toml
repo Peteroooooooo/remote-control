@@ -1,0 +1,13 @@
+# Example rc-relay configuration for a server with a domain name and TLS
+# certificate (used with `rc-relay --config /etc/rc-relay/config.toml serve`).
+state_dir = "/var/lib/rc-relay"
+public_urls = ["https://relay.example.com:7843"]
+http_bind_addr = "127.0.0.1:7841"
+enable_quic_addr_discovery = true
+
+[tls]
+https_bind_addr = "[::]:7843"
+quic_bind_addr = "[::]:7842"
+cert_mode = "Reloading"
+manual_cert_path = "/etc/rc-relay/tls/cert.pem"
+manual_key_path = "/etc/rc-relay/tls/key.pem"

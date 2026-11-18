@@ -1,0 +1,50 @@
+[package]
+name = "rc-relay"
+description = "Self-hosted relay for remote-control: iroh-relay that only helps its owners"
+edition.workspace = true
+version.workspace = true
+publish.workspace = true
+
+# The app uses this crate with `default-features = false`: only the claim /
+# add-owner client and the request codes, which add nothing to iroh's tree.
+[features]
+default = ["server"]
+server = ["iroh-relay/server", "dep:bytes", "dep:clap", "dep:http-body-util", "dep:hyper", "dep:netdev", "dep:rcgen", "dep:serde", "dep:toml", "dep:tracing-subscriber"]
+
+[[bin]]
+name = "rc-relay"
+required-features = ["server"]
+
+[dependencies]
+anyhow = "1.0.104"
+# Fingerprints of self-made relay certificates (see `tls`).
+blake3 = "1.8"
+bs58 = "0.5"
+getrandom = "0.4"
+http = "1"
+iroh-base = { version = "1.4.1", default-features = false, features = ["key"] }
+# Patched copy, see vendor/iroh-relay/PATCHES.md.
+iroh-relay = "1.4.1"
+rc-ident = { path = "../../crates/rc-ident" }
+# Already in the tree through iroh-relay; used for the claim / add-owner calls.
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std"] }
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+url = "2.5"
+
+bytes = { version = "1.12.1", optional = true }
+clap = { version = "4.6.7", features = ["derive", "env"], optional = true }
+http-body-util = { version = "0.1", optional = true }
+hyper = { version = "1", optional = true }
+# The public IPs a relay without a config file uses.
+netdev = { version = "0.45", optional = true }
+# The certificate a relay without a domain name makes itself.
+rcgen = { version = "0.14", optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+toml = { version = "1.0", optional = true }
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"], optional = true }
+
+[dev-dependencies]
+iroh = "1.4.1"
+rcgen = "0.14"

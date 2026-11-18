@@ -1,0 +1,21 @@
+[Unit]
+Description=rc-relay: self-hosted relay for remote-control
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=rc-relay
+Group=rc-relay
+ExecStart=/opt/rc-relay/rc-relay --config /etc/rc-relay/config.toml serve
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+StateDirectory=rc-relay
+StateDirectoryMode=0750
+MemoryMax=256M
+
+[Install]
+WantedBy=multi-user.target

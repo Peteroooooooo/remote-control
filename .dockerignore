@@ -1,0 +1,8 @@
+# What `docker build` of apps/rc-relay/Dockerfile does not need.
+target
+measurements-raw
+docs
+scripts
+.git
+**/*.key
+**/*.csv

@@ -1,0 +1,727 @@
+//! What the lobby window works with: the node (in this process, or in the
+//! service's helper over a pipe), the latest snapshot of it, and the session
+//! windows this computer opened. The window only draws `Snap` and calls the
+//! methods here.
+
+use std::{
+    collections::BTreeMap,
+    io::{BufRead, Write},
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
+
+use anyhow::{Result, anyhow};
+use iroh::{EndpointId, SecretKey};
+
+use crate::{host::HostArgs, install, log, net::PathKind, node};
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Snap {
+    pub me: String,
+    /// The node runs in the service's helper.
+    pub service: bool,
+    pub name: String,
+    /// The name set in the settings (empty: the computer name).
+    pub set_name: String,
+    pub public: bool,
+    pub lan: bool,
+    pub accept_new: bool,
+    pub clipboard: bool,
+    /// The service's options.
+    pub boot: bool,
+    pub lock: bool,
+    pub awake: bool,
+    /// Own relays, tried in turn.
+    pub relays: Vec<Relay>,
+    pub hosting: Option<String>,
+    pub asking: Option<String>,
+    pub notice: Option<(String, String)>,
+    pub suggest: Option<String>,
+    pub codes: Vec<Code>,
+    pub devs: Vec<Dev>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Relay {
+    pub url: String,
+    /// "home" (in use), "ok", "fail" or "wait".
+    pub state: String,
+    /// The names of the computers that gave it (joined by "、"); empty for one added here.
+    pub granted_by: String,
+}
+
+/// How a message to the user feels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Tone {
+    Ok,
+    Info,
+    Warn,
+    Err,
+}
+
+#[derive(Clone, Debug)]
+pub struct Note {
+    pub tone: Tone,
+    pub text: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Code {
+    pub token: String,
+    pub age_s: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Status {
+    Checking,
+    Online { rtt_ms: f64, path: PathKind },
+    Offline,
+    Unreachable,
+    Refused(u8),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Dev {
+    pub id: EndpointId,
+    pub listed: bool,
+    pub auto: bool,
+    /// Met this run: "lan", "code" or "-".
+    pub met: String,
+    pub status: Status,
+    pub on_lan: bool,
+    pub name: String,
+}
+
+fn parse(text: &str) -> Snap {
+    let mut s = Snap::default();
+    for line in text.lines() {
+        let f: Vec<&str> = line.split('\t').collect();
+        let g = |i: usize| f.get(i).copied().unwrap_or("").to_string();
+        match f[0] {
+            "me" => {
+                s.me = g(1);
+                s.service = g(2) == "1";
+            }
+            "settings" => {
+                s.name = g(1);
+                s.set_name = g(2);
+                let on = |i: usize| g(i) == "1";
+                (s.public, s.lan, s.accept_new, s.clipboard) = (on(3), on(4), on(5), on(6));
+                (s.boot, s.lock, s.awake) = (on(7), on(8), on(9));
+            }
+            "relay" => s.relays.push(Relay { url: g(1), state: g(2), granted_by: g(3) }),
+            "hosting" => s.hosting = Some(g(2)),
+            "asking" => s.asking = Some(g(1)),
+            "notice" => s.notice = Some((g(1), g(2))),
+            "suggest" => s.suggest = Some(g(1)),
+            "code" => s.codes.push(Code { token: g(1), age_s: g(2).parse().unwrap_or(0) }),
+            "dev" => {
+                let Ok(id) = g(1).parse() else { continue };
+                let st = g(5);
+                let status = match st.as_str() {
+                    "online" => Status::Online {
+                        rtt_ms: g(6).parse().unwrap_or(0.0),
+                        path: PathKind::from_code(g(7).parse().unwrap_or(0)),
+                    },
+                    "offline" => Status::Offline,
+                    "unreachable" => Status::Unreachable,
+                    s if s.starts_with("refused:") => Status::Refused(s[8..].parse().unwrap_or(1)),
+                    _ => Status::Checking,
+                };
+                s.devs.push(Dev {
+                    id,
+                    listed: g(2) == "1",
+                    auto: g(3) == "1",
+                    met: g(4),
+                    status,
+                    on_lan: g(8) == "1",
+                    name: g(9),
+                });
+            }
+            _ => {}
+        }
+    }
+    s
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SessionState {
+    Connecting,
+    /// The other side's user is asked.
+    Waiting,
+    Connected,
+    /// Only a public relay left: the picture is paused.
+    Paused,
+}
+
+enum Mode {
+    Local(node::Node),
+    /// The service's helper runs the node.
+    Remote,
+    /// Neither (between the two, or the local node failed to start).
+    Off,
+}
+
+struct Sh {
+    key: PathBuf,
+    lan: bool,
+    view_args: Vec<String>,
+    rt: tokio::runtime::Runtime,
+    mode: Mutex<Mode>,
+    snap: Mutex<Snap>,
+    /// Why there is no snapshot now.
+    trouble: Mutex<Option<String>>,
+    repaint: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+    sessions: Mutex<BTreeMap<EndpointId, (String, SessionState)>>,
+    /// Installing or removing the service.
+    busy: Mutex<Option<String>>,
+    /// The lobby's own messages (sessions, install), not yet shown.
+    notes: Mutex<Vec<Note>>,
+    job: Mutex<Option<Job>>,
+}
+
+/// A request that waits for the network (the own relay), run on a thread.
+#[derive(Clone, Debug)]
+pub struct Job {
+    /// The request's first field.
+    pub what: String,
+    /// `None` while it runs.
+    pub answer: Option<Result<String, String>>,
+}
+
+#[derive(Clone)]
+pub struct Backend {
+    sh: Arc<Sh>,
+}
+
+impl Sh {
+    fn changed(&self) {
+        if let Some(f) = self.repaint.lock().unwrap().as_ref() {
+            f();
+        }
+    }
+
+    fn note(&self, tone: Tone, text: impl Into<String>) {
+        let text = text.into();
+        log!("lobby: {text}");
+        self.notes.lock().unwrap().push(Note { tone, text });
+        self.changed();
+    }
+
+    /// One request to the node; the answer's text, or the node's error.
+    fn request(&self, line: &str) -> Result<String> {
+        // The node may wait for the network (the own relay): not under the lock.
+        let local = match &*self.mode.lock().unwrap() {
+            Mode::Local(n) => Some(n.clone()),
+            Mode::Remote => None,
+            Mode::Off => return Err(anyhow!("正在启动")),
+        };
+        let answer = match local {
+            Some(n) => n.request(line),
+            None => crate::pipe::call(node::PIPE, line, Duration::from_secs(1))?,
+        };
+        match answer.split_once('\t') {
+            Some(("ok", rest)) => Ok(rest.to_string()),
+            Some(("err", e)) => Err(anyhow!("{e}")),
+            _ if answer == "ok" => Ok(String::new()),
+            _ => Err(anyhow!("bad answer: {answer}")),
+        }
+    }
+
+    fn start_local(&self) {
+        let host = HostArgs::defaults();
+        let mut opts = host.node_options(false);
+        opts.key = self.key.clone();
+        opts.lan = self.lan;
+        match self.rt.block_on(node::Node::start(opts)) {
+            Ok(n) => {
+                log!("lobby: node running here");
+                *self.mode.lock().unwrap() = Mode::Local(n);
+                *self.trouble.lock().unwrap() = None;
+            }
+            Err(e) => {
+                log!("lobby: node: {e:#}");
+                *self.trouble.lock().unwrap() = Some(format!("{e:#}"));
+            }
+        }
+    }
+
+    fn stop_local(&self) {
+        let old = std::mem::replace(&mut *self.mode.lock().unwrap(), Mode::Off);
+        if let Mode::Local(n) = old {
+            self.rt.block_on(n.stop());
+        }
+    }
+
+    /// Keeps the mode in line with the service (also when it is installed or
+    /// removed from the command line) and the snapshot fresh.
+    fn poll(self: &Arc<Self>) {
+        let mut last_mode_check = Instant::now() - Duration::from_secs(10);
+        let mut remote_failing: Option<Instant> = None;
+        loop {
+            if last_mode_check.elapsed() >= Duration::from_secs(1) {
+                last_mode_check = Instant::now();
+                let running = install::service_running() == Some(true);
+                let busy = self.busy.lock().unwrap().is_some();
+                let mode = match &*self.mode.lock().unwrap() {
+                    Mode::Local(_) => 0,
+                    Mode::Remote => 1,
+                    Mode::Off => 2,
+                };
+                match (running, mode) {
+                    (true, 0) => {
+                        log!("lobby: the service runs now: it takes over");
+                        self.stop_local();
+                        *self.mode.lock().unwrap() = Mode::Remote;
+                    }
+                    (true, 2) => *self.mode.lock().unwrap() = Mode::Remote,
+                    (false, 1) if !busy => {
+                        // Give a restarting service a moment.
+                        if remote_failing.is_some_and(|t| t.elapsed() > Duration::from_secs(3)) {
+                            log!("lobby: the service is gone: going online here");
+                            *self.mode.lock().unwrap() = Mode::Off;
+                            self.start_local();
+                        }
+                    }
+                    (false, 2) if !busy => self.start_local(),
+                    _ => {}
+                }
+            }
+            match self.request(&format!("snapshot\t{}", std::process::id())) {
+                Ok(text) => {
+                    remote_failing = None;
+                    *self.trouble.lock().unwrap() = None;
+                    let s = parse(&text);
+                    let mut cur = self.snap.lock().unwrap();
+                    if *cur != s {
+                        *cur = s;
+                        drop(cur);
+                        self.changed();
+                    }
+                }
+                Err(e) => {
+                    let first = remote_failing.is_none();
+                    remote_failing.get_or_insert_with(Instant::now);
+                    if first {
+                        log!("lobby: snapshot: {e:#}");
+                    }
+                    let is_remote = matches!(*self.mode.lock().unwrap(), Mode::Remote);
+                    if is_remote {
+                        *self.trouble.lock().unwrap() = Some("正在连接后台服务…".into());
+                        self.changed();
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+    }
+}
+
+impl Backend {
+    pub fn start(key: PathBuf, view_args: Vec<String>, lan: bool) -> Result<Backend> {
+        let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+        let sh = Arc::new(Sh {
+            key,
+            lan,
+            view_args,
+            rt,
+            mode: Mutex::new(Mode::Off),
+            snap: Mutex::default(),
+            trouble: Mutex::new(Some("正在启动…".into())),
+            repaint: Mutex::default(),
+            sessions: Mutex::default(),
+            busy: Mutex::default(),
+            notes: Mutex::default(),
+            job: Mutex::default(),
+        });
+        if service_up() {
+            log!("lobby: the service runs: talking to it");
+            *sh.mode.lock().unwrap() = Mode::Remote;
+        } else {
+            sh.start_local();
+        }
+        let s2 = sh.clone();
+        std::thread::Builder::new().name("lobby-poll".into()).spawn(move || s2.poll())?;
+        // `remote-control ctl` reaches the node in this process here.
+        let s3 = sh.clone();
+        let pipe = format!(r"\\.\pipe\remote-control-node-s{}", my_session());
+        std::thread::Builder::new().name("lobby-pipe".into()).spawn(move || {
+            let b = Backend { sh: s3 };
+            let r = crate::pipe::serve(&pipe, crate::pipe::Access::Owner, move |req| {
+                // `control <id>`: what the row's button does (for tests).
+                if let Some(id) = req.strip_prefix("control\t").and_then(|i| i.trim().parse::<EndpointId>().ok()) {
+                    let name = b.snap().devs.iter().find(|d| d.id == id).map_or(String::new(), |d| d.name.clone());
+                    b.control(id, &name);
+                    return "ok\t".into();
+                }
+                match b.sh.request(req) {
+                    Ok(t) => format!("ok\t{t}"),
+                    Err(e) => format!("err\t{e:#}"),
+                }
+            });
+            log!("lobby pipe: {r:?}");
+        })?;
+        Ok(Backend { sh })
+    }
+
+    pub fn on_change(&self, f: impl Fn() + Send + Sync + 'static) {
+        *self.sh.repaint.lock().unwrap() = Some(Box::new(f));
+    }
+
+    pub fn snap(&self) -> Snap {
+        self.sh.snap.lock().unwrap().clone()
+    }
+
+    pub fn trouble(&self) -> Option<String> {
+        self.sh.trouble.lock().unwrap().clone()
+    }
+
+    pub fn busy(&self) -> Option<String> {
+        self.sh.busy.lock().unwrap().clone()
+    }
+
+    /// Messages for the user since the last call.
+    pub fn take_notices(&self) -> Vec<Note> {
+        std::mem::take(&mut *self.sh.notes.lock().unwrap())
+    }
+
+    pub fn sessions(&self) -> BTreeMap<EndpointId, (String, SessionState)> {
+        self.sh.sessions.lock().unwrap().clone()
+    }
+
+    /// A request whose answer only matters if it failed (shown as a notice).
+    pub fn act(&self, line: &str) {
+        if let Err(e) = self.sh.request(line) {
+            self.sh.note(Tone::Err, format!("{e:#}"));
+        }
+        self.refresh();
+    }
+
+    pub fn request(&self, line: &str) -> Result<String> {
+        let r = self.sh.request(line);
+        self.refresh();
+        r
+    }
+
+    /// Runs `line` on a thread; `job` tells how it went.
+    pub fn start_job(&self, line: String) {
+        let what = line.split('\t').next().unwrap_or("").to_string();
+        *self.sh.job.lock().unwrap() = Some(Job { what, answer: None });
+        self.sh.changed();
+        let b = self.clone();
+        let r = std::thread::Builder::new().name("job".into()).spawn(move || {
+            let r = b.sh.request(&line).map_err(|e| format!("{e:#}"));
+            if let Some(j) = b.sh.job.lock().unwrap().as_mut() {
+                j.answer = Some(r);
+            }
+            b.refresh();
+        });
+        if let Err(e) = r {
+            *self.sh.job.lock().unwrap() = None;
+            self.sh.note(Tone::Err, format!("{e}"));
+        }
+    }
+
+    pub fn job(&self) -> Option<Job> {
+        self.sh.job.lock().unwrap().clone()
+    }
+
+    pub fn clear_job(&self) {
+        let mut j = self.sh.job.lock().unwrap();
+        if j.as_ref().is_some_and(|j| j.answer.is_some()) {
+            *j = None;
+        }
+    }
+
+    /// Takes a new snapshot now rather than at the next poll.
+    fn refresh(&self) {
+        if let Ok(t) = self.sh.request(&format!("snapshot\t{}", std::process::id())) {
+            *self.sh.snap.lock().unwrap() = parse(&t);
+        }
+        self.sh.changed();
+    }
+
+    /// Opens a session window to `id` (one per device).
+    pub fn control(&self, id: EndpointId, name: &str) {
+        {
+            let mut s = self.sh.sessions.lock().unwrap();
+            if s.contains_key(&id) {
+                return;
+            }
+            s.insert(id, (name.to_string(), SessionState::Connecting));
+        }
+        self.sh.changed();
+        let sh = self.sh.clone();
+        let name = name.to_string();
+        let r = std::thread::Builder::new().name("session".into()).spawn(move || {
+            if let Err(e) = session(&sh, id, &name) {
+                sh.note(Tone::Err, format!("没能控制「{name}」：{e:#}"));
+            }
+            sh.sessions.lock().unwrap().remove(&id);
+            sh.changed();
+        });
+        if let Err(e) = r {
+            self.sh.note(Tone::Err, format!("{e}"));
+        }
+    }
+
+    /// Installs (`true`) or removes the service: one UAC prompt.
+    pub fn service(&self, install: bool) {
+        *self.sh.busy.lock().unwrap() =
+            Some(if install { "正在安装后台服务，请在弹窗里点「是」" } else { "正在卸载后台服务，请在弹窗里点「是」" }.into());
+        self.sh.changed();
+        let sh = self.sh.clone();
+        let _ = std::thread::Builder::new().name("service-setup".into()).spawn(move || {
+            if install {
+                // The service goes online with this computer's device key: this
+                // process must be offline first.
+                sh.stop_local();
+            }
+            let r = run_elevated(install, &sh.key);
+            match r {
+                Ok(t) => sh.note(Tone::Ok, t),
+                Err(e) => sh.note(Tone::Err, format!("{}失败：{e:#}", if install { "安装" } else { "卸载" })),
+            }
+            if !install {
+                sh.stop_local();
+                *sh.mode.lock().unwrap() = Mode::Off;
+            }
+            *sh.busy.lock().unwrap() = None;
+            sh.changed();
+        });
+    }
+
+    pub fn service_installed(&self) -> bool {
+        install::service_running().is_some()
+    }
+
+    /// The window closes: sessions hosted here end with `code` (the
+    /// service's go on). The service forgets the temporary devices now
+    /// instead of when the snapshots stop coming.
+    pub fn goodbye(&self, code: u32) {
+        let node = match &*self.sh.mode.lock().unwrap() {
+            Mode::Local(n) => Some(n.clone()),
+            Mode::Remote => {
+                let _ = crate::pipe::call(node::PIPE, &format!("lobby-closed\t{}", std::process::id()), Duration::from_secs(1));
+                None
+            }
+            Mode::Off => None,
+        };
+        if let Some(n) = node {
+            self.sh.rt.block_on(n.goodbye(code));
+        }
+    }
+}
+
+/// Whether the service runs, starting it first if it is installed but
+/// stopped (it was not set to start with the computer).
+fn service_up() -> bool {
+    match install::service_running() {
+        Some(true) => true,
+        Some(false) => {
+            if let Err(e) = install::start_service() {
+                log!("lobby: starting the service: {e:#}");
+                return false;
+            }
+            log!("lobby: started the service");
+            let t = Instant::now();
+            while t.elapsed() < Duration::from_secs(5) {
+                if install::service_running() == Some(true) {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            false
+        }
+        None => false,
+    }
+}
+
+fn my_session() -> u32 {
+    let mut s = 0u32;
+    unsafe {
+        let _ = windows::Win32::System::RemoteDesktop::ProcessIdToSessionId(
+            windows::Win32::System::Threading::GetCurrentProcessId(),
+            &mut s,
+        );
+    }
+    s
+}
+
+fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+/// Runs `view` with a session key of its own and the node's proof for it,
+/// following its `@status` lines. Errors are what the user is told.
+fn session(sh: &Arc<Sh>, id: EndpointId, name: &str) -> Result<()> {
+    use std::os::windows::process::CommandExt;
+    let dial = sh.request(&format!("dial\t{id}"))?;
+    let f: Vec<&str> = dial.split('\t').collect();
+    let list = |i: usize| -> Vec<String> {
+        f.get(i).map_or(Vec::new(), |s| s.split(',').filter(|x| !x.is_empty()).map(String::from).collect())
+    };
+    let (addrs, via) = (list(0), list(1));
+    let own = f.get(2).copied().unwrap_or("");
+    let public = f.get(3) != Some(&"0");
+    let session_key = SecretKey::generate();
+    let proof = sh.request(&format!("proof\t{}", session_key.public()))?;
+    let mut args: Vec<String> = vec!["view".into(), id.to_string(), "--name".into(), name.into(), "--proof-stdin".into()];
+    for a in &addrs {
+        args.extend(["--addr".into(), a.clone()]);
+    }
+    for v in &via {
+        args.extend(["--via".into(), v.clone()]);
+    }
+    for r in own.split(',').filter(|r| !r.is_empty()) {
+        args.extend(["--relay".into(), r.into()]);
+    }
+    if !public {
+        args.push("--no-public".into());
+    }
+    args.extend(sh.view_args.iter().cloned());
+    let log_path = sh.key.with_file_name("session.log");
+    log!("lobby: session to {name}: {}", args.join(" "));
+    let mut log_file = std::fs::File::create(&log_path)?;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let mut child = std::process::Command::new(std::env::current_exe()?)
+        .args(&args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(log_file.try_clone()?)
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn()?;
+    {
+        let mut stdin = child.stdin.take().expect("piped");
+        writeln!(stdin, "{}\n{proof}", hex(&session_key.to_bytes()))?;
+    }
+    let out = child.stdout.take().expect("piped");
+    let t = Instant::now();
+    let mut ending: Option<Result<(), String>> = None;
+    for line in std::io::BufReader::new(out).lines() {
+        let Ok(line) = line else { break };
+        let _ = writeln!(log_file, "{line}");
+        let Some(st) = line.strip_prefix("@status ") else { continue };
+        let (word, text) = st.split_once('\t').unwrap_or((st, ""));
+        let state = match word {
+            "connecting" => Some(SessionState::Connecting),
+            "waiting" => Some(SessionState::Waiting),
+            "connected" | "resumed" => Some(SessionState::Connected),
+            "paused" => Some(SessionState::Paused),
+            "failed" => {
+                ending = Some(Err(text.to_string()));
+                None
+            }
+            "closed" => {
+                ending = Some(Ok(()));
+                if !text.is_empty() {
+                    sh.note(Tone::Warn, format!("已和「{name}」断开：{text}"));
+                }
+                None
+            }
+            _ => None,
+        };
+        if let Some(s) = state {
+            if let Some(e) = sh.sessions.lock().unwrap().get_mut(&id) {
+                e.1 = s;
+            }
+            sh.changed();
+        }
+    }
+    let status = child.wait()?;
+    log!("lobby: session to {name} ended after {:.1} s ({status})", t.elapsed().as_secs_f64());
+    match ending {
+        Some(Err(e)) => Err(anyhow!("{e}")),
+        None if !status.success() => Err(anyhow!("会话窗口异常退出（{status}），详情见 {}", log_path.display())),
+        _ => Ok(()),
+    }
+}
+
+/// Runs install-service / uninstall-service elevated (one UAC prompt) and
+/// returns what to tell the user.
+fn run_elevated(install: bool, key: &Path) -> Result<String> {
+    use windows::{
+        Win32::{
+            Foundation::CloseHandle,
+            System::Threading::{GetExitCodeProcess, INFINITE, WaitForSingleObject},
+            UI::{
+                Shell::{SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW},
+                WindowsAndMessaging::SW_HIDE,
+            },
+        },
+        core::{HSTRING, w},
+    };
+    let report = key.with_file_name("service-setup.log");
+    let _ = std::fs::remove_file(&report);
+    let exe = std::env::current_exe()?;
+    let params = format!(
+        "{} --from-lobby \"{}\" --lobby-pid {}",
+        if install { "install-service" } else { "uninstall-service" },
+        key.display(),
+        std::process::id()
+    );
+    let (file, params) = (HSTRING::from(exe.as_os_str()), HSTRING::from(params));
+    let mut info = SHELLEXECUTEINFOW {
+        cbSize: size_of::<SHELLEXECUTEINFOW>() as u32,
+        fMask: SEE_MASK_NOCLOSEPROCESS,
+        lpVerb: w!("runas"),
+        lpFile: windows::core::PCWSTR(file.as_ptr()),
+        lpParameters: windows::core::PCWSTR(params.as_ptr()),
+        nShow: SW_HIDE.0,
+        ..Default::default()
+    };
+    let code = unsafe {
+        ShellExecuteExW(&mut info).map_err(|e: windows::core::Error| {
+            if e.code().0 as u32 == 0x8007_04C7 { anyhow!("管理员确认被取消了") } else { anyhow!("{e}") }
+        })?;
+        WaitForSingleObject(info.hProcess, INFINITE);
+        let mut code = 1u32;
+        let _ = GetExitCodeProcess(info.hProcess, &mut code);
+        let _ = CloseHandle(info.hProcess);
+        code
+    };
+    let out = std::fs::read_to_string(&report).unwrap_or_default();
+    log!("{} exit {code}:\n{out}", if install { "install-service" } else { "uninstall-service" });
+    if code != 0 {
+        let why = out.lines().rev().find_map(|l| l.strip_prefix("Error: ")).unwrap_or("没有输出");
+        return Err(anyhow!("{why}"));
+    }
+    Ok(if install {
+        "后台服务已装好".into()
+    } else {
+        "后台服务已卸载".into()
+    })
+}
+
+/// The text on the clipboard, if any.
+pub fn clipboard_text() -> Option<String> {
+    use windows::Win32::{
+        Foundation::{HANDLE, HGLOBAL},
+        System::{
+            DataExchange::{CloseClipboard, GetClipboardData, OpenClipboard},
+            Memory::{GlobalLock, GlobalUnlock},
+        },
+    };
+    const CF_UNICODETEXT: u32 = 13;
+    unsafe {
+        OpenClipboard(None).ok()?;
+        let r = (|| {
+            let h: HANDLE = GetClipboardData(CF_UNICODETEXT).ok()?;
+            let g = HGLOBAL(h.0);
+            let p = GlobalLock(g) as *const u16;
+            if p.is_null() {
+                return None;
+            }
+            let mut n = 0usize;
+            while *p.add(n) != 0 && n < 1 << 20 {
+                n += 1;
+            }
+            let s = String::from_utf16_lossy(std::slice::from_raw_parts(p, n));
+            let _ = GlobalUnlock(g);
+            Some(s)
+        })();
+        let _ = CloseClipboard();
+        r
+    }
+}

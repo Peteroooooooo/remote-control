@@ -1,0 +1,9 @@
+[package]
+name = "rc-stream"
+description = "Video datagram framing for the remote-control project: FEC, pacing and bitrate control"
+edition.workspace = true
+version.workspace = true
+publish.workspace = true
+
+[dependencies]
+reed-solomon-simd = "3.1.0"

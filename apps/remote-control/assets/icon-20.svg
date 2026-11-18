@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><defs><linearGradient id="dwg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#13704F"/><stop offset="1" stop-color="#0A3F2D"/></linearGradient></defs>
+<!-- icon.svg redrawn on the 20 px grid for icon.ico: whole pixels, the cursor as pixels. -->
+<rect x="7" y="2" width="12" height="9" rx="1.75" fill="#7EE2B8"/>
+<rect x="1" y="7" width="14" height="11" rx="2" fill="url(#dwg)"/>
+<rect x="2" y="10" width="12" height="7" rx="0.75" fill="#06180F"/>
+<rect x="2.5" y="8" width="2" height="1" fill="#7EE2B8"/>
+<path fill="#06180F" d="M12 4h1v1h-1zM11 5h1v1h-1zM13 5h1v1h-1zM11 6h1v1h-1zM14 6h1v1h-1zM11 7h1v1h-1zM15 7h1v1h-1zM11 8h1v1h-1zM16 8h1v1h-1zM11 9h1v1h-1zM17 9h1v1h-1zM11 10h1v1h-1zM14 10h1v1h-1zM16 10h1v1h-1zM11 11h1v1h-1zM13 11h2v1h-2zM17 11h1v1h-1zM12 12h1v1h-1zM15 12h1v1h-1zM17 12h1v1h-1zM16 13h1v1h-1z"/>
+<path fill="#FFFFFF" d="M12 5h1v1h-1zM12 6h2v1h-2zM12 7h3v1h-3zM12 8h4v1h-4zM12 9h5v1h-5zM12 10h2v1h-2zM15 10h1v1h-1zM12 11h1v1h-1zM15 11h2v1h-2zM16 12h1v1h-1z"/>
+</svg>

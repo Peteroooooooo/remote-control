@@ -1,0 +1,16 @@
+[package]
+name = "nettest"
+edition.workspace = true
+version.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow = "1.0.104"
+bytes = "1.12.1"
+clap = { version = "4.6.7", features = ["derive"] }
+iroh = "1.4.1"
+# Same version iroh uses; only for the congestion controller configs iroh does not re-export.
+noq-proto = { version = "1.4.0", default-features = false }
+rc-stream = { path = "../../crates/rc-stream" }
+tokio = { version = "1", features = ["full"] }
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }

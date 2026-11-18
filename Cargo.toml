@@ -1,0 +1,20 @@
+[workspace]
+resolver = "3"
+members = ["apps/remote-control", "apps/rc-relay", "crates/rc-ident", "crates/rc-stream", "spikes/nettest"]
+exclude = ["vendor/iroh-relay"]
+
+[workspace.package]
+edition = "2024"
+license = "Apache-2.0"
+version = "0.0.1"
+publish = false
+
+[profile.release]
+lto = "thin"
+codegen-units = 4
+strip = true
+
+# Our relay needs hooks iroh-relay does not have (see vendor/iroh-relay/PATCHES.md).
+# iroh's client side uses the same crate, so everything builds against the patched copy.
+[patch.crates-io]
+iroh-relay = { path = "vendor/iroh-relay" }

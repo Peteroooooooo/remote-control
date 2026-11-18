@@ -1,0 +1,1112 @@
+//! The viewer's controls: the line's quality ("直连 · 6 ms", a click shows
+//! the numbers), switch display, Ctrl+Alt+Del, release keyboard and mouse,
+//! full screen, 断开. In a window they sit in its title bar, which is drawn
+//! here along with the minimise, maximise and close buttons (window.rs hands
+//! over the title bar's painting, hit testing and mouse). In full screen they
+//! move into a bar at the top edge that shows for a moment, then slides up
+//! leaving a 4 px edge; it comes down while the pointer is at the top edge
+//! above it or on it, and goes up a moment after the pointer leaves. It stays
+//! down while the numbers are open, input is released, the picture is paused
+//! and once the session has ended.
+//!
+//! The numbers, the tips and the full-screen bar are in a layered window
+//! owned by the session window (above it, gone with it), see-through and
+//! click-through outside its shapes. It lives on the session window's thread
+//! and message loop.
+
+use std::{
+    cell::RefCell,
+    sync::{
+        Mutex,
+        atomic::{AtomicIsize, Ordering},
+    },
+    time::{Duration, Instant},
+};
+
+use windows::{
+    Win32::{
+        Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
+        Graphics::Gdi::{ClientToScreen, HFONT, InvalidateRect, ScreenToClient},
+        System::LibraryLoader::GetModuleHandleW,
+        UI::{
+            Input::KeyboardAndMouse::{TME_LEAVE, TME_NONCLIENT, TRACKMOUSEEVENT, TrackMouseEvent},
+            WindowsAndMessaging::*,
+        },
+    },
+    core::{HSTRING, w},
+};
+
+use crate::{
+    gdi::{self, Canvas, coverage, rect, rgb},
+    keys, log, theme, window,
+};
+
+/// The title bar's height (window units, 96 DPI, as below).
+pub const CAPTION: i32 = 32;
+/// A caption button (minimise, maximise, close).
+const CAP_W: i32 = 46;
+const BAR_H: i32 = 40;
+const RADIUS: i32 = 12;
+/// What is left of the full-screen bar when it is up.
+const HANDLE: i32 = 4;
+const STATS_W: i32 = 340;
+const ROW_H: i32 = 22;
+/// The full-screen bar shows this long when full screen starts.
+const FIRST_SHOW: Duration = Duration::from_millis(1500);
+/// Goes up this long after the pointer left.
+const LINGER: Duration = Duration::from_millis(1200);
+const TIP_DELAY: Duration = Duration::from_millis(500);
+const SLIDE: f32 = 0.26;
+const RELEASED: &str = "键鼠已释放，点画面继续";
+
+const TIMER_ANIMATE: usize = 1;
+const TIMER_WATCH: usize = 2;
+const WM_APP_UPDATE: u32 = WM_APP + 1;
+const WM_APP_FOLLOW: u32 = WM_APP + 2;
+const WM_MOUSELEAVE: u32 = 0x02A3;
+const WM_NCMOUSELEAVE: u32 = 0x02A2;
+
+const FILL: u32 = theme::CHROME;
+const EDGE: u32 = 0x3a3c42;
+const GREEN: u32 = 0x3fb950;
+const AMBER: u32 = 0xd29922;
+const RED: u32 = 0xe5534b;
+const DANGER: u32 = 0xff8a83;
+const CLOSE_HOT: u32 = 0xc42b1c;
+const CLOSE_DOWN: u32 = 0xa82a1c;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Tone {
+    Good,
+    Fair,
+    Bad,
+}
+
+struct Info {
+    tone: Tone,
+    badge: String,
+    rows: Vec<(String, String)>,
+    /// Keep the full-screen bar down (picture paused, session over).
+    hold: bool,
+}
+
+static INFO: Mutex<Info> = Mutex::new(Info { tone: Tone::Fair, badge: String::new(), rows: Vec::new(), hold: false });
+static TOOLBAR: AtomicIsize = AtomicIsize::new(0);
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Part {
+    Badge,
+    Monitor,
+    Cad,
+    Release,
+    Terminal,
+    Full,
+    Disconnect,
+}
+
+/// Something under the pointer that reacts to it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Hot {
+    Part(Part),
+    Min,
+    Max,
+    Close,
+}
+
+/// Sizes of the controls (window units): smaller in the title bar.
+struct Metrics {
+    font: i32,
+    badge_h: i32,
+    icon_w: i32,
+    icon_h: i32,
+    end_w: i32,
+    end_h: i32,
+    sep_h: i32,
+}
+
+const IN_CAPTION: Metrics = Metrics { font: 12, badge_h: 24, icon_w: 30, icon_h: 26, end_w: 48, end_h: 22, sep_h: 14 };
+const IN_BAR: Metrics = Metrics { font: 13, badge_h: 28, icon_w: 30, icon_h: 30, end_w: 56, end_h: 26, sep_h: 20 };
+
+/// What the controls show right now.
+struct Look {
+    tone: Tone,
+    badge: String,
+    rows: Vec<(String, String)>,
+    hold: bool,
+    input: bool,
+    released: bool,
+    full: bool,
+    monitors: usize,
+}
+
+fn look() -> Look {
+    let i = INFO.lock().unwrap();
+    let badge = if i.badge.is_empty() { "正在连接…".to_string() } else { i.badge.clone() };
+    let input = window::input();
+    Look {
+        tone: i.tone,
+        badge,
+        rows: i.rows.clone(),
+        hold: i.hold,
+        input,
+        released: input && !window::captured(),
+        full: window::fullscreen(),
+        monitors: window::monitors().1,
+    }
+}
+
+struct State {
+    /// The session window.
+    owner: HWND,
+    /// Laid out for full screen (the bar) rather than the title bar.
+    full: bool,
+    /// When full screen started.
+    started: Instant,
+    /// The full-screen bar: 0 up, 1 down.
+    t: f32,
+    open: bool,
+    last_frame: Instant,
+    last_near: Instant,
+    stats: bool,
+    hover: Option<(Hot, Instant)>,
+    pressed: Option<Hot>,
+    tip_shown: bool,
+    /// The title bar's controls, in the session window's client pixels.
+    caption: Vec<(Hot, RECT)>,
+    /// What the last drawing of this window put where, in its pixels, and
+    /// where it is on the screen.
+    parts: Vec<(Part, RECT)>,
+    bar: RECT,
+    panel: Option<RECT>,
+    origin: POINT,
+}
+
+thread_local! {
+    static STATE: RefCell<Option<State>> = const { RefCell::new(None) };
+}
+
+/// The latest numbers (any thread).
+pub fn update(tone: Tone, badge: String, rows: Vec<(String, String)>, hold: bool) {
+    *INFO.lock().unwrap() = Info { tone, badge, rows, hold };
+    post(WM_APP_UPDATE);
+}
+
+/// The session ended: `why` in red, until the window closes (any thread).
+pub fn closed(why: &str) {
+    {
+        let mut i = INFO.lock().unwrap();
+        i.tone = Tone::Bad;
+        i.badge = why.to_string();
+        i.hold = true;
+    }
+    post(WM_APP_UPDATE);
+}
+
+/// Draw again: capture, displays, title or full screen changed (any thread).
+pub fn refresh() {
+    post(WM_APP_UPDATE);
+}
+
+/// The session window moved or changed size.
+pub fn follow() {
+    post(WM_APP_FOLLOW);
+}
+
+/// The picture was clicked: the numbers close (session window's thread).
+pub fn dismiss() {
+    if with(|s| std::mem::take(&mut s.stats)).unwrap_or(false) {
+        changed();
+    }
+}
+
+fn post(msg: u32) {
+    let h = toolbar();
+    if !h.is_invalid() {
+        unsafe {
+            let _ = PostMessageW(Some(h), msg, WPARAM(0), LPARAM(0));
+        }
+    }
+}
+
+fn toolbar() -> HWND {
+    HWND(TOOLBAR.load(Ordering::Relaxed) as *mut _)
+}
+
+/// Opens the layered window over `owner`, on its thread.
+pub fn create(owner: HWND) {
+    if let Err(e) = open(owner) {
+        log!("toolbar could not open: {e}");
+    }
+}
+
+fn open(owner: HWND) -> windows::core::Result<()> {
+    unsafe {
+        let inst = GetModuleHandleW(None)?;
+        let class = w!("remote-control-toolbar");
+        let wc = WNDCLASSW {
+            lpfnWndProc: Some(wndproc),
+            hInstance: inst.into(),
+            lpszClassName: class,
+            hCursor: LoadCursorW(None, IDC_ARROW)?,
+            ..Default::default()
+        };
+        RegisterClassW(&wc);
+        let ex = WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE;
+        let hwnd =
+            CreateWindowExW(ex, class, &HSTRING::from("remote control toolbar"), WS_POPUP, 0, 0, 10, 10, Some(owner), None, Some(inst.into()), None)?;
+        let now = Instant::now();
+        STATE.set(Some(State {
+            owner,
+            full: false,
+            started: now,
+            t: 0.0,
+            open: false,
+            last_frame: now,
+            last_near: now,
+            stats: false,
+            hover: None,
+            pressed: None,
+            tip_shown: false,
+            caption: Vec::new(),
+            parts: Vec::new(),
+            bar: RECT::default(),
+            panel: None,
+            origin: POINT::default(),
+        }));
+        TOOLBAR.store(hwnd.0 as isize, Ordering::Relaxed);
+        SetTimer(Some(hwnd), TIMER_WATCH, 50, None);
+        Ok(())
+    }
+}
+
+fn eased(t: f32) -> f32 {
+    1.0 - (1.0 - t).powi(3)
+}
+
+fn with<R>(f: impl FnOnce(&mut State) -> R) -> Option<R> {
+    STATE.with(|s| s.try_borrow_mut().ok().and_then(|mut s| s.as_mut().map(f)))
+}
+
+fn redraw(hwnd: HWND) {
+    with(|s| draw(hwnd, s));
+}
+
+/// Something shown changed: draw this window and the title bar again.
+fn changed() {
+    redraw(toolbar());
+    if let Some(owner) = with(|s| s.owner) {
+        invalidate_caption(owner);
+    }
+}
+
+fn invalidate_caption(owner: HWND) {
+    let px = gdi::scale(owner);
+    let mut c = RECT::default();
+    unsafe {
+        let _ = GetClientRect(owner, &mut c);
+        c.bottom = c.bottom.min(px(CAPTION));
+        let _ = InvalidateRect(Some(owner), Some(&c), false);
+    }
+}
+
+fn tip(part: Part, look: &Look) -> Option<String> {
+    Some(match part {
+        Part::Badge | Part::Disconnect => return None,
+        Part::Monitor => {
+            let (current, count) = window::monitors();
+            format!("显示器 {}/{count}（Ctrl+Alt+Shift+→）", current + 1)
+        }
+        Part::Cad => "发送 Ctrl+Alt+Del（Ctrl+Alt+End）".into(),
+        Part::Release if look.released => "继续控制（点画面也行）".into(),
+        Part::Release => "释放键鼠（Ctrl+Alt+Shift+Z）".into(),
+        Part::Terminal => "终端：在对方电脑上开 PowerShell".into(),
+        Part::Full if look.full => "退出全屏".into(),
+        Part::Full => "全屏".into(),
+    })
+}
+
+fn has_tip(part: Part) -> bool {
+    !matches!(part, Part::Badge | Part::Disconnect)
+}
+
+fn tone_color(t: Tone) -> u32 {
+    match t {
+        Tone::Good => GREEN,
+        Tone::Fair => AMBER,
+        Tone::Bad => RED,
+    }
+}
+
+/// The controls left to right from `x0`, centred in a strip `h` pixels high.
+struct Layout {
+    parts: Vec<(Part, RECT)>,
+    seps: Vec<i32>,
+    note: Option<RECT>,
+    right: i32,
+}
+
+fn layout(px: &dyn Fn(i32) -> i32, m: &Metrics, h: i32, x0: i32, badge_w: i32, note_w: i32, look: &Look) -> Layout {
+    let span = |size: i32| ((h - px(size)) / 2, (h + px(size)) / 2);
+    let (mut parts, mut seps) = (Vec::new(), Vec::new());
+    let mut x = x0;
+    let (t, b) = span(m.badge_h);
+    let bw = px(22) + badge_w + px(8);
+    parts.push((Part::Badge, rect(x, t, x + bw, b)));
+    x += bw + px(5);
+    seps.push(x);
+    x += px(6);
+    let mut icons = Vec::new();
+    if look.monitors > 1 {
+        icons.push(Part::Monitor);
+    }
+    if look.input {
+        icons.extend([Part::Cad, Part::Release]);
+    }
+    icons.push(Part::Terminal);
+    icons.push(Part::Full);
+    let (t, b) = span(m.icon_h);
+    for p in icons {
+        parts.push((p, rect(x, t, x + px(m.icon_w), b)));
+        x += px(m.icon_w) + px(2);
+    }
+    x += px(3);
+    seps.push(x);
+    x += px(6);
+    let (t, b) = span(m.end_h);
+    parts.push((Part::Disconnect, rect(x, t, x + px(m.end_w), b)));
+    x += px(m.end_w);
+    let note = look.released.then(|| {
+        let r = rect(x + px(10), 0, x + px(10) + note_w + 2, h);
+        x = r.right;
+        r
+    });
+    Layout { parts, seps, note, right: x }
+}
+
+impl Layout {
+    fn shift(&mut self, dx: i32) {
+        for (_, r) in self.parts.iter_mut() {
+            r.left += dx;
+            r.right += dx;
+        }
+        for s in self.seps.iter_mut() {
+            *s += dx;
+        }
+        if let Some(r) = self.note.as_mut() {
+            r.left += dx;
+            r.right += dx;
+        }
+        self.right += dx;
+    }
+}
+
+fn moved(r: &RECT, dx: i32, dy: i32) -> RECT {
+    rect(r.left + dx, r.top + dy, r.right + dx, r.bottom + dy)
+}
+
+struct Paint<'a> {
+    px: &'a dyn Fn(i32) -> i32,
+    pf: &'a dyn Fn(f32) -> f32,
+    font: HFONT,
+    hover: Option<Hot>,
+    pressed: Option<Hot>,
+    stats: bool,
+    /// The controls react (the bar is down).
+    live: bool,
+}
+
+/// The controls, `dy` pixels down from where `lay` has them.
+fn paint_parts(c: &Canvas, lay: &Layout, dy: i32, h: i32, m: &Metrics, look: &Look, p: &Paint) {
+    let px = p.px;
+    for (part, r) in &lay.parts {
+        let r = moved(r, 0, dy);
+        let hot = p.live && p.hover == Some(Hot::Part(*part));
+        let down = hot && p.pressed == Some(Hot::Part(*part));
+        match part {
+            Part::Badge => {
+                if hot || p.stats {
+                    c.round(&r, px(6), Some(rgb(theme::BUTTON_HOVER)), None);
+                }
+                let cy = (r.top + r.bottom) / 2;
+                c.circle(r.left + px(12), cy, px(4), Some(rgb(tone_color(look.tone))), None);
+                c.text(&rect(r.left + px(22), r.top, r.right, r.bottom), &look.badge, p.font, gdi::TEXT, false);
+            }
+            Part::Disconnect => {
+                let fill = match (hot, down) {
+                    (true, true) => 0x4a2b2c,
+                    (true, false) => 0x5a2f30,
+                    _ => theme::BUTTON_HOVER,
+                };
+                c.round(&r, px(6), Some(rgb(fill)), None);
+                c.text(&r, "断开", p.font, rgb(DANGER), true);
+            }
+            _ => {
+                let on = *part == Part::Release && look.released;
+                if on {
+                    c.round(&r, px(6), Some(rgb(mix(FILL, AMBER, if hot { 0.28 } else { 0.18 }))), None);
+                } else if hot {
+                    c.round(&r, px(6), Some(rgb(if down { theme::BUTTON } else { theme::BUTTON_HOVER })), None);
+                }
+                let color = if on {
+                    AMBER
+                } else if hot {
+                    theme::TEXT
+                } else {
+                    theme::DIM
+                };
+                icon(c, *part, &r, p.pf, rgb(color), look.full);
+            }
+        }
+    }
+    let cy = h / 2 + dy;
+    for s in &lay.seps {
+        c.fill(&rect(*s, cy - px(m.sep_h) / 2, *s + 1, cy + px(m.sep_h) / 2), rgb(EDGE));
+    }
+    if let Some(n) = lay.note {
+        c.text(&moved(&n, 0, dy), RELEASED, p.font, rgb(AMBER), false);
+    }
+}
+
+/// The title bar of the session window `hwnd` (its WM_PAINT).
+pub fn paint_caption(hwnd: HWND) {
+    let px = gdi::scale(hwnd);
+    let pf = |v: f32| v * px(96) as f32 / 96.0;
+    let h = px(CAPTION);
+    let mut c = Canvas::begin_top(hwnd, rgb(FILL), h);
+    let look = look();
+    if look.full {
+        return;
+    }
+    let bold = c.font(px(IN_CAPTION.font), true);
+    let f = c.font(px(IN_CAPTION.font), false);
+    let name = window::name();
+    let name_w = c.text_width(&name, bold);
+    let badge_w = c.text_width(&look.badge, f);
+    let note_w = c.text_width(RELEASED, f);
+    let active = unsafe { GetForegroundWindow() } == hwnd;
+    let left = px(12);
+    c.text(&rect(left, 0, left + name_w + 2, h), &name, bold, if active { gdi::TEXT } else { gdi::DIM }, false);
+    let lay = layout(&px, &IN_CAPTION, h, left + name_w + px(14), badge_w, note_w, &look);
+    let (hover, pressed, stats) = with(|s| (s.hover.map(|h| h.0), s.pressed, s.stats)).unwrap_or((None, None, false));
+    let paint = Paint { px: &px, pf: &pf, font: f, hover, pressed, stats, live: true };
+    paint_parts(&c, &lay, 0, h, &IN_CAPTION, &look, &paint);
+
+    let w = c.size.right;
+    let cw = px(CAP_W);
+    let caps = [(Hot::Min, rect(w - cw * 3, 0, w - cw * 2, h)), (Hot::Max, rect(w - cw * 2, 0, w - cw, h)), (Hot::Close, rect(w - cw, 0, w, h))];
+    let zoomed = unsafe { IsZoomed(hwnd) }.as_bool();
+    for (k, r) in &caps {
+        // The caption buttons win over controls a narrow window pushes under them.
+        c.fill(r, rgb(FILL));
+        let hot = hover == Some(*k);
+        paint_cap(&c, *k, r, hot, hot && pressed == Some(*k), zoomed, active, &pf);
+    }
+    let mut hits: Vec<(Hot, RECT)> = caps.to_vec();
+    hits.extend(lay.parts.iter().filter(|(_, r)| r.right <= w - cw * 3).map(|(p, r)| (Hot::Part(*p), *r)));
+    with(|s| s.caption = hits);
+}
+
+/// A caption button with its glyph, drawn like Windows 11's.
+#[allow(clippy::too_many_arguments)]
+fn paint_cap(c: &Canvas, k: Hot, r: &RECT, hot: bool, down: bool, zoomed: bool, active: bool, pf: &dyn Fn(f32) -> f32) {
+    let close = k == Hot::Close;
+    if hot {
+        let bg = match (close, down) {
+            (true, false) => CLOSE_HOT,
+            (true, true) => CLOSE_DOWN,
+            (false, false) => theme::BUTTON_HOVER,
+            (false, true) => theme::BUTTON,
+        };
+        c.fill(r, rgb(bg));
+    }
+    let color = rgb(if hot && close {
+        0xffffff
+    } else if active || hot {
+        theme::TEXT
+    } else {
+        theme::DIM
+    });
+    let (cx, cy) = (((r.left + r.right) / 2) as f32 + 0.5, ((r.top + r.bottom) / 2) as f32 + 0.5);
+    let s = pf(5.0).round();
+    let w = pf(1.0);
+    match k {
+        Hot::Min => c.lines(&[(cx - s, cy), (cx + s, cy)], w, color),
+        Hot::Max if zoomed => {
+            let o = pf(2.0).round();
+            c.lines(&[(cx - s, cy - s + o), (cx + s - o, cy - s + o), (cx + s - o, cy + s), (cx - s, cy + s), (cx - s, cy - s + o)], w, color);
+            c.lines(&[(cx - s + o, cy - s + o), (cx - s + o, cy - s), (cx + s, cy - s), (cx + s, cy + s - o), (cx + s - o, cy + s - o)], w, color);
+        }
+        Hot::Max => c.lines(&[(cx - s, cy - s), (cx + s, cy - s), (cx + s, cy + s), (cx - s, cy + s), (cx - s, cy - s)], w, color),
+        Hot::Close => {
+            c.lines(&[(cx - s, cy - s), (cx + s, cy + s)], w, color);
+            c.lines(&[(cx + s, cy - s), (cx - s, cy + s)], w, color);
+        }
+        Hot::Part(_) => {}
+    }
+}
+
+fn caption_at(x: i32, y: i32) -> Option<Hot> {
+    with(|s| s.caption.iter().find(|(_, r)| gdi::inside(r, x, y)).map(|(k, _)| *k)).flatten()
+}
+
+/// What the title bar has at (`x`, `y`) in client pixels, for WM_NCHITTEST:
+/// the controls are client area, the rest drags the window.
+pub fn caption_hit(x: i32, y: i32) -> u32 {
+    match caption_at(x, y) {
+        Some(Hot::Part(_)) => HTCLIENT,
+        Some(Hot::Min) => HTMINBUTTON,
+        Some(Hot::Max) => HTMAXBUTTON,
+        Some(Hot::Close) => HTCLOSE,
+        None => HTCAPTION,
+    }
+}
+
+fn cap_of(ht: usize) -> Option<Hot> {
+    match ht as u32 {
+        HTMINBUTTON => Some(Hot::Min),
+        HTMAXBUTTON => Some(Hot::Max),
+        HTCLOSE => Some(Hot::Close),
+        _ => None,
+    }
+}
+
+fn set_hover(owner: HWND, k: Option<Hot>) {
+    let changed = with(|s| {
+        if s.hover.map(|h| h.0) == k {
+            return false;
+        }
+        s.hover = k.map(|k| (k, Instant::now()));
+        s.pressed = s.pressed.filter(|p| Some(*p) == k);
+        true
+    })
+    .unwrap_or(false);
+    if changed {
+        invalidate_caption(owner);
+        redraw(toolbar());
+    }
+}
+
+fn track(hwnd: HWND, nonclient: bool) {
+    let flags = if nonclient { TME_LEAVE | TME_NONCLIENT } else { TME_LEAVE };
+    let mut t = TRACKMOUSEEVENT { cbSize: size_of::<TRACKMOUSEEVENT>() as u32, dwFlags: flags, hwndTrack: hwnd, dwHoverTime: 0 };
+    unsafe {
+        let _ = TrackMouseEvent(&mut t);
+    }
+}
+
+/// The title bar's mouse messages; None to leave the message to Windows
+/// (dragging, the window menu).
+pub fn caption_mouse(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
+    let point = || POINT { x: lp.0 as i16 as i32, y: (lp.0 >> 16) as i16 as i32 };
+    let client_at = || {
+        let p = point();
+        caption_at(p.x, p.y)
+    };
+    match msg {
+        WM_MOUSEMOVE => {
+            set_hover(hwnd, client_at().filter(|k| matches!(k, Hot::Part(_))));
+            track(hwnd, false);
+            Some(LRESULT(0))
+        }
+        WM_NCMOUSEMOVE => {
+            set_hover(hwnd, cap_of(wp.0));
+            track(hwnd, true);
+            // Windows would draw its old buttons over the caption buttons.
+            cap_of(wp.0).map(|_| LRESULT(0))
+        }
+        WM_MOUSELEAVE | WM_NCMOUSELEAVE => {
+            // Leaving the client area for the caption buttons (or back) sends
+            // a leave too: what is under the pointer now decides.
+            let mut p = POINT::default();
+            let mut k = None;
+            unsafe {
+                if GetCursorPos(&mut p).is_ok() && WindowFromPoint(p) == hwnd {
+                    let _ = ScreenToClient(hwnd, &mut p);
+                    k = caption_at(p.x, p.y);
+                }
+            }
+            set_hover(hwnd, k);
+            if let Some(k) = k {
+                track(hwnd, !matches!(k, Hot::Part(_)));
+            }
+            Some(LRESULT(0))
+        }
+        WM_LBUTTONDOWN | WM_LBUTTONDBLCLK => {
+            let k = client_at();
+            with(|s| s.pressed = k);
+            invalidate_caption(hwnd);
+            Some(LRESULT(0))
+        }
+        WM_LBUTTONUP => {
+            let k = client_at();
+            let was = with(|s| s.pressed.take()).flatten();
+            invalidate_caption(hwnd);
+            if let (Some(Hot::Part(p)), true) = (was, was == k) {
+                act(p);
+            }
+            Some(LRESULT(0))
+        }
+        WM_NCLBUTTONDOWN | WM_NCLBUTTONDBLCLK => {
+            let k = cap_of(wp.0)?;
+            with(|s| s.pressed = Some(k));
+            invalidate_caption(hwnd);
+            Some(LRESULT(0))
+        }
+        WM_NCLBUTTONUP => {
+            let k = cap_of(wp.0)?;
+            let was = with(|s| s.pressed.take()).flatten();
+            invalidate_caption(hwnd);
+            if was == Some(k) {
+                let cmd = match k {
+                    Hot::Min => SC_MINIMIZE,
+                    Hot::Max if unsafe { IsZoomed(hwnd) }.as_bool() => SC_RESTORE,
+                    Hot::Max => SC_MAXIMIZE,
+                    _ => SC_CLOSE,
+                };
+                unsafe {
+                    let _ = PostMessageW(Some(hwnd), WM_SYSCOMMAND, WPARAM(cmd as usize), LPARAM(0));
+                }
+            }
+            Some(LRESULT(0))
+        }
+        _ => None,
+    }
+}
+
+/// Measures with the controls' font: the badge, the released note, the tip
+/// (if one is due) and the numbers' widest key and value.
+fn measure(px: &dyn Fn(i32) -> i32, m: &Metrics, look: &Look, tip_text: Option<&str>) -> (i32, i32, i32, i32, i32) {
+    let mut c = Canvas::offscreen(1, 1, rgb(FILL));
+    let f = c.font(px(m.font), false);
+    let tf = c.font(px(13), false);
+    let key_w = look.rows.iter().map(|r| c.text_width(&r.0, tf)).max().unwrap_or(0);
+    let value_w = look.rows.iter().map(|r| c.text_width(&r.1, tf)).max().unwrap_or(0);
+    (c.text_width(&look.badge, f), c.text_width(RELEASED, f), tip_text.map_or(0, |t| c.text_width(t, tf)), key_w, value_w)
+}
+
+fn due_tip(st: &State, look: &Look) -> Option<(Part, String)> {
+    match st.hover {
+        Some((Hot::Part(p), since)) if since.elapsed() >= TIP_DELAY && !st.stats => tip(p, look).map(|t| (p, t)),
+        _ => None,
+    }
+}
+
+fn panel_size(px: &dyn Fn(i32) -> i32, look: &Look, key_w: i32, value_w: i32) -> (i32, i32) {
+    (px(STATS_W).max(key_w + value_w + px(28 + 24)), px(12) * 2 + px(ROW_H) * look.rows.len() as i32)
+}
+
+fn paint_panel(c: &Canvas, r: &RECT, px: &dyn Fn(i32) -> i32, f: HFONT, look: &Look, value_w: i32) {
+    c.round(r, px(10), Some(rgb(FILL)), Some((rgb(EDGE), 1)));
+    for (i, (k, v)) in look.rows.iter().enumerate() {
+        let y = r.top + px(12) + px(ROW_H) * i as i32;
+        let row = rect(r.left + px(14), y, r.right - px(14), y + px(ROW_H));
+        c.text(&row, k, f, gdi::DIM, false);
+        c.text(&rect(row.right - value_w - 2, y, row.right, y + px(ROW_H)), v, f, gdi::TEXT, false);
+    }
+}
+
+fn paint_tip(c: &Canvas, r: &RECT, px: &dyn Fn(i32) -> i32, f: HFONT, text: &str) {
+    c.round(r, px(6), Some(rgb(theme::RAISED)), Some((rgb(EDGE), 1)));
+    c.text(r, text, f, gdi::TEXT, true);
+}
+
+fn shape(r: &RECT, radius: i32) -> ([f32; 4], f32) {
+    ([r.left, r.top, r.right, r.bottom].map(|v| v as f32), radius as f32)
+}
+
+fn present(c: &Canvas, hwnd: HWND, at: POINT, shapes: &[([f32; 4], f32)]) {
+    c.present_layered(hwnd, at.x, at.y, |x, y| {
+        let mut a = 0.0f32;
+        for (s, rr) in shapes {
+            let v = coverage(*s, *rr, x, y);
+            a = a + v * (1.0 - a);
+        }
+        a
+    });
+}
+
+fn draw(hwnd: HWND, st: &mut State) {
+    let look = look();
+    if look.full != st.full {
+        st.full = look.full;
+        st.hover = None;
+        st.pressed = None;
+        if look.full {
+            let now = Instant::now();
+            st.started = now;
+            st.last_near = now;
+            st.open = true;
+            st.t = 1.0;
+        }
+    }
+    if look.full {
+        draw_bar(hwnd, st, &look);
+        if (look.hold || look.released) && !st.open {
+            st.open = true;
+            start_animation(hwnd, st);
+        }
+    } else {
+        draw_popups(hwnd, st, &look);
+    }
+}
+
+fn show(hwnd: HWND, on: bool) {
+    unsafe {
+        if IsWindowVisible(hwnd).as_bool() != on {
+            let _ = ShowWindow(hwnd, if on { SW_SHOWNOACTIVATE } else { SW_HIDE });
+        }
+    }
+}
+
+/// In a window: the numbers under the badge, a tip under a title bar button.
+fn draw_popups(hwnd: HWND, st: &mut State, look: &Look) {
+    let px = gdi::scale(hwnd);
+    let tip_due = due_tip(st, look);
+    let (_, _, tip_w, key_w, value_w) = measure(&px, &IN_CAPTION, look, tip_due.as_ref().map(|t| t.1.as_str()));
+    let owner = st.owner;
+    let screen = |r: &RECT| {
+        let mut p = POINT { x: r.left, y: r.top };
+        unsafe {
+            let _ = ClientToScreen(owner, &mut p);
+        }
+        rect(p.x, p.y, p.x + r.right - r.left, p.y + r.bottom - r.top)
+    };
+    let find = |k: Hot| st.caption.iter().find(|(h, _)| *h == k).map(|(_, r)| screen(r));
+    let panel = match find(Hot::Part(Part::Badge)) {
+        Some(b) if st.stats => {
+            let (w, h) = panel_size(&px, look, key_w, value_w);
+            let top = b.bottom + px(6);
+            Some(rect(b.left - px(6), top, b.left - px(6) + w, top + h))
+        }
+        _ => None,
+    };
+    let tip = tip_due.and_then(|(p, text)| {
+        let r = find(Hot::Part(p))?;
+        let w = tip_w + px(16);
+        let l = (r.left + r.right) / 2 - w / 2;
+        Some((rect(l, r.bottom + px(6), l + w, r.bottom + px(6) + px(24)), text))
+    });
+    st.tip_shown = tip.is_some();
+    st.parts.clear();
+    st.panel = None;
+    let boxes: Vec<RECT> = panel.iter().copied().chain(tip.iter().map(|t| t.0)).collect();
+    if boxes.is_empty() {
+        show(hwnd, false);
+        return;
+    }
+    let area = boxes.iter().skip(1).fold(boxes[0], |a, b| rect(a.left.min(b.left), a.top.min(b.top), a.right.max(b.right), a.bottom.max(b.bottom)));
+    let at = POINT { x: area.left - 1, y: area.top - 1 };
+    let mut c = Canvas::offscreen(area.right - area.left + 2, area.bottom - area.top + 2, rgb(FILL));
+    let f = c.font(px(13), false);
+    let mut shapes = Vec::new();
+    if let Some(p) = panel {
+        let r = moved(&p, -at.x, -at.y);
+        paint_panel(&c, &r, &px, f, look, value_w);
+        shapes.push(shape(&r, px(10)));
+    }
+    if let Some((t, text)) = &tip {
+        let r = moved(t, -at.x, -at.y);
+        paint_tip(&c, &r, &px, f, text);
+        shapes.push(shape(&r, px(6)));
+    }
+    present(&c, hwnd, at, &shapes);
+    st.origin = at;
+    show(hwnd, true);
+}
+
+/// Full screen: the bar at the top edge, with the numbers or a tip under it.
+fn draw_bar(hwnd: HWND, st: &mut State, look: &Look) {
+    let px = gdi::scale(hwnd);
+    let pf = |v: f32| v * px(96) as f32 / 96.0;
+    let tip_due = due_tip(st, look);
+    let (badge_w, note_w, tip_w, key_w, value_w) = measure(&px, &IN_BAR, look, tip_due.as_ref().map(|t| t.1.as_str()));
+    st.tip_shown = tip_due.is_some();
+
+    let h = px(BAR_H);
+    let mut lay = layout(&px, &IN_BAR, h, px(6), badge_w, note_w, look);
+    let bar_w = lay.right + if lay.note.is_some() { px(12) } else { px(6) };
+    let (panel_w, panel_h) = panel_size(&px, look, key_w, value_w);
+    let panel_h = if st.stats { panel_h } else { 0 };
+    let win_w = bar_w.max(panel_w).max(tip_w + px(40)) + 2;
+    let win_h = h + px(8) + panel_h.max(px(30)) + 2;
+    let left = (win_w - bar_w) / 2;
+    lay.shift(left);
+
+    let off = ((1.0 - eased(st.t)) * (h - px(HANDLE)) as f32).round() as i32;
+    let mut c = Canvas::offscreen(win_w, win_h, rgb(FILL));
+    let f = c.font(px(IN_BAR.font), false);
+    let r = px(RADIUS);
+    let bar = rect(left, -off - r, left + bar_w, h - off);
+    c.round(&bar, r, Some(rgb(FILL)), Some((rgb(EDGE), 1)));
+    // A grip on the edge that is left when the bar is up.
+    let grip = 1.0 - eased(st.t);
+    if grip > 0.01 {
+        let gy = (h - off - px(2)) as f32;
+        let cx = (left + bar_w / 2) as f32;
+        c.lines(&[(cx - pf(14.0), gy), (cx + pf(14.0), gy)], pf(1.5), rgb(mix(FILL, theme::DIM, grip)));
+    }
+    let paint = Paint { px: &px, pf: &pf, font: f, hover: st.hover.map(|h| h.0), pressed: st.pressed, stats: st.stats, live: st.t > 0.9 };
+    paint_parts(&c, &lay, -off, h, &IN_BAR, look, &paint);
+
+    let mut shapes = vec![shape(&bar, r)];
+    let mut panel = None;
+    if st.stats && st.t > 0.0 {
+        let pl = (win_w - panel_w) / 2;
+        let pt = h - off + px(8);
+        let pr = rect(pl, pt, pl + panel_w, pt + panel_h);
+        paint_panel(&c, &pr, &px, f, look, value_w);
+        shapes.push(shape(&pr, px(10)));
+        panel = Some(pr);
+    }
+    if let Some((p, text)) = &tip_due
+        && let Some((_, br)) = lay.parts.iter().find(|(q, _)| q == p)
+    {
+        let tw = tip_w + px(16);
+        let tl = ((br.left + br.right) / 2 - tw / 2).clamp(1, win_w - tw - 1);
+        let tt = h - off + px(6);
+        let tr = rect(tl, tt, tl + tw, tt + px(24));
+        paint_tip(&c, &tr, &px, f, text);
+        shapes.push(shape(&tr, px(6)));
+    }
+
+    let (origin, client_w) = owner_top(st.owner);
+    let pos = POINT { x: origin.x + (client_w - win_w) / 2, y: origin.y };
+    present(&c, hwnd, pos, &shapes);
+    st.parts = lay.parts.iter().map(|(p, r)| (*p, moved(r, 0, -off))).collect();
+    st.bar = rect(left, 0, left + bar_w, h - off);
+    st.panel = panel;
+    st.origin = pos;
+    show(hwnd, true);
+}
+
+fn mix(a: u32, b: u32, t: f32) -> u32 {
+    let ch = |s: u32| {
+        let (x, y) = ((a >> s & 0xff) as f32, (b >> s & 0xff) as f32);
+        ((x + (y - x) * t).round() as u32) << s
+    };
+    ch(16) | ch(8) | ch(0)
+}
+
+/// The session window's client area: its top left on the screen, and width.
+fn owner_top(owner: HWND) -> (POINT, i32) {
+    let mut p = POINT::default();
+    let mut c = RECT::default();
+    unsafe {
+        let _ = ClientToScreen(owner, &mut p);
+        let _ = GetClientRect(owner, &mut c);
+    }
+    (p, c.right)
+}
+
+/// Icons on a 16 × 16 grid, centred in `r`.
+fn icon(c: &Canvas, part: Part, r: &RECT, pf: &dyn Fn(f32) -> f32, color: COLORREF, full: bool) {
+    let s = pf(16.0) / 16.0;
+    let (ox, oy) = ((r.left + r.right) as f32 / 2.0 - 8.0 * s, (r.top + r.bottom) as f32 / 2.0 - 8.0 * s);
+    let p = |x: f32, y: f32| (ox + x * s, oy + y * s);
+    let w = pf(1.5);
+    let line = |pts: &[(f32, f32)]| c.lines(&pts.iter().map(|&(x, y)| p(x, y)).collect::<Vec<_>>(), w, color);
+    let frame = |l: f32, t: f32, rr: f32, b: f32| line(&[(l, t), (rr, t), (rr, b), (l, b), (l, t)]);
+    match part {
+        Part::Monitor => {
+            frame(1.8, 2.8, 14.2, 10.8);
+            line(&[(8.0, 10.8), (8.0, 13.5)]);
+            line(&[(5.5, 13.5), (10.5, 13.5)]);
+        }
+        Part::Cad => {
+            frame(1.5, 4.0, 14.5, 12.0);
+            line(&[(4.0, 8.0), (4.1, 8.0)]);
+            line(&[(6.5, 8.0), (6.6, 8.0)]);
+            line(&[(9.0, 8.0), (12.0, 8.0)]);
+        }
+        Part::Release => {
+            line(&[(5.0, 2.5), (12.0, 9.0), (8.3, 9.0), (10.3, 13.2), (8.7, 14.0), (6.7, 9.8), (5.0, 12.0), (5.0, 2.5)]);
+        }
+        Part::Terminal => {
+            frame(1.5, 2.5, 14.5, 13.5);
+            line(&[(4.0, 6.0), (6.5, 8.0), (4.0, 10.0)]);
+            line(&[(8.0, 10.5), (11.5, 10.5)]);
+        }
+        Part::Full if full => {
+            line(&[(6.0, 2.5), (6.0, 6.0), (2.5, 6.0)]);
+            line(&[(10.0, 2.5), (10.0, 6.0), (13.5, 6.0)]);
+            line(&[(13.5, 10.0), (10.0, 10.0), (10.0, 13.5)]);
+            line(&[(2.5, 10.0), (6.0, 10.0), (6.0, 13.5)]);
+        }
+        Part::Full => {
+            line(&[(2.5, 6.0), (2.5, 2.5), (6.0, 2.5)]);
+            line(&[(10.0, 2.5), (13.5, 2.5), (13.5, 6.0)]);
+            line(&[(13.5, 10.0), (13.5, 13.5), (10.0, 13.5)]);
+            line(&[(6.0, 13.5), (2.5, 13.5), (2.5, 10.0)]);
+        }
+        _ => {}
+    }
+}
+
+fn start_animation(hwnd: HWND, st: &mut State) {
+    st.last_frame = Instant::now();
+    unsafe {
+        SetTimer(Some(hwnd), TIMER_ANIMATE, 15, None);
+    }
+}
+
+/// Full screen: the pointer at the top edge above the bar, or on the bar
+/// (or the numbers) while it is down.
+fn near(hwnd: HWND, st: &State) -> bool {
+    let px = gdi::scale(hwnd);
+    let mut p = POINT::default();
+    unsafe {
+        if GetCursorPos(&mut p).is_err() {
+            return false;
+        }
+        let under = WindowFromPoint(p);
+        if under != st.owner && under != hwnd && under != window::picture() {
+            return false;
+        }
+    }
+    let (x, y) = (p.x - st.origin.x, p.y - st.origin.y);
+    let (l, r) = (st.bar.left, st.bar.right);
+    let at_edge = y >= 0 && y < px(6) && x >= l - px(40) && x < r + px(40);
+    let on_bar = st.t > 0.5 && x >= l && x < r && y < st.bar.bottom + px(6);
+    let on_panel = st.panel.is_some_and(|pr| gdi::inside(&pr, x, y));
+    at_edge || on_bar || on_panel
+}
+
+fn watch(hwnd: HWND, st: &mut State) {
+    if st.full {
+        let now = Instant::now();
+        if near(hwnd, st) {
+            st.last_near = now;
+        }
+        let look = look();
+        let open = look.hold || look.released || st.stats || now - st.started < FIRST_SHOW || now - st.last_near < LINGER;
+        if open != st.open {
+            st.open = open;
+            if !open {
+                st.hover = None;
+            }
+            start_animation(hwnd, st);
+        }
+    }
+    let tip_due = st.hover.is_some_and(|(k, since)| matches!(k, Hot::Part(p) if has_tip(p)) && since.elapsed() >= TIP_DELAY);
+    if tip_due && !st.tip_shown && !st.stats {
+        draw(hwnd, st);
+    }
+}
+
+fn animate(hwnd: HWND, st: &mut State) {
+    let now = Instant::now();
+    let dt = (now - st.last_frame).as_secs_f32().min(0.05);
+    st.last_frame = now;
+    let target = if st.open { 1.0 } else { 0.0 };
+    let step = dt / SLIDE;
+    st.t = if st.t < target { (st.t + step).min(target) } else { (st.t - step).max(target) };
+    draw(hwnd, st);
+    if st.t == target {
+        unsafe {
+            let _ = KillTimer(Some(hwnd), TIMER_ANIMATE);
+        }
+    }
+}
+
+/// The full-screen bar's control at a point in this window.
+fn part_at(st: &State, lp: LPARAM) -> Option<Part> {
+    let (x, y) = ((lp.0 & 0xffff) as i16 as i32, ((lp.0 >> 16) & 0xffff) as i16 as i32);
+    if !st.full || st.t < 0.9 {
+        return None;
+    }
+    st.parts.iter().find(|(_, r)| gdi::inside(r, x, y)).map(|(p, _)| *p)
+}
+
+fn act(part: Part) {
+    match part {
+        Part::Badge => {
+            with(|s| s.stats = !s.stats);
+            changed();
+        }
+        Part::Monitor => window::pick_monitor(keys::MonitorKey::Next),
+        Part::Cad => window::send_sas(),
+        Part::Release => window::toggle_capture(),
+        Part::Terminal => crate::term::open_for_session(),
+        Part::Full => window::toggle_fullscreen(),
+        Part::Disconnect => window::disconnect(),
+    }
+}
+
+unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    unsafe {
+        match msg {
+            WM_TIMER => {
+                with(|s| match wp.0 {
+                    TIMER_ANIMATE => animate(hwnd, s),
+                    TIMER_WATCH => watch(hwnd, s),
+                    _ => {}
+                });
+                LRESULT(0)
+            }
+            WM_APP_UPDATE => {
+                changed();
+                LRESULT(0)
+            }
+            WM_APP_FOLLOW => {
+                redraw(hwnd);
+                LRESULT(0)
+            }
+            WM_MOUSEACTIVATE => LRESULT(MA_NOACTIVATE as isize),
+            WM_SETCURSOR => {
+                let hand = with(|s| s.hover.is_some() && s.full).unwrap_or(false);
+                if let Ok(c) = LoadCursorW(None, if hand { IDC_HAND } else { IDC_ARROW }) {
+                    SetCursor(Some(c));
+                }
+                LRESULT(1)
+            }
+            WM_MOUSEMOVE => {
+                with(|s| {
+                    let on = part_at(s, lp).map(Hot::Part);
+                    if s.full && on != s.hover.map(|h| h.0) {
+                        s.hover = on.map(|p| (p, Instant::now()));
+                        s.pressed = s.pressed.filter(|p| Some(*p) == on);
+                        draw(hwnd, s);
+                    }
+                });
+                track(hwnd, false);
+                LRESULT(0)
+            }
+            WM_MOUSELEAVE => {
+                with(|s| {
+                    if s.full && (s.hover.is_some() || s.pressed.is_some()) {
+                        s.hover = None;
+                        s.pressed = None;
+                        draw(hwnd, s);
+                    }
+                });
+                LRESULT(0)
+            }
+            WM_LBUTTONDOWN | WM_LBUTTONDBLCLK => {
+                with(|s| {
+                    s.pressed = part_at(s, lp).map(Hot::Part);
+                    draw(hwnd, s);
+                });
+                LRESULT(0)
+            }
+            WM_LBUTTONUP => {
+                let hit = with(|s| {
+                    let was = s.pressed.take();
+                    let hit = was.filter(|p| part_at(s, lp).map(Hot::Part) == Some(*p));
+                    draw(hwnd, s);
+                    hit
+                })
+                .flatten();
+                if let Some(Hot::Part(p)) = hit {
+                    act(p);
+                }
+                LRESULT(0)
+            }
+            WM_NCDESTROY => {
+                TOOLBAR.store(0, Ordering::Relaxed);
+                STATE.set(None);
+                LRESULT(0)
+            }
+            _ => DefWindowProcW(hwnd, msg, wp, lp),
+        }
+    }
+}

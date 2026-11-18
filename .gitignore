@@ -1,0 +1,7 @@
+target/
+/measurements-raw
+/docs/
+/scripts/
+*.csv
+*.key
+*.lnk
