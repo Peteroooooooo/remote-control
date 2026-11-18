@@ -31,24 +31,6 @@
 
 ---
 
-## 独特设计与安全隐私保障
-
-### 1. 中转绝不泄密，也不怕别人蹭
-
-- **端到端加密，中转是“瞎的”**：所有画面、键鼠、剪贴板和命令行都在两台设备之间端到端加密；无论是公共牵线节点还是自建中转，都**只能看到密文字节，无法窥探任何内容**。
-- **公共节点只“牵线”，不传画面**：默认情况下公共节点只用来帮两台设备交换网络地址并尝试打洞直连，绝不承担视频流；能直连时流量完全在两台电脑之间点对点走。
-- **白名单硬隔离**：自建 `rc-relay` 内置认领机制，只有「主人」和主人当前允许连接的设备才能转发流量，且**至少一端必须是主人**；名单之外的陌生设备一个包都不会转发。
-- **无域名也防劫持**：没有域名和 Let's Encrypt 证书时，中转首次启动会自动生成证书并把指纹写进中转码里；客户端只凭指纹认准这台服务器，避免中间人掉包。
-
-### 2. 为顺手而做的细节设计
-
-- **「我的电脑」免确认 + 自动共享中转**：把自己的另一台电脑设为「免确认」后，不仅直接控屏免弹窗，你在本机配置好的自建中转也会自动同步共享给它。
-- **剪贴板自动识码**：点一下复制连接码发给对方，对方切回大厅窗口会自动弹出「接入」提示，不用再输一遍 ID 和密码。
-- **动态选路**：连上后自动比较直连与自建中转的质量——能直连就优先直连，直连突然卡顿丢包时自动切回更稳的中转。
-- **物理级防误触断开条**：被控时屏幕顶部会留一条小提示条，**只响应被控端本地鼠标**（控制端碰不到），随时一键断开收回控制权。
-
----
-
 ## 3 分钟上手
 
 ### 1. 控制桌面
@@ -75,10 +57,15 @@ remote-control cp .\report.pdf laptop:Desktop          # 传文件或文件夹�
 
 ### 4. 一键部署私人自建中转（可选）
 
-仅在两台电脑打不通直连时需要。提供 `linux/amd64` 与 `linux/arm64` 多架构预构建镜像 `ghcr.io/peteroooooooo/rc-relay:latest`：
+仅在双端网络复杂、打不通点对点直连时需要。提供预构建多架构镜像 `ghcr.io/peteroooooooo/rc-relay:latest`（支持 amd64 / arm64）：
 
-1. 在 Portainer / 1Panel / Dockge 等面板新建 Stack，直接粘贴 [apps/rc-relay/deploy/docker-compose.yml](apps/rc-relay/deploy/docker-compose.yml) 启动（开放 `7843/tcp` 和 `7842/udp`）。
-2. 在容器日志（`docker logs rc-relay`）里复制打印出的中转码，贴到大厅 **「设置 → 自建中转」** 即可认领。
+1. 在 Portainer / 1Panel / Dockge 等面板新建 Stack，粘贴 [apps/rc-relay/deploy/docker-compose.yml](apps/rc-relay/deploy/docker-compose.yml) 启动（开放 `7843/tcp` 和 `7842/udp`）。
+2. 在容器日志（`docker logs rc-relay`）复制中转码，贴到大厅 **「设置 → 自建中转」** 认领。
+
+> **中转安全与隐私**：
+> - **纯密文转发，中转是“瞎的”**：所有画面、键鼠与命令数据全程双端加密，中转节点只能转发密文字节，无法窥探内容。
+> - **白名单硬隔离，防被蹭流量**：内置主人认领与动态设备名单，只有主人授权的连接才转发，陌生设备连入也无法蹭流量。
+> - **自签证书防劫持**：无域名和 Let's Encrypt 证书时，中转自动生成证书并将指纹随中转码分发，只认指纹防中间人掉包。
 
 非 host 网络环境、域名证书配置或原生二进制运行见 [apps/rc-relay/README.md](apps/rc-relay/README.md)。
 
@@ -86,12 +73,12 @@ remote-control cp .\report.pdf laptop:Desktop          # 传文件或文件夹�
 
 ## 获取与编译
 
-- **直接下载**：打 `v*` 标签后会在仓库右侧 **Releases** 自动生成 `remote-control.exe`。
+- **直接下载**：前往仓库右侧 [**Releases 页面**](https://github.com/Peteroooooooo/remote-control/releases) 下载最新预编译的 `remote-control.exe`，免安装单文件，双击即可运行。
 - **本地编译**（Windows 10/11 + Rust）：
   ```powershell
   cargo build --release -p remote-control
   ```
-  产物为单文件 `target/release/remote-control.exe`，拷走即可运行。
+  产物为单文件 `target/release/remote-control.exe`。
 
 ---
 
