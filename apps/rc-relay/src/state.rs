@@ -50,13 +50,14 @@ pub struct Owner {
     pub name: String,
 }
 
-/// A device blocked on this relay (`blocked.txt`).
+/// A guest kicked on the relay (`kicked.txt`), waiting for `owner`'s client
+/// to receive the drop notice and stop listing it.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Blocked {
-    pub id: EndpointId,
+pub struct Kicked {
+    pub owner: EndpointId,
+    pub guest: EndpointId,
     /// Unix seconds.
-    pub added: u64,
-    pub name: String,
+    pub at: u64,
 }
 
 /// A temporary guest brought in via a connection code (`POST /rc/meet`),
@@ -177,6 +178,50 @@ impl Store {
         Ok(gone)
     }
 
+    /// Restores a previously deleted code (keeping its `n` if still free, or
+    /// picking the smallest free one) along with its owners and their guests.
+    pub fn restore_code(&self, code: &Code, owners: &[Owner], guests: &BTreeMap<EndpointId, Vec<Guest>>) -> Result<Code> {
+        let mut codes = self.codes()?;
+        let n = if codes.iter().any(|c| c.n == code.n) {
+            (1..).find(|n| !codes.iter().any(|c| c.n == *n)).expect("a free number")
+        } else {
+            code.n
+        };
+        let restored = Code { n, key: code.key, name: clean(&code.name) };
+        codes.push(restored.clone());
+        codes.sort_by_key(|c| c.n);
+        self.save_codes(&codes)?;
+        for o in owners {
+            let mut o = o.clone();
+            o.code = n;
+            let gs = guests.get(&o.id).map(Vec::as_slice).unwrap_or(&[]);
+            self.restore_owner(&o, gs)?;
+        }
+        Ok(restored)
+    }
+
+    /// Restores a previously removed owner (if its code exists) and its guests.
+    pub fn restore_owner(&self, owner: &Owner, guests: &[Guest]) -> Result<()> {
+        let mut owners = self.owners()?;
+        if let Some(cur) = owners.iter_mut().find(|o| o.id == owner.id) {
+            cur.code = owner.code;
+            if !owner.name.is_empty() {
+                cur.name = clean(&owner.name);
+            }
+        } else {
+            owners.push(Owner {
+                id: owner.id,
+                code: owner.code,
+                added: owner.added,
+                name: clean(&owner.name),
+            });
+        }
+        self.save_owners(&owners)?;
+        if !guests.is_empty() {
+            self.set_guests(&owner.id, guests)?;
+        }
+        Ok(())
+    }
     /// The code whose key is `key`.
     pub fn code_with(&self, key: &[u8; 16]) -> Result<Option<Code>> {
         Ok(self.codes()?.into_iter().find(|c| constant_eq(&c.key, key)))
@@ -250,6 +295,12 @@ impl Store {
         self.save_owners(&owners)?;
         self.set_guests(id, &[])?;
         self.set_invites(id, &[])?;
+        let mut kicked = self.kicked()?;
+        let kb = kicked.len();
+        kicked.retain(|k| k.owner != *id);
+        if kicked.len() != kb {
+            self.save_kicked(&kicked)?;
+        }
         Ok(true)
     }
 
@@ -334,57 +385,104 @@ impl Store {
         self.write(&self.guests_path(), &text)
     }
 
-    pub fn blocked_path(&self) -> PathBuf {
-        self.dir.join("blocked.txt")
+    pub fn kicked_path(&self) -> PathBuf {
+        self.dir.join("kicked.txt")
     }
 
-    /// Blocked devices (`blocked.txt`). A missing file is none blocked.
-    pub fn blocked(&self) -> Result<Vec<Blocked>> {
-        let path = self.blocked_path();
+    /// Pending guest kicks (`kicked.txt`). A missing file is none kicked.
+    pub fn kicked(&self) -> Result<Vec<Kicked>> {
+        let path = self.kicked_path();
         let mut v = Vec::new();
         for (i, line) in lines(&path)?.iter().enumerate() {
             let f: Vec<&str> = line.split('\t').collect();
             let bad = || anyhow!("{}:{}: bad line", path.display(), i + 1);
-            let id = f[0].trim().parse().map_err(|_| bad())?;
-            let added = f.get(1).and_then(|s| s.trim().parse().ok()).unwrap_or(0);
-            let name = f.get(2).map(|s| clean(s)).unwrap_or_default();
-            v.push(Blocked { id, added, name });
+            let owner = f[0].trim().parse().map_err(|_| bad())?;
+            let guest = f.get(1).ok_or_else(bad)?.trim().parse().map_err(|_| bad())?;
+            let at = f.get(2).and_then(|s| s.trim().parse().ok()).unwrap_or(0);
+            v.push(Kicked { owner, guest, at });
         }
         Ok(v)
     }
 
-    fn save_blocked(&self, list: &[Blocked]) -> Result<()> {
-        let mut text = String::from("# rc-relay blocked: device id, added (Unix seconds), name\n");
-        for b in list {
-            text += &format!("{}\t{}\t{}\n", b.id, b.added, clean(&b.name));
+    fn save_kicked(&self, list: &[Kicked]) -> Result<()> {
+        let mut text = String::from("# rc-relay kicked: owner id, guest id, at (Unix seconds)\n");
+        for k in list {
+            text += &format!("{}\t{}\t{}\n", k.owner, k.guest, k.at);
         }
-        self.write(&self.blocked_path(), &text)
+        self.write(&self.kicked_path(), &text)
     }
 
-    pub fn block(&self, id: EndpointId, name: &str) -> Result<bool> {
-        let mut list = self.blocked()?;
-        let name = clean(name);
-        if let Some(b) = list.iter_mut().find(|b| b.id == id) {
-            if b.name.is_empty() && !name.is_empty() {
-                b.name = name;
-                self.save_blocked(&list)?;
+    /// Kicks `guest` from `owner`: adds to `kicked.txt` (so forwarding stops and
+    /// `owner`'s client will be told to drop it) and removes it from `guests.txt`.
+    pub fn kick(&self, owner: EndpointId, guest: EndpointId) -> Result<bool> {
+        let mut list = self.kicked()?;
+        let added = if list.iter().any(|k| k.owner == owner && k.guest == guest) {
+            false
+        } else {
+            list.push(Kicked { owner, guest, at: unix_now() });
+            self.save_kicked(&list)?;
+            true
+        };
+        if let Some(mut gs) = self.guests()?.remove(&owner) {
+            let before = gs.len();
+            gs.retain(|g| g.id != guest);
+            if gs.len() != before {
+                self.set_guests(&owner, &gs)?;
             }
-            return Ok(false);
         }
-        list.push(Blocked { id, added: unix_now(), name });
-        self.save_blocked(&list)?;
-        Ok(true)
+        Ok(added)
     }
 
-    pub fn unblock(&self, id: &EndpointId) -> Result<bool> {
-        let mut list = self.blocked()?;
+    /// Undoes a kick of `guest` under `owner` (if still pending).
+    pub fn unkick(&self, owner: &EndpointId, guest: &EndpointId) -> Result<bool> {
+        let mut list = self.kicked()?;
         let before = list.len();
-        list.retain(|b| b.id != *id);
+        list.retain(|k| !(k.owner == *owner && k.guest == *guest));
         if list.len() == before {
             return Ok(false);
         }
-        self.save_blocked(&list)?;
+        self.save_kicked(&list)?;
         Ok(true)
+    }
+
+    /// Restores a kicked guest under `owner`.
+    pub fn restore_guest(&self, owner: &EndpointId, guest: &Guest, add_to_list: bool) -> Result<()> {
+        self.unkick(owner, &guest.id)?;
+        if add_to_list {
+            let mut gs = self.guests()?.remove(owner).unwrap_or_default();
+            if !gs.iter().any(|g| g.id == guest.id) {
+                gs.push(Guest { id: guest.id, name: clean(&guest.name) });
+                self.set_guests(owner, &gs)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Reconciles `owner`'s newly uploaded `sent` guest list against `kicked.txt`:
+    /// - Returns `(kept, dropped)` where `dropped` are IDs in `sent` that were
+    ///   kicked and must be reported back to `owner`'s client (`"drop"`).
+    /// - Any `kicked` entry for `owner` no longer present in `sent` is removed
+    ///   automatically (the owner's client has already dropped it).
+    pub fn reconcile_kicked(&self, owner: &EndpointId, sent: &[Guest]) -> Result<(Vec<Guest>, Vec<EndpointId>)> {
+        let mut list = self.kicked()?;
+        let sent_ids: std::collections::HashSet<EndpointId> = sent.iter().map(|g| g.id).collect();
+        let before = list.len();
+        list.retain(|k| k.owner != *owner || sent_ids.contains(&k.guest));
+        if list.len() != before {
+            self.save_kicked(&list)?;
+        }
+        let kicked_for_owner: std::collections::HashSet<EndpointId> =
+            list.iter().filter(|k| k.owner == *owner).map(|k| k.guest).collect();
+        let mut kept = Vec::with_capacity(sent.len());
+        let mut dropped = Vec::new();
+        for g in sent {
+            if kicked_for_owner.contains(&g.id) {
+                dropped.push(g.id);
+            } else {
+                kept.push(g.clone());
+            }
+        }
+        Ok((kept, dropped))
     }
 
     fn invites_path(&self) -> PathBuf {
@@ -629,16 +727,44 @@ mod tests {
     }
 
     #[test]
-    fn blocked_round_trip() {
-        let s = temp("blocked");
-        assert!(s.blocked().unwrap().is_empty());
-        assert!(s.block(id(5), "stranger").unwrap());
-        assert!(!s.block(id(5), "again").unwrap());
-        let b = s.blocked().unwrap();
-        assert_eq!((b.len(), b[0].id, b[0].name.as_str()), (1, id(5), "stranger"));
-        assert!(s.unblock(&id(5)).unwrap());
-        assert!(!s.unblock(&id(5)).unwrap());
-        assert!(s.blocked().unwrap().is_empty());
+    fn kicked_reconciles_and_restores() {
+        let s = temp("kicked");
+        assert!(s.kicked().unwrap().is_empty());
+        let c = s.new_code("group").unwrap();
+        s.join(id(1), c.n, "DESKTOP").unwrap();
+        let g = |n: u8, name: &str| Guest { id: id(n), name: name.into() };
+        s.set_guests(&id(1), &[g(5, "friend"), g(6, "laptop")]).unwrap();
+
+        assert!(s.kick(id(1), id(5)).unwrap());
+        assert!(!s.kick(id(1), id(5)).unwrap());
+        assert_eq!(s.guests().unwrap()[&id(1)], [g(6, "laptop")]);
+
+        // Owner still sends id(5): rejected and told to drop it.
+        let (kept, dropped) = s.reconcile_kicked(&id(1), &[g(5, "friend"), g(6, "laptop")]).unwrap();
+        assert_eq!(kept, [g(6, "laptop")]);
+        assert_eq!(dropped, [id(5)]);
+        assert_eq!(s.kicked().unwrap().len(), 1);
+
+        // Owner drops id(5) and sends the shorter list: pending kick is auto-cleaned.
+        let (kept, dropped) = s.reconcile_kicked(&id(1), &[g(6, "laptop")]).unwrap();
+        assert_eq!(kept, [g(6, "laptop")]);
+        assert!(dropped.is_empty());
+        assert!(s.kicked().unwrap().is_empty());
+
+        // Undo kick / restore code round-trip.
+        assert!(s.kick(id(1), id(6)).unwrap());
+        s.restore_guest(&id(1), &g(6, "laptop"), true).unwrap();
+        assert!(s.kicked().unwrap().is_empty());
+        assert_eq!(s.guests().unwrap()[&id(1)], [g(6, "laptop")]);
+
+        let owners = s.owners().unwrap();
+        let guests = s.guests().unwrap();
+        s.delete_code(c.n).unwrap();
+        assert!(s.codes().unwrap().is_empty());
+        s.restore_code(&c, &owners, &guests).unwrap();
+        assert_eq!(s.codes().unwrap(), [c]);
+        assert_eq!(s.owners().unwrap()[0].id, id(1));
+        assert_eq!(s.guests().unwrap()[&id(1)], [g(6, "laptop")]);
     }
 
     #[test]

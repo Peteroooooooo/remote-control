@@ -3,7 +3,7 @@
 在 iroh-relay 上加了转发规则的中转程序：
 
 - **成员与访客规则**：贴过中转码的设备都是成员（`owners.txt`），成员之间以及成员与各自带来的访客都可以互相转发；通过连接码连进来的访客（`guests.txt` / 临时见面）**只能连带它进来的那台成员**，不能跨成员、也不能连其他访客。
-- **黑名单（`blocked.txt`）**：在管理界面选中访客按 `d` 即可立即拦截，即使成员电脑仍在同步名单也不会转发，直到在左侧「已禁止」里解除。
+- **踢人与同步清理（`kicked.txt`）**：在管理界面选中成员或访客按 `d` 即可立即停止转发并从界面移除（按 `u` 可撤回上一步）；若是访客，中转会记录待同步踢除，等成员电脑下次同步名单（15 秒内）时回传 `drop\t<id>` 让电脑端同步从设备列表里删除，随后自动清理记录，不留黑名单负担。
 - **中转码分组**：中转在 `codes.txt` 里维护一组或多组中转码（默认按最小空闲编号命名为 `码 1`、`码 2`…，可改名）。**同一个码可以给多台电脑重复贴**；谁贴了某个码，谁就成为成员并记在 `owners.txt` 对应的组下，直到在管理界面里把这台电脑移除或删掉整个码。
 - 名单 = 成员 + 每台成员报上来的访客（`guests.txt`，带电脑名称）。成员的电脑自动维护自己那一份：它的设备列表，加上这次运行里用连接码见过的临时设备；每次有变化就把整份发给中转（`POST /rc/guests`），新的一份替换旧的。
 - 一台设备连上中转时，按它自己的设备码算；带了设备证明（`Authorization: Bearer rcd1…`，会话窗口的临时设备码）就按证明里的设备算。证明只在连上的那一刻核对有效期。
@@ -55,7 +55,7 @@ Linux 版在 WSL 里编，别在小内存 VPS 上编。编完用
 | 命令 | 在哪跑 | 做什么 |
 |---|---|---|
 | `rc-relay serve [--public …]` | 服务器 | 运行中转，启动时打印第一个中转码 |
-| `rc-relay`（或 `rc-relay ui`） | 服务器 | 打开全屏管理界面：按中转码分组查看在线成员与各自访客电脑名，支持 `n` 新建码、`r` 改名、`d` 删除成员或禁止/解禁访客；改动 2 秒内生效 |
+| `rc-relay`（或 `rc-relay ui`） | 服务器 | 打开全屏管理界面：按中转码分组查看在线成员与各自访客电脑名，支持 `n` 新建码、`c` 复制/单行展示中转码、`r` 改名、`d` 删除成员或踢出访客、`u` 撤回上一步；改动 2 秒内生效 |
 | `rc-relay ui --demo` | 任意机器 | 用临时目录里的模拟数据试用管理界面（退出自动清理） |
 | `rc-relay codes` | 服务器 | 以纯文本打印所有中转码和各自名下的电脑 |
 | `rc-relay claim <中转码> [--name 电脑名] [--key 设备密钥文件]` | 主人的电脑 | 加入中转（软件里"贴中转码"做的就是这个） |
@@ -66,7 +66,7 @@ Linux 版在 WSL 里编，别在小内存 VPS 上编。编完用
 
 ## systemd 部署参考
 
-- 程序 `/opt/rc-relay/rc-relay`，配置 `/etc/rc-relay/config.toml`（参考 `deploy/config.example.toml`），状态 `/var/lib/rc-relay/`（`codes.txt`、`owners.txt`、`guests.txt`、`blocked.txt`、`invites.txt`、`status.txt`），服务 `rc-relay.service`（`deploy/rc-relay.service`）。
+- 程序 `/opt/rc-relay/rc-relay`，配置 `/etc/rc-relay/config.toml`（参考 `deploy/config.example.toml`），状态 `/var/lib/rc-relay/`（`codes.txt`、`owners.txt`、`guests.txt`、`kicked.txt`、`invites.txt`、`status.txt`），服务 `rc-relay.service`（`deploy/rc-relay.service`）。
 - 端口：HTTPS 7843/TCP、QUIC 地址发现 7842/UDP。
 
 ## 在线检查

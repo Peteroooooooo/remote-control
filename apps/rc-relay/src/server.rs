@@ -44,8 +44,8 @@ impl Shared {
     fn reload(&self) -> Result<()> {
         let owners = self.store.owners()?;
         let guests = guest_ids(self.store.guests()?);
-        let blocked = self.store.blocked()?;
-        self.policy.set_roster(owners.iter().map(|o| o.id), guests, blocked.into_iter().map(|b| b.id));
+        let kicked = self.store.kicked()?.into_iter().map(|k| (k.owner, k.guest));
+        self.policy.set_roster(owners.iter().map(|o| o.id), guests, kicked);
         Ok(())
     }
 
@@ -91,13 +91,22 @@ impl Shared {
         let req = GuestsRequest::decode(header).map_err(|_| Refusal::BadRequest)?;
         self.signed_by_owner("guests", &req.device, req.time, req.nonce)?;
         let _g = self.writing.lock().unwrap();
-        self.store.set_guests(&req.device, &req.guests).map_err(|e| {
+        let (kept, dropped) = self.store.reconcile_kicked(&req.device, &req.guests).map_err(|e| {
             warn!("guests: {e:#}");
             Refusal::Server
         })?;
-        info!("{} lists {} guest(s)", req.device.fmt_short(), req.guests.len());
-        self.policy.set_guests(req.device, req.guests.into_iter().map(|g| g.id).collect());
-        Ok("ok".into())
+        self.store.set_guests(&req.device, &kept).map_err(|e| {
+            warn!("guests: {e:#}");
+            Refusal::Server
+        })?;
+        info!("{} lists {} guest(s)", req.device.fmt_short(), kept.len());
+        self.policy.set_guests(req.device, kept.into_iter().map(|g| g.id).collect());
+        if dropped.is_empty() {
+            Ok("ok".into())
+        } else {
+            let ids: Vec<String> = dropped.into_iter().map(|id| id.to_string()).collect();
+            Ok(format!("drop\t{}", ids.join("\t")))
+        }
     }
 
     fn set_invites(&self, header: &str) -> Result<String, Refusal> {
@@ -117,8 +126,8 @@ impl Shared {
     fn meet(&self, header: &str) -> Result<String, Refusal> {
         let req = MeetRequest::decode(header).map_err(|_| Refusal::BadRequest)?;
         let (o, d) = (req.owner.fmt_short(), req.device.fmt_short());
-        if self.policy.is_blocked(&req.device) {
-            info!("{d} brought a connection code of {o}: blocked");
+        if self.policy.is_kicked(&req.owner, &req.device) {
+            info!("{d} brought a connection code of {o}: kicked");
             return Err(Refusal::UnknownInvite);
         }
         if self.policy.admitted(&req.owner, &req.device) {
@@ -177,8 +186,8 @@ impl Relay {
         store.upgrade()?;
         let owners: Vec<EndpointId> = store.owners()?.iter().map(|o| o.id).collect();
         let guests = guest_ids(store.guests()?);
-        let blocked: Vec<EndpointId> = store.blocked()?.into_iter().map(|b| b.id).collect();
-        let policy = Arc::new(Policy::new(owners, guests, blocked));
+        let kicked = store.kicked()?.into_iter().map(|k| (k.owner, k.guest));
+        let policy = Arc::new(Policy::new(owners, guests, kicked));
         let shared = Arc::new(Shared {
             store,
             policy: policy.clone(),
@@ -239,15 +248,15 @@ fn guest_ids(m: BTreeMap<EndpointId, Vec<crate::api::Guest>>) -> BTreeMap<Endpoi
     m.into_iter().map(|(o, gs)| (o, gs.into_iter().map(|g| g.id).collect())).collect()
 }
 
-/// Picks up changes other processes make to `owners.txt` and `blocked.txt`,
+/// Picks up changes other processes make to `owners.txt` and `kicked.txt`,
 /// and writes `status.txt` (connected devices and temporary guests) when they change.
 async fn watch_owners(sh: Arc<Shared>, started: u64) {
     let op = sh.store.owners_path();
-    let bp = sh.store.blocked_path();
+    let kp = sh.store.kicked_path();
     let stamps = || {
         (
             std::fs::metadata(&op).and_then(|m| m.modified()).ok(),
-            std::fs::metadata(&bp).and_then(|m| m.modified()).ok(),
+            std::fs::metadata(&kp).and_then(|m| m.modified()).ok(),
         )
     };
     let mut last: (Option<SystemTime>, Option<SystemTime>) = stamps();

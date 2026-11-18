@@ -123,9 +123,9 @@ impl Setup {
         tokio::time::timeout(Duration::from_secs(5), attempt).await.ok().flatten().is_some()
     }
 
-    async fn set_guests(&self, owner: &SecretKey, guests: &[(&SecretKey, &str)]) {
+    async fn set_guests(&self, owner: &SecretKey, guests: &[(&SecretKey, &str)]) -> Vec<iroh::EndpointId> {
         let ids: Vec<_> = guests.iter().map(|(g, n)| Guest { id: g.public(), name: (*n).to_string() }).collect();
-        client::set_guests(std::slice::from_ref(&self.url), owner, &self.ca(), &ids).await.unwrap();
+        client::set_guests(std::slice::from_ref(&self.url), owner, &self.ca(), &ids).await.unwrap()
     }
 }
 
@@ -199,13 +199,24 @@ async fn claim_then_only_the_roster_gets_help() {
     assert!(!s.reaches(&g, &x).await, "guest → stranger");
     assert!(!s.reaches(&x, &g).await, "stranger → guest");
 
-    // Blocking a guest stops it even while still listed; unblocking restores it.
-    s.store().block(gk.public(), "guest-1").unwrap();
+    // Kicking a guest stops it at once and tells the owner to drop it;
+    // once the owner sends the cleaned list, the pending kick auto-clears.
+    assert!(s.store().kick(owner.public(), gk.public()).unwrap());
     tokio::time::sleep(Duration::from_secs(3)).await;
-    assert!(!s.reaches(&g, &o).await, "blocked guest");
-    assert!(s.store().unblock(&gk.public()).unwrap());
-    tokio::time::sleep(Duration::from_secs(3)).await;
-    assert!(s.reaches(&g, &o).await, "unblocked guest");
+    assert!(!s.reaches(&g, &o).await, "kicked guest");
+    assert_eq!(
+        s.set_guests(&owner, &[(&gk, "guest-1"), (&gk2, "guest-2")]).await,
+        vec![gk.public()],
+        "relay tells owner to drop kicked guest"
+    );
+    assert!(!s.reaches(&g, &o).await, "still kicked after stale list");
+    assert_eq!(s.store().kicked().unwrap().len(), 1);
+    assert!(s.set_guests(&owner, &[(&gk2, "guest-2")]).await.is_empty());
+    assert!(s.store().kicked().unwrap().is_empty(), "auto-cleaned once owner stopped sending it");
+
+    // Re-adding the guest works again without any manual unblock step.
+    s.set_guests(&owner, &[(&gk, "guest-1"), (&gk2, "guest-2")]).await;
+    assert!(s.reaches(&g, &o).await, "guest re-added");
 
     // The new list replaces the old one, at once.
     s.set_guests(&owner, &[(&gk2, "guest-2")]).await;

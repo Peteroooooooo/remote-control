@@ -5,7 +5,8 @@
 //!   of an owner's connection codes via `POST /rc/meet` within [`crate::api::MEET_KEEP`])
 //!   may reach only the owner(s) that listed or admitted it — never another
 //!   owner and never another guest.
-//! - Anything in `blocked.txt` is never forwarded, even if an owner lists it.
+//! - Any `(owner, guest)` in `kicked.txt` is never forwarded, even while the
+//!   owner's client has not yet synced the drop notice.
 //!
 //! An endpoint counts as the device it is, or as the device its device
 //! proof speaks for (`Authorization: Bearer rcd1…`: a session window's own
@@ -27,8 +28,9 @@ struct Roster {
     owners: HashSet<EndpointId>,
     /// Each owner's guests, as the owner sent them.
     guests: BTreeMap<EndpointId, HashSet<EndpointId>>,
-    /// Devices blocked on this relay (`blocked.txt`).
-    blocked: HashSet<EndpointId>,
+    /// Guests kicked on the relay (`kicked.txt`), waiting for the owner's
+    /// client to sync the drop notice.
+    kicked: HashSet<(EndpointId, EndpointId)>,
 }
 
 #[derive(Debug, Default)]
@@ -71,12 +73,12 @@ impl Policy {
     pub fn new(
         owners: impl IntoIterator<Item = EndpointId>,
         guests: BTreeMap<EndpointId, Vec<EndpointId>>,
-        blocked: impl IntoIterator<Item = EndpointId>,
+        kicked: impl IntoIterator<Item = (EndpointId, EndpointId)>,
     ) -> Policy {
         let r = Roster {
             owners: owners.into_iter().collect(),
             guests: guests.into_iter().map(|(o, gs)| (o, gs.into_iter().collect())).collect(),
-            blocked: blocked.into_iter().collect(),
+            kicked: kicked.into_iter().collect(),
         };
         Policy { roster: RwLock::new(r), peers: Mutex::default(), met: Mutex::default() }
     }
@@ -85,12 +87,14 @@ impl Policy {
         &self,
         owners: impl IntoIterator<Item = EndpointId>,
         guests: BTreeMap<EndpointId, Vec<EndpointId>>,
-        blocked: impl IntoIterator<Item = EndpointId>,
+        kicked: impl IntoIterator<Item = (EndpointId, EndpointId)>,
     ) {
+        let kicked_set: HashSet<(EndpointId, EndpointId)> = kicked.into_iter().collect();
+        self.met.lock().unwrap().retain(|k, _| !kicked_set.contains(k));
         let mut r = self.roster.write().unwrap();
         r.owners = owners.into_iter().collect();
         r.guests = guests.into_iter().map(|(o, gs)| (o, gs.into_iter().collect())).collect();
-        r.blocked = blocked.into_iter().collect();
+        r.kicked = kicked_set;
     }
 
     /// A device the owner lists no longer needs the grant from its invite
@@ -129,15 +133,15 @@ impl Policy {
         m.retain(|_, (t, _)| *t > now);
         let mut v: Vec<_> = m
             .iter()
-            .filter(|((o, d), _)| r.owners.contains(o) && !r.blocked.contains(d))
+            .filter(|((o, d), _)| r.owners.contains(o) && !r.kicked.contains(&(*o, *d)))
             .map(|((o, d), (_, n))| (*o, *d, n.clone()))
             .collect();
         v.sort_by_key(|(o, d, _)| (*o, *d));
         v
     }
 
-    pub fn is_blocked(&self, id: &EndpointId) -> bool {
-        self.roster.read().unwrap().blocked.contains(id)
+    pub fn is_kicked(&self, owner: &EndpointId, guest: &EndpointId) -> bool {
+        self.roster.read().unwrap().kicked.contains(&(*owner, *guest))
     }
 
     pub fn owners(&self) -> HashSet<EndpointId> {
@@ -167,11 +171,13 @@ impl AccessControl for Policy {
         let what = {
             let r = self.roster.read().unwrap();
             let dev = speaks.unwrap_or(id);
-            let kind = if r.blocked.contains(&id) || r.blocked.contains(&dev) {
-                "blocked"
-            } else if r.owners.contains(&id) || r.owners.contains(&dev) {
+            let kind = if r.owners.contains(&id) || r.owners.contains(&dev) {
                 "an owner"
-            } else if r.guests.iter().any(|(o, gs)| r.owners.contains(o) && (gs.contains(&id) || gs.contains(&dev))) {
+            } else if r.guests.iter().any(|(o, gs)| {
+                r.owners.contains(o)
+                    && ((gs.contains(&id) && !r.kicked.contains(&(*o, id)))
+                        || (gs.contains(&dev) && !r.kicked.contains(&(*o, dev))))
+            }) {
                 "a guest"
             } else {
                 "not listed"
@@ -200,9 +206,6 @@ impl AccessControl for Policy {
     fn allow_forward(&self, src: EndpointId, dst: EndpointId, _len: usize) -> bool {
         let r = self.roster.read().unwrap();
         let peers = self.peers.lock().unwrap();
-        if counts_in(&peers, &src, &r.blocked) || counts_in(&peers, &dst, &r.blocked) {
-            return false;
-        }
         if counts_in(&peers, &src, &r.owners) && counts_in(&peers, &dst, &r.owners) {
             return true;
         }
@@ -211,6 +214,7 @@ impl AccessControl for Policy {
         let (a, b) = (devices(&peers, &src), devices(&peers, &dst));
         let pair = |o: &EndpointId, g: &EndpointId| {
             r.owners.contains(o)
+                && !r.kicked.contains(&(*o, *g))
                 && (r.guests.get(o).is_some_and(|gs| gs.contains(g))
                     || met.get(&(*o, *g)).is_some_and(|(t, _)| *t > now))
         };
@@ -247,7 +251,7 @@ mod tests {
     }
 
     #[test]
-    fn guests_reach_only_their_own_owner_and_blocked_stops_at_once() {
+    fn guests_reach_only_their_own_owner_and_kicked_stops_at_once() {
         let p = Policy::new([id(1), id(2)], BTreeMap::new(), []);
         assert!(p.allow_forward(id(1), id(2), 0), "owner ↔ owner");
         p.set_guests(id(1), vec![id(3)]);
@@ -259,10 +263,12 @@ mod tests {
         // A guest's own list counts for nothing.
         p.set_guests(id(3), vec![id(4)]);
         assert!(!p.allow_forward(id(4), id(3), 0));
-        // Blocking a guest stops it even while listed.
-        p.set_roster([id(1), id(2)], BTreeMap::from([(id(1), vec![id(3)])]), [id(3)]);
-        assert!(!p.allow_forward(id(3), id(1), 0), "blocked");
-        // Unblocked: works again.
+        // Kicking (id(1), id(3)) stops id(3) ↔ id(1) immediately, even while listed,
+        // without touching id(2) unless id(2) also kicked it.
+        p.set_roster([id(1), id(2)], BTreeMap::from([(id(1), vec![id(3)]), (id(2), vec![id(3)])]), [(id(1), id(3))]);
+        assert!(!p.allow_forward(id(3), id(1), 0), "kicked under id(1)");
+        assert!(p.allow_forward(id(3), id(2), 0), "still allowed under id(2)");
+        // Unkicked: works again.
         p.set_roster([id(1), id(2)], BTreeMap::from([(id(1), vec![id(3)])]), []);
         assert!(p.allow_forward(id(3), id(1), 0));
         // An owner removed (its code deleted on the relay): its guests are out.

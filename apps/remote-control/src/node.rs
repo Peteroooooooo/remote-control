@@ -452,13 +452,50 @@ impl Shared {
         Ok(())
     }
 
-    /// Replaces this computer's guest list on `relay` (its addresses). The
-    /// error is the relay's own (a `Refusal`, see `relay_error`).
-    async fn send_guests(&self, relay: &[RelayUrl], guests: &[Guest]) -> Result<()> {
+    /// Removes `id` from the device list or active temporary peers and tells
+    /// it to forget this computer too.
+    fn drop_guest(self: &Arc<Self>, id: EndpointId, why: &str) -> bool {
+        let mut st = self.st.lock().unwrap();
+        let deleted = if st.store.forget(&id) {
+            log!("{why}: deleted {} from the device list", id.fmt_short());
+            true
+        } else if let Some(name) = st.peers.get(&id).filter(|p| p.met == Some(Met::Code)).map(|p| p.name.clone()) {
+            // Kept as deleted until it knows, like a device of the list.
+            st.store.add(id).name = name;
+            st.store.forget(&id);
+            log!("{why}: deleted {} (met with a code)", id.fmt_short());
+            true
+        } else {
+            false
+        };
+        if deleted {
+            self.save(&mut st);
+            if let Some(p) = st.peers.get_mut(&id) {
+                p.met = None;
+                p.token = None;
+                p.invite = None;
+                // A connection it opened: closed now, so it calls again, is
+                // refused and drops its card. Over this computer's own
+                // connection the woken task tells it instead.
+                if let Some(c) = p.conn.take_if(|c| c.side().is_server()) {
+                    c.close(0u32.into(), b"forgotten");
+                    p.status = Status::Offline;
+                    p.since = None;
+                }
+            }
+            self.ensure(&mut st, id);
+        }
+        deleted
+    }
+
+    /// Replaces this computer's guest list on `relay` (its addresses),
+    /// returning any guest IDs the relay kicked and asked this computer to drop.
+    /// The error is the relay's own (a `Refusal`, see `relay_error`).
+    async fn send_guests(&self, relay: &[RelayUrl], guests: &[Guest]) -> Result<Vec<EndpointId>> {
         let _one = self.sending_guests.lock().await;
-        rc_relay::client::set_guests(relay, &self.secret, &rc_relay::tls::ca(), guests).await?;
+        let dropped = rc_relay::client::set_guests(relay, &self.secret, &rc_relay::tls::ca(), guests).await?;
         log!("guest list on {}: {} device(s)", relay[0], guests.len());
-        Ok(())
+        Ok(dropped)
     }
 
     /// The connection codes on every own relay now, not at `guests_loop`'s
@@ -1193,36 +1230,7 @@ impl Node {
     /// Deletes a device from the list, or a device met with a code; it is
     /// told (now, or when next reached) and forgets this computer too.
     fn remove(&self, id: EndpointId) -> String {
-        let mut st = self.sh.st.lock().unwrap();
-        let deleted = if st.store.forget(&id) {
-            log!("deleted {} from the device list", id.fmt_short());
-            true
-        } else if let Some(name) = st.peers.get(&id).filter(|p| p.met == Some(Met::Code)).map(|p| p.name.clone()) {
-            // Kept as deleted until it knows, like a device of the list.
-            st.store.add(id).name = name;
-            st.store.forget(&id);
-            log!("deleted {} (met with a code)", id.fmt_short());
-            true
-        } else {
-            false
-        };
-        if deleted {
-            self.sh.save(&mut st);
-            if let Some(p) = st.peers.get_mut(&id) {
-                p.met = None;
-                p.token = None;
-                p.invite = None;
-                // A connection it opened: closed now, so it calls again, is
-                // refused and drops its card. Over this computer's own
-                // connection the woken task tells it instead.
-                if let Some(c) = p.conn.take_if(|c| c.side().is_server()) {
-                    c.close(0u32.into(), b"forgotten");
-                    p.status = Status::Offline;
-                    p.since = None;
-                }
-            }
-            self.sh.ensure(&mut st, id);
-        }
+        self.sh.drop_guest(id, "deleted");
         String::new()
     }
 
@@ -1986,18 +1994,24 @@ fn lobby_closed(st: &mut St) {
 /// One list `guests_loop` keeps on one relay.
 struct Track<T> {
     sent: Option<T>,
+    synced_at: Option<Instant>,
     retry_at: Option<Instant>,
     last_error: String,
 }
 
 impl<T: Clone + PartialEq> Track<T> {
     fn new(sent: Option<T>) -> Self {
-        Track { sent, retry_at: None, last_error: String::new() }
+        Track { sent, synced_at: None, retry_at: None, last_error: String::new() }
     }
 
-    /// Whether `list` should go out now.
-    fn due(&self, list: &T) -> bool {
-        self.sent.as_ref() != Some(list) && self.retry_at.is_none_or(|at| Instant::now() >= at)
+    /// Whether `list` should go out now (`refresh` also re-syncs periodically
+    /// when unchanged so relay-side kicks reach this computer).
+    fn due(&self, list: &T, refresh: Option<Duration>) -> bool {
+        if self.retry_at.is_some_and(|at| Instant::now() < at) {
+            return false;
+        }
+        self.sent.as_ref() != Some(list)
+            || refresh.is_some_and(|every| self.synced_at.is_none_or(|at| at.elapsed() >= every))
     }
 
     /// Takes the outcome of sending `list`; true if it went through.
@@ -2006,6 +2020,7 @@ impl<T: Clone + PartialEq> Track<T> {
         match r {
             Ok(()) => {
                 self.sent = Some(list.clone());
+                self.synced_at = Some(Instant::now());
                 self.retry_at = None;
                 self.last_error.clear();
                 true
@@ -2031,18 +2046,17 @@ struct RelayTrack {
 
 /// Keeps this computer's guest list and connection codes on every own
 /// relay: each whole list goes out at start (the codes only once there are
-/// any) and whenever it changes (checked every 2 s), again 30 s after a
-/// failure. A relay no longer used gets empty lists. Only the guest list
-/// tells whether the relay works: one older than the codes still helps the
-/// devices it knows.
+/// any), whenever it changes (checked every 2 s), and every 15 s for guests
+/// so relay-side kicks sync back immediately; again 30 s after a failure.
 async fn guests_loop(sh: Arc<Shared>) {
     const EVERY: Duration = Duration::from_secs(2);
+    const GUEST_SYNC_EVERY: Duration = Duration::from_secs(15);
     let mut tracked: BTreeMap<Vec<RelayUrl>, RelayTrack> = BTreeMap::new();
     loop {
         if sh.is_stopped() || sh.leaving.load(std::sync::atomic::Ordering::SeqCst) {
             return;
         }
-        let (relays, guests, invites) = {
+        let (relays, mut guests, invites) = {
             let st = sh.st.lock().unwrap();
             (st.settings.relays.clone(), sh.guests(&st), sh.invites(&st))
         };
@@ -2057,13 +2071,29 @@ async fn guests_loop(sh: Arc<Shared>) {
         }
         for relay in &relays {
             let RelayTrack { guests: g, invites: i } = tracked.entry(relay.clone()).or_insert_with(|| RelayTrack { guests: Track::new(None), invites: Track::new(Some(Vec::new())) });
-            if g.due(&guests) {
+            if g.due(&guests, Some(GUEST_SYNC_EVERY)) {
                 let r = sh.send_guests(relay, &guests).await;
-                let ok = g.note(r.map_err(relay_error), relay, "guest list", &guests);
+                let dropped = r.as_ref().ok().cloned().unwrap_or_default();
+                let ok = g.note(r.map(|_| ()).map_err(relay_error), relay, "guest list", &guests);
                 sh.st.lock().unwrap().relay_ok.insert(relay[0].to_string(), ok);
+                if !dropped.is_empty() {
+                    let mut changed = false;
+                    for id in dropped {
+                        changed |= sh.drop_guest(id, "kicked on relay");
+                    }
+                    if changed {
+                        guests = {
+                            let st = sh.st.lock().unwrap();
+                            sh.guests(&st)
+                        };
+                        let r2 = sh.send_guests(relay, &guests).await;
+                        let ok2 = g.note(r2.map(|_| ()).map_err(relay_error), relay, "guest list", &guests);
+                        sh.st.lock().unwrap().relay_ok.insert(relay[0].to_string(), ok2);
+                    }
+                }
                 sh.changed();
             }
-            if i.due(&invites) {
+            if i.due(&invites, None) {
                 i.note(sh.send_invites(relay, &invites).await, relay, "connection codes", &invites);
             }
         }

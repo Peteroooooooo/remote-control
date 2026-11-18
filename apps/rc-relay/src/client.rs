@@ -124,24 +124,30 @@ pub async fn claim(code: &RelayCode, device: &SecretKey, name: &str, ca: &CaTlsC
 
 /// Tells the relay, as its owner `device`, the whole list of devices that
 /// may use it to reach this owner (replaces the list sent before).
+/// Returns any guest IDs the relay kicked and asks this owner to drop.
 /// An older relay that does not take guest names gets the keys alone.
-pub async fn set_guests(relay: &[RelayUrl], device: &SecretKey, ca: &CaTlsConfig, guests: &[Guest]) -> Result<()> {
+pub async fn set_guests(relay: &[RelayUrl], device: &SecretKey, ca: &CaTlsConfig, guests: &[Guest]) -> Result<Vec<PublicKey>> {
     let client = http(ca)?;
     let send = |guests: &[Guest]| {
         let req = GuestsRequest::new(device, unix_now(), guests).encode();
         let client = client.clone();
         async move { race(relay, |u| call(client.clone(), u, api::GUESTS_PATH, req.clone())).await }
     };
-    match send(guests).await?.1 {
+    let body = match send(guests).await?.1 {
         Err(Refusal::BadRequest) if guests.iter().any(|g| !g.name.is_empty()) => {
             let plain: Vec<Guest> = guests.iter().map(|g| Guest::from(g.id)).collect();
-            send(&plain).await?.1?;
+            send(&plain).await?.1?
         }
-        r => {
-            r?;
-        }
-    }
-    Ok(())
+        r => r?,
+    };
+    Ok(parse_dropped(&body))
+}
+
+fn parse_dropped(body: &str) -> Vec<PublicKey> {
+    let Some(rest) = body.trim().strip_prefix("drop\t") else {
+        return Vec::new();
+    };
+    rest.split('\t').filter_map(|s| s.trim().parse().ok()).collect()
 }
 
 /// Tells the relay, as its owner `device`, its connection codes not used
