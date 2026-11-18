@@ -67,6 +67,19 @@ pub type HyperHandler = Box<
         + 'static,
 >;
 
+/// rc-relay patch: in the extensions of a request to an extra route. A
+/// handler whose answer stays open (a long poll) calls [`Established::confirm`]
+/// once it trusts the request, so the connection outlives `ESTABLISH_TIMEOUT`.
+#[derive(Debug, Clone)]
+pub struct Established(Arc<Notify>);
+
+impl Established {
+    /// Lifts the timeout for this request's connection.
+    pub fn confirm(&self) {
+        self.0.notify_waiters();
+    }
+}
+
 /// WebSocket GUID needed for accepting websocket connections, see RFC 6455 (<https://www.rfc-editor.org/rfc/rfc6455>) section 1.3
 const SEC_WEBSOCKET_ACCEPT_GUID: &[u8] = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
@@ -777,6 +790,9 @@ impl Service<Request<Incoming>> for RelayServiceWithNotify {
             .handlers
             .get(&(req.method().clone(), uri.path()))
         {
+            let mut req = req;
+            req.extensions_mut()
+                .insert(Established(self.on_establish.clone()));
             let response = handler(req, self.service.0.default_response());
             return std::future::ready(response);
         }

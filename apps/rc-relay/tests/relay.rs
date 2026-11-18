@@ -470,6 +470,33 @@ async fn a_kick_reaches_the_owners_watch_at_once() {
     assert!(ended.is_ok(), "{ended:?}");
 }
 
+/// The relay ends connections that are not relay connections after 30 s;
+/// an owner's watch is kept open past that.
+#[tokio::test]
+async fn the_watch_stays_open_past_half_a_minute() {
+    let s = Setup::new("watch-long").await;
+    let owner = key();
+    s.claim(&owner).await;
+    let gk = key();
+    s.set_guests(&owner, &[(&gk, "laptop")]).await;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let (url, ca, o) = (s.url.clone(), s.ca(), owner.clone());
+    let watch = tokio::spawn(async move {
+        client::watch(&[url], &o, &ca, move || {
+            let _ = tx.send(());
+        })
+        .await
+    });
+    assert!(got(&mut rx, 5).await, "sync once open");
+    tokio::time::sleep(Duration::from_secs(35)).await;
+    assert!(!watch.is_finished(), "the watch ended: {:?}", watch.await);
+    let t = std::time::Instant::now();
+    assert!(s.store().kick(owner.public(), gk.public()).unwrap());
+    assert!(got(&mut rx, 3).await, "sync on a kick after 35 s");
+    assert!(t.elapsed() < Duration::from_secs(1), "took {:?}", t.elapsed());
+    watch.abort();
+}
+
 /// Whether a sync came within `secs`.
 async fn got(rx: &mut tokio::sync::mpsc::UnboundedReceiver<()>, secs: u64) -> bool {
     tokio::time::timeout(Duration::from_secs(secs), rx.recv()).await.ok().flatten().is_some()

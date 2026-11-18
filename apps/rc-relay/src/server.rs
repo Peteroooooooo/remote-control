@@ -19,7 +19,7 @@ use hyper::body::Incoming;
 use iroh_base::{EndpointId, RelayUrl};
 use iroh_relay::server::{
     self as relay, CertConfig, QuicConfig, RelayConfig, ServerConfig, TlsConfig,
-    http_server::{BytesBody, HyperHandler, HyperResult},
+    http_server::{BytesBody, Established, HyperHandler, HyperResult},
 };
 use rc_ident::{proof::unix_now, relay_code::RelayCode};
 use tracing::{info, warn};
@@ -220,11 +220,18 @@ fn watch_route(sh: &Arc<Shared>) -> HyperHandler {
             None => Err(Refusal::BadRequest),
         };
         match r {
-            Ok(body) => Ok(res
-                .status(StatusCode::OK)
-                .header("content-type", "text/plain; charset=utf-8")
-                .header("cache-control", "no-store")
-                .body(body)?),
+            Ok(body) => {
+                // A signed owner's watch stays open past the relay's 30 s limit
+                // for connections that never become a relay connection.
+                if let Some(e) = req.extensions().get::<Established>() {
+                    e.confirm();
+                }
+                Ok(res
+                    .status(StatusCode::OK)
+                    .header("content-type", "text/plain; charset=utf-8")
+                    .header("cache-control", "no-store")
+                    .body(body)?)
+            }
             Err(e) => reply(res, Err(e)),
         }
     })

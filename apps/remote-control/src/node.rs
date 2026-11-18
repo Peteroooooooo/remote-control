@@ -2374,8 +2374,9 @@ const GUEST_SYNC_EVERY: Duration = Duration::from_secs(15);
 
 /// Keeps this computer's watch open on one own relay (see `rc_relay::api`):
 /// each `sync` from it has `guests_loop` send the guest list now. Opened
-/// again a second after it ends, more slowly while that keeps failing; on a
-/// relay too old for it, tried again every 10 minutes.
+/// again a second after it ends (the first `sync` of the new one covers what
+/// came in between), more slowly while opening keeps failing; on a relay too
+/// old for it, tried again every 10 minutes.
 async fn watch_relay(sh: Arc<Shared>, relay: Vec<RelayUrl>) {
     const NO_WATCH_RETRY: Duration = Duration::from_secs(600);
     let mut wait = Duration::from_secs(1);
@@ -2384,10 +2385,11 @@ async fn watch_relay(sh: Arc<Shared>, relay: Vec<RelayUrl>) {
         if sh.is_stopped() {
             return;
         }
-        let opened = Instant::now();
+        let open = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let sync = {
-            let (sh, relay) = (sh.clone(), relay.clone());
+            let (sh, relay, open) = (sh.clone(), relay.clone(), open.clone());
             move || {
+                open.store(true, std::sync::atomic::Ordering::SeqCst);
                 sh.watching.lock().unwrap().insert(relay.clone());
                 sh.resync.lock().unwrap().insert(relay.clone());
                 sh.guests_wake.notify_one();
@@ -2395,9 +2397,8 @@ async fn watch_relay(sh: Arc<Shared>, relay: Vec<RelayUrl>) {
         };
         let r = rc_relay::client::watch(&relay, &sh.secret, &rc_relay::tls::ca(), sync).await;
         sh.watching.lock().unwrap().remove(&relay);
-        if opened.elapsed() > Duration::from_secs(60) {
+        if open.load(std::sync::atomic::Ordering::SeqCst) {
             wait = Duration::from_secs(1);
-            last_err.clear();
         }
         match r {
             Err(e) if e.downcast_ref::<rc_relay::client::NoWatch>().is_some() => {
