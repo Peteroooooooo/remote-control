@@ -200,7 +200,7 @@ impl App {
             term.draw(|f| self.draw(f))?;
             if event::poll(Duration::from_millis(500))? {
                 if let Event::Key(k) = event::read()? {
-                    if k.kind == KeyEventKind::Press && !self.key(k.code, k.modifiers)? {
+                    if k.kind == KeyEventKind::Press && !self.key(term, k.code, k.modifiers)? {
                         return Ok(());
                     }
                 }
@@ -217,7 +217,7 @@ impl App {
     }
 
     /// False: quit.
-    fn key(&mut self, key: KeyCode, mods: KeyModifiers) -> Result<bool> {
+    fn key(&mut self, term: &mut ratatui::DefaultTerminal, key: KeyCode, mods: KeyModifiers) -> Result<bool> {
         if mods.contains(KeyModifiers::CONTROL) && key == KeyCode::Char('c') {
             return Ok(false);
         }
@@ -320,10 +320,10 @@ impl App {
                 self.toast(format!("已生成「{}」，按 r 可以改名", c.shown_name()), true);
             }
             KeyCode::Char('c') if self.code().is_some() => {
-                if let Some(c) = self.code() {
+                if let Some(c) = self.code().cloned() {
                     let text = RelayCode { urls: self.urls.clone(), claim_key: c.key }.encode();
-                    copy_osc52(&text);
-                    self.toast(format!("已复制「{}」中转码到剪贴板", c.shown_name()), true);
+                    show_copy_line(term, &text, &c.shown_name())?;
+                    self.toast(format!("已显示「{}」单行中转码", c.shown_name()), true);
                 }
             }
             KeyCode::Char('r') if self.code().is_some() => {
@@ -586,7 +586,7 @@ impl App {
         let text = RelayCode { urls: self.urls.clone(), claim_key: c.key }.encode();
         let p = Paragraph::new(vec![
             Line::styled(text, Style::new().fg(CYAN)),
-            Line::styled("按 c 一键复制，或直接拖选（没有左右边框干扰）。同一组的电脑贴同一个码。", Style::new().fg(DIM)),
+            Line::styled("按 c 切出单行纯文本并复制（网页终端按 c 后三击整行即可复制）。同一组的电脑贴同一个码。", Style::new().fg(DIM)),
         ])
         .wrap(Wrap { trim: false });
         f.render_widget(p, inner);
@@ -736,6 +736,35 @@ impl App {
 
 fn shown_name(name: &str, id: EndpointId) -> String {
     if name.is_empty() { format!("设备 {}", id.fmt_short()) } else { name.to_string() }
+}
+
+/// Drops out of the alternate screen to print `text` as one plain unwrapped
+/// line (so web consoles like Portainer's xterm.js let you triple-click or
+/// drag-select it with zero newlines/spaces) and also sends OSC 52.
+fn show_copy_line(term: &mut ratatui::DefaultTerminal, text: &str, label: &str) -> Result<()> {
+    use std::io::Write;
+    use ratatui::crossterm::{
+        cursor::{Hide, Show},
+        execute,
+        terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+    };
+    let mut out = std::io::stdout();
+    let _ = disable_raw_mode();
+    let _ = execute!(out, LeaveAlternateScreen, Show);
+    copy_osc52(text);
+    println!("\n「{label}」完整中转码：\n\n{text}\n\n支持剪贴板的终端已自动复制；网页终端直接三击上面这整行复制，按任意键返回面板…");
+    let _ = out.flush();
+    let _ = enable_raw_mode();
+    loop {
+        if let Event::Key(k) = event::read()? {
+            if k.kind == KeyEventKind::Press {
+                break;
+            }
+        }
+    }
+    let _ = execute!(out, EnterAlternateScreen, Hide);
+    term.clear()?;
+    Ok(())
 }
 
 /// Copies `text` to the terminal's clipboard via OSC 52 (supported by Windows
