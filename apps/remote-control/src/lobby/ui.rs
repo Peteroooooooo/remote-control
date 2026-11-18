@@ -128,8 +128,8 @@ pub struct App {
     /// The node's notice already shown.
     seen_notice: Option<String>,
     cards: Cards,
-    /// Whether the service runs an older exe than this window, and when that was looked at.
-    service_old: Option<(Instant, bool)>,
+    /// Whether the service runs another exe than this window, and when that was looked at.
+    service_other: Option<(Instant, bool)>,
     /// 「以后」 on the card saying so, until the window closes.
     update_later: bool,
     renaming: Option<(EndpointId, String)>,
@@ -142,7 +142,8 @@ pub struct App {
     relay_paste: String,
 }
 
-pub fn run(b: Backend) -> anyhow::Result<()> {
+/// `hidden`: started at sign-in, with only the icon in the tray.
+pub fn run(b: Backend, hidden: bool) -> anyhow::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("remote control")
@@ -151,7 +152,8 @@ pub fn run(b: Backend) -> anyhow::Result<()> {
             // An empty icon: eframe would otherwise put its own (or one picture
             // rescaled for every size) on the window on the first frame, over
             // the exe's drawn sizes that `theme::set_icon` gives it.
-            .with_icon(egui::IconData::default()),
+            .with_icon(egui::IconData::default())
+            .with_visible(!hidden),
         ..Default::default()
     };
     eframe::run_native(
@@ -167,6 +169,7 @@ pub fn run(b: Backend) -> anyhow::Result<()> {
                 let hwnd = HWND(w.hwnd.get() as *mut _);
                 theme::frame(hwnd, theme::CHROME);
                 theme::set_icon(hwnd);
+                super::tray::set_window(hwnd);
             }
             let ctx = cc.egui_ctx.clone();
             b.on_change(move || ctx.request_repaint());
@@ -189,7 +192,7 @@ pub fn run(b: Backend) -> anyhow::Result<()> {
                 saved: None,
                 adding_relay: false,
                 relay_paste: String::new(),
-                service_old: None,
+                service_other: None,
                 update_later: false,
             }))
         }),
@@ -655,6 +658,10 @@ impl eframe::App for App {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        if ctx.input(|i| i.viewport().close_requested()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.hide_to_tray();
+        }
         let snap = self.b.snap();
         self.take_notices(&snap);
         self.watch_clipboard(&ctx, &snap);
@@ -701,6 +708,18 @@ impl eframe::App for App {
 }
 
 impl App {
+    /// Closing the window: it goes to the tray, and counts as closed.
+    fn hide_to_tray(&mut self) {
+        for (_, what) in std::mem::take(&mut self.pending) {
+            self.carry_out(what);
+        }
+        self.toasts.clear();
+        self.renaming = None;
+        self.update_later = false;
+        super::tray::hide();
+        self.b.set_visible(false);
+    }
+
     fn new_id(&mut self) -> u64 {
         self.next_id += 1;
         self.next_id
@@ -952,12 +971,12 @@ impl App {
             })
         });
 
-        let old = self.service_old() && !self.update_later;
+        let other = self.service_other() && !self.update_later;
         let mut later = false;
-        reveal(ui, Id::new("card-update"), old, 10.0, |ui| {
-            card(ui, ACCENT, false, "后台服务还是旧版本，更新后才用上这一版", |ui| {
+        reveal(ui, Id::new("card-update"), other, 10.0, |ui| {
+            card(ui, ACCENT, false, "后台服务用的是另一个位置的程序，改用这个", |ui| {
                 later = ui.button("以后").clicked();
-                if ui.add_enabled(idle, accent_button("更新")).clicked() {
+                if ui.add_enabled(idle, accent_button("改用这个")).clicked() {
                     b.service(true);
                 }
             })
@@ -965,13 +984,14 @@ impl App {
         self.update_later |= later;
     }
 
-    /// `install::service_outdated`, looked at every few seconds.
-    fn service_old(&mut self) -> bool {
-        if self.service_old.is_none_or(|(t, _)| t.elapsed() >= Duration::from_secs(5)) {
-            let old = self.b.service_installed() && crate::install::service_outdated();
-            self.service_old = Some((Instant::now(), old));
+    /// Whether the service runs another exe (`install::service_elsewhere`),
+    /// looked at every few seconds.
+    fn service_other(&mut self) -> bool {
+        if self.service_other.is_none_or(|(t, _)| t.elapsed() >= Duration::from_secs(5)) {
+            let other = self.b.service_installed() && crate::install::service_elsewhere().is_some();
+            self.service_other = Some((Instant::now(), other));
         }
-        self.service_old.is_some_and(|(_, old)| old)
+        self.service_other.is_some_and(|(_, other)| other)
     }
 
     fn devices(&mut self, ui: &mut egui::Ui, snap: &Snap) {
@@ -1229,12 +1249,12 @@ impl App {
         });
 
         ui.add_space(14.0);
-        let old = self.service_old();
+        let other = self.service_other();
         group(ui, "后台服务", |ui| {
             let installed = b.service_installed();
             let busy = b.busy().is_some();
             let (title, desc) = match (installed, snap.service) {
-                (true, true) if old => ("运行中，旧版本", "更新后才用上这一版"),
+                (true, true) if other => ("运行中，用的是另一个位置的程序", "改用这个才用上这一版"),
                 (true, true) => ("运行中", "关掉窗口也在线"),
                 (true, false) => ("已安装，没在运行", "装上后锁屏时也能被控制"),
                 _ => ("没装", "装上后锁屏时也能被控制"),
@@ -1247,7 +1267,7 @@ impl App {
                 } else if ui.add_enabled(!busy, egui::Button::new("卸载")).clicked() {
                     b.service(false);
                 }
-                if installed && old && ui.add_enabled(!busy, accent_button("更新")).clicked() {
+                if installed && other && ui.add_enabled(!busy, accent_button("改用这个")).clicked() {
                     b.service(true);
                 }
             });

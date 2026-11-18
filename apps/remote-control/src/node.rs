@@ -347,11 +347,13 @@ impl Shared {
         }
     }
 
+    /// Whether the lobby window shows. Without a lobby that reports (the
+    /// `host` command), it counts as open.
     fn lobby_open(&self, st: &St) -> bool {
-        !self.opts.service || st.lobby_seen.is_some_and(|t| t.elapsed() < LOBBY_GONE)
+        (!self.opts.service && st.lobby_window.is_none()) || st.lobby_seen.is_some_and(|t| t.elapsed() < LOBBY_GONE)
     }
 
-    /// Acts on the lobby window opening or closing (service mode).
+    /// Acts on the lobby window opening or closing (or going to the tray).
     fn lobby_check(&self, st: &mut St) -> bool {
         let open = self.lobby_open(st);
         if open == st.lobby_was_open {
@@ -1085,12 +1087,12 @@ impl Node {
         Ok(all[all.len().saturating_sub(lines.min(5000))..].join("\n"))
     }
 
-    /// The lobby window `window` (its process id) closes: in service mode
-    /// that takes effect now, not `LOBBY_GONE` after its last snapshot.
+    /// The lobby window `window` closes or goes to the tray: that takes
+    /// effect now, not `LOBBY_GONE` after its last snapshot.
     fn lobby_closing(&self, window: &str) -> String {
         let sh = &self.sh;
         let mut st = sh.st.lock().unwrap();
-        if sh.opts.service && st.lobby_window.as_deref() == Some(window) {
+        if st.lobby_window.as_deref() == Some(window) {
             st.closed_window = Some(window.to_string());
             st.lobby_seen = None;
             sh.lobby_check(&mut st);
@@ -1099,12 +1101,13 @@ impl Node {
     }
 
     /// Everything the lobby shows. `seen`: from the lobby window, which is
-    /// open then; `window` names that window's process, so a window closed
-    /// and opened again within `LOBBY_GONE` still counts as closed.
+    /// open then; `window` names that window (its process and showing,
+    /// `pid-n`), so a window closed and opened again within `LOBBY_GONE`
+    /// still counts as closed.
     fn snapshot(&self, seen: bool, window: Option<&str>) -> String {
         let sh = &self.sh;
         let mut st = sh.st.lock().unwrap();
-        if sh.opts.service && seen && (window.is_none() || window != st.closed_window.as_deref()) {
+        if seen && (window.is_none() || window != st.closed_window.as_deref()) {
             if let Some(w) = window {
                 if st.lobby_window.as_deref().is_some_and(|old| old != w && !process_alive(old)) && sh.lobby_open(&st) {
                     log!("the lobby window was opened again: connection codes void, temporary devices forgotten");
@@ -2017,7 +2020,7 @@ fn process_alive(pid: &str) -> bool {
         Foundation::{CloseHandle, STILL_ACTIVE},
         System::Threading::{GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION},
     };
-    let Ok(pid) = pid.parse::<u32>() else { return false };
+    let Ok(pid) = pid.split('-').next().unwrap_or(pid).parse::<u32>() else { return false };
     unsafe {
         let Ok(h) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else { return false };
         let mut code = 0u32;

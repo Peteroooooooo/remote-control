@@ -3,16 +3,17 @@
 //! helper`, the real host with desktop following on) alive in the active
 //! console session, as SYSTEM so the helper may open the Winlogon desktop, and
 //! answers Ctrl+Alt+Del requests on a pipe: SendSAS only works when called by
-//! a service. The helper runs the node (`node`) with the computer's device
-//! key, which install copied here from the user's folder.
+//! a service. The helper runs the node (`node`) with the user's device key,
+//! device list and settings where the lobby keeps them (`--key`, set by
+//! install); the service and the helper log next to them.
 
 use std::{
     ffi::OsString,
     fs::OpenOptions,
     os::windows::io::AsRawHandle,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, OnceLock,
         atomic::{AtomicU8, Ordering},
     },
     time::{Duration, Instant},
@@ -55,23 +56,33 @@ fn known_folder(var: &str, fallback: &str) -> PathBuf {
     std::env::var_os(var).map(PathBuf::from).unwrap_or_else(|| PathBuf::from(fallback))
 }
 
-/// `C:\Program Files\remote-control`: the installed exe.
-pub fn install_dir() -> PathBuf {
+/// Where older versions put a copy of the exe (`C:\Program Files\remote-control`).
+pub fn old_install_dir() -> PathBuf {
     known_folder("ProgramFiles", r"C:\Program Files").join("remote-control")
 }
 
-/// `C:\ProgramData\remote-control`: device key, allow list and logs of the
-/// service. Readable by SYSTEM and Administrators only (set by install).
-pub fn data_dir() -> PathBuf {
+/// Where older versions kept the service's copies of the key, device list
+/// and settings, and its logs (`C:\ProgramData\remote-control`).
+pub fn old_data_dir() -> PathBuf {
     known_folder("ProgramData", r"C:\ProgramData").join("remote-control")
 }
 
-pub fn installed_exe() -> PathBuf {
-    install_dir().join("remote-control.exe")
+/// The device key the service and its helper use (`--key`).
+static KEY: OnceLock<PathBuf> = OnceLock::new();
+
+/// The service's or the helper's `--key`; without one (a service installed
+/// by an older version), the old data folder's.
+pub fn set_key(key: Option<PathBuf>) -> &'static Path {
+    KEY.get_or_init(|| key.unwrap_or_else(|| old_data_dir().join("device.key")))
 }
 
 pub fn key_path() -> PathBuf {
-    data_dir().join("device.key")
+    set_key(None).to_path_buf()
+}
+
+/// The folder of the key: the service's and the helper's logs go there too.
+pub fn data_dir() -> PathBuf {
+    key_path().parent().map_or_else(old_data_dir, Path::to_path_buf)
 }
 
 /// Sends stdout and stderr (`log!`, tracing) to `<data dir>\<name>.log`;
@@ -123,7 +134,8 @@ pub fn request_sas() -> Result<()> {
 define_windows_service!(ffi_service_main, service_main);
 
 /// The SCM entry point; fails when started from a console.
-pub fn run() -> Result<()> {
+pub fn run(key: Option<PathBuf>) -> Result<()> {
+    set_key(key);
     service_dispatcher::start(SERVICE_NAME, ffi_service_main).context("only the service manager can start this")
 }
 

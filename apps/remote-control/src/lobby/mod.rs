@@ -1,7 +1,9 @@
 //! The lobby: what a double-click opens. `backend` holds the node and the
-//! sessions, `ui` draws them with egui.
+//! sessions, `ui` draws them with egui, `tray` is its icon in the taskbar's
+//! notification area: closing the window hides it, 退出 there quits.
 
 mod backend;
+mod tray;
 mod ui;
 
 use std::path::PathBuf;
@@ -22,6 +24,9 @@ pub struct LobbyArgs {
     /// Neither answer nor search on the LAN (for tests of connection codes).
     #[arg(long, hide = true)]
     no_lan: bool,
+    /// Start in the tray, without the window (at logon, with the service).
+    #[arg(long, hide = true)]
+    hidden: bool,
 }
 
 /// Started from Explorer, the console window is this process's alone: hide
@@ -43,8 +48,8 @@ fn leave_own_console(log: &std::path::Path) {
 
 /// One lobby per device key: a second one would talk to the same service as
 /// another window (each counts as the lobby reopened, see `node`), or go
-/// online with the same key. Started again, the lobby brings the open one
-/// to the front instead. Returns false then.
+/// online with the same key. Started again, the lobby shows the running
+/// one's window (also when it is in the tray) instead. Returns false then.
 fn first_lobby(key: &std::path::Path) -> bool {
     use windows::{
         Win32::{
@@ -62,6 +67,9 @@ fn first_lobby(key: &std::path::Path) -> bool {
         }
         if GetLastError() != ERROR_ALREADY_EXISTS {
             return true;
+        }
+        if tray::open_running() {
+            return false;
         }
         if let Ok(h) = FindWindowW(None, w!("remote control")) {
             if IsIconic(h).as_bool() {
@@ -84,7 +92,11 @@ pub fn run(a: LobbyArgs) -> Result<()> {
     leave_own_console(&key.with_file_name("lobby.log"));
     crate::goaway::install(false);
     let view_args = a.view_args.map(|s| s.split_whitespace().map(String::from).collect()).unwrap_or_default();
-    let b = backend::Backend::start(key, view_args, !a.no_lan)?;
+    let b = backend::Backend::start(key, view_args, !a.no_lan, !a.hidden)?;
+    {
+        let (shown, quit) = (b.clone(), b.clone());
+        tray::spawn(move || shown.set_visible(true), move || quit.quit());
+    }
     {
         // Closing the window (or Windows ending the session) ends the
         // sessions this computer hosts, with a reason.
@@ -97,7 +109,7 @@ pub fn run(a: LobbyArgs) -> Result<()> {
             std::process::exit(0);
         });
     }
-    let r = ui::run(b.clone());
+    let r = ui::run(b.clone(), a.hidden);
     b.goodbye(net::CLOSE_STOPPED);
     r
 }

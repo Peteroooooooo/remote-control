@@ -14,7 +14,7 @@ use std::{
 use anyhow::{Result, anyhow};
 use iroh::{EndpointId, SecretKey};
 
-use crate::{host::HostArgs, install, log, net::PathKind, node};
+use crate::{host::HostArgs, install, log, net::{self, PathKind}, node};
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Snap {
@@ -177,6 +177,11 @@ struct Sh {
     /// The lobby's own messages (sessions, install), not yet shown.
     notes: Mutex<Vec<Note>>,
     job: Mutex<Option<Job>>,
+    /// Whether the window shows (not only the tray icon).
+    visible: std::sync::atomic::AtomicBool,
+    /// Counts the window's showings: the node takes a window shown again as
+    /// a lobby opened again (`window_id`).
+    shown: std::sync::atomic::AtomicU32,
 }
 
 /// A request that waits for the network (the own relay), run on a thread.
@@ -252,12 +257,40 @@ impl Sh {
         }
     }
 
+    /// What the node knows this window by (`snapshot`, `lobby-closed`): the
+    /// process and the showing.
+    fn window_id(&self) -> String {
+        format!("{}-{}", std::process::id(), self.shown.load(std::sync::atomic::Ordering::SeqCst))
+    }
+
+    /// While the service runs this exe, the lobby starts hidden at logon if
+    /// the service starts with Windows (开机自动在线); otherwise not.
+    fn sync_autostart(&self, last: &mut Option<bool>) {
+        let Ok(me) = std::env::current_exe() else { return };
+        let want = match install::service_exe() {
+            Some(exe) if install::same_file(&me, &exe) => self.snap.lock().unwrap().boot,
+            Some(_) => return,
+            None => false,
+        };
+        if *last != Some(want) {
+            match install::set_autostart(&me, want) {
+                Ok(()) => *last = Some(want),
+                Err(e) => log!("lobby: start at logon: {e:#}"),
+            }
+        }
+    }
+
     /// Keeps the mode in line with the service (also when it is installed or
     /// removed from the command line) and the snapshot fresh.
     fn poll(self: &Arc<Self>) {
         let mut last_mode_check = Instant::now() - Duration::from_secs(10);
         let mut remote_failing: Option<Instant> = None;
+        let (mut last_autostart_check, mut autostart) = (Instant::now() - Duration::from_secs(60), None);
         loop {
+            if last_autostart_check.elapsed() >= Duration::from_secs(5) && self.busy.lock().unwrap().is_none() {
+                last_autostart_check = Instant::now();
+                self.sync_autostart(&mut autostart);
+            }
             if last_mode_check.elapsed() >= Duration::from_secs(1) {
                 last_mode_check = Instant::now();
                 let running = install::service_running() == Some(true);
@@ -286,7 +319,13 @@ impl Sh {
                     _ => {}
                 }
             }
-            match self.request(&format!("snapshot\t{}", std::process::id())) {
+            // Hidden in the tray, the window does not count as open (`node::lobby_open`).
+            let ask = if self.visible.load(std::sync::atomic::Ordering::SeqCst) {
+                format!("snapshot\t{}", self.window_id())
+            } else {
+                "peek".to_string()
+            };
+            match self.request(&ask) {
                 Ok(text) => {
                     remote_failing = None;
                     *self.trouble.lock().unwrap() = None;
@@ -317,7 +356,7 @@ impl Sh {
 }
 
 impl Backend {
-    pub fn start(key: PathBuf, view_args: Vec<String>, lan: bool) -> Result<Backend> {
+    pub fn start(key: PathBuf, view_args: Vec<String>, lan: bool, visible: bool) -> Result<Backend> {
         let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
         let sh = Arc::new(Sh {
             key,
@@ -332,6 +371,8 @@ impl Backend {
             busy: Mutex::default(),
             notes: Mutex::default(),
             job: Mutex::default(),
+            visible: visible.into(),
+            shown: Default::default(),
         });
         if service_up() {
             log!("lobby: the service runs: talking to it");
@@ -479,7 +520,7 @@ impl Backend {
             let update = install && install::service_running().is_some();
             let r = run_elevated(install, &sh.key);
             match r {
-                Ok(_) if update => sh.note(Tone::Ok, "后台服务已更新"),
+                Ok(_) if update => sh.note(Tone::Ok, "后台服务已改用这个程序"),
                 Ok(t) => sh.note(Tone::Ok, t),
                 Err(e) => sh.note(Tone::Err, format!("{}失败：{e:#}", if install { "安装" } else { "卸载" })),
             }
@@ -496,6 +537,39 @@ impl Backend {
         install::service_running().is_some()
     }
 
+    /// The window shows (`true`) or went to the tray. Hidden, it does not
+    /// count as open: connection codes are void and the temporary devices
+    /// forgotten, as when it closed before there was a tray.
+    pub fn set_visible(&self, on: bool) {
+        use std::sync::atomic::Ordering::SeqCst;
+        if self.sh.visible.swap(on, SeqCst) == on {
+            return;
+        }
+        if on {
+            self.sh.shown.fetch_add(1, SeqCst);
+        } else {
+            let _ = self.sh.request(&format!("lobby-closed\t{}", self.sh.window_id()));
+        }
+        self.refresh();
+    }
+
+    /// 退出 in the tray: offline until the lobby is opened again. The
+    /// service stops too (it starts again with the lobby, or with Windows),
+    /// so nothing runs the exe any more.
+    pub fn quit(&self) {
+        let remote = matches!(*self.sh.mode.lock().unwrap(), Mode::Remote);
+        self.goodbye(net::CLOSE_STOPPED);
+        if remote {
+            *self.sh.busy.lock().unwrap() = Some("正在退出".into());
+            match install::stop_service_now() {
+                Ok(()) => log!("lobby: quit: the service stopped"),
+                Err(e) => log!("lobby: quit: stopping the service: {e:#}"),
+            }
+        }
+        crate::goaway::done();
+        std::process::exit(0);
+    }
+
     /// The window closes: sessions hosted here end with `code` (the
     /// service's go on). The service forgets the temporary devices now
     /// instead of when the snapshots stop coming.
@@ -503,7 +577,7 @@ impl Backend {
         let node = match &*self.sh.mode.lock().unwrap() {
             Mode::Local(n) => Some(n.clone()),
             Mode::Remote => {
-                let _ = crate::pipe::call(node::PIPE, &format!("lobby-closed\t{}", std::process::id()), Duration::from_secs(1));
+                let _ = crate::pipe::call(node::PIPE, &format!("lobby-closed\t{}", self.sh.window_id()), Duration::from_secs(1));
                 None
             }
             Mode::Off => None,

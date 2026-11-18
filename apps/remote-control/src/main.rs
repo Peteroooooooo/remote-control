@@ -116,22 +116,22 @@ enum Cmd {
     /// Check how the encoder follows bitrate changes (no network; for tests).
     EncTest(enctest::EncTestArgs),
     /// Install the service (admin): starts with Windows, works on the UAC
-    /// prompt, lock and login screens, Ctrl+Alt+Del. It takes over this
-    /// user's device key, device list and settings.
+    /// prompt, lock and login screens, Ctrl+Alt+Del. It runs this exe, where
+    /// it is, with this user's device key, device list and settings.
     InstallService {
         /// Device id that may control this computer without asking (repeatable).
         #[arg(long)]
         allow: Vec<iroh::EndpointId>,
-        /// The user's key file whose device list and settings go along
+        /// The user's key file, next to its device list and settings
         /// (default: this user's); the lobby passes it.
         #[arg(long)]
         from_lobby: Option<std::path::PathBuf>,
-        /// The lobby that asked: left running even if it runs from the install folder.
+        /// The lobby that asked (not ended with the service's leftovers).
         #[arg(long)]
         lobby_pid: Option<u32>,
     },
-    /// Remove the service, its files, policy and firewall rule (admin); the
-    /// device list and settings go back to the user's folder.
+    /// Remove the service, its policy and firewall rule (admin); the exe,
+    /// the device list and settings stay where they are.
     UninstallService {
         #[arg(long)]
         from_lobby: Option<std::path::PathBuf>,
@@ -142,7 +142,11 @@ enum Cmd {
     ServiceStatus,
     /// Started by the service manager.
     #[command(hide = true)]
-    Service,
+    Service {
+        /// The device key (next to the device list and settings) the helper uses.
+        #[arg(long)]
+        key: Option<std::path::PathBuf>,
+    },
     /// Started by the service in the console session: the node, following
     /// the input desktop.
     #[command(hide = true)]
@@ -206,8 +210,9 @@ fn main() -> Result<()> {
             install::uninstall(from_lobby.as_deref(), lobby_pid)
         }
         Cmd::ServiceStatus => install::status(),
-        Cmd::Service => service::run(),
+        Cmd::Service { key } => service::run(key),
         Cmd::Helper(mut a) => {
+            service::set_key(a.key.clone());
             service::redirect_output("helper")?;
             desktop::enable();
             goaway::install(true);

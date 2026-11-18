@@ -1,6 +1,12 @@
 //! `install-service`, `uninstall-service` and `service-status` (admin).
 //! Install and uninstall can be run again after a failure; each step skips
 //! what is already done.
+//!
+//! The service runs the exe it was installed from, where it is, with the
+//! user's device key, device list and settings where the lobby keeps them:
+//! nothing is copied. Older versions copied the exe to Program Files and the
+//! data to ProgramData; install and uninstall move the data back and remove
+//! those copies.
 
 use std::{
     path::{Path, PathBuf},
@@ -12,14 +18,15 @@ use anyhow::{Context, Result, bail};
 use iroh::EndpointId;
 use windows::{
     Win32::{
-        Foundation::CloseHandle,
+        Foundation::{CloseHandle, HANDLE},
+        Security::{GetTokenInformation, IsWellKnownSid, TOKEN_QUERY, TOKEN_USER, TokenUser, WinLocalSystemSid},
         System::{
             Diagnostics::ToolHelp::{
                 CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
             },
             Threading::{
-                OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
-                QueryFullProcessImageNameW, TerminateProcess, WaitForSingleObject,
+                OpenProcess, OpenProcessToken, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+                PROCESS_TERMINATE, QueryFullProcessImageNameW, TerminateProcess, WaitForSingleObject,
             },
         },
     },
@@ -29,11 +36,14 @@ use windows_service::{
     service::{ServiceAccess, ServiceErrorControl, ServiceInfo, ServiceStartType, ServiceState, ServiceType},
     service_manager::{ServiceManager, ServiceManagerAccess},
 };
-use winreg::{RegKey, enums::HKEY_LOCAL_MACHINE};
+use winreg::{
+    RegKey,
+    enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE},
+};
 
 use crate::{
     net,
-    service::{SERVICE_NAME, data_dir, install_dir, installed_exe, key_path},
+    service::{SERVICE_NAME, old_data_dir, old_install_dir},
     store::{self, Store},
 };
 
@@ -42,6 +52,13 @@ const POLICY_VALUE: &str = "SoftwareSASGeneration";
 /// Where install keeps the policy value it replaced, for uninstall.
 const BACKUP_KEY: &str = r"SOFTWARE\remote-control";
 const FIREWALL_RULE: &str = "remote-control-service";
+/// Interactive users may start and stop the service (the lobby starts it,
+/// its tray menu stops it), only administrators change or remove it.
+const SERVICE_SDDL: &str =
+    "D:(A;;CCLCSWRPWPDTLOCRRC;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)(A;;CCLCSWRPWPLOCRRC;;;IU)(A;;CCLCSWLOCRRC;;;SU)";
+/// The lobby, hidden in the tray, at logon while the service is installed.
+const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
+const RUN_VALUE: &str = "remote-control";
 
 fn require_admin() -> Result<()> {
     if unsafe { windows::Win32::UI::Shell::IsUserAnAdmin() }.as_bool() {
@@ -71,20 +88,80 @@ fn stop_service(mgr: &ServiceManager) -> Result<bool> {
     };
     if svc.query_status()?.current_state != ServiceState::Stopped {
         let _ = svc.stop();
-        for _ in 0..75 {
-            if svc.query_status()?.current_state == ServiceState::Stopped {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(200));
-        }
+        wait_stopped(&svc)?;
         println!("  stopped the service");
     }
     Ok(true)
 }
 
-/// Processes (other than this one and `keep`) whose exe is in the install folder.
-fn installed_processes(keep: Option<u32>) -> Vec<u32> {
-    let dir = install_dir().to_string_lossy().to_lowercase() + "\\";
+fn wait_stopped(svc: &windows_service::service::Service) -> Result<()> {
+    for _ in 0..75 {
+        if svc.query_status()?.current_state == ServiceState::Stopped {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    Ok(())
+}
+
+/// The exe in a service command line (`"C:\…\remote-control.exe" service --key …`).
+fn exe_of(command: &str) -> PathBuf {
+    let c = command.trim();
+    if let Some(rest) = c.strip_prefix('"') {
+        return PathBuf::from(rest.split('"').next().unwrap_or(rest));
+    }
+    let lower = c.to_lowercase();
+    match lower.find(".exe") {
+        Some(i) => PathBuf::from(&c[..i + 4]),
+        None => PathBuf::from(c.split(' ').next().unwrap_or(c)),
+    }
+}
+
+/// The exe the installed service runs (`None`: no service).
+pub fn service_exe() -> Option<PathBuf> {
+    let mgr = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT).ok()?;
+    let svc = mgr.open_service(SERVICE_NAME, ServiceAccess::QUERY_CONFIG).ok()?;
+    Some(exe_of(&svc.query_config().ok()?.executable_path.to_string_lossy()))
+}
+
+pub fn same_file(a: &Path, b: &Path) -> bool {
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// The exe the service runs when it is not this one (moved, another build,
+/// or a copy an older version made).
+pub fn service_elsewhere() -> Option<PathBuf> {
+    let theirs = service_exe()?;
+    let me = std::env::current_exe().ok()?;
+    (!same_file(&me, &theirs)).then_some(theirs)
+}
+
+fn is_system(process: HANDLE) -> bool {
+    unsafe {
+        let mut tok = HANDLE::default();
+        if OpenProcessToken(process, TOKEN_QUERY, &mut tok).is_err() {
+            return false;
+        }
+        let mut buf = [0u8; 256];
+        let mut len = 0u32;
+        let ok = GetTokenInformation(tok, TokenUser, Some(buf.as_mut_ptr().cast()), buf.len() as u32, &mut len).is_ok();
+        let _ = CloseHandle(tok);
+        if !ok {
+            return false;
+        }
+        let user = &*(buf.as_ptr() as *const TOKEN_USER);
+        IsWellKnownSid(user.User.Sid, WinLocalSystemSid).as_bool()
+    }
+}
+
+/// Processes running as SYSTEM from one of `exes` (other than this one and
+/// `keep`): helpers of a service that did not stop cleanly. The user's own
+/// processes from the same exe (the lobby, session windows) stay.
+fn leftover_helpers(exes: &[PathBuf], keep: Option<u32>) -> Vec<u32> {
+    let exes: Vec<String> = exes.iter().map(|p| p.to_string_lossy().to_lowercase()).collect();
     let me = std::process::id();
     let mut found = Vec::new();
     unsafe {
@@ -100,7 +177,8 @@ fn installed_processes(keep: Option<u32>) -> Vec<u32> {
                 let mut buf = [0u16; 1024];
                 let mut len = buf.len() as u32;
                 if QueryFullProcessImageNameW(h, PROCESS_NAME_WIN32, PWSTR(buf.as_mut_ptr()), &mut len).is_ok()
-                    && String::from_utf16_lossy(&buf[..len as usize]).to_lowercase().starts_with(&dir)
+                    && exes.contains(&String::from_utf16_lossy(&buf[..len as usize]).to_lowercase())
+                    && is_system(h)
                 {
                     found.push(pid);
                 }
@@ -113,9 +191,8 @@ fn installed_processes(keep: Option<u32>) -> Vec<u32> {
     found
 }
 
-/// Ends helpers left behind by a service that did not stop cleanly.
-fn kill_installed_processes(keep: Option<u32>) {
-    for pid in installed_processes(keep) {
+fn kill_leftover_helpers(exes: &[PathBuf], keep: Option<u32>) {
+    for pid in leftover_helpers(exes, keep) {
         unsafe {
             if let Ok(h) = OpenProcess(PROCESS_TERMINATE, false, pid) {
                 if TerminateProcess(h, 1).is_ok() {
@@ -164,14 +241,6 @@ fn restore_sas_policy() -> Result<()> {
     Ok(())
 }
 
-/// The data folder holds the device's secret key: SYSTEM and Administrators only.
-fn create_data_dir() -> Result<()> {
-    let dir = data_dir();
-    std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
-    let d = dir.to_string_lossy();
-    run("icacls", &[&d, "/inheritance:r", "/grant:r", "*S-1-5-18:(OI)(CI)F", "*S-1-5-32-544:(OI)(CI)F", "/q"])
-}
-
 fn remove_firewall_rule() {
     let _ = Command::new("netsh")
         .args(["advfirewall", "firewall", "delete", "rule", &format!("name={FIREWALL_RULE}")])
@@ -180,7 +249,7 @@ fn remove_firewall_rule() {
 
 /// Without a rule the firewall drops direct connections to the service: it
 /// never shows the "allow access" prompt for a program without a desktop.
-fn add_firewall_rule() -> Result<()> {
+fn add_firewall_rule(exe: &Path) -> Result<()> {
     remove_firewall_rule();
     run(
         "netsh",
@@ -192,20 +261,13 @@ fn add_firewall_rule() -> Result<()> {
             &format!("name={FIREWALL_RULE}"),
             "dir=in",
             "action=allow",
-            &format!("program={}", installed_exe().display()),
+            &format!("program={}", exe.display()),
             "enable=yes",
             "profile=any",
         ],
     )?;
-    println!("  firewall: allowed incoming connections to {}", installed_exe().display());
+    println!("  firewall: allowed incoming connections to {}", exe.display());
     Ok(())
-}
-
-fn same_file(a: &Path, b: &Path) -> bool {
-    match (a.canonicalize(), b.canonicalize()) {
-        (Ok(a), Ok(b)) => a == b,
-        _ => false,
-    }
 }
 
 /// Whether the service is installed (Some) and running. Needs no admin.
@@ -213,16 +275,6 @@ pub fn service_running() -> Option<bool> {
     let mgr = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT).ok()?;
     let svc = mgr.open_service(SERVICE_NAME, ServiceAccess::QUERY_STATUS).ok()?;
     Some(svc.query_status().ok()?.current_state == ServiceState::Running)
-}
-
-/// Whether this exe is newer than the service's copy (`installed_exe`).
-/// Installing copies the exe with its modification time, so a later one
-/// here is a newer build or download.
-pub fn service_outdated() -> bool {
-    let Ok(me) = std::env::current_exe() else { return false };
-    let modified = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
-    let (Some(mine), Some(theirs)) = (modified(&me), modified(&installed_exe())) else { return false };
-    mine.duration_since(theirs).is_ok_and(|d| d > Duration::from_secs(2)) && !same_file(&me, &installed_exe())
 }
 
 /// Changes the service's start type to automatic (AutoStart) or demand-start (Manual).
@@ -266,6 +318,33 @@ pub fn start_service() -> Result<()> {
     }
 }
 
+/// Stops the service until the lobby starts it again (its tray menu's 退出).
+/// Works for an interactive non-admin user once SDDL is set.
+pub fn stop_service_now() -> Result<()> {
+    let mgr = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
+    let svc = mgr.open_service(SERVICE_NAME, ServiceAccess::STOP | ServiceAccess::QUERY_STATUS)?;
+    if svc.query_status()?.current_state != ServiceState::Stopped {
+        svc.stop()?;
+        wait_stopped(&svc)?;
+    }
+    Ok(())
+}
+
+/// The lobby starts hidden in the tray at logon (`on`), or not. The lobby
+/// sets this itself: the elevated install may run as another user.
+pub fn set_autostart(exe: &Path, on: bool) -> Result<()> {
+    let (run, _) = RegKey::predef(HKEY_CURRENT_USER).create_subkey(RUN_KEY)?;
+    let value = format!("\"{}\" lobby --hidden", exe.display());
+    if on {
+        if run.get_value::<String, _>(RUN_VALUE).ok().as_deref() != Some(value.as_str()) {
+            run.set_value(RUN_VALUE, &value)?;
+        }
+    } else if run.get_raw_value(RUN_VALUE).is_ok() {
+        run.delete_value(RUN_VALUE)?;
+    }
+    Ok(())
+}
+
 /// Run elevated by the lobby: the output goes to a file next to the user's
 /// key that the lobby reads, since it cannot see this process's console.
 pub fn report_to_lobby(user_key: Option<&Path>) -> Result<()> {
@@ -275,152 +354,31 @@ pub fn report_to_lobby(user_key: Option<&Path>) -> Result<()> {
     }
 }
 
-/// The files the service takes over from the user (and gives back).
-fn user_files(user_key: &Path) -> [(PathBuf, PathBuf); 2] {
-    let svc = key_path();
-    [
-        (store::devices_path(user_key), store::devices_path(&svc)),
-        (store::settings_path(user_key), store::settings_path(&svc)),
-    ]
-}
-
-/// One computer, one device key: the service goes online with the user's
-/// key (made now if there is none), with their device list and settings.
-/// Installing over a service already there keeps the service's own list and
-/// settings: while it runs, the lobby changes those, not the user's copies.
-/// Leftovers of phase 1, when the service had a key of its own, go.
-fn take_over(user_key: &Path, allow: &[EndpointId], upgrade: bool) -> Result<EndpointId> {
-    let id = net::load_key(user_key)?.public();
-    std::fs::copy(user_key, key_path()).context("copy the device key")?;
-    for (from, to) in user_files(user_key) {
-        if upgrade && to.exists() {
-            continue;
-        }
-        if from.exists() {
-            std::fs::copy(&from, &to).with_context(|| format!("copy {}", from.display()))?;
-        } else {
-            let _ = std::fs::remove_file(&to);
-        }
-    }
-    for f in ["allowed.txt", "lobby-id.txt", "service-id.txt", "device.key.online"] {
-        let _ = std::fs::remove_file(data_dir().join(f));
-    }
-    if !allow.is_empty() {
-        let mut s = Store::load(&store::devices_path(&key_path()))?;
-        for a in allow {
-            s.add(*a).auto_accept = true;
-        }
-        s.save()?;
-    }
-    println!("  the service uses this computer's device key, device list and settings ({})", user_key.display());
-    Ok(id)
-}
-
-pub fn install(allow: &[EndpointId], user_key: Option<&Path>, lobby: Option<u32>) -> Result<()> {
-    require_admin()?;
-    let user_key = user_key.map(Path::to_path_buf).unwrap_or_else(net::default_key_path);
-    let mgr = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE)?;
-    let exists = stop_service(&mgr)?;
-    kill_installed_processes(lobby);
-
-    let me = std::env::current_exe()?;
-    if !same_file(&me, &installed_exe()) {
-        std::fs::create_dir_all(install_dir())?;
-        // A process just ended can hold its exe open for a moment longer.
-        let mut tries = 0;
-        loop {
-            match std::fs::copy(&me, installed_exe()) {
-                Ok(_) => break,
-                Err(e) if e.raw_os_error() == Some(32) && tries < 20 => {
-                    tries += 1;
-                    std::thread::sleep(Duration::from_millis(250));
-                }
-                Err(e) => return Err(e).context("copy the exe"),
-            }
-        }
-        println!("  copied the exe to {}", installed_exe().display());
-    }
-    create_data_dir()?;
-    let id = take_over(&user_key, allow, exists)?;
-    set_sas_policy()?;
-    add_firewall_rule()?;
-
-    let access = ServiceAccess::START | ServiceAccess::QUERY_STATUS;
-    let svc = if exists {
-        mgr.open_service(SERVICE_NAME, access)?
-    } else {
-        let info = ServiceInfo {
-            name: SERVICE_NAME.into(),
-            display_name: "remote-control host".into(),
-            service_type: ServiceType::OWN_PROCESS,
-            start_type: ServiceStartType::AutoStart,
-            error_control: ServiceErrorControl::Normal,
-            executable_path: installed_exe(),
-            launch_arguments: vec!["service".into()],
-            dependencies: vec![],
-            account_name: None,
-            account_password: None,
-        };
-        let s = mgr.create_service(&info, access)?;
-        println!("  created service {SERVICE_NAME} (LocalSystem, starts with Windows)");
-        s
-    };
-    run(
-        "sc.exe",
-        &[
-            "sdset",
-            SERVICE_NAME,
-            "D:(A;;CCLCSWRPWPDTLOCRRC;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)(A;;CCLCSWRPLOCRRC;;;IU)(A;;CCLCSWLOCRRC;;;SU)",
-        ],
-    )?;
-    svc.start::<&str>(&[]).context("start the service")?;
-    for _ in 0..25 {
-        if svc.query_status()?.current_state == ServiceState::Running {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(200));
-    }
-    println!("  service state: {:?}", svc.query_status()?.current_state);
-    println!("device id {id}");
-    println!("logs: {}", data_dir().display());
-    Ok(())
-}
-
-/// Run from the install folder (the lobby was started from there), the
-/// program and its firewall rule stay: only the service and its data go.
-pub fn uninstall(user_key: Option<&Path>, lobby: Option<u32>) -> Result<()> {
-    require_admin()?;
-    let user_key = user_key.map(Path::to_path_buf).unwrap_or_else(net::default_key_path);
-    let keep_exe = same_file(&std::env::current_exe()?, &installed_exe());
-    let mgr = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
-    if stop_service(&mgr)? {
-        mgr.open_service(SERVICE_NAME, ServiceAccess::DELETE)?.delete()?;
-        println!("  deleted service {SERVICE_NAME}");
-    } else {
-        println!("  service not installed");
-    }
-    kill_installed_processes(lobby);
-    // The device list and settings changed while the service ran: back to the user.
-    if key_path().exists() {
+/// An older version's service kept copies of the device list and settings
+/// (changed while it ran) in ProgramData: they go back next to the user's
+/// key, then its copies of the exe and the data are removed.
+fn move_old_copies_back(user_key: &Path) -> Result<()> {
+    let old_key = old_data_dir().join("device.key");
+    if old_key.exists() {
         if let Some(dir) = user_key.parent() {
             std::fs::create_dir_all(dir)?;
         }
         if !user_key.exists() {
-            std::fs::copy(key_path(), &user_key).context("copy the device key back")?;
+            std::fs::copy(&old_key, user_key).context("copy the device key back")?;
         }
-        for (to, from) in user_files(&user_key) {
+        for (to, from) in [
+            (store::devices_path(user_key), store::devices_path(&old_key)),
+            (store::settings_path(user_key), store::settings_path(&old_key)),
+        ] {
             if from.exists() {
                 std::fs::copy(&from, &to).with_context(|| format!("copy {} back", from.display()))?;
             }
         }
-        println!("  device list and settings back in {}", user_key.parent().unwrap_or(&user_key).display());
+        println!("  device list and settings back in {}", user_key.parent().unwrap_or(user_key).display());
     }
-    for dir in [install_dir(), data_dir()] {
-        if keep_exe && dir == install_dir() {
-            println!("  kept {} (this program runs from there)", installed_exe().display());
-            continue;
-        }
-        if !dir.exists() {
+    let me = std::env::current_exe()?;
+    for dir in [old_install_dir(), old_data_dir()] {
+        if !dir.exists() || me.starts_with(&dir) {
             continue;
         }
         // A process that just ended may hold its exe or log for a moment.
@@ -433,32 +391,116 @@ pub fn uninstall(user_key: Option<&Path>, lobby: Option<u32>) -> Result<()> {
             r = std::fs::remove_dir_all(&dir);
         }
         r.with_context(|| format!("remove {}", dir.display()))?;
-        println!("  removed {}", dir.display());
+        println!("  removed {} (an older version's copy)", dir.display());
     }
-    restore_sas_policy()?;
-    if keep_exe {
-        println!("  kept the firewall rule (the program stays)");
+    Ok(())
+}
+
+/// The exes a service's helpers may run from: the service's own and an
+/// older version's copy.
+fn helper_exes() -> Vec<PathBuf> {
+    let mut v: Vec<PathBuf> = service_exe().into_iter().collect();
+    v.push(old_install_dir().join("remote-control.exe"));
+    v
+}
+
+pub fn install(allow: &[EndpointId], user_key: Option<&Path>, lobby: Option<u32>) -> Result<()> {
+    require_admin()?;
+    let user_key = user_key.map(Path::to_path_buf).unwrap_or_else(net::default_key_path);
+    let mgr = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE)?;
+    let exes = helper_exes();
+    let exists = stop_service(&mgr)?;
+    kill_leftover_helpers(&exes, lobby);
+    move_old_copies_back(&user_key)?;
+    let id = net::load_key(&user_key)?.public();
+    if !allow.is_empty() {
+        let mut s = Store::load(&store::devices_path(&user_key))?;
+        for a in allow {
+            s.add(*a).auto_accept = true;
+        }
+        s.save()?;
+    }
+    set_sas_policy()?;
+    let exe = std::env::current_exe()?;
+    add_firewall_rule(&exe)?;
+
+    let info = ServiceInfo {
+        name: SERVICE_NAME.into(),
+        display_name: "remote-control host".into(),
+        service_type: ServiceType::OWN_PROCESS,
+        start_type: ServiceStartType::AutoStart,
+        error_control: ServiceErrorControl::Normal,
+        executable_path: exe.clone(),
+        launch_arguments: vec!["service".into(), "--key".into(), user_key.clone().into_os_string()],
+        dependencies: vec![],
+        account_name: None,
+        account_password: None,
+    };
+    let access = ServiceAccess::START | ServiceAccess::QUERY_STATUS | ServiceAccess::QUERY_CONFIG | ServiceAccess::CHANGE_CONFIG;
+    let svc = if exists {
+        let s = mgr.open_service(SERVICE_NAME, access)?;
+        // The start type stays as the user set it (开机自动在线).
+        let start_type = s.query_config()?.start_type;
+        s.change_config(&ServiceInfo { start_type, ..info })?;
+        println!("  service {SERVICE_NAME} now runs {}", exe.display());
+        s
     } else {
-        remove_firewall_rule();
-        println!("  removed the firewall rule");
+        let s = mgr.create_service(&info, access)?;
+        println!("  created service {SERVICE_NAME} (LocalSystem, starts with Windows), running {}", exe.display());
+        s
+    };
+    run("sc.exe", &["sdset", SERVICE_NAME, SERVICE_SDDL])?;
+    svc.start::<&str>(&[]).context("start the service")?;
+    for _ in 0..25 {
+        if svc.query_status()?.current_state == ServiceState::Running {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
     }
+    println!("  service state: {:?}", svc.query_status()?.current_state);
+    println!("  the service uses this computer's device key, device list and settings ({})", user_key.display());
+    println!("device id {id}");
+    println!("logs: {}", user_key.parent().unwrap_or(&user_key).display());
+    Ok(())
+}
+
+/// The exe, the device list and settings stay where they are.
+pub fn uninstall(user_key: Option<&Path>, lobby: Option<u32>) -> Result<()> {
+    require_admin()?;
+    let user_key = user_key.map(Path::to_path_buf).unwrap_or_else(net::default_key_path);
+    let mgr = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
+    let exes = helper_exes();
+    if stop_service(&mgr)? {
+        mgr.open_service(SERVICE_NAME, ServiceAccess::DELETE)?.delete()?;
+        println!("  deleted service {SERVICE_NAME}");
+    } else {
+        println!("  service not installed");
+    }
+    kill_leftover_helpers(&exes, lobby);
+    move_old_copies_back(&user_key)?;
+    restore_sas_policy()?;
+    remove_firewall_rule();
+    println!("  removed the firewall rule");
     println!("done.");
     Ok(())
 }
 
 pub fn status() -> Result<()> {
     let mgr = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
-    match mgr.open_service(SERVICE_NAME, ServiceAccess::QUERY_STATUS) {
-        Ok(s) => println!("service: {:?}", s.query_status()?.current_state),
+    match mgr.open_service(SERVICE_NAME, ServiceAccess::QUERY_STATUS | ServiceAccess::QUERY_CONFIG) {
+        Ok(s) => {
+            println!("service: {:?}", s.query_status()?.current_state);
+            println!("command: {}", s.query_config()?.executable_path.display());
+        }
         Err(_) => println!("service: not installed"),
     }
-    println!("installed exe: {}", if installed_exe().exists() { "present" } else { "missing" });
-    println!("running from the install folder: {:?}", installed_processes(None));
-    match std::fs::read(key_path()) {
-        Ok(_) => println!("device id {}", net::load_key(&key_path())?.public()),
-        Err(e) => println!("device id: cannot read {} ({e}; needs admin)", key_path().display()),
+    println!("leftover helpers: {:?}", leftover_helpers(&helper_exes(), None));
+    let key = net::default_key_path();
+    match net::load_key(&key) {
+        Ok(k) => println!("device id {}", k.public()),
+        Err(e) => println!("device id: cannot read {} ({e:#})", key.display()),
     }
-    if let Ok(s) = Store::load(&store::devices_path(&key_path())) {
+    if let Ok(s) = Store::load(&store::devices_path(&key)) {
         for d in s.listed() {
             println!("  {} {:<16} {}", d.id, d.name, if d.auto_accept { "my computer" } else { "trusted" });
         }
@@ -468,6 +510,23 @@ pub fn status() -> Result<()> {
         .ok()
         .and_then(|k| k.get_value::<u32, _>(POLICY_VALUE).ok());
     println!("{POLICY_VALUE}: {policy:?}");
-    println!("logs: {}", data_dir().display());
+    println!("logs: {}", key.parent().unwrap_or(&key).display());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::exe_of;
+    use std::path::PathBuf;
+
+    #[test]
+    fn exe_of_a_service_command_line() {
+        let p = |s: &str| PathBuf::from(s);
+        assert_eq!(
+            exe_of(r#""D:\a b\remote-control.exe" service --key "C:\Users\x\device.key""#),
+            p(r"D:\a b\remote-control.exe")
+        );
+        assert_eq!(exe_of(r"C:\Program Files\remote-control\remote-control.exe service"), p(r"C:\Program Files\remote-control\remote-control.exe"));
+        assert_eq!(exe_of(r"C:\x\rc.EXE"), p(r"C:\x\rc.EXE"));
+    }
 }
