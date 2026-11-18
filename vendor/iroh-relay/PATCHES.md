@@ -10,7 +10,7 @@
 |---|---|---|
 | `src/server.rs` | `AccessControl` 加方法 `allow_forward(src, dst, len) -> bool`，默认返回 `true`；`DynAccessControl` 和它的通用实现跟着加同名方法 | 原版只能在连接时决定放不放行，rc-relay 要按名单逐个数据包决定转不转发（名单变了马上生效，不用断开重连） |
 | `src/server/client.rs` | `handle_frame_send_packet` 转发前先问 `allow_forward`，返回 `false` 就丢弃（计入 `send_packets_dropped`） | 同上，这是钩子的调用点 |
-| `src/server.rs` | `RelayConfig` 加字段 `handlers: Vec<(Method, &'static str, HyperHandler)>`（`RelayConfig::new` 里为空）；`Server::spawn` 把它们注册到 HTTPS 服务上 | 认领（`/rc/claim`）、添加主人（`/rc/add-owner`）和报名单（`/rc/guests`）要和 `/relay` 用同一个端口、同一张证书 |
+| `src/server.rs` | `RelayConfig` 加字段 `handlers: Vec<(Method, &'static str, HyperHandler)>`（`RelayConfig::new` 里为空）；`Server::spawn` 把它们注册到 HTTPS 服务上 | 加入中转（`/rc/claim`）和报名单（`/rc/guests`）等接口要和 `/relay` 用同一个端口、同一张证书 |
 | `src/server/http_server.rs` | `HyperHandler` 类型从 `pub(super)` 改成 `pub` | 外部要能构造上面的 handler |
 | `src/server/testing.rs` | 测试用的 `RelayConfig` 字面量补上 `handlers: Vec::new()` | 加了字段后原测试代码要能编译 |
 

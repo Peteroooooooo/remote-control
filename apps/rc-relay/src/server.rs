@@ -1,9 +1,11 @@
 //! Runs the relay: iroh-relay with [`Policy`] as its access control and the
-//! claim / add-owner / guests / invites / meet routes, and keeps the policy's roster in step
-//! with `owners.txt` (which `rc-relay owners …` may change while it runs).
+//! claim / guests / invites / meet routes, and keeps the policy's roster in
+//! step with `owners.txt` (which the management screen may change while it
+//! runs). It also writes `status.txt` every few seconds: when it started
+//! and which devices are connected, for the management screen to show.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     sync::{Arc, Mutex},
     time::{Duration, SystemTime},
 };
@@ -22,10 +24,10 @@ use rc_ident::{proof::unix_now, relay_code::RelayCode};
 use tracing::{info, warn};
 
 use crate::{
-    api::{self, AddOwnerRequest, ClaimRequest, GuestsRequest, InvitesRequest, MeetRequest, Refusal},
+    api::{self, ClaimRequest, GuestsRequest, InvitesRequest, MeetRequest, Refusal},
     config::{Config, Resolved},
     policy::Policy,
-    state::{Claim, Store},
+    state::{Code, Store, Status},
 };
 
 struct Shared {
@@ -65,6 +67,8 @@ impl Shared {
         Ok(())
     }
 
+    /// A device joins with one of the relay's codes: it is an owner now,
+    /// in that code's group. The code stays valid.
     fn claim(&self, header: &str) -> Result<String, Refusal> {
         let req = ClaimRequest::decode(header).map_err(|_| Refusal::BadRequest)?;
         let _g = self.writing.lock().unwrap();
@@ -72,27 +76,14 @@ impl Shared {
             warn!("claim: {e:#}");
             Refusal::Server
         };
-        if !self.store.take_claim(&req.claim_key).map_err(server)? {
-            info!("claim by {}: unknown key", req.device.fmt_short());
+        let Some(code) = self.store.code_with(&req.claim_key).map_err(server)? else {
+            info!("claim by {}: no such code", req.device.fmt_short());
             return Err(Refusal::UnknownKey);
-        }
-        self.store.add_owner(req.device, "claimed").map_err(server)?;
+        };
+        self.store.join(req.device, code.n, &req.name).map_err(server)?;
         self.reload().map_err(server)?;
-        info!("{} claimed the relay: it is an owner now", req.device);
+        info!("{} ({}) joined with {}: it is an owner now", req.device.fmt_short(), req.name, code.shown_name());
         Ok("ok".into())
-    }
-
-    fn add_owner(&self, header: &str) -> Result<String, Refusal> {
-        let req = AddOwnerRequest::decode(header).map_err(|_| Refusal::BadRequest)?;
-        self.signed_by_owner("add-owner", &req.device, req.time, req.nonce)?;
-        let _g = self.writing.lock().unwrap();
-        let claim = Claim::valid_for(api::ADDED_CODE_LIFETIME);
-        self.store.add_claim(claim.clone()).map_err(|e| {
-            warn!("add-owner: {e:#}");
-            Refusal::Server
-        })?;
-        info!("{} asked for a relay code for another computer", req.device.fmt_short());
-        Ok(RelayCode { urls: self.urls.clone(), claim_key: claim.key }.encode())
     }
 
     fn set_guests(&self, header: &str) -> Result<String, Refusal> {
@@ -103,15 +94,8 @@ impl Shared {
             warn!("guests: {e:#}");
             Refusal::Server
         })?;
-        let mine = req.guests.iter().filter(|g| g.mine).count();
-        info!("{} lists {} guest(s), {mine} of them its own computers", req.device.fmt_short(), req.guests.len());
-        let (came, went) = self.policy.set_guests(req.device, req.guests);
-        for o in came {
-            info!("{} owns the relay now (one of {}'s computers)", o.fmt_short(), req.device.fmt_short());
-        }
-        for o in went {
-            info!("{} no longer owns the relay", o.fmt_short());
-        }
+        info!("{} lists {} guest(s)", req.device.fmt_short(), req.guests.len());
+        self.policy.set_guests(req.device, req.guests);
         Ok("ok".into())
     }
 
@@ -185,6 +169,7 @@ impl Relay {
     pub async fn spawn(cfg: &Config, resolved: Resolved) -> Result<Relay> {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let store = Store::new(&cfg.state_dir);
+        store.upgrade()?;
         let owners: Vec<EndpointId> = store.owners()?.iter().map(|o| o.id).collect();
         let policy = Arc::new(Policy::new(owners, store.guests()?));
         let shared = Arc::new(Shared {
@@ -200,7 +185,6 @@ impl Relay {
         rc.access = policy;
         rc.handlers = vec![
             (Method::POST, api::CLAIM_PATH, route(&shared, Shared::claim)),
-            (Method::POST, api::ADD_OWNER_PATH, route(&shared, Shared::add_owner)),
             (Method::POST, api::GUESTS_PATH, route(&shared, Shared::set_guests)),
             (Method::POST, api::INVITES_PATH, route(&shared, Shared::set_invites)),
             (Method::POST, api::MEET_PATH, route(&shared, Shared::meet)),
@@ -209,7 +193,7 @@ impl Relay {
         sc.relay = Some(rc);
         sc.quic = cfg.enable_quic_addr_discovery.then(|| QuicConfig::new(cfg.quic_bind_addr()));
         let server = relay::Server::spawn(sc).await.map_err(|e| anyhow!("start the relay: {e:#}"))?;
-        let watch = tokio::spawn(watch_owners(shared.clone()));
+        let watch = tokio::spawn(watch_owners(shared.clone(), unix_now()));
         Ok(Relay { server, shared, _watch: watch })
     }
 
@@ -221,17 +205,18 @@ impl Relay {
         self.server.quic_addr()
     }
 
-    /// The relay code to print while nobody owns the relay.
-    pub fn unclaimed_code(&self) -> Result<Option<String>> {
-        if !self.shared.store.owners()?.is_empty() {
-            return Ok(None);
-        }
-        let c = self.shared.store.initial_claim()?;
-        Ok(Some(RelayCode { urls: self.shared.urls.clone(), claim_key: c.key }.encode()))
+    /// The code to print at start: the first one (made on a new relay).
+    pub fn first_code(&self) -> Result<Option<String>> {
+        Ok(self.shared.store.first_code()?.map(|c| self.code_text(&c)))
     }
 
-    pub fn connected(&self) -> Vec<(EndpointId, bool)> {
-        self.shared.policy.connected()
+    /// What a device pastes to join with `code`.
+    pub fn code_text(&self, code: &Code) -> String {
+        RelayCode { urls: self.shared.urls.clone(), claim_key: code.key }.encode()
+    }
+
+    pub fn online(&self) -> std::collections::HashSet<EndpointId> {
+        self.shared.policy.online()
     }
 
     pub async fn shutdown(self) -> Result<()> {
@@ -243,13 +228,35 @@ impl Relay {
     }
 }
 
-/// Picks up changes other processes make to `owners.txt`.
-async fn watch_owners(sh: Arc<Shared>) {
+/// Picks up changes other processes make to `owners.txt`, and writes
+/// `status.txt` (connected devices) when they change.
+async fn watch_owners(sh: Arc<Shared>, started: u64) {
     let path = sh.store.owners_path();
     let stamp = || std::fs::metadata(&path).and_then(|m| m.modified()).ok();
     let mut last: Option<SystemTime> = stamp();
+    let mut shown: Option<Vec<EndpointId>> = None;
+    let mut written = 0;
     loop {
         tokio::time::sleep(Duration::from_secs(2)).await;
+        let mut online: Vec<EndpointId> = sh.policy.online().into_iter().collect();
+        online.sort();
+        // Again every minute even unchanged: the management screen reads its age.
+        if shown.as_ref() != Some(&online) || unix_now() >= written + 60 {
+            let seen = sh.store.status().map(|s| s.seen).unwrap_or_default();
+            let mut seen: BTreeMap<EndpointId, u64> = seen;
+            let now = unix_now();
+            for id in &online {
+                seen.insert(*id, now);
+            }
+            let status = Status { started, written: now, online: online.clone(), seen };
+            match sh.store.set_status(&status) {
+                Ok(()) => {
+                    shown = Some(online);
+                    written = now;
+                }
+                Err(e) => warn!("status.txt: {e:#}"),
+            }
+        }
         let now = stamp();
         if now == last {
             continue;
@@ -271,11 +278,13 @@ pub async fn run(cfg: Config, public: &[String]) -> Result<()> {
         .map(|u| format!("{}{}", u.host_str().unwrap_or("?"), u.port().map(|p| format!(":{p}")).unwrap_or_default()))
         .collect();
     let mut relay = Relay::spawn(&cfg, resolved).await?;
-    println!("中转已启动：{}（HTTPS {}，QUIC {}）", hosts.join("  "), cfg.tls.https_bind_addr, cfg.quic_bind_addr());
-    match relay.unclaimed_code()? {
-        Some(code) => println!("还没有主人。中转码（贴到软件「设置 → 自建中转」）：\n{code}"),
-        None => println!("主人 {} 台", relay.shared.store.owners()?.len()),
+    println!("rc-relay 已启动  {}", hosts.join(" · "));
+    match relay.first_code()? {
+        Some(code) => println!("中转码（你的每台电脑都贴这一个，贴到软件「设置 → 自建中转」）：
+{code}"),
+        None => println!("没有可用的中转码：在容器控制台执行 rc-relay，按 n 新建"),
     }
+    println!("管理设备、分组和踢人：在容器控制台执行 rc-relay");
     tokio::select! {
         r = relay.join() => r?,
         _ = stop_signal() => info!("stopping"),

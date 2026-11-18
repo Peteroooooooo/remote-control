@@ -1,6 +1,7 @@
-//! Relay code `rcr1…`: where a self-hosted relay is and a one-time key that
-//! makes the computer that presents it an owner of the relay. The relay
-//! prints one on its first start; an owner can ask it for more.
+//! Relay code `rcr1…`: where a self-hosted relay is and a group key that
+//! makes any computer that presents it an owner of the relay, until the
+//! code is deleted on the relay. The relay prints one on start; more can be
+//! created in its management screen.
 //!
 //! Payload: version 1, URL count, per URL (length, UTF-8), 16-byte claim key.
 //! Up to 4 URLs, so a relay reachable as both an IPv4 and an IPv6 address

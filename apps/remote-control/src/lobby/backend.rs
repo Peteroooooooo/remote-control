@@ -47,8 +47,6 @@ pub struct Relay {
     pub url: String,
     /// "home" (in use), "ok", "fail" or "wait".
     pub state: String,
-    /// The names of the computers that gave it (joined by "、"); empty for one added here.
-    pub granted_by: String,
 }
 
 /// How a message to the user feels.
@@ -110,7 +108,7 @@ fn parse(text: &str) -> Snap {
                 (s.public, s.lan, s.accept_new, s.clipboard) = (on(3), on(4), on(5), on(6));
                 (s.boot, s.lock, s.awake) = (on(7), on(8), on(9));
             }
-            "relay" => s.relays.push(Relay { url: g(1), state: g(2), granted_by: g(3) }),
+            "relay" => s.relays.push(Relay { url: g(1), state: g(2) }),
             "hosting" => s.hosting = Some(g(2)),
             "asking" => s.asking = Some(g(1)),
             "notice" => s.notice = Some((g(1), g(2))),

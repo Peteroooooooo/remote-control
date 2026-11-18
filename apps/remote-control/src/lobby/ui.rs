@@ -1297,17 +1297,14 @@ impl App {
                 };
                 let host = host_of(&r.url);
                 let mut remove = false;
-                let given = (!r.granted_by.is_empty()).then(|| format!("{state} · 「{}」给的", r.granted_by.replace('、', "」「")));
                 let line = Item {
                     title_font: FontId::monospace(13.5),
-                    desc: Some((given.as_deref().unwrap_or(state), if color == AMBER { AMBER } else { DIM })),
+                    desc: Some((state, if color == AMBER { AMBER } else { DIM })),
                     lead: Some(color),
                     ..Item::new(&host).first(i == 0)
                 };
                 line.show(ui, |ui| {
-                    if given.is_none() {
-                        remove = icon_button(ui, Icon::Trash, 32.0, &format!("移除 {host}"), true).clicked();
-                    }
+                    remove = icon_button(ui, Icon::Trash, 32.0, &format!("移除 {host}"), true).clicked();
                 });
                 if remove {
                     self.undoable(Undoable::Relay(r.url.clone()), format!("已移除中转 {host}"));

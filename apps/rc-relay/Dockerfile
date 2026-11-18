@@ -22,6 +22,7 @@ RUN apt-get update \
     && mkdir -p /var/lib/rc-relay \
     && chown rc-relay /var/lib/rc-relay
 COPY --from=build /rc-relay /usr/local/bin/rc-relay
+ENV LANG=C.UTF-8
 USER rc-relay
 # Owners, guest lists, claim codes and the relay's own certificate.
 VOLUME /var/lib/rc-relay

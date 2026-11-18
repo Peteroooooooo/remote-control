@@ -1,4 +1,5 @@
 target/
+/rc-relay-state/
 /measurements-raw
 /docs/
 /scripts/

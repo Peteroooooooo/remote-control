@@ -17,7 +17,7 @@ use rc_ident::{
     relay_code::RelayCode,
 };
 use rc_relay::{
-    api::{self, AddOwnerRequest, Guest, Invite, Refusal},
+    api::{self, GuestsRequest, Invite, Refusal},
     client,
     config::{Config, Tls},
     server::Relay,
@@ -74,10 +74,14 @@ impl Setup {
         Store::new(self.dir.join("state"))
     }
 
-    /// Claims the relay with the code it prints while unclaimed.
+    /// The code the relay prints at start.
+    fn first_code(&self) -> RelayCode {
+        RelayCode::decode(&self.relay.first_code().unwrap().expect("a new relay has a code")).unwrap()
+    }
+
+    /// Joins the relay with the code it prints at start.
     async fn claim(&self, device: &SecretKey) {
-        let code = RelayCode::decode(&self.relay.unclaimed_code().unwrap().expect("unclaimed")).unwrap();
-        assert_eq!(client::claim(&code, device, &self.ca()).await.unwrap(), vec![self.url.clone()]);
+        assert_eq!(client::claim(&self.first_code(), device, "test", &self.ca()).await.unwrap(), vec![self.url.clone()]);
     }
 
     /// An endpoint that uses only this relay, optionally with a device proof.
@@ -120,7 +124,7 @@ impl Setup {
     }
 
     async fn set_guests(&self, owner: &SecretKey, guests: &[&SecretKey]) {
-        let ids: Vec<Guest> = guests.iter().map(|g| g.public().into()).collect();
+        let ids: Vec<_> = guests.iter().map(|g| g.public()).collect();
         client::set_guests(std::slice::from_ref(&self.url), owner, &self.ca(), &ids).await.unwrap();
     }
 }
@@ -161,7 +165,6 @@ fn proof(device: &SecretKey, ephemeral: &SecretKey, expires: u64) -> String {
 async fn unclaimed_relay_forwards_nothing() {
     let s = Setup::new("unclaimed").await;
     assert_eq!(client::ping(std::slice::from_ref(&s.url), &s.ca()).await.unwrap(), s.url, "answers its probe");
-    assert!(s.relay.unclaimed_code().unwrap().is_some());
     let (a, b) = (s.endpoint(key(), None).await, s.endpoint(key(), None).await);
     assert!(!s.reaches(&a, &b).await);
     assert!(!s.reaches(&b, &a).await);
@@ -170,14 +173,11 @@ async fn unclaimed_relay_forwards_nothing() {
 #[tokio::test]
 async fn claim_then_only_the_roster_gets_help() {
     let s = Setup::new("claim").await;
-    let code = RelayCode::decode(&s.relay.unclaimed_code().unwrap().unwrap()).unwrap();
+    let code = s.first_code();
     let owner = key();
-    assert_eq!(client::claim(&code, &owner, &s.ca()).await.unwrap(), vec![s.url.clone()]);
-    assert!(s.relay.unclaimed_code().unwrap().is_none());
-    // The claim key is used up.
-    let e = client::claim(&code, &key(), &s.ca()).await.unwrap_err();
-    assert_eq!(e.downcast_ref::<Refusal>(), Some(&Refusal::UnknownKey));
-    assert_eq!(s.store().owners().unwrap().len(), 1);
+    assert_eq!(client::claim(&code, &owner, "DESKTOP", &s.ca()).await.unwrap(), vec![s.url.clone()]);
+    let o = s.store().owners().unwrap();
+    assert_eq!((o.len(), o[0].name.as_str()), (1, "DESKTOP"));
 
     let (gk, gk2) = (key(), key());
     let o = s.endpoint(owner.clone(), None).await;
@@ -189,7 +189,7 @@ async fn claim_then_only_the_roster_gets_help() {
 
     // Listed while connected: no reconnect needed.
     s.set_guests(&owner, &[&gk, &gk2]).await;
-    assert_eq!(s.store().guests().unwrap()[&owner.public()], [gk.public().into(), gk2.public().into()]);
+    assert_eq!(s.store().guests().unwrap()[&owner.public()], [gk.public(), gk2.public()]);
     assert!(s.reaches(&g, &o).await, "guest → owner");
     assert!(s.reaches(&o, &g).await, "owner → guest");
     assert!(!s.reaches(&g, &g2).await, "guest → guest: no owner at either end");
@@ -202,34 +202,44 @@ async fn claim_then_only_the_roster_gets_help() {
     assert!(s.reaches(&g2, &o).await, "still listed");
 
     // Only an owner may send a list.
-    let e = client::set_guests(std::slice::from_ref(&s.url), &key(), &s.ca(), &[gk.public().into()]).await.unwrap_err();
+    let e = client::set_guests(std::slice::from_ref(&s.url), &key(), &s.ca(), &[gk.public()]).await.unwrap_err();
     assert_eq!(e.downcast_ref::<Refusal>(), Some(&Refusal::NotOwner));
 }
 
 #[tokio::test]
-async fn add_owner_flow() {
-    let s = Setup::new("add-owner").await;
-    let first = key();
-    s.claim(&first).await;
+async fn a_code_works_for_every_computer_until_deleted() {
+    let s = Setup::new("codes").await;
+    let code = s.first_code();
+    let (a, b) = (key(), key());
+    client::claim(&code, &a, "DESKTOP", &s.ca()).await.unwrap();
+    client::claim(&code, &b, "laptop", &s.ca()).await.expect("the same code again, another computer");
+    let (ea, eb) = (s.endpoint(a.clone(), None).await, s.endpoint(b.clone(), None).await);
+    assert!(s.reaches(&ea, &eb).await, "two owners reach each other");
 
-    // A stranger cannot get a code.
-    let e = client::add_owner(std::slice::from_ref(&s.url), &key(), &s.ca()).await.unwrap_err();
-    assert_eq!(e.downcast_ref::<Refusal>(), Some(&Refusal::NotOwner));
+    // A second code, for another group.
+    let other = s.store().new_code("爸妈").unwrap();
+    assert_eq!(other.n, 2);
+    let dad = key();
+    let other_code = RelayCode { urls: code.urls.clone(), claim_key: other.key };
+    client::claim(&other_code, &dad, "DAD-PC", &s.ca()).await.unwrap();
+    let ed = s.endpoint(dad.clone(), None).await;
+    assert!(s.reaches(&ed, &ea).await);
 
-    let code = client::add_owner(std::slice::from_ref(&s.url), &first, &s.ca()).await.unwrap();
-    assert_eq!(code.urls, std::slice::from_ref(&s.url));
-    let second = key();
-    client::claim(&code, &second, &s.ca()).await.unwrap();
-    let e = client::claim(&code, &key(), &s.ca()).await.unwrap_err();
+    // The group deleted: its device is out at once, and the code no longer works.
+    assert_eq!(s.store().delete_code(other.n).unwrap(), [dad.public()]);
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(!s.reaches(&ed, &ea).await, "its code deleted");
+    let e = client::claim(&other_code, &dad, "DAD-PC", &s.ca()).await.unwrap_err();
     assert_eq!(e.downcast_ref::<Refusal>(), Some(&Refusal::UnknownKey));
-    let owners: Vec<_> = s.store().owners().unwrap().into_iter().map(|o| o.id).collect();
-    assert_eq!(owners, [first.public(), second.public()]);
 
-    let p = s.endpoint(second, None).await;
-    let f = s.endpoint(first.clone(), None).await;
-    assert!(s.reaches(&f, &p).await, "owner → the new owner");
+    // One device removed: out, but its code still works for it.
+    assert!(s.store().remove_owner(&b.public()).unwrap());
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(!s.reaches(&eb, &ea).await, "removed");
+    client::claim(&code, &b, "laptop", &s.ca()).await.unwrap();
+    assert!(s.reaches(&eb, &ea).await, "joined again with the same code");
 
-    // The same signed request twice; a request with a far-off clock.
+    // A signed request seen twice; a request with a far-off clock.
     let http = reqwest::Client::builder()
         .tls_backend_preconfigured(s.ca().client_config(iroh_relay::tls::default_provider()).unwrap())
         .no_proxy()
@@ -238,14 +248,14 @@ async fn add_owner_flow() {
     let post = |req: String| {
         let http = http.clone();
         let mut url: url::Url = (*s.url).clone();
-        url.set_path(api::ADD_OWNER_PATH);
+        url.set_path(api::GUESTS_PATH);
         async move { http.post(url).header(api::HEADER, req).send().await.unwrap().text().await.unwrap() }
     };
-    let req = AddOwnerRequest::new(&first, unix_now()).encode();
-    assert!(RelayCode::decode(&post(req.clone()).await).is_ok());
+    let req = GuestsRequest::new(&a, unix_now(), &[]).encode();
+    assert_eq!(post(req.clone()).await, "ok");
     assert_eq!(post(req).await, "replay");
-    assert_eq!(post(AddOwnerRequest::new(&first, unix_now() - 1000).encode()).await, "clock");
-    assert_eq!(post("rcqa1nonsense".into()).await, "bad-request");
+    assert_eq!(post(GuestsRequest::new(&a, unix_now() - 1000, &[]).encode()).await, "clock");
+    assert_eq!(post("rcqg1nonsense".into()).await, "bad-request");
 }
 
 #[tokio::test]
@@ -346,8 +356,8 @@ async fn owners_file_changes_apply_while_running() {
     let (a, b) = (s.endpoint(k.clone(), None).await, s.endpoint(first.clone(), None).await);
     let g = s.endpoint(guest, None).await;
     assert!(!s.reaches(&b, &a).await);
-    // What `rc-relay owners add` does.
-    assert!(s.store().add_owner(k.public(), "test").unwrap());
+    // What the management screen does: change the files the relay reads.
+    s.store().join(k.public(), 1, "test").unwrap();
     tokio::time::sleep(Duration::from_secs(3)).await;
     assert!(s.reaches(&b, &a).await, "added owner");
     assert!(s.store().remove_owner(&k.public()).unwrap());
@@ -361,31 +371,17 @@ async fn owners_file_changes_apply_while_running() {
 }
 
 #[tokio::test]
-async fn an_owners_own_computer_owns_the_relay_until_the_mark_goes() {
-    let s = Setup::new("mine").await;
-    let first = key();
-    s.claim(&first).await;
-    let (laptop, friend) = (key(), key());
-    let urls = std::slice::from_ref(&s.url);
-    let refused = |e: anyhow::Error| e.downcast_ref::<Refusal>().copied();
-    let e = client::set_guests(urls, &laptop, &s.ca(), &[friend.public().into()]).await.unwrap_err();
-    assert_eq!(refused(e), Some(Refusal::NotOwner), "not yet");
-
-    // The first owner marks the laptop as its own computer.
-    client::set_guests(urls, &first, &s.ca(), &[Guest { id: laptop.public(), mine: true }]).await.unwrap();
-    assert!(s.store().guests().unwrap()[&first.public()][0].mine, "kept across restarts");
-    client::set_guests(urls, &laptop, &s.ca(), &[friend.public().into()]).await.expect("an owner now");
-    client::set_invites(urls, &laptop, &s.ca(), &[Invite { token: [1; 8], expires: unix_now() + 600 }]).await.unwrap();
-    client::add_owner(urls, &laptop, &s.ca()).await.expect("an owner may ask for a relay code");
-    let l = s.endpoint(laptop.clone(), None).await;
-    let f = s.endpoint(friend.clone(), None).await;
-    assert!(s.reaches(&f, &l).await, "the laptop's friend → the laptop");
-
-    // Trusted only from now on: the laptop owns nothing, its friend is out.
-    client::set_guests(urls, &first, &s.ca(), &[laptop.public().into()]).await.unwrap();
-    assert!(!s.reaches(&f, &l).await, "the laptop's friend after the mark went");
-    let e = client::set_guests(urls, &laptop, &s.ca(), &[]).await.unwrap_err();
-    assert_eq!(refused(e), Some(Refusal::NotOwner));
-    let o = s.endpoint(first.clone(), None).await;
-    assert!(s.reaches(&l, &o).await, "still the first owner's guest");
+async fn the_status_file_shows_who_is_online() {
+    let s = Setup::new("status").await;
+    let owner = key();
+    s.claim(&owner).await;
+    let _o = s.endpoint(owner.clone(), None).await;
+    let t = std::time::Instant::now();
+    while !s.store().status().unwrap().online.contains(&owner.public()) {
+        assert!(t.elapsed() < Duration::from_secs(10), "the relay writes who is connected");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    let st = s.store().status().unwrap();
+    assert!(st.started > 0 && st.written >= st.started);
+    assert!(st.seen.contains_key(&owner.public()));
 }

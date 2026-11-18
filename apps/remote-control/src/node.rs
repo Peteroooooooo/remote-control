@@ -21,11 +21,10 @@
 //! the relay its home. When no own relay answers for a while, the public
 //! relays help instead, if allowed (`fallback_loop`).
 //!
-//! A device this computer lists as "my computer" owns its relays too (the
-//! guest list marks it, see `rc_relay::policy`), and hears of them in each
-//! hello and welcome (`grant_for`). The other side uses them from then on,
-//! as given (`take_grant`), until they are no longer given or the relay
-//! refuses it as an owner (`not_owner`).
+//! A relay is this computer's own once it joined it with one of the relay's
+//! codes; nothing hands a relay on to other computers. Hellos and welcomes
+//! still carry an empty `grant`, so an older version on the other side
+//! drops a relay it was once given here.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -41,7 +40,7 @@ use rc_ident::{
     conn_code::{ConnCode, Find},
     relay_code::RelayCode,
 };
-use rc_relay::api::{Guest, Invite, Refusal};
+use rc_relay::api::{Invite, Refusal};
 use tokio::sync::Notify;
 
 use crate::{
@@ -50,7 +49,7 @@ use crate::{
     net::PathKind,
     pipeline::PipeConfig,
     proto::{self, Msg, read_msg},
-    store::{self, Grant, Settings, Store, clean, relay_urls, url_list},
+    store::{self, Settings, Store, clean, relay_urls, url_list},
     term,
 };
 
@@ -185,8 +184,6 @@ struct St {
     /// Per-relay outcome of the last guest-list send: true = ok, false = fail
     /// (by the relay's first address).
     relay_ok: BTreeMap<String, bool>,
-    /// When each relay in `settings.granted` was given this run.
-    granted_at: BTreeMap<Vec<RelayUrl>, Instant>,
 }
 
 struct Shared {
@@ -239,9 +236,6 @@ const LOBBY_GONE: Duration = Duration::from_secs(4);
 const FALLBACK_AFTER: Duration = Duration::from_secs(10);
 /// While they do, how often the own relays are asked whether they are back.
 const FALLBACK_RECHECK: Duration = Duration::from_secs(30);
-/// A relay given this long ago that refuses this computer as an owner is
-/// no longer given; a younger one waits for the giver's list to arrive.
-const GRANT_GRACE: Duration = Duration::from_secs(20);
 
 fn short(id: &EndpointId) -> String {
     format!("设备 {}", &id.to_string()[..6])
@@ -408,94 +402,13 @@ impl Shared {
 
     /// The devices this computer lets use its own relay (`target-plan` 5.2):
     /// the device list, and the devices met with a connection code while
-    /// the lobby is open and the software is not going away. Its own
-    /// computers ("my computer") are marked: they own the relay too.
-    fn guests(&self, st: &St) -> Vec<Guest> {
-        let mut v: BTreeMap<EndpointId, bool> = st.store.listed().map(|d| (d.id, d.auto_accept)).collect();
+    /// the lobby is open and the software is not going away.
+    fn guests(&self, st: &St) -> Vec<EndpointId> {
+        let mut v: BTreeSet<EndpointId> = st.store.listed().map(|d| d.id).collect();
         if self.lobby_open(st) && !self.is_stopped() && !self.leaving.load(std::sync::atomic::Ordering::SeqCst) {
-            for (id, _) in st.peers.iter().filter(|(_, p)| p.met == Some(Met::Code)) {
-                v.entry(*id).or_insert(false);
-            }
+            v.extend(st.peers.iter().filter(|(_, p)| p.met == Some(Met::Code)).map(|(id, _)| *id));
         }
-        v.into_iter().map(|(id, mine)| Guest { id, mine }).collect()
-    }
-
-    /// The relays this computer gives `id` (`grant` in its hellos and
-    /// welcomes): every own relay, when `id` is "my computer" here. It owns
-    /// them through this computer then (see `rc_relay::policy`).
-    fn grant_for(&self, st: &St, id: &EndpointId) -> String {
-        if !st.store.get(id).is_some_and(|d| d.auto_accept) {
-            return String::new();
-        }
-        st.settings.relays.iter().map(|g| url_list(g)).collect::<Vec<_>>().join(" ")
-    }
-
-    /// The relays `from` gives this computer now (`None`: a version that
-    /// gives none, so nothing changes). Taken only from a device in the
-    /// list; a relay added here stays as it is.
-    fn take_grant(&self, st: &mut St, from: &EndpointId, grant: Option<String>) {
-        let Some(text) = grant else { return };
-        let given: Vec<Vec<RelayUrl>> =
-            if st.store.get(from).is_some() { text.split(' ').map(relay_urls).filter(|g| !g.is_empty()).collect() } else { Vec::new() };
-        let before = relays_of(&st.settings);
-        let name = self.shown_name(st, from);
-        let mut changed = false;
-        for g in &given {
-            if let Some(x) = st.settings.granted.iter_mut().find(|x| same_group(&x.urls, g)) {
-                if !x.by.contains(from) {
-                    x.by.push(*from);
-                    changed = true;
-                }
-            } else if !st.settings.relays.iter().any(|r| same_group(r, g)) {
-                log!("{} ({name}) lists this computer as its own: using its relay {} too", from.fmt_short(), url_list(g));
-                st.settings.relays.push(g.clone());
-                st.settings.granted.push(Grant { urls: g.clone(), by: vec![*from] });
-                st.granted_at.insert(g.clone(), Instant::now());
-                self.notice(st, format!("「{name}」把这台电脑设成了它的电脑，这里也用上了它的中转 {}", host_of(g)));
-                changed = true;
-            }
-        }
-        for x in st.settings.granted.iter_mut() {
-            if x.by.contains(from) && !given.iter().any(|g| same_group(&x.urls, g)) {
-                x.by.retain(|b| b != from);
-                changed = true;
-            }
-        }
-        if changed {
-            let gone = self.drop_grants(st, |x| x.by.is_empty());
-            if !gone.is_empty() {
-                self.notice(st, format!("「{name}」不再把这台电脑当作它的电脑，它给的中转 {} 已移除", gone.join("、")));
-            }
-            self.settings_changed(st, before);
-        }
-    }
-
-    /// Takes the granted relays `which` picks out of use. Returns their hosts.
-    fn drop_grants(&self, st: &mut St, which: impl Fn(&Grant) -> bool) -> Vec<String> {
-        let gone: Vec<Vec<RelayUrl>> = st.settings.granted.iter().filter(|x| which(x)).map(|x| x.urls.clone()).collect();
-        st.settings.granted.retain(|x| !gone.contains(&x.urls));
-        st.settings.relays.retain(|r| !gone.contains(r));
-        for g in &gone {
-            st.granted_at.remove(g);
-            log!("no longer using the relay {} (given by another computer)", url_list(g));
-        }
-        gone.iter().map(|g| host_of(g)).collect()
-    }
-
-    /// The relay at `relay` says this computer does not own it: a granted
-    /// one goes out of use, unless it was given a moment ago (the giver's
-    /// list may not have reached the relay yet).
-    fn not_owner(&self, relay: &[RelayUrl]) {
-        let mut st = self.st.lock().unwrap();
-        if st.granted_at.get(relay).is_some_and(|t| t.elapsed() < GRANT_GRACE) {
-            return;
-        }
-        let before = relays_of(&st.settings);
-        let gone = self.drop_grants(&mut st, |x| x.urls == relay);
-        if !gone.is_empty() {
-            self.notice(&mut st, format!("中转 {} 不再认这台电脑是它的主人，已移除", gone.join("、")));
-            self.settings_changed(&mut st, before);
-        }
+        v.into_iter().collect()
     }
 
     /// Settings changed in `st` (the relays were `before`): saved, every
@@ -534,11 +447,10 @@ impl Shared {
 
     /// Replaces this computer's guest list on `relay` (its addresses). The
     /// error is the relay's own (a `Refusal`, see `relay_error`).
-    async fn send_guests(&self, relay: &[RelayUrl], guests: &[Guest]) -> Result<()> {
+    async fn send_guests(&self, relay: &[RelayUrl], guests: &[EndpointId]) -> Result<()> {
         let _one = self.sending_guests.lock().await;
         rc_relay::client::set_guests(relay, &self.secret, &rc_relay::tls::ca(), guests).await?;
-        let mine = guests.iter().filter(|g| g.mine).count();
-        log!("guest list on {}: {} device(s), {mine} of them this computer's own", relay[0], guests.len());
+        log!("guest list on {}: {} device(s)", relay[0], guests.len());
         Ok(())
     }
 
@@ -666,8 +578,7 @@ impl Shared {
         };
         let home = url_list(&self.home_list(st));
         let token = st.peers.get(id).and_then(|p| p.token);
-        let grant = Some(self.grant_for(st, id));
-        (Msg::MeetHi { name: st.settings.shown_name(), home, token, event, grant }, event)
+        (Msg::MeetHi { name: st.settings.shown_name(), home, token, event, grant: Some(String::new()) }, event)
     }
 
     /// Status of a connected device from its connection's selected path.
@@ -695,7 +606,7 @@ impl Shared {
         }
     }
 
-    fn welcomed(&self, st: &mut St, id: &EndpointId, conn: &Connection, name: String, home: String, grant: Option<String>, sent: u8) {
+    fn welcomed(&self, st: &mut St, id: &EndpointId, conn: &Connection, name: String, home: String, sent: u8) {
         let name = clean(&name);
         let home = relay_urls(&home);
         if let Some(p) = st.peers.get_mut(id) {
@@ -742,7 +653,6 @@ impl Shared {
                 self.save(st);
             }
         }
-        self.take_grant(st, id, grant);
         self.path_status(st, id);
     }
 
@@ -795,12 +705,12 @@ impl Shared {
     }
 
     /// The answer to a hello from `from` (see `meet`).
-    fn on_hi(self: &Arc<Self>, from: EndpointId, conn: &Connection, name: String, home: String, token: Option<[u8; 8]>, event: u8, grant: Option<String>) -> Msg {
+    fn on_hi(self: &Arc<Self>, from: EndpointId, conn: &Connection, name: String, home: String, token: Option<[u8; 8]>, event: u8) -> Msg {
         let mut st = self.st.lock().unwrap();
         let welcome = |st: &St| Msg::MeetWelcome {
             name: st.settings.shown_name(),
             home: url_list(&self.home_list(st)),
-            grant: Some(self.grant_for(st, &from)),
+            grant: Some(String::new()),
         };
         let name = clean(&name);
         if event == meet::EVENT_FORGET {
@@ -872,7 +782,6 @@ impl Shared {
                 p.home = h;
             }
         }
-        self.take_grant(&mut st, &from, grant);
         // Waking a connected peer task here would make the two sides' hellos wake
         // each other forever; only an idle one (not connected) needs it.
         if st.peers.get(&from).is_none_or(|p| !p.running || p.conn.is_none()) {
@@ -947,7 +856,6 @@ impl Node {
             notice_seq: 0,
             suggest: None,
             relay_ok: BTreeMap::new(),
-            granted_at: BTreeMap::new(),
         };
         let sh = Arc::new(Shared { opts, secret, me, ep: std::sync::RwLock::new(ep.clone()), st: Mutex::new(st), repaint: Mutex::default(), rt: tokio::runtime::Handle::current(),
             detoured: detoured.into(),
@@ -1058,7 +966,6 @@ impl Node {
             "set-name" => Ok(self.settings(|s| s.name = clean(f.get(1).copied().unwrap_or("")))),
             "set-public" => Ok(self.settings(|s| s.public_relays = f.get(1) == Some(&"1"))),
             "relay-claim" => self.claim_relay(f.get(1).copied().unwrap_or("")),
-            "relay-add" => self.relay_code_for_another(f.get(1).copied().unwrap_or("")),
             "relay-remove" => self.remove_relay(f.get(1).copied().unwrap_or("")),
             "disconnect" => {
                 if let Some(h) = &self.sh.st.lock().unwrap().hosting {
@@ -1155,7 +1062,7 @@ impl Node {
                     None => "wait",
                 }
             };
-            out += &format!("relay\t{}\t{state}\t{}\n", url_list(g), granted_by(sh, &st, g));
+            out += &format!("relay\t{}\t{state}\t\n", url_list(g));
         }
         if let Some(h) = &st.hosting {
             out += &format!("hosting\t{}\t{}\n", h.id, h.name);
@@ -1321,27 +1228,16 @@ impl Node {
             ));
         };
         let ca = rc_relay::tls::ca();
-        let claim = rc_relay::client::claim(&code, &self.sh.secret, &ca);
+        let name = self.sh.st.lock().unwrap().settings.shown_name();
+        let claim = rc_relay::client::claim(&code, &self.sh.secret, &name, &ca);
         let urls = self.sh.rt.block_on(claim).map_err(relay_error)?;
-        log!("claimed the relay {}: using it from now on", url_list(&urls));
+        log!("joined the relay {}: using it from now on", url_list(&urls));
         self.settings(|s| {
-            // The same relay again (a new claim, other addresses): its addresses now.
+            // The same relay again (another code, other addresses): its addresses now.
             s.relays.retain(|g| !g.iter().any(|u| urls.contains(u) || same_relay(u, &urls)));
-            s.granted.retain(|g| !same_group(&g.urls, &urls));
             s.relays.push(urls.clone());
         });
         Ok(url_list(&urls))
-    }
-
-    /// A relay code for another of the owner's computers (a day, once).
-    /// `urls`: the relay's addresses, as in the snapshot.
-    fn relay_code_for_another(&self, urls: &str) -> Result<String> {
-        let relay = self.own_relay(urls)?;
-        let ca = rc_relay::tls::ca();
-        let ask = rc_relay::client::add_owner(&relay, &self.sh.secret, &ca);
-        let code = self.sh.rt.block_on(ask).map_err(relay_error)?;
-        log!("got a relay code for another computer from {}", relay[0]);
-        Ok(code.encode())
     }
 
     /// The own relay one of `urls` belongs to (all its addresses).
@@ -1353,13 +1249,6 @@ impl Node {
 
     fn remove_relay(&self, urls: &str) -> Result<String> {
         let relay = self.own_relay(urls)?;
-        {
-            let st = self.sh.st.lock().unwrap();
-            if let Some(g) = st.settings.granted.iter().find(|g| g.urls == relay) {
-                let names: Vec<String> = g.by.iter().map(|b| format!("「{}」", self.sh.shown_name(&st, b))).collect();
-                return Err(anyhow!("这台中转是{}给的：在那边关掉这台电脑的免确认，或者在这里删掉它，就会移除", names.join("、")));
-            }
-        }
         self.settings(|s| {
             s.relays.retain(|g| *g != relay);
         });
@@ -1371,7 +1260,6 @@ impl Node {
         if let Some(d) = st.store.get_mut(&id) {
             d.auto_accept = on;
             self.sh.save(&mut st);
-            // A hello now: it hears which relays it is given (`grant_for`).
             self.sh.ensure(&mut st, id);
         }
         String::new()
@@ -1463,34 +1351,15 @@ fn same_relay(u: &RelayUrl, urls: &[RelayUrl]) -> bool {
     rc_relay::tls::pin_of(u).is_some_and(|p| urls.iter().any(|v| rc_relay::tls::pin_of(v) == Some(p)))
 }
 
-/// Whether two address lists are of the same relay.
-fn same_group(a: &[RelayUrl], b: &[RelayUrl]) -> bool {
-    a.iter().any(|u| b.contains(u) || same_relay(u, b))
-}
-
-/// How a relay is named to the user: its first address's host and port.
-fn host_of(g: &[RelayUrl]) -> String {
-    g.first().map_or_else(String::new, |u| {
-        format!("{}{}", u.host_str().unwrap_or("?"), u.port().map(|p| format!(":{p}")).unwrap_or_default())
-    })
-}
-
 /// What a failed call to the own relay means to the user.
 fn relay_error(e: anyhow::Error) -> anyhow::Error {
     match e.downcast_ref::<Refusal>() {
-        Some(Refusal::UnknownKey) => anyhow!("这个中转码已经用过、过期或者作废了，请重新生成一个"),
-        Some(Refusal::NotOwner) => anyhow!("这台电脑不是这台中转的主人"),
+        Some(Refusal::UnknownKey) => anyhow!("这个中转码已经在中转上删掉了，请向中转的管理者要一个新的"),
+        Some(Refusal::NotOwner) => anyhow!("这台电脑已经被移出这台中转，请重新贴一次中转码"),
         Some(Refusal::Clock) => anyhow!("这台电脑的时间和中转相差太多，请先校准时间"),
         Some(r) => anyhow!("中转拒绝了（{}）", r.word()),
         None => anyhow!("连不上中转：{e:#}"),
     }
-}
-
-/// The names of the computers that give the relay `g` (joined by "、");
-/// empty for one added here.
-fn granted_by(sh: &Shared, st: &St, g: &[RelayUrl]) -> String {
-    let by = st.settings.granted.iter().find(|x| x.urls == g).map(|x| x.by.clone()).unwrap_or_default();
-    by.iter().map(|b| sh.shown_name(st, b).replace(['\t', '\n', '、'], " ")).collect::<Vec<_>>().join("、")
 }
 
 /// One `dev` line of the snapshot.
@@ -1625,11 +1494,11 @@ async fn talk(sh: &Arc<Shared>, id: EndpointId, conn: &Connection, wake: &Notify
             sh.hello(&st, &id)
         };
         match meet::ask(conn, &hi).await {
-            Ok(Msg::MeetWelcome { name, home, grant }) => {
+            Ok(Msg::MeetWelcome { name, home, .. }) => {
                 let first = {
                     let mut st = sh.st.lock().unwrap();
                     let first = st.peers.get(&id).is_none_or(|p| p.conn.is_none());
-                    sh.welcomed(&mut st, &id, conn, name.clone(), home, grant, sent);
+                    sh.welcomed(&mut st, &id, conn, name.clone(), home, sent);
                     first
                 };
                 if first {
@@ -1709,8 +1578,8 @@ async fn serve_meet(sh: Arc<Shared>, conn: Connection) {
     let mut watching = false;
     loop {
         match meet::next_hi(&conn).await {
-            Ok(Some((Msg::MeetHi { name, home, token, event, grant }, send))) => {
-                let reply = sh.on_hi(from, &conn, name, home, token, event, grant);
+            Ok(Some((Msg::MeetHi { name, home, token, event, .. }, send))) => {
+                let reply = sh.on_hi(from, &conn, name, home, token, event);
                 let welcomed = matches!(reply, Msg::MeetWelcome { .. });
                 if let Err(e) = meet::answer(send, &reply).await {
                     log!("answer to {}: {e:#}", from.fmt_short());
@@ -2148,7 +2017,7 @@ impl<T: Clone + PartialEq> Track<T> {
 
 /// What `guests_loop` told one own relay.
 struct RelayTrack {
-    guests: Track<Vec<Guest>>,
+    guests: Track<Vec<EndpointId>>,
     invites: Track<Vec<Invite>>,
 }
 
@@ -2182,9 +2051,6 @@ async fn guests_loop(sh: Arc<Shared>) {
             let RelayTrack { guests: g, invites: i } = tracked.entry(relay.clone()).or_insert_with(|| RelayTrack { guests: Track::new(None), invites: Track::new(Some(Vec::new())) });
             if g.due(&guests) {
                 let r = sh.send_guests(relay, &guests).await;
-                if r.as_ref().err().and_then(|e| e.downcast_ref::<Refusal>()) == Some(&Refusal::NotOwner) {
-                    sh.not_owner(relay);
-                }
                 let ok = g.note(r.map_err(relay_error), relay, "guest list", &guests);
                 sh.st.lock().unwrap().relay_ok.insert(relay[0].to_string(), ok);
                 sh.changed();
@@ -2193,28 +2059,7 @@ async fn guests_loop(sh: Arc<Shared>) {
                 i.note(sh.send_invites(relay, &invites).await, relay, "connection codes", &invites);
             }
         }
-        prune_grants(&sh);
         tokio::time::sleep(EVERY).await;
-    }
-}
-
-/// A relay given by a device no longer in the list is no longer given by it.
-fn prune_grants(sh: &Shared) {
-    let mut st = sh.st.lock().unwrap();
-    let before = relays_of(&st.settings);
-    let mut changed = false;
-    let listed: BTreeSet<EndpointId> = st.store.listed().map(|d| d.id).collect();
-    for x in st.settings.granted.iter_mut() {
-        let n = x.by.len();
-        x.by.retain(|b| listed.contains(b));
-        changed |= x.by.len() != n;
-    }
-    if changed {
-        let gone = sh.drop_grants(&mut st, |x| x.by.is_empty());
-        if !gone.is_empty() {
-            sh.notice(&mut st, format!("给这台电脑中转的设备已删除，它给的中转 {} 已移除", gone.join("、")));
-        }
-        sh.settings_changed(&mut st, before);
     }
 }
 
@@ -2853,75 +2698,5 @@ mod live {
     fn deleting_over_the_other_sides_connection() {
         let took = meet_then_forget("delete1", true, delete);
         assert!(took < Duration::from_secs(4), "the other side took {took:?}");
-    }
-
-    /// On this computer: A owns a relay (an address nothing answers at) and
-    /// makes B its "my computer"; B is given the relay and uses it, until A
-    /// turns that off. B cannot remove it itself.
-    #[test]
-    fn my_computer_is_given_my_relays() {
-        let relay = "https://127.0.0.1:9/";
-        let dir = std::env::temp_dir().join(format!("rc-grant-{}", std::process::id()));
-        let (a, b) = (dir.join("a"), dir.join("b"));
-        for d in [&a, &b] {
-            std::fs::create_dir_all(d).unwrap();
-        }
-        std::fs::write(a.join("settings.txt"), format!("relay={relay}\npublic_relays=0\nlan_visible=0\n")).unwrap();
-        std::fs::write(b.join("settings.txt"), "public_relays=0\nlan_visible=0\n").unwrap();
-        let opts = |d: &std::path::Path| {
-            let mut o = host::HostArgs::defaults().node_options(false);
-            o.key = d.join("device.key");
-            o.lan = false;
-            o
-        };
-        let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
-        let na = rt.block_on(Node::start(opts(&a))).unwrap();
-        let nb = rt.block_on(Node::start(opts(&b))).unwrap();
-        let (ida, idb) = (na.sh.me, nb.sh.me);
-        let ask = |n: &Node, req: &str| n.request(req);
-        let wait = |what: &str, ok: &dyn Fn() -> bool| {
-            let t = Instant::now();
-            while !ok() {
-                assert!(t.elapsed() < Duration::from_secs(30), "{what}");
-                std::thread::sleep(Duration::from_millis(200));
-            }
-        };
-        // Each in the other's list; A lets B in without asking.
-        na.sh.st.lock().unwrap().store.add(idb).auto_accept = true;
-        nb.sh.st.lock().unwrap().store.add(ida);
-        {
-            let st = na.sh.st.lock().unwrap();
-            assert_eq!(na.sh.guests(&st), [Guest { id: idb, mine: true }], "B goes to the relay as A's own computer");
-        }
-        let given = |n: &Node| {
-            let st = n.sh.st.lock().unwrap();
-            st.settings.relays.iter().flatten().any(|u| u.to_string() == relay)
-        };
-        wait("a code with addresses", &|| ConnCode::find(&ask(&na, "code")).is_some_and(|(c, _)| !c.addrs.is_empty()));
-        let code = ask(&na, "code");
-        let code = code.strip_prefix("ok\t").unwrap();
-        assert!(ask(&nb, &format!("paste\t{code}")).starts_with("ok"));
-        wait("B is given A's relay", &|| given(&nb));
-        {
-            let st = nb.sh.st.lock().unwrap();
-            assert_eq!(st.settings.granted.len(), 1);
-            assert_eq!(st.settings.granted[0].by, [ida]);
-        }
-        let snap = ask(&nb, "peek");
-        assert!(snap.lines().any(|l| l.starts_with(&format!("relay\t{relay}\t")) && !l.ends_with('\t')), "{snap}");
-        let r = ask(&nb, &format!("relay-remove\t{relay}"));
-        assert!(r.starts_with("err"), "a given relay goes only when no longer given: {r}");
-        assert!(given(&nb));
-        assert!(!ask(&na, "peek").lines().any(|l| l.starts_with("relay") && !l.ends_with('\t')), "A's own relay is not a given one");
-        // A turns it off: B no longer has it.
-        assert!(ask(&na, &format!("auto\t{idb}\t0")).starts_with("ok"));
-        wait("B no longer has A's relay", &|| !given(&nb));
-        assert!(nb.sh.st.lock().unwrap().settings.granted.is_empty());
-        assert!(given(&na), "A keeps its own");
-        rt.block_on(async {
-            na.goodbye(0).await;
-            nb.goodbye(0).await;
-        });
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

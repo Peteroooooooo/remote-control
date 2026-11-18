@@ -1,7 +1,7 @@
-//! The calls a remote-control client makes to a relay: claim it with a relay
-//! code, ask it for a relay code for another of the owner's computers, keep
-//! its guest list and invites, bring an invite, and see whether it answers. Errors the relay answered
-//! with are a [`Refusal`] inside the `anyhow` error.
+//! The calls a remote-control client makes to a relay: join it with a relay
+//! code, keep its guest list and invites, bring an invite, and see whether
+//! it answers. Errors the relay answered with are a [`Refusal`] inside the
+//! `anyhow` error.
 //!
 //! A relay may have several addresses (an IPv4 and an IPv6 one); every call
 //! goes to all of them, IPv6 first and each next one a moment later, and
@@ -14,7 +14,7 @@ use iroh_base::{PublicKey, RelayUrl, SecretKey};
 use iroh_relay::tls::CaTlsConfig;
 use rc_ident::{proof::unix_now, relay_code::RelayCode};
 
-use crate::api::{self, AddOwnerRequest, ClaimRequest, Guest, GuestsRequest, Invite, InvitesRequest, MeetRequest, Refusal};
+use crate::api::{self, ClaimRequest, GuestsRequest, Invite, InvitesRequest, MeetRequest, Refusal};
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 /// The head start of each address over the next one (Happy Eyeballs).
@@ -110,11 +110,11 @@ async fn call(client: reqwest::Client, relay: RelayUrl, path: &'static str, requ
     }
 }
 
-/// Makes `device` an owner of the relay in `code`, using its claim key up.
-/// Returns the relay's addresses, the one that answered first.
-pub async fn claim(code: &RelayCode, device: &SecretKey, ca: &CaTlsConfig) -> Result<Vec<RelayUrl>> {
+/// Makes `device` (named `name`) an owner of the relay in `code`. Returns
+/// the relay's addresses, the one that answered first.
+pub async fn claim(code: &RelayCode, device: &SecretKey, name: &str, ca: &CaTlsConfig) -> Result<Vec<RelayUrl>> {
     let client = http(ca)?;
-    let req = ClaimRequest::new(code.claim_key, device).encode();
+    let req = ClaimRequest::new(code.claim_key, device, name).encode();
     let (url, r) = race(&code.urls, |u| call(client.clone(), u, api::CLAIM_PATH, req.clone())).await?;
     r?;
     let mut urls = vec![url.clone()];
@@ -122,35 +122,12 @@ pub async fn claim(code: &RelayCode, device: &SecretKey, ca: &CaTlsConfig) -> Re
     Ok(urls)
 }
 
-/// Asks the relay, as its owner `device`, for a relay code another computer
-/// can claim with (valid for a day, once).
-pub async fn add_owner(relay: &[RelayUrl], device: &SecretKey, ca: &CaTlsConfig) -> Result<RelayCode> {
-    let client = http(ca)?;
-    let req = AddOwnerRequest::new(device, unix_now()).encode();
-    let (url, r) = race(relay, |u| call(client.clone(), u, api::ADD_OWNER_PATH, req.clone())).await?;
-    RelayCode::decode(&r?).map_err(|e| anyhow!("{url}: answered a bad relay code: {e}"))
-}
-
 /// Tells the relay, as its owner `device`, the whole list of devices that
-/// may use it to reach this owner (replaces the list sent before). A relay
-/// from before `mine` does not read such a list: it gets the list without
-/// the marks, so the devices still get through.
-pub async fn set_guests(relay: &[RelayUrl], device: &SecretKey, ca: &CaTlsConfig, guests: &[Guest]) -> Result<()> {
+/// may use it to reach this owner (replaces the list sent before).
+pub async fn set_guests(relay: &[RelayUrl], device: &SecretKey, ca: &CaTlsConfig, guests: &[PublicKey]) -> Result<()> {
     let client = http(ca)?;
-    let send = |guests: &[Guest]| {
-        let req = GuestsRequest::new(device, unix_now(), guests).encode();
-        let client = client.clone();
-        async move { race(relay, |u| call(client.clone(), u, api::GUESTS_PATH, req.clone())).await }
-    };
-    match send(guests).await?.1 {
-        Err(Refusal::BadRequest) if guests.iter().any(|g| g.mine) => {
-            let plain: Vec<Guest> = guests.iter().map(|g| Guest::from(g.id)).collect();
-            send(&plain).await?.1?;
-        }
-        r => {
-            r?;
-        }
-    }
+    let req = GuestsRequest::new(device, unix_now(), guests).encode();
+    race(relay, |u| call(client.clone(), u, api::GUESTS_PATH, req.clone())).await?.1?;
     Ok(())
 }
 

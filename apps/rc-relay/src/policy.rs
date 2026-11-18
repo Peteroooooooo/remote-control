@@ -1,11 +1,10 @@
 //! Who the relay forwards for: the roster (`target-plan` 5.2). The roster
 //! is the owners and each owner's guests (the devices it listed in
-//! `guests.txt`). The owners are the keys in `owners.txt` and, from them on,
-//! every guest an owner marks as its own computer ("my computer" there):
-//! taking that mark away, or the owner that gave it losing its own, ends it.
-//! A datagram is forwarded only if both ends are on the roster and at least
-//! one is an owner; anything else is dropped. Anyone may connect, so a
-//! device an owner lists a moment later gets through without reconnecting.
+//! `guests.txt`). The owners are the devices that joined with one of the
+//! relay's codes (`owners.txt`). A datagram is forwarded only if both ends
+//! are on the roster and at least one is an owner; anything else is
+//! dropped. Anyone may connect, so a device an owner lists a moment later
+//! gets through without reconnecting.
 //!
 //! A device not on the roster that brought one of an owner's invites (a
 //! connection code, `POST /rc/meet`) and that owner also get through to
@@ -31,45 +30,21 @@ use iroh_relay::server::{Access, AccessControl, ClientRequest, ConnectionId};
 use rc_ident::proof::{DeviceProof, unix_now};
 use tracing::info;
 
-use crate::api::Guest;
-
-/// The device a connection speaks for (from its proof).
-type Speaks = Option<EndpointId>;
-
-/// The owners: `stored` (`owners.txt`) and, from them on, the guests an
-/// owner marks `mine`.
-pub fn owners_of(stored: &HashSet<EndpointId>, guests: &BTreeMap<EndpointId, Vec<Guest>>) -> HashSet<EndpointId> {
-    let mut owners = stored.clone();
-    let mut todo: Vec<EndpointId> = stored.iter().copied().collect();
-    while let Some(o) = todo.pop() {
-        for g in guests.get(&o).into_iter().flatten().filter(|g| g.mine) {
-            if owners.insert(g.id) {
-                todo.push(g.id);
-            }
-        }
-    }
-    owners
-}
-
 #[derive(Debug, Default)]
 struct Roster {
-    /// The keys in `owners.txt`.
-    stored: HashSet<EndpointId>,
-    /// Each owner's guests, as the owner sent them.
-    guests: BTreeMap<EndpointId, Vec<Guest>>,
-    /// See [`owners_of`].
     owners: HashSet<EndpointId>,
+    /// Each owner's guests, as the owner sent them.
+    guests: BTreeMap<EndpointId, Vec<EndpointId>>,
     /// The owners and the guests of the current owners.
     listed: HashSet<EndpointId>,
 }
 
 impl Roster {
     fn update(&mut self) {
-        self.owners = owners_of(&self.stored, &self.guests);
         self.listed = self.owners.clone();
         for (o, gs) in &self.guests {
             if self.owners.contains(o) {
-                self.listed.extend(gs.iter().map(|g| g.id));
+                self.listed.extend(gs.iter().copied());
             }
         }
     }
@@ -77,7 +52,7 @@ impl Roster {
 
 #[derive(Debug, Default)]
 struct Peer {
-    conns: Vec<(ConnectionId, Speaks)>,
+    conns: Vec<(ConnectionId, Option<EndpointId>)>,
 }
 
 impl Peer {
@@ -112,34 +87,31 @@ fn counts_in(peers: &HashMap<EndpointId, Peer>, id: &EndpointId, set: &HashSet<E
 }
 
 impl Policy {
-    pub fn new(owners: impl IntoIterator<Item = EndpointId>, guests: BTreeMap<EndpointId, Vec<Guest>>) -> Policy {
-        let mut r = Roster { stored: owners.into_iter().collect(), guests, ..Roster::default() };
+    pub fn new(owners: impl IntoIterator<Item = EndpointId>, guests: BTreeMap<EndpointId, Vec<EndpointId>>) -> Policy {
+        let mut r = Roster { owners: owners.into_iter().collect(), guests, ..Roster::default() };
         r.update();
         Policy { roster: RwLock::new(r), peers: Mutex::default(), met: Mutex::default() }
     }
 
-    pub fn set_roster(&self, owners: impl IntoIterator<Item = EndpointId>, guests: BTreeMap<EndpointId, Vec<Guest>>) {
+    pub fn set_roster(&self, owners: impl IntoIterator<Item = EndpointId>, guests: BTreeMap<EndpointId, Vec<EndpointId>>) {
         let mut r = self.roster.write().unwrap();
-        r.stored = owners.into_iter().collect();
+        r.owners = owners.into_iter().collect();
         r.guests = guests;
         r.update();
     }
 
     /// A device the owner lists no longer needs the grant from its invite
     /// (`admit`): from now on the list decides, so taking it off the list
-    /// (the owner's lobby closed) stops the forwarding. Returns the owners
-    /// that came and went with this list.
-    pub fn set_guests(&self, owner: EndpointId, guests: Vec<Guest>) -> (Vec<EndpointId>, Vec<EndpointId>) {
-        self.met.lock().unwrap().retain(|(o, d), _| *o != owner || !guests.iter().any(|g| g.id == *d));
+    /// (the owner's lobby closed) stops the forwarding.
+    pub fn set_guests(&self, owner: EndpointId, guests: Vec<EndpointId>) {
+        self.met.lock().unwrap().retain(|(o, d), _| *o != owner || !guests.contains(d));
         let mut r = self.roster.write().unwrap();
-        let before = r.owners.clone();
         if guests.is_empty() {
             r.guests.remove(&owner);
         } else {
             r.guests.insert(owner, guests);
         }
         r.update();
-        (r.owners.difference(&before).copied().collect(), before.difference(&r.owners).copied().collect())
     }
 
     /// `device` brought one of `owner`'s invites: the two may reach each
@@ -160,11 +132,10 @@ impl Policy {
         self.roster.read().unwrap().owners.clone()
     }
 
-    /// The connected endpoints and whether each counts as an owner now.
-    pub fn connected(&self) -> Vec<(EndpointId, bool)> {
-        let r = self.roster.read().unwrap();
+    /// The devices connected now (by key, and by what their proofs speak for).
+    pub fn online(&self) -> HashSet<EndpointId> {
         let peers = self.peers.lock().unwrap();
-        peers.iter().map(|(id, p)| (*id, p.any(id, &r.owners))).collect()
+        peers.keys().flat_map(|id| devices(&peers, id)).collect()
     }
 }
 
@@ -241,14 +212,6 @@ mod tests {
         SecretKey::from_bytes(&[n; 32]).public()
     }
 
-    fn guest(n: u8) -> Guest {
-        Guest::from(id(n))
-    }
-
-    fn mine(n: u8) -> Guest {
-        Guest { id: id(n), mine: true }
-    }
-
     #[test]
     fn an_invite_holds_until_the_owner_lists_the_device_then_the_list_decides() {
         let (owner, stranger, other) = (id(1), id(2), id(3));
@@ -257,9 +220,9 @@ mod tests {
         p.admit(owner, stranger, unix_now() + 600);
         assert!(p.allow_forward(stranger, owner, 0));
         // A list sent before the owner welcomed the stranger leaves the grant.
-        p.set_guests(owner, vec![other.into()]);
+        p.set_guests(owner, vec![other]);
         assert!(p.allow_forward(owner, stranger, 0));
-        p.set_guests(owner, vec![stranger.into()]);
+        p.set_guests(owner, vec![stranger]);
         assert!(p.allow_forward(stranger, owner, 0));
         // Off the list (the owner's lobby closed): no more forwarding.
         p.set_guests(owner, vec![]);
@@ -268,57 +231,28 @@ mod tests {
     }
 
     #[test]
-    fn an_owners_own_computers_own_the_relay_too() {
-        // 1 claimed the relay; 2 is its "my computer", 3 only trusted.
+    fn only_owners_lists_count() {
+        let p = Policy::new([id(1), id(2)], BTreeMap::new());
+        assert!(p.allow_forward(id(1), id(2), 0), "owner ↔ owner");
+        p.set_guests(id(1), vec![id(3)]);
+        assert!(p.allow_forward(id(3), id(1), 0));
+        assert!(p.allow_forward(id(3), id(2), 0), "a guest of one owner reaches the other owners");
+        // A guest's own list counts for nothing.
+        p.set_guests(id(3), vec![id(4)]);
+        assert!(!p.allow_forward(id(4), id(3), 0));
+        // An owner removed (its code deleted on the relay): its guests are out.
+        p.set_roster([id(2)], BTreeMap::from([(id(1), vec![id(3)])]));
+        assert!(!p.allow_forward(id(3), id(2), 0));
+        assert!(!p.allow_forward(id(1), id(2), 0));
+        assert_eq!(p.owners(), HashSet::from([id(2)]));
+    }
+
+    #[test]
+    fn a_removed_owner_cannot_meet_with_its_codes() {
         let p = Policy::new([id(1)], BTreeMap::new());
-        let (came, went) = p.set_guests(id(1), vec![mine(2), guest(3)]);
-        assert_eq!((came, went), (vec![id(2)], vec![]));
-        assert_eq!(p.owners(), HashSet::from([id(1), id(2)]));
-        // 2 lists a friend of its own: the relay forwards between them.
-        p.set_guests(id(2), vec![guest(4)]);
-        assert!(p.allow_forward(id(4), id(2), 0));
-        assert!(!p.allow_forward(id(4), id(3), 0), "two guests, no owner");
-        // A trusted device's own list counts for nothing.
-        p.set_guests(id(3), vec![mine(5), guest(6)]);
-        assert!(!p.owners().contains(&id(3)) && !p.owners().contains(&id(5)));
-        assert!(!p.allow_forward(id(6), id(3), 0));
-    }
-
-    #[test]
-    fn taking_the_mark_away_revokes_what_only_it_gave() {
-        // 1 → 2 → 3 by "my computer", and 4 also marks 3 (4 claimed too).
-        let p = Policy::new([id(1), id(4)], BTreeMap::new());
-        p.set_guests(id(1), vec![mine(2)]);
-        p.set_guests(id(2), vec![mine(3), guest(7)]);
-        assert_eq!(p.owners(), HashSet::from([id(1), id(2), id(3), id(4)]));
-        // 1 turns 2 into a trusted device: 2 and what 2 alone gave go.
-        let (came, mut went) = p.set_guests(id(1), vec![guest(2)]);
-        went.sort();
-        let mut want = vec![id(2), id(3)];
-        want.sort();
-        assert_eq!((came, went), (vec![], want));
-        assert!(p.allow_forward(id(2), id(1), 0), "still 1's guest");
-        assert!(!p.allow_forward(id(7), id(2), 0), "2's guest: 2 owns nothing now");
-        // Given by two owners, it holds while either still gives it.
-        p.set_guests(id(1), vec![mine(2)]);
-        p.set_guests(id(4), vec![mine(3)]);
-        p.set_guests(id(1), vec![]);
-        assert_eq!(p.owners(), HashSet::from([id(1), id(3), id(4)]));
-        // A loop of marks without a stored owner in it owns nothing.
-        p.set_guests(id(8), vec![mine(9)]);
-        p.set_guests(id(9), vec![mine(8)]);
-        assert!(!p.owners().contains(&id(8)) && !p.owners().contains(&id(9)));
-        // The stored owner removed (`rc-relay owners remove`): its marks go too.
-        p.set_roster([id(1)], BTreeMap::from([(id(4), vec![mine(3)])]));
-        assert_eq!(p.owners(), HashSet::from([id(1)]));
-    }
-
-    #[test]
-    fn a_derived_owner_can_meet_with_its_codes() {
-        let p = Policy::new([id(1)], BTreeMap::from([(id(1), vec![mine(2)])]));
-        p.admit(id(2), id(5), unix_now() + 600);
-        assert!(p.allow_forward(id(5), id(2), 0));
-        p.set_guests(id(1), vec![]);
-        assert!(!p.allow_forward(id(5), id(2), 0), "no owner any more, so no grant either");
+        p.admit(id(1), id(5), unix_now() + 600);
+        assert!(p.allow_forward(id(5), id(1), 0));
+        p.set_roster([], BTreeMap::new());
+        assert!(!p.allow_forward(id(5), id(1), 0), "no owner any more, so no grant either");
     }
 }

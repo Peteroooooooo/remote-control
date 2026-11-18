@@ -2,38 +2,33 @@
 //! The request rides in the `x-rc-request` header (the server's route
 //! handlers cannot read a body), as a checked Base58 code.
 //!
-//! - `POST /rc/claim`: a claim key from a relay code, the device key that
-//!   becomes an owner, and that key's signature. Uses the claim key up.
-//! - `POST /rc/add-owner`: an owner asks for a new relay code for another
-//!   of its computers.
+//! - `POST /rc/claim`: the key of one of the relay's codes, the device key
+//!   that becomes an owner, the device's name, and that key's signature. A
+//!   code works any number of times, until it is deleted on the relay.
 //! - `POST /rc/guests`: an owner's whole guest list (the devices it lets
-//!   use the relay to reach it), replacing the one it sent before. A guest
-//!   marked `mine` (the owner's "my computer") owns the relay too.
+//!   use the relay to reach it), replacing the one it sent before.
 //! - `POST /rc/invites`: an owner's connection codes not used yet (their
 //!   tokens and expiry), replacing the ones it sent before.
 //! - `POST /rc/meet`: a device with one of those codes, signed by that
 //!   device: the relay uses the invite up and lets the device and the owner
 //!   reach each other for [`MEET_KEEP`], until the owner lists it as a guest.
 //!
-//! Add-owner, guests and invites are signed by the owner with a time and a
+//! Guests and invites are signed by the owner with a time and a
 //! random nonce; the relay takes such a request only within [`MAX_SKEW`] of
 //! its own clock and only once.
 //!
-//! Answers are plain text: `ok` or a relay code, else one of the [`Refusal`] words.
+//! Answers are plain text: `ok`, else one of the [`Refusal`] words.
 
 use iroh_base::{PublicKey, SecretKey, Signature};
 use rc_ident::{Error, text, wire::Reader};
 
 pub const CLAIM_PATH: &str = "/rc/claim";
-pub const ADD_OWNER_PATH: &str = "/rc/add-owner";
 pub const GUESTS_PATH: &str = "/rc/guests";
 pub const INVITES_PATH: &str = "/rc/invites";
 pub const MEET_PATH: &str = "/rc/meet";
 pub const HEADER: &str = "x-rc-request";
 /// How far the time in a signed request may be from the relay's clock (seconds).
 pub const MAX_SKEW: u64 = 300;
-/// How long a relay code from add-owner stays valid (seconds).
-pub const ADDED_CODE_LIFETIME: u64 = 24 * 3600;
 /// Most guests one owner may list (keeps the request header small).
 pub const MAX_GUESTS: usize = 256;
 /// Most unused connection codes one owner may have on the relay.
@@ -43,13 +38,11 @@ pub const MAX_INVITES: usize = 64;
 pub const MEET_KEEP: u64 = 600;
 
 const CLAIM_PREFIX: &str = "rcqc1";
-const ADD_PREFIX: &str = "rcqa1";
 const GUESTS_PREFIX: &str = "rcqg1";
 const INVITES_PREFIX: &str = "rcqi1";
 const MEET_PREFIX: &str = "rcqm1";
 const VERSION: u8 = 1;
 const CLAIM_DOMAIN: &[u8] = b"remote-control relay claim v1\0";
-const ADD_DOMAIN: &[u8] = b"remote-control relay add owner v1\0";
 const GUESTS_DOMAIN: &[u8] = b"remote-control relay guests v1\0";
 const INVITES_DOMAIN: &[u8] = b"remote-control relay invites v1\0";
 const MEET_DOMAIN: &[u8] = b"remote-control relay meet v1\0";
@@ -64,7 +57,7 @@ pub fn random_key() -> [u8; 16] {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Refusal {
     BadRequest,
-    /// The claim key is unknown, used already or expired.
+    /// No code of the relay has that key (never had, or it was deleted).
     UnknownKey,
     /// No such unused connection code of that owner on the relay.
     UnknownInvite,
@@ -116,7 +109,7 @@ impl std::fmt::Display for Refusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Refusal::BadRequest => "the relay did not understand the request",
-            Refusal::UnknownKey => "the relay code is used up, expired or not from this relay",
+            Refusal::UnknownKey => "the relay code was deleted or is not from this relay",
             Refusal::UnknownInvite => "the connection code is used up, expired or unknown to the relay",
             Refusal::NotOwner => "this device does not own the relay",
             Refusal::Clock => "this computer's clock is too far off the relay's",
@@ -132,21 +125,45 @@ impl std::error::Error for Refusal {}
 pub struct ClaimRequest {
     pub claim_key: [u8; 16],
     pub device: PublicKey,
+    /// The computer's name, shown on the relay (empty from older versions).
+    pub name: String,
     pub signature: Signature,
 }
 
-fn claim_signed(claim_key: &[u8; 16], device: &PublicKey) -> Vec<u8> {
-    [CLAIM_DOMAIN, &[VERSION], claim_key, device.as_bytes()].concat()
+/// Version 1 has no name; version 2 ends with one (a length byte, UTF-8).
+const CLAIM_NAMED: u8 = 2;
+/// Longest name kept (bytes).
+pub const MAX_NAME: usize = 64;
+
+fn claim_signed(version: u8, claim_key: &[u8; 16], device: &PublicKey, name: &str) -> Vec<u8> {
+    let mut v = [CLAIM_DOMAIN, &[version], claim_key, device.as_bytes()].concat();
+    if version == CLAIM_NAMED {
+        v.push(name.len() as u8);
+        v.extend_from_slice(name.as_bytes());
+    }
+    v
+}
+
+/// `name` cut to [`MAX_NAME`] bytes on a character boundary.
+fn cut(name: &str) -> String {
+    let mut n = name.len().min(MAX_NAME);
+    while !name.is_char_boundary(n) {
+        n -= 1;
+    }
+    name[..n].to_string()
 }
 
 impl ClaimRequest {
-    pub fn new(claim_key: [u8; 16], device: &SecretKey) -> ClaimRequest {
-        let signature = device.sign(&claim_signed(&claim_key, &device.public()));
-        ClaimRequest { claim_key, device: device.public(), signature }
+    pub fn new(claim_key: [u8; 16], device: &SecretKey, name: &str) -> ClaimRequest {
+        let name = cut(name);
+        let signature = device.sign(&claim_signed(CLAIM_NAMED, &claim_key, &device.public(), &name));
+        ClaimRequest { claim_key, device: device.public(), name, signature }
     }
 
     pub fn encode(&self) -> String {
-        let v = [&[VERSION][..], &self.claim_key, self.device.as_bytes(), &self.signature.to_bytes()].concat();
+        let mut v = [&[CLAIM_NAMED][..], &self.claim_key, self.device.as_bytes(), &self.signature.to_bytes()].concat();
+        v.push(self.name.len() as u8);
+        v.extend_from_slice(self.name.as_bytes());
         text::encode(CLAIM_PREFIX, &v)
     }
 
@@ -154,76 +171,25 @@ impl ClaimRequest {
     pub fn decode(s: &str) -> Result<ClaimRequest, Error> {
         let p = text::decode(CLAIM_PREFIX, s)?;
         let mut r = Reader::new(&p);
-        match r.u8()? {
-            VERSION => {}
+        let version = match r.u8()? {
+            v @ (VERSION | CLAIM_NAMED) => v,
             v => return Err(Error::Version(v)),
-        }
+        };
         let claim_key = r.array()?;
         let device = PublicKey::from_bytes(&r.array()?).map_err(|_| Error::Field("device key"))?;
         let signature = Signature::from_bytes(&r.array()?);
+        let name = if version == CLAIM_NAMED {
+            let n = r.u8()? as usize;
+            if n > MAX_NAME {
+                return Err(Error::Field("name"));
+            }
+            std::str::from_utf8(r.take(n)?).map_err(|_| Error::Field("name"))?.to_string()
+        } else {
+            String::new()
+        };
         r.finish()?;
-        device.verify(&claim_signed(&claim_key, &device), &signature).map_err(|_| Error::Signature)?;
-        Ok(ClaimRequest { claim_key, device, signature })
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AddOwnerRequest {
-    pub device: PublicKey,
-    /// Unix seconds.
-    pub time: u64,
-    pub nonce: [u8; 16],
-    pub signature: Signature,
-}
-
-fn add_signed(device: &PublicKey, time: u64, nonce: &[u8; 16]) -> Vec<u8> {
-    [ADD_DOMAIN, &[VERSION], device.as_bytes(), &time.to_be_bytes(), nonce].concat()
-}
-
-impl AddOwnerRequest {
-    pub fn new(device: &SecretKey, time: u64) -> AddOwnerRequest {
-        let nonce = random_key();
-        let signature = device.sign(&add_signed(&device.public(), time, &nonce));
-        AddOwnerRequest { device: device.public(), time, nonce, signature }
-    }
-
-    pub fn encode(&self) -> String {
-        let v =
-            [&[VERSION][..], self.device.as_bytes(), &self.time.to_be_bytes(), &self.nonce, &self.signature.to_bytes()]
-                .concat();
-        text::encode(ADD_PREFIX, &v)
-    }
-
-    /// Decodes and checks the signature (not the time).
-    pub fn decode(s: &str) -> Result<AddOwnerRequest, Error> {
-        let p = text::decode(ADD_PREFIX, s)?;
-        let mut r = Reader::new(&p);
-        match r.u8()? {
-            VERSION => {}
-            v => return Err(Error::Version(v)),
-        }
-        let device = PublicKey::from_bytes(&r.array()?).map_err(|_| Error::Field("device key"))?;
-        let time = r.u64()?;
-        let nonce = r.array()?;
-        let signature = Signature::from_bytes(&r.array()?);
-        r.finish()?;
-        device.verify(&add_signed(&device, time, &nonce), &signature).map_err(|_| Error::Signature)?;
-        Ok(AddOwnerRequest { device, time, nonce, signature })
-    }
-}
-
-/// A device an owner lets use the relay. `mine`: the owner's own computer
-/// ("my computer" there, it controls the owner without asking), which then
-/// owns the relay too, for as long as the owner does and lists it so.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Guest {
-    pub id: PublicKey,
-    pub mine: bool,
-}
-
-impl From<PublicKey> for Guest {
-    fn from(id: PublicKey) -> Guest {
-        Guest { id, mine: false }
+        device.verify(&claim_signed(version, &claim_key, &device, &name), &signature).map_err(|_| Error::Signature)?;
+        Ok(ClaimRequest { claim_key, device, name, signature })
     }
 }
 
@@ -234,48 +200,41 @@ pub struct GuestsRequest {
     /// Unix seconds.
     pub time: u64,
     pub nonce: [u8; 16],
-    pub guests: Vec<Guest>,
+    /// The devices the owner lets use the relay.
+    pub guests: Vec<PublicKey>,
     pub signature: Signature,
 }
 
-/// Version 1 lists keys only; version 2 adds a `mine` byte after each.
-const GUESTS_MINE: u8 = 2;
+/// Version 1 lists keys only. Version 2 (older apps) adds a byte after each
+/// key, which marked "my computer"; it is read and left unused.
+const GUESTS_MARKED: u8 = 2;
 
-fn guests_signed(version: u8, device: &PublicKey, time: u64, nonce: &[u8; 16], guests: &[Guest]) -> Vec<u8> {
+fn guests_signed(version: u8, device: &PublicKey, time: u64, nonce: &[u8; 16], guests: &[PublicKey], marks: &[u8]) -> Vec<u8> {
     let mut v = [GUESTS_DOMAIN, &[version], device.as_bytes(), &time.to_be_bytes(), nonce].concat();
-    put_guests(&mut v, version, guests);
-    v
-}
-
-fn put_guests(v: &mut Vec<u8>, version: u8, guests: &[Guest]) {
-    for g in guests {
-        v.extend_from_slice(g.id.as_bytes());
-        if version == GUESTS_MINE {
-            v.push(g.mine as u8);
+    for (i, g) in guests.iter().enumerate() {
+        v.extend_from_slice(g.as_bytes());
+        if version == GUESTS_MARKED {
+            v.push(marks[i]);
         }
     }
+    v
 }
 
 impl GuestsRequest {
     /// At most [`MAX_GUESTS`] of `guests` go in.
-    pub fn new(device: &SecretKey, time: u64, guests: &[Guest]) -> GuestsRequest {
+    pub fn new(device: &SecretKey, time: u64, guests: &[PublicKey]) -> GuestsRequest {
         let guests = guests[..guests.len().min(MAX_GUESTS)].to_vec();
         let nonce = random_key();
-        let signature = device.sign(&guests_signed(Self::version_for(&guests), &device.public(), time, &nonce, &guests));
+        let signature = device.sign(&guests_signed(VERSION, &device.public(), time, &nonce, &guests, &[]));
         GuestsRequest { device: device.public(), time, nonce, guests, signature }
     }
 
-    /// Version 1 when no guest is `mine`, so a relay from before version 2
-    /// still takes the list.
-    fn version_for(guests: &[Guest]) -> u8 {
-        if guests.iter().any(|g| g.mine) { GUESTS_MINE } else { VERSION }
-    }
-
     pub fn encode(&self) -> String {
-        let version = Self::version_for(&self.guests);
-        let mut v = [&[version][..], self.device.as_bytes(), &self.time.to_be_bytes(), &self.nonce, &self.signature.to_bytes()]
+        let mut v = [&[VERSION][..], self.device.as_bytes(), &self.time.to_be_bytes(), &self.nonce, &self.signature.to_bytes()]
             .concat();
-        put_guests(&mut v, version, &self.guests);
+        for g in &self.guests {
+            v.extend_from_slice(g.as_bytes());
+        }
         text::encode(GUESTS_PREFIX, &v)
     }
 
@@ -284,24 +243,27 @@ impl GuestsRequest {
         let p = text::decode(GUESTS_PREFIX, s)?;
         let mut r = Reader::new(&p);
         let version = match r.u8()? {
-            v @ (VERSION | GUESTS_MINE) => v,
+            v @ (VERSION | GUESTS_MARKED) => v,
             v => return Err(Error::Version(v)),
         };
         let device = PublicKey::from_bytes(&r.array()?).map_err(|_| Error::Field("device key"))?;
         let time = r.u64()?;
         let nonce = r.array()?;
         let signature = Signature::from_bytes(&r.array()?);
-        let mut guests = Vec::new();
+        let (mut guests, mut marks) = (Vec::new(), Vec::new());
         while let Ok(g) = r.array::<32>() {
             if guests.len() == MAX_GUESTS {
                 return Err(Error::Length);
             }
-            let id = PublicKey::from_bytes(&g).map_err(|_| Error::Field("guest key"))?;
-            let mine = version == GUESTS_MINE && r.u8()? != 0;
-            guests.push(Guest { id, mine });
+            guests.push(PublicKey::from_bytes(&g).map_err(|_| Error::Field("guest key"))?);
+            if version == GUESTS_MARKED {
+                marks.push(r.u8()?);
+            }
         }
         r.finish()?;
-        device.verify(&guests_signed(version, &device, time, &nonce, &guests), &signature).map_err(|_| Error::Signature)?;
+        device
+            .verify(&guests_signed(version, &device, time, &nonce, &guests, &marks), &signature)
+            .map_err(|_| Error::Signature)?;
         Ok(GuestsRequest { device, time, nonce, guests, signature })
     }
 }
@@ -431,59 +393,65 @@ mod tests {
 
     #[test]
     fn claim_round_trip_and_forgery() {
-        let r = ClaimRequest::new([9; 16], &key(1));
+        let r = ClaimRequest::new([9; 16], &key(1), "书房");
         assert_eq!(ClaimRequest::decode(&r.encode()).unwrap(), r);
         // Someone else's key with a signature not made by it.
-        let mut f = ClaimRequest::new([9; 16], &key(2));
+        let mut f = ClaimRequest::new([9; 16], &key(2), "书房");
         f.device = key(1).public();
         assert_eq!(ClaimRequest::decode(&f.encode()), Err(Error::Signature));
-        // Same signature, another claim key.
+        // Same signature, another claim key or another name.
         let mut f = r.clone();
         f.claim_key = [8; 16];
         assert_eq!(ClaimRequest::decode(&f.encode()), Err(Error::Signature));
+        let mut f = r.clone();
+        f.name = "客厅".into();
+        assert_eq!(ClaimRequest::decode(&f.encode()), Err(Error::Signature));
+        // A long name is cut on a character boundary.
+        let long = ClaimRequest::new([9; 16], &key(1), &"设".repeat(40));
+        assert_eq!(long.name, "设".repeat(21));
+        assert_eq!(ClaimRequest::decode(&long.encode()).unwrap(), long);
     }
 
     #[test]
-    fn add_owner_round_trip_and_forgery() {
-        let r = AddOwnerRequest::new(&key(1), 1_000);
-        assert_eq!(AddOwnerRequest::decode(&r.encode()).unwrap(), r);
-        let mut f = r.clone();
-        f.time = 2_000;
-        assert_eq!(AddOwnerRequest::decode(&f.encode()), Err(Error::Signature));
-        assert_ne!(AddOwnerRequest::new(&key(1), 1_000).nonce, r.nonce);
-        // A claim request is not an add-owner request.
-        assert_eq!(AddOwnerRequest::decode(&ClaimRequest::new([1; 16], &key(1)).encode()), Err(Error::WrongPrefix));
+    fn claim_from_an_older_version_has_no_name() {
+        let (k, ck) = (key(1), [9; 16]);
+        let signature = k.sign(&[CLAIM_DOMAIN, &[VERSION], &ck, k.public().as_bytes()].concat());
+        let v = [&[VERSION][..], &ck, k.public().as_bytes(), &signature.to_bytes()].concat();
+        let r = ClaimRequest::decode(&text::encode(CLAIM_PREFIX, &v)).unwrap();
+        assert_eq!((r.device, r.name.as_str()), (k.public(), ""));
     }
 
     #[test]
     fn guests_round_trip_and_forgery() {
-        let guests: Vec<Guest> = [key(2).public(), key(3).public()].map(Guest::from).into();
+        let guests = [key(2).public(), key(3).public()];
         let r = GuestsRequest::new(&key(1), 1_000, &guests);
         assert_eq!(GuestsRequest::decode(&r.encode()).unwrap(), r);
         let empty = GuestsRequest::new(&key(1), 1_000, &[]);
         assert_eq!(GuestsRequest::decode(&empty.encode()).unwrap().guests, []);
         // A guest slipped in after signing.
         let mut f = r.clone();
-        f.guests.push(key(4).public().into());
+        f.guests.push(key(4).public());
         assert_eq!(GuestsRequest::decode(&f.encode()), Err(Error::Signature));
-        let many: Vec<Guest> = (0..MAX_GUESTS + 5).map(|_| SecretKey::generate().public().into()).collect();
+        let many: Vec<PublicKey> = (0..MAX_GUESTS + 5).map(|_| SecretKey::generate().public()).collect();
         assert_eq!(GuestsRequest::new(&key(1), 1_000, &many).guests.len(), MAX_GUESTS);
-        assert_eq!(GuestsRequest::decode(&AddOwnerRequest::new(&key(1), 1_000).encode()), Err(Error::WrongPrefix));
+        assert_eq!(GuestsRequest::decode(&ClaimRequest::new([1; 16], &key(1), "").encode()), Err(Error::WrongPrefix));
     }
 
     #[test]
-    fn guests_with_my_computers() {
-        let guests = [Guest { id: key(2).public(), mine: true }, key(3).public().into()];
-        let r = GuestsRequest::new(&key(1), 1_000, &guests);
-        assert!(r.encode().len() > GuestsRequest::new(&key(1), 1_000, &[key(2).public().into(), key(3).public().into()]).encode().len());
-        assert_eq!(GuestsRequest::decode(&r.encode()).unwrap(), r);
-        // Made one of the owner's computers after signing.
-        let mut f = r.clone();
-        f.guests[1].mine = true;
-        assert_eq!(GuestsRequest::decode(&f.encode()), Err(Error::Signature));
-        // Without any, the list goes as version 1, as older relays read it.
-        let plain = GuestsRequest::new(&key(1), 1_000, &[key(2).public().into()]);
-        assert_eq!(text::decode(GUESTS_PREFIX, &plain.encode()).unwrap()[0], VERSION);
+    fn guests_from_an_older_version_with_marks() {
+        let (k, nonce) = (key(1), [3; 16]);
+        let guests = [key(2).public(), key(3).public()];
+        let signed = guests_signed(GUESTS_MARKED, &k.public(), 1_000, &nonce, &guests, &[1, 0]);
+        let mut v = [&[GUESTS_MARKED][..], k.public().as_bytes(), &1_000u64.to_be_bytes(), &nonce, &k.sign(&signed).to_bytes()].concat();
+        for (g, m) in guests.iter().zip([1u8, 0]) {
+            v.extend_from_slice(g.as_bytes());
+            v.push(m);
+        }
+        assert_eq!(GuestsRequest::decode(&text::encode(GUESTS_PREFIX, &v)).unwrap().guests, guests);
+        // A mark changed after signing.
+        let n = v.len();
+        v[n - 1] = 1;
+        assert_eq!(GuestsRequest::decode(&text::encode(GUESTS_PREFIX, &v)), Err(Error::Signature));
     }
 
     #[test]

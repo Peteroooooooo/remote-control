@@ -1,20 +1,19 @@
-//! Command line: `serve` on the relay's machine, `reset-claim` and `owners …`
-//! next to it, and `claim` / `add-owner` from an owner's computer (what the
-//! app does with a pasted relay code; for setup and tests).
+//! Command line: `serve` runs the relay; without a command, the management
+//! screen ([`crate::tui`]) for its codes and the devices that joined with
+//! them. `codes` prints the same as plain text (for scripts and terminals
+//! without a full screen), and `claim` joins a relay from a computer with a
+//! device key file (what the app does with a pasted code; for tests).
 
-use std::{
-    collections::HashSet,
-    path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
-use iroh_base::{EndpointId, RelayUrl, SecretKey};
+use iroh_base::SecretKey;
 use iroh_relay::tls::CaTlsConfig;
 use rc_ident::relay_code::RelayCode;
 use rustls::pki_types::{CertificateDer, pem::PemObject};
 
-use crate::{client, config::Config, policy::owners_of, state::Store};
+use crate::{client, config::Config, state::Store};
 
 #[cfg(unix)]
 const DEFAULT_CONFIG: &str = "/etc/rc-relay/config.toml";
@@ -24,11 +23,11 @@ const DEFAULT_CONFIG: &str = "rc-relay.toml";
 #[derive(Parser)]
 #[command(name = "rc-relay", version, about = "Self-hosted relay for remote-control")]
 struct Cli {
-    /// Config file (for serve, reset-claim, owners); without one, the defaults (see `config`).
+    /// Config file; without one, the defaults (see `config`).
     #[arg(long, global = true)]
     config: Option<PathBuf>,
     #[command(subcommand)]
-    cmd: Cmd,
+    cmd: Option<Cmd>,
 }
 
 #[derive(Subcommand)]
@@ -40,38 +39,22 @@ enum Cmd {
         #[arg(long, env = "RC_RELAY_PUBLIC", value_delimiter = ',')]
         public: Vec<String>,
     },
-    /// Print a new relay code for claiming; the previous one stops working.
-    ResetClaim,
-    /// The devices that own this relay.
-    Owners {
-        #[command(subcommand)]
-        cmd: OwnersCmd,
+    /// The management screen (also what `rc-relay` alone opens).
+    Ui {
+        /// Made-up codes and devices in a temporary directory, to try the screen.
+        #[arg(long)]
+        demo: bool,
     },
-    /// Claim a relay with a relay code, as the device whose key is given.
+    /// Print the codes and the devices that joined with each, as text.
+    Codes,
+    /// Join a relay with one of its codes, as the device whose key is given.
     Claim {
         code: String,
-        #[command(flatten)]
-        client: ClientArgs,
-    },
-    /// As an owner, get a relay code for another computer (valid one day, once).
-    AddOwner {
-        /// The relay's URL, e.g. https://relay.example.com:7843 (several: comma-separated)
-        relay: String,
-        #[command(flatten)]
-        client: ClientArgs,
-    },
-}
-
-#[derive(Subcommand)]
-enum OwnersCmd {
-    List,
-    Add {
-        id: String,
+        /// The name the relay shows for this device.
         #[arg(long, default_value = "")]
-        note: String,
-    },
-    Remove {
-        id: String,
+        name: String,
+        #[command(flatten)]
+        client: ClientArgs,
     },
 }
 
@@ -110,38 +93,30 @@ impl ClientArgs {
 
 pub fn main() -> Result<()> {
     let cli = Cli::parse();
-    let default_log = if matches!(cli.cmd, Cmd::Serve { .. }) { "info,iroh_relay=warn" } else { "warn" };
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_log)),
-        )
-        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stdout()))
-        .init();
-    let rt = tokio::runtime::Runtime::new()?;
+    let serving = matches!(cli.cmd, Some(Cmd::Serve { .. }));
+    if !matches!(cli.cmd, None | Some(Cmd::Ui { .. })) {
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(if serving { "info,iroh_relay=warn" } else { "warn" })),
+            )
+            .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stdout()))
+            .init();
+    }
     match cli.cmd {
-        Cmd::Serve { public } => rt.block_on(crate::server::run(load(&cli.config)?, &public)),
-        Cmd::ResetClaim => {
-            let cfg = load(&cli.config)?;
-            let claim = Store::new(&cfg.state_dir).reset_initial_claim()?;
-            println!("新的中转码（旧的作废）：\n{}", RelayCode { urls: cfg.saved_urls()?, claim_key: claim.key }.encode());
-            Ok(())
-        }
-        Cmd::Owners { cmd } => owners(&load(&cli.config)?, cmd),
-        Cmd::Claim { code, client } => {
+        Some(Cmd::Serve { public }) => tokio::runtime::Runtime::new()?.block_on(crate::server::run(load(&cli.config)?, &public)),
+        None => crate::tui::run(&load(&cli.config)?, false),
+        Some(Cmd::Ui { demo }) => crate::tui::run(&load(&cli.config)?, demo),
+        Some(Cmd::Codes) => codes(&load(&cli.config)?),
+        Some(Cmd::Claim { code, name, client }) => {
             let code = match RelayCode::find(&code) {
                 Some(c) => c,
                 None => RelayCode::decode(&code).map_err(|e| anyhow!("relay code: {e}"))?,
             };
             let key = client.key()?;
-            let urls = rt.block_on(client::claim(&code, &key, &client.ca()?))?;
-            println!("认领成功：{} 现在是 {} 的主人", key.public(), urls[0]);
-            Ok(())
-        }
-        Cmd::AddOwner { relay, client } => {
-            let relay: Vec<RelayUrl> = relay.split(',').map(|u| u.trim().parse().map_err(|e| anyhow!("{u}: {e}"))).collect::<Result<_>>()?;
-            let code = rt.block_on(client::add_owner(&relay, &client.key()?, &client.ca()?))?;
-            println!("给另一台电脑的中转码（24 小时内有效，只能用一次）：\n{}", code.encode());
+            let rt = tokio::runtime::Runtime::new()?;
+            let urls = rt.block_on(client::claim(&code, &key, &name, &client.ca()?))?;
+            println!("已加入：{} 现在是 {} 的主人", key.public(), urls[0]);
             Ok(())
         }
     }
@@ -155,59 +130,26 @@ fn load(path: &Option<PathBuf>) -> Result<Config> {
     }
 }
 
-fn owners(cfg: &Config, cmd: OwnersCmd) -> Result<()> {
+fn codes(cfg: &Config) -> Result<()> {
     let store = Store::new(&cfg.state_dir);
-    let id = |s: &str| -> Result<EndpointId> { s.trim().parse().map_err(|e| anyhow!("{s}: not a device id: {e}")) };
-    // An owner's own computers own the relay too; who gave each that.
-    let derived = || -> Result<Vec<(EndpointId, EndpointId)>> {
-        let stored: HashSet<EndpointId> = store.owners()?.iter().map(|o| o.id).collect();
-        let guests = store.guests()?;
-        let all = owners_of(&stored, &guests);
-        let mut v = Vec::new();
-        for (o, gs) in &guests {
-            for g in gs.iter().filter(|g| g.mine && all.contains(o) && !stored.contains(&g.id)) {
-                if !v.iter().any(|(d, _)| *d == g.id) {
-                    v.push((g.id, *o));
-                }
-            }
-        }
-        Ok(v)
-    };
-    match cmd {
-        OwnersCmd::List => {
-            let owners = store.owners()?;
-            if owners.is_empty() {
-                println!("还没有主人");
-            }
-            let guests = store.guests()?;
-            let n = |o: &EndpointId| guests.get(o).map_or(0, Vec::len);
-            for o in owners {
-                println!("{}\t{}\t名单上 {} 台\t{}", o.id, date(o.added), n(&o.id), o.note);
-            }
-            for (d, by) in derived()? {
-                println!("{d}\t-\t名单上 {} 台\t{} 的我的电脑", n(&d), by.fmt_short());
-            }
-        }
-        OwnersCmd::Add { id: s, note } => {
-            if !store.add_owner(id(&s)?, &note)? {
-                println!("已经是主人");
-            }
-        }
-        OwnersCmd::Remove { id: s } => {
-            let d = id(&s)?;
-            if !store.remove_owner(&d)? {
-                if let Some((_, by)) = derived()?.into_iter().find(|(x, _)| *x == d) {
-                    bail!("{s} 是 {by} 的我的电脑：在那台电脑上把它删掉或者关掉它的免确认");
-                }
-                bail!("{s} 不是主人");
-            }
+    store.upgrade()?;
+    let urls = cfg.saved_urls()?;
+    let owners = store.owners()?;
+    let codes = store.codes()?;
+    if codes.is_empty() {
+        println!("没有中转码。执行 rc-relay，按 n 新建。");
+    }
+    for c in codes {
+        println!("{}\n  {}", c.shown_name(), RelayCode { urls: urls.clone(), claim_key: c.key }.encode());
+        for o in owners.iter().filter(|o| o.code == c.n) {
+            println!("  - {}\t{}\t{}", if o.name.is_empty() { "（没有名字）" } else { &o.name }, o.id.fmt_short(), date(o.added));
         }
     }
     Ok(())
 }
 
 /// Unix seconds as a UTC date (YYYY-MM-DD).
-fn date(secs: u64) -> String {
+pub fn date(secs: u64) -> String {
     // Howard Hinnant's days-to-civil.
     let z = (secs / 86_400) as i64 + 719_468;
     let era = z.div_euclid(146_097);

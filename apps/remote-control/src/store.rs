@@ -197,13 +197,6 @@ impl Store {
     }
 }
 
-/// A relay another computer gave this one, and the computers that give it.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Grant {
-    pub urls: Vec<RelayUrl>,
-    pub by: Vec<EndpointId>,
-}
-
 /// Settings. Unknown lines are left out; missing values take defaults.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Settings {
@@ -212,9 +205,6 @@ pub struct Settings {
     /// This computer's own (self-hosted) relays, each with its addresses
     /// (an IPv4 and an IPv6 one, or a name).
     pub relays: Vec<Vec<RelayUrl>>,
-    /// Those of `relays` given by other computers that list this one as
-    /// "my computer" (it owns them through them), not added here.
-    pub granted: Vec<Grant>,
     /// Use the free public relays to meet and to find a direct way.
     pub public_relays: bool,
     /// Answer LAN discovery for strangers and accept incoming LAN connections from them.
@@ -236,7 +226,6 @@ impl Default for Settings {
         Settings {
             name: String::new(),
             relays: Vec::new(),
-            granted: Vec::new(),
             public_relays: true,
             lan_visible: true,
             accept_new: true,
@@ -251,6 +240,9 @@ impl Default for Settings {
 impl Settings {
     pub fn load(path: &Path) -> Settings {
         let mut s = Settings::default();
+        // A relay another computer gave this one (older versions): not this
+        // computer's own, so it goes; paste the relay's code to use it.
+        let mut given: Vec<Vec<RelayUrl>> = Vec::new();
         if let Ok(text) = std::fs::read_to_string(path) {
             for line in text.lines() {
                 match line.split_once('=') {
@@ -261,14 +253,7 @@ impl Settings {
                             s.relays.push(urls);
                         }
                     }
-                    Some(("granted", v)) => {
-                        let (urls, by) = v.split_once(' ').unwrap_or((v, ""));
-                        let urls = relay_urls(urls);
-                        let by: Vec<EndpointId> = by.split(',').filter_map(|s| s.trim().parse().ok()).collect();
-                        if !urls.is_empty() && !by.is_empty() {
-                            s.granted.push(Grant { urls, by });
-                        }
-                    }
+                    Some(("granted", v)) => given.push(relay_urls(v.split_once(' ').map_or(v, |(u, _)| u))),
                     Some(("public_relays", v)) => s.public_relays = v.trim() != "0",
                     Some(("lan_visible", v)) => s.lan_visible = v.trim() != "0",
                     Some(("accept_new", v)) => s.accept_new = v.trim() != "0",
@@ -280,9 +265,7 @@ impl Settings {
                 }
             }
         }
-        // A grant only for a relay in use.
-        let relays = s.relays.clone();
-        s.granted.retain(|g| relays.contains(&g.urls));
+        s.relays.retain(|r| !given.contains(r));
         s
     }
 
@@ -293,10 +276,6 @@ impl Settings {
         let mut text = format!("name={}\n", clean(&self.name));
         for r in &self.relays {
             text += &format!("relay={}\n", url_list(r));
-        }
-        for g in &self.granted {
-            let by: Vec<String> = g.by.iter().map(|i| i.to_string()).collect();
-            text += &format!("granted={} {}\n", url_list(&g.urls), by.join(","));
         }
         text += &format!(
             "public_relays={}\nlan_visible={}\naccept_new={}\nclipboard={}\nboot_online={}\nlock_control={}\nstay_awake={}\n",
@@ -444,7 +423,6 @@ mod tests {
                 vec!["https://203.0.113.7:7843".parse().unwrap(), "https://[2001:db8::7]:7843".parse().unwrap()],
                 vec!["https://203.0.113.8:7843".parse().unwrap()],
             ],
-            granted: vec![Grant { urls: vec!["https://203.0.113.8:7843".parse().unwrap()], by: vec![id(1), id(2)] }],
             public_relays: false,
             lan_visible: false,
             accept_new: true,
@@ -456,9 +434,9 @@ mod tests {
         s.save(&p).unwrap();
         assert_eq!(Settings::load(&p), s);
         assert_eq!(s.shown_name(), "客厅");
-        // A grant for a relay no longer in use is dropped.
-        std::fs::write(&p, format!("granted=https://203.0.113.9:7843 {}\n", id(1))).unwrap();
-        assert!(Settings::load(&p).granted.is_empty());
+        // A relay another computer gave this one (older versions) goes.
+        std::fs::write(&p, format!("relay=https://203.0.113.7:7843\nrelay=https://203.0.113.9:7843\ngranted=https://203.0.113.9:7843 {}\n", id(1))).unwrap();
+        assert_eq!(Settings::load(&p).relays, vec![vec!["https://203.0.113.7:7843".parse::<RelayUrl>().unwrap()]]);
         // An old file with a single relay line or an empty relay line.
         std::fs::write(&p, "relay=\npublic_relays=1\n").unwrap();
         assert_eq!(Settings::load(&p).relays, Vec::<Vec<RelayUrl>>::new());

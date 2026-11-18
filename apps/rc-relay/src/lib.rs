@@ -25,3 +25,5 @@ pub mod policy;
 pub mod server;
 #[cfg(feature = "server")]
 pub mod state;
+#[cfg(feature = "server")]
+pub mod tui;

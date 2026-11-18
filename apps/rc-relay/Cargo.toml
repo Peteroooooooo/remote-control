@@ -6,10 +6,10 @@ version.workspace = true
 publish.workspace = true
 
 # The app uses this crate with `default-features = false`: only the claim /
-# add-owner client and the request codes, which add nothing to iroh's tree.
+# guest-list client and the request codes, which add nothing to iroh's tree.
 [features]
 default = ["server"]
-server = ["iroh-relay/server", "dep:bytes", "dep:clap", "dep:http-body-util", "dep:hyper", "dep:netdev", "dep:rcgen", "dep:serde", "dep:toml", "dep:tracing-subscriber"]
+server = ["iroh-relay/server", "dep:bytes", "dep:clap", "dep:http-body-util", "dep:hyper", "dep:netdev", "dep:ratatui", "dep:rcgen", "dep:serde", "dep:toml", "dep:tracing-subscriber"]
 
 [[bin]]
 name = "rc-relay"
@@ -26,7 +26,7 @@ iroh-base = { version = "1.4.1", default-features = false, features = ["key"] }
 # Patched copy, see vendor/iroh-relay/PATCHES.md.
 iroh-relay = "1.4.1"
 rc-ident = { path = "../../crates/rc-ident" }
-# Already in the tree through iroh-relay; used for the claim / add-owner calls.
+# Already in the tree through iroh-relay; used for the relay HTTP API calls.
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std"] }
 tokio = { version = "1", features = ["full"] }
@@ -39,6 +39,8 @@ http-body-util = { version = "0.1", optional = true }
 hyper = { version = "1", optional = true }
 # The public IPs a relay without a config file uses.
 netdev = { version = "0.45", optional = true }
+# The management screen (`rc-relay` without arguments).
+ratatui = { version = "0.30", default-features = false, features = ["crossterm"], optional = true }
 # The certificate a relay without a domain name makes itself.
 rcgen = { version = "0.14", optional = true }
 serde = { version = "1", features = ["derive"], optional = true }

@@ -15,7 +15,7 @@
 //! enable_quic_addr_discovery = true
 //!
 //! [tls]
-//! https_bind_addr = "[::]:7843"           # relay, /rc/claim, /rc/add-owner, /rc/guests
+//! https_bind_addr = "[::]:7843"           # relay, /rc/claim, /rc/guests, /rc/invites, /rc/meet
 //! quic_bind_addr = "[::]:7842"            # QUIC address discovery
 //! cert_mode = "Reloading"                 # or "Manual" (read once); default "SelfSigned"
 //! manual_cert_path = "/etc/rc-relay/tls/cert.pem"
@@ -170,7 +170,7 @@ impl Config {
         self.state_dir.join("urls.txt")
     }
 
-    /// The addresses `serve` printed last time (for `reset-claim`).
+    /// The addresses `serve` printed last time (for the management screen and `codes`).
     pub fn saved_urls(&self) -> Result<Vec<RelayUrl>> {
         let text = std::fs::read_to_string(self.urls_file())
             .with_context(|| format!("{}: run `rc-relay serve` once first", self.urls_file().display()))?;
