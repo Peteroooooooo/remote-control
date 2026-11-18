@@ -184,6 +184,8 @@ struct St {
     /// Per-relay outcome of the last guest-list send: true = ok, false = fail
     /// (by the relay's first address).
     relay_ok: BTreeMap<String, bool>,
+    /// The own relay standing in while the chosen one does not answer.
+    using: Option<Vec<RelayUrl>>,
 }
 
 struct Shared {
@@ -274,8 +276,27 @@ fn first_of(group: &[RelayUrl], first: &RelayUrl) -> Vec<RelayUrl> {
     v
 }
 
-fn relays_of(s: &Settings) -> net::Relays {
-    net::Relays { own: own_urls(s), public: s.public_relays, theirs: Vec::new(), token: None }
+/// The own relay the endpoint uses: the chosen one (first in the list), or
+/// `using` while it stands in for the chosen one (`fallback_loop`).
+fn current_group(s: &Settings, using: &Option<Vec<RelayUrl>>) -> Option<Vec<RelayUrl>> {
+    using.clone().filter(|g| s.relays.contains(g)).or_else(|| s.relays.first().cloned())
+}
+
+/// Every own relay gets the guest list (`guests_loop`); the endpoint is
+/// only at the one in use.
+fn relays_of(s: &Settings, using: &Option<Vec<RelayUrl>>) -> net::Relays {
+    net::Relays { own: current_group(s, using).unwrap_or_default(), public: s.public_relays, theirs: Vec::new(), token: None }
+}
+
+/// The relays in the endpoint's map for `r` (public fallback aside).
+fn map_urls(r: &net::Relays) -> Vec<RelayUrl> {
+    if !r.own.is_empty() {
+        r.own.clone()
+    } else if r.public {
+        net::public_relays()
+    } else {
+        Vec::new()
+    }
 }
 
 /// Up to three addresses for a connection code (`target-plan` 4.3): public
@@ -420,6 +441,8 @@ impl Shared {
 
     /// Settings changed in `st` (the relays were `before`): saved, every
     /// device hears of it, and the endpoint uses the relays now in them.
+    /// Another relay in use voids the connection codes not used yet: they
+    /// point at where this computer no longer is.
     fn settings_changed(&self, st: &mut St, before: net::Relays) {
         if let Err(e) = st.settings.save(&store::settings_path(&self.opts.key)) {
             let msg = format!("设置保存失败：{e:#}");
@@ -428,7 +451,14 @@ impl Shared {
         for p in st.peers.values() {
             p.wake.notify_one();
         }
-        let after = relays_of(&st.settings);
+        let after = relays_of(&st.settings, &st.using);
+        if map_urls(&before) != map_urls(&after) {
+            let n = st.codes.iter().filter(|c| c.by.is_none()).count();
+            st.codes.retain(|c| c.by.is_some());
+            if n > 0 {
+                log!("the relay in use changed: {n} connection code(s) not used yet are void");
+            }
+        }
         if before != after {
             let ep = self.ep();
             tokio::spawn(async move { apply_relays(&ep, &before, &after).await });
@@ -874,7 +904,7 @@ impl Node {
             store.save()?;
         }
         let detoured = net::ipv6_detour().is_some();
-        let ep = net::endpoint(secret.clone(), &relays_of(&settings), true).await?;
+        let ep = net::endpoint(secret.clone(), &relays_of(&settings, &None), true).await?;
         let me = ep.id();
         log!("node: device id {me}{}", if opts.service { " (service)" } else { "" });
         for a in ep.bound_sockets() {
@@ -901,6 +931,7 @@ impl Node {
             notice_seq: 0,
             suggest: None,
             relay_ok: BTreeMap::new(),
+            using: None,
         };
         let sh = Arc::new(Shared { opts, secret, me, ep: std::sync::RwLock::new(ep.clone()), st: Mutex::new(st), repaint: Mutex::default(), rt: tokio::runtime::Handle::current(),
             detoured: detoured.into(),
@@ -1011,6 +1042,7 @@ impl Node {
             "set-name" => Ok(self.settings(|s| s.name = clean(f.get(1).copied().unwrap_or("")))),
             "set-public" => Ok(self.settings(|s| s.public_relays = f.get(1) == Some(&"1"))),
             "relay-claim" => self.claim_relay(f.get(1).copied().unwrap_or("")),
+            "relay-use" => self.use_relay(f.get(1).copied().unwrap_or("")),
             "relay-remove" => self.remove_relay(f.get(1).copied().unwrap_or("")),
             "disconnect" => {
                 if let Some(h) = &self.sh.st.lock().unwrap().hosting {
@@ -1096,16 +1128,22 @@ impl Node {
             s.lock_control as u8,
             s.stay_awake as u8,
         );
+        // In the order of the list, the chosen relay first. home: in use;
+        // temp: in use while the chosen one does not answer; idle: joined,
+        // gets the guest list, not in use; fail: the last guest list did not
+        // go through; wait: in use, not connected yet.
         let home = net::home_relay(&sh.ep());
-        for g in &s.relays {
-            let state = if home.as_ref().is_some_and(|h| g.contains(h)) && net::connected_to(&sh.ep(), g) {
-                "home"
+        let cur = current_group(s, &st.using);
+        for (i, g) in s.relays.iter().enumerate() {
+            let ok = st.relay_ok.get(&g[0].to_string()).copied();
+            let state = if ok == Some(false) {
+                "fail"
+            } else if cur.as_ref() != Some(g) {
+                "idle"
+            } else if home.as_ref().is_some_and(|h| g.contains(h)) && net::connected_to(&sh.ep(), g) {
+                if i == 0 { "home" } else { "temp" }
             } else {
-                match st.relay_ok.get(&g[0].to_string()) {
-                    Some(true) => "ok",
-                    Some(false) => "fail",
-                    None => "wait",
-                }
+                "wait"
             };
             out += &format!("relay\t{}\t{state}\t\n", url_list(g));
         }
@@ -1153,15 +1191,12 @@ impl Node {
         getrandom::fill(&mut token).map_err(|e| anyhow!("random: {e}"))?;
         let (text, own) = {
             let mut st = self.sh.st.lock().unwrap();
-            let find = match net::home_relay(&self.sh.ep()) {
-                Some(h) => match group_of(&st.settings, &h) {
-                    Some(g) => Find::Relay(first_of(g, &h)),
-                    None => net::public_index(&h).map_or_else(|| Find::Relay(vec![h.clone()]), Find::Public),
-                },
-                None => match st.settings.relays.first() {
-                    Some(g) => Find::Relay(g.clone()),
-                    None => Find::Nowhere,
-                },
+            let home = net::home_relay(&self.sh.ep());
+            let find = match (current_group(&st.settings, &st.using), home) {
+                (Some(g), Some(h)) if g.contains(&h) => Find::Relay(first_of(&g, &h)),
+                (Some(g), _) => Find::Relay(g),
+                (None, Some(h)) => net::public_index(&h).map_or_else(|| Find::Relay(vec![h.clone()]), Find::Public),
+                (None, None) => Find::Nowhere,
             };
             let code = ConnCode { device: self.sh.me, token, find, addrs: code_addrs(&self.sh.ep()) };
             let text = code.encode();
@@ -1248,11 +1283,7 @@ impl Node {
         let claim = rc_relay::client::claim(&code, &self.sh.secret, &name, &ca);
         let urls = self.sh.rt.block_on(claim).map_err(relay_error)?;
         log!("joined the relay {}: using it from now on", url_list(&urls));
-        self.settings(|s| {
-            // The same relay again (another code, other addresses): its addresses now.
-            s.relays.retain(|g| !g.iter().any(|u| urls.contains(u) || same_relay(u, &urls)));
-            s.relays.push(urls.clone());
-        });
+        self.choose_relay(urls.clone());
         Ok(url_list(&urls))
     }
 
@@ -1269,6 +1300,25 @@ impl Node {
             s.relays.retain(|g| *g != relay);
         });
         Ok(String::new())
+    }
+
+    /// 「使用」 on a relay of the list: it is the chosen one from now on.
+    fn use_relay(&self, urls: &str) -> Result<String> {
+        let relay = self.own_relay(urls)?;
+        log!("chose the relay {}: using it from now on", url_list(&relay));
+        self.choose_relay(relay);
+        Ok(String::new())
+    }
+
+    /// Makes `relay` the chosen one (first in the list) and uses it now; the
+    /// same relay at other addresses gives way to it.
+    fn choose_relay(&self, relay: Vec<RelayUrl>) {
+        let mut st = self.sh.st.lock().unwrap();
+        let before = relays_of(&st.settings, &st.using);
+        st.settings.relays.retain(|g| *g != relay && !g.iter().any(|u| relay.contains(u) || same_relay(u, &relay)));
+        st.settings.relays.insert(0, relay);
+        st.using = None;
+        self.sh.settings_changed(&mut st, before);
     }
 
     fn set_auto(&self, id: EndpointId, on: bool) -> String {
@@ -1314,7 +1364,8 @@ impl Node {
         if home.iter().any(|r| net::public_index(r).is_none()) {
             relays.retain(|r| net::public_index(r).is_none());
         }
-        let own_relays: Vec<String> = own_urls(&st.settings).iter().map(|r| r.to_string()).collect();
+        let own_relays: Vec<String> =
+            current_group(&st.settings, &st.using).unwrap_or_default().iter().map(|r| r.to_string()).collect();
         format!(
             "{}\t{}\t{}\t{}\t{}",
             list(addrs.iter().map(|a| a.to_string()).collect()),
@@ -1327,9 +1378,12 @@ impl Node {
 
     fn settings(&self, f: impl FnOnce(&mut Settings)) -> String {
         let mut st = self.sh.st.lock().unwrap();
-        let before = relays_of(&st.settings);
+        let before = relays_of(&st.settings, &st.using);
         let before_boot = st.settings.boot_online;
         f(&mut st.settings);
+        if st.using.as_ref().is_some_and(|g| !st.settings.relays.contains(g)) {
+            st.using = None;
+        }
         crate::power::STAY_AWAKE.store(st.settings.stay_awake, std::sync::atomic::Ordering::SeqCst);
         if self.sh.opts.service
             && before_boot != st.settings.boot_online
@@ -1343,16 +1397,7 @@ impl Node {
 }
 
 async fn apply_relays(ep: &Endpoint, before: &net::Relays, after: &net::Relays) {
-    let urls = |r: &net::Relays| -> Vec<RelayUrl> {
-        if !r.own.is_empty() {
-            r.own.clone()
-        } else if r.public {
-            net::public_relays()
-        } else {
-            Vec::new()
-        }
-    };
-    let (old, new) = (urls(before), urls(after));
+    let (old, new) = (map_urls(before), map_urls(after));
     for u in old.iter().filter(|u| !new.contains(u)) {
         ep.remove_relay(u).await;
     }
@@ -2101,74 +2146,122 @@ async fn guests_loop(sh: Arc<Shared>) {
     }
 }
 
-/// With own relays: when none of them has been connected for
-/// `FALLBACK_AFTER`, the public relays go into the endpoint's map (if
-/// allowed), so devices still meet and find a direct way; video stays off
-/// them as always. While they are in, the own relays are asked every
-/// `FALLBACK_RECHECK` whether they answer again; then the public relays go.
+/// With own relays the endpoint is at one of them: the chosen one (first in
+/// the list). When the one in use has not been connected for
+/// `FALLBACK_AFTER`, the next own relay that answers stands in; when none
+/// does, the public relays help (if allowed), so devices still meet and find
+/// a direct way; video stays off them as always. Every `FALLBACK_RECHECK`
+/// the chosen relay is asked whether it answers again, and taken back then.
 async fn fallback_loop(sh: Arc<Shared>) {
     use std::sync::atomic::Ordering::SeqCst;
     let mut down_since: Option<Instant> = None;
     let mut asked: Option<Instant> = None;
+    let mut last: Option<Vec<RelayUrl>> = None;
     loop {
         tokio::time::sleep(Duration::from_secs(2)).await;
         if sh.is_stopped() {
             return;
         }
-        let (groups, public_ok) = {
+        let (groups, public_ok, cur) = {
             let st = sh.st.lock().unwrap();
-            (st.settings.relays.clone(), st.settings.public_relays)
+            (st.settings.relays.clone(), st.settings.public_relays, current_group(&st.settings, &st.using))
         };
-        let on = sh.fallback.load(SeqCst);
-        if groups.is_empty() {
+        let Some(cur) = cur else {
             // No own relay: the public relays are the endpoint's own anyway (`apply_relays`).
             sh.fallback.store(false, SeqCst);
-            down_since = None;
+            (down_since, last) = (None, None);
             continue;
-        }
-        let own: Vec<RelayUrl> = groups.iter().flatten().cloned().collect();
-        if !on {
-            if net::connected_to(&sh.ep(), &own) {
-                down_since = None;
-                continue;
-            }
-            let since = *down_since.get_or_insert_with(Instant::now);
-            if public_ok && since.elapsed() >= FALLBACK_AFTER {
-                log!("no own relay connected for {} s: the public relays help meanwhile", since.elapsed().as_secs());
-                for u in net::public_relays() {
-                    sh.ep().insert_relay(u.clone(), Arc::new(RelayConfig::from(u))).await;
-                }
-                sh.fallback.store(true, SeqCst);
-                asked = Some(Instant::now());
-                wake_all(&sh);
-            }
-            continue;
-        }
-        let back = if !public_ok {
-            true
-        } else if asked.is_none_or(|t| t.elapsed() >= FALLBACK_RECHECK) {
-            asked = Some(Instant::now());
-            let mut any = false;
-            for g in &groups {
-                if rc_relay::client::ping(g, &rc_relay::tls::ca()).await.is_ok() {
-                    any = true;
-                    break;
-                }
-            }
-            any
-        } else {
-            false
         };
-        if back {
-            log!("{}: the public relays leave the map", if public_ok { "an own relay answers again" } else { "public relays turned off" });
-            for u in net::public_relays() {
-                sh.ep().remove_relay(&u).await;
-            }
-            sh.fallback.store(false, SeqCst);
+        if last.as_ref() != Some(&cur) {
             down_since = None;
+            last = Some(cur.clone());
+        }
+        let chosen = groups[0].clone();
+        let on = sh.fallback.load(SeqCst);
+        if net::connected_to(&sh.ep(), &cur) || (on && !public_ok) {
+            down_since = None;
+            if on {
+                public_out(&sh, if public_ok { "an own relay is connected again" } else { "public relays turned off" }).await;
+            }
+            if cur != chosen && asked.is_none_or(|t| t.elapsed() >= FALLBACK_RECHECK) {
+                asked = Some(Instant::now());
+                if first_answering(std::slice::from_ref(&chosen)).await.is_some() {
+                    log!("the chosen relay {} answers again: using it", chosen[0]);
+                    use_group(&sh, None).await;
+                }
+            }
+            continue;
+        }
+        if on {
+            if asked.is_none_or(|t| t.elapsed() >= FALLBACK_RECHECK) {
+                asked = Some(Instant::now());
+                if let Some(g) = first_answering(&groups).await {
+                    use_group(&sh, Some(g)).await;
+                    public_out(&sh, "an own relay answers again").await;
+                    down_since = None;
+                }
+            }
+            continue;
+        }
+        let since = *down_since.get_or_insert_with(Instant::now);
+        let down = since.elapsed();
+        if down < FALLBACK_AFTER {
+            continue;
+        }
+        // Tried again after another `FALLBACK_AFTER` if nothing answers now.
+        down_since = Some(Instant::now());
+        let others: Vec<Vec<RelayUrl>> = groups.iter().filter(|g| **g != cur).cloned().collect();
+        if let Some(g) = first_answering(&others).await {
+            log!("{} not connected for {} s: {} stands in", cur[0], down.as_secs(), g[0]);
+            use_group(&sh, Some(g)).await;
+            asked = Some(Instant::now());
+            continue;
+        }
+        if public_ok {
+            log!("no own relay connected for {} s: the public relays help meanwhile", down.as_secs());
+            for u in net::public_relays() {
+                sh.ep().insert_relay(u.clone(), Arc::new(RelayConfig::from(u))).await;
+            }
+            sh.fallback.store(true, SeqCst);
+            asked = Some(Instant::now());
             wake_all(&sh);
         }
     }
+}
+
+/// The first of `groups` (own relays) that answers its probe.
+async fn first_answering(groups: &[Vec<RelayUrl>]) -> Option<Vec<RelayUrl>> {
+    for g in groups {
+        if rc_relay::client::ping(g, &rc_relay::tls::ca()).await.is_ok() {
+            return Some(g.clone());
+        }
+    }
+    None
+}
+
+/// The endpoint at the own relay `g` (`None`: the chosen one) from now on.
+async fn use_group(sh: &Arc<Shared>, g: Option<Vec<RelayUrl>>) {
+    let (before, after) = {
+        let mut st = sh.st.lock().unwrap();
+        let before = relays_of(&st.settings, &st.using);
+        let chosen = st.settings.relays.first().cloned();
+        st.using = g.filter(|g| Some(g) != chosen.as_ref());
+        (before, relays_of(&st.settings, &st.using))
+    };
+    if before != after {
+        apply_relays(&sh.ep(), &before, &after).await;
+        wake_all(sh);
+        sh.changed();
+    }
+}
+
+async fn public_out(sh: &Arc<Shared>, why: &str) {
+    log!("{why}: the public relays leave the map");
+    for u in net::public_relays() {
+        sh.ep().remove_relay(&u).await;
+    }
+    sh.fallback.store(false, std::sync::atomic::Ordering::SeqCst);
+    wake_all(sh);
 }
 
 /// Every device task says hello again (the home relay changed) or, if it is
@@ -2268,7 +2361,10 @@ async fn v6_loop(sh: Arc<Shared>) {
 
 async fn renew(sh: &Arc<Shared>, detoured: bool) -> Result<()> {
     use std::sync::atomic::Ordering::SeqCst;
-    let relays = relays_of(&sh.st.lock().unwrap().settings);
+    let relays = {
+        let st = sh.st.lock().unwrap();
+        relays_of(&st.settings, &st.using)
+    };
     // First, so the relay never sees two endpoints with this id. Meet
     // connections end with it; both sides dial again (this one at the
     // addresses it last reached the others at, `Peer::reached_at`).

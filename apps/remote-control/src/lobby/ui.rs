@@ -1291,12 +1291,13 @@ impl App {
             for (i, r) in relays.iter().enumerate() {
                 let (state, color) = match r.state.as_str() {
                     "home" => ("在用", GREEN),
-                    "ok" => ("备用", DIM),
+                    "temp" => ("临时在用（首选连不上）", GREEN),
                     "fail" => ("连不上", AMBER),
+                    "idle" => ("未使用，名单照常同步", DIM),
                     _ => ("正在连接…", DIM),
                 };
                 let host = host_of(&r.url);
-                let mut remove = false;
+                let (mut remove, mut pick) = (false, false);
                 let line = Item {
                     title_font: FontId::monospace(13.5),
                     desc: Some((state, if color == AMBER { AMBER } else { DIM })),
@@ -1305,7 +1306,15 @@ impl App {
                 };
                 line.show(ui, |ui| {
                     remove = icon_button(ui, Icon::Trash, 32.0, &format!("移除 {host}"), true).clicked();
+                    if i != 0 {
+                        pick = ui.button("使用").on_hover_text("以后优先用这台中转").clicked();
+                    }
                 });
+                if pick {
+                    self.b.act(&format!("relay-use\t{}", r.url));
+                    let note = if snap.codes.is_empty() || r.state == "temp" { "" } else { "，没用掉的连接码已作废" };
+                    self.toast(Tone::Ok, format!("已改用中转 {host}{note}"));
+                }
                 if remove {
                     self.undoable(Undoable::Relay(r.url.clone()), format!("已移除中转 {host}"));
                 }
@@ -1365,7 +1374,7 @@ impl App {
             }
         });
         ui.add_space(6.0);
-        ui.label(RichText::new("打不通时画面走中转，从上往下试").size(13.0).color(DIM));
+        ui.label(RichText::new("打不通时画面走第一台中转；它连不上时，下一台能连上的临时顶替").size(13.0).color(DIM));
     }
 
     /// The toasts, centred at the top of the page: they slide in, stay a
