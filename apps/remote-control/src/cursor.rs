@@ -67,53 +67,6 @@ impl CursorImage {
             && (self.color.is_empty() || self.color.len() == w * h * 4)
             && self.mask.len() == Self::stride(self.width) * self.mask_rows()
     }
-
-    fn mask_bit(&self, row: usize, x: usize) -> bool {
-        self.mask[row * Self::stride(self.width) + x / 8] & (0x80 >> (x % 8)) != 0
-    }
-
-    /// Nearest-neighbour resize by `s`; the hotspot moves with the picture.
-    pub fn scaled(&self, s: f64) -> CursorImage {
-        let (w, h) = (self.width as usize, self.height as usize);
-        let nw = ((w as f64 * s).round() as usize).clamp(1, MAX_SIDE as usize);
-        let nh = ((h as f64 * s).round() as usize).clamp(1, MAX_SIDE as usize);
-        if (nw, nh) == (w, h) {
-            return self.clone();
-        }
-        let src = |i: usize, n: usize, old: usize| (i * old / n).min(old - 1);
-        let stride = Self::stride(nw as u16);
-        let planes = if self.is_color() { 1 } else { 2 };
-        let mut mask = vec![0u8; stride * nh * planes];
-        for p in 0..planes {
-            for y in 0..nh {
-                let sy = p * h + src(y, nh, h);
-                for x in 0..nw {
-                    if self.mask_bit(sy, src(x, nw, w)) {
-                        mask[(p * nh + y) * stride + x / 8] |= 0x80 >> (x % 8);
-                    }
-                }
-            }
-        }
-        let mut color = Vec::new();
-        if self.is_color() {
-            color.reserve(nw * nh * 4);
-            for y in 0..nh {
-                let sy = src(y, nh, h);
-                for x in 0..nw {
-                    let i = (sy * w + src(x, nw, w)) * 4;
-                    color.extend_from_slice(&self.color[i..i + 4]);
-                }
-            }
-        }
-        CursorImage {
-            width: nw as u16,
-            height: nh as u16,
-            hot_x: ((self.hot_x as f64 * nw as f64 / w as f64) as u16).min(nw as u16 - 1),
-            hot_y: ((self.hot_y as f64 * nh as f64 / h as f64) as u16).min(nh as u16 - 1),
-            color,
-            mask,
-        }
-    }
 }
 
 struct Bitmaps(ICONINFO);
@@ -267,11 +220,10 @@ pub fn dump(cursor: HCURSOR, img: &CursorImage, path: &Path) -> Result<()> {
 }
 
 /// Host side, on its own thread until `sh.stop`: watches the cursor and
-/// sends its shape when it changes. Scaled like the video (`PipeShared::scale`),
-/// so the cursor keeps its size relative to the streamed picture.
+/// sends its shape when it changes, at the size the host shows it.
 pub fn watch(out: UnboundedSender<Msg>, sh: Arc<PipeShared>) {
     let mut ids: HashMap<u64, u32> = HashMap::new();
-    let mut last: Option<(bool, isize, u32)> = None;
+    let mut last: Option<(bool, isize)> = None;
     let mut repeats = 0u32;
     let mut follow_failed = 0u64;
     while !sh.stop.load(Ordering::Relaxed) {
@@ -288,10 +240,10 @@ pub fn watch(out: UnboundedSender<Msg>, sh: Arc<PipeShared>) {
         if unsafe { GetCursorInfo(&mut ci) }.is_err() {
             continue;
         }
-        let scale = *sh.scale.lock().unwrap();
-        let scale = if scale > 0.0 && scale < 0.999 { scale } else { 1.0 };
-        let showing = ci.flags.0 & CURSOR_SHOWING.0 != 0 && !ci.hCursor.is_invalid();
-        let key = (showing, if showing { ci.hCursor.0 as isize } else { 0 }, (scale * 1000.0).round() as u32);
+        let showing = ci.flags.0 & CURSOR_SHOWING.0 != 0
+            && !ci.hCursor.is_invalid()
+            && !sh.pointer_in_image.load(Ordering::Relaxed);
+        let key = (showing, if showing { ci.hCursor.0 as isize } else { 0 });
         if last == Some(key) {
             continue;
         }
@@ -299,10 +251,7 @@ pub fn watch(out: UnboundedSender<Msg>, sh: Arc<PipeShared>) {
         let msg = if !showing {
             Msg::CursorHidden
         } else {
-            let Some(mut img) = read(ci.hCursor) else { continue };
-            if scale < 1.0 {
-                img = img.scaled(scale);
-            }
+            let Some(img) = read(ci.hCursor) else { continue };
             let mut hasher = DefaultHasher::new();
             img.hash(&mut hasher);
             let next = ids.len() as u32 + 1;
@@ -350,9 +299,9 @@ mod tests {
             let h = unsafe { LoadCursorW(None, id) }.unwrap();
             let img = read(h).unwrap_or_else(|| panic!("{name}: not readable"));
             assert!(img.valid(), "{name}");
-            let built = build(&img.scaled(0.75)).unwrap();
+            let built = build(&img).unwrap();
             let path = dir.join(format!("{name}.png"));
-            dump(built, &img.scaled(0.75), &path).unwrap();
+            dump(built, &img, &path).unwrap();
             assert!(std::fs::metadata(&path).unwrap().len() > 0);
             unsafe { DestroyCursor(built) }.unwrap();
         }
@@ -383,39 +332,5 @@ mod tests {
         let mut big = mono(MAX_SIDE, 1);
         big.width = MAX_SIDE + 1;
         assert!(!big.valid());
-    }
-
-    #[test]
-    fn scaling_keeps_both_masks_and_hotspot() {
-        let m = mono(32, 32).scaled(1.5);
-        assert_eq!((m.width, m.height, m.hot_x, m.hot_y), (48, 48, 1, 3));
-        assert!(m.valid());
-        for y in 0..48 {
-            assert!(m.mask_bit(y, 0), "AND column at row {y}");
-            assert!(!m.mask_bit(y, 2));
-        }
-        for x in 0..48 {
-            assert!(m.mask_bit(48, x), "XOR row at column {x}");
-            assert!(!m.mask_bit(50, x));
-        }
-        assert_eq!(mono(32, 32).scaled(1.0), mono(32, 32));
-    }
-
-    #[test]
-    fn scaling_a_colour_cursor() {
-        let (w, h) = (4u16, 2u16);
-        let color: Vec<u8> = (0..(w * h) as u8).flat_map(|i| [i, i, i, 255]).collect();
-        let img = CursorImage {
-            width: w,
-            height: h,
-            hot_x: 3,
-            hot_y: 1,
-            color,
-            mask: vec![0u8; CursorImage::stride(w) * h as usize],
-        };
-        let s = img.scaled(0.5);
-        assert_eq!((s.width, s.height, s.hot_x, s.hot_y), (2, 1, 1, 0));
-        assert_eq!(s.color, vec![0, 0, 0, 255, 2, 2, 2, 255]);
-        assert!(s.valid());
     }
 }

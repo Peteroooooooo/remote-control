@@ -114,8 +114,8 @@ thread_local! {
     static ROUTER: RefCell<KeyRouter> = RefCell::default();
     /// Buttons whose press recaptured input; their release is not sent either.
     static SKIP_UP: Cell<u8> = const { Cell::new(0) };
-    /// Cursors built for the current picture scale (in 1/16 steps), by id.
-    static BUILT: RefCell<(i32, HashMap<u32, HCURSOR>)> = RefCell::default();
+    /// Cursors built from the host's images, by id.
+    static BUILT: RefCell<HashMap<u32, HCURSOR>> = RefCell::default();
 }
 
 /// The host's displays: (streamed one, how many), from its latest list.
@@ -150,7 +150,7 @@ pub fn pick_monitor(key: keys::MonitorKey) {
 }
 
 /// The stream changed size (another display, or the host's resolution
-/// changed): map the pointer and scale the cursor for the new size.
+/// changed): map the pointer for the new size.
 pub fn set_stream(size: (u32, u32)) {
     let Some(s) = STATE.get() else { return };
     *s.stream.lock().unwrap() = size;
@@ -504,44 +504,24 @@ fn release() {
     refresh_cursor(picture());
 }
 
-/// The picture's scale on screen in 1/16 steps; within one step of 1 counts as 1.
-fn scale_key(hwnd: HWND) -> i32 {
-    let mut c = RECT::default();
-    unsafe {
-        let _ = GetClientRect(hwnd, &mut c);
-    }
-    let stream = STATE.get().map(|s| *s.stream.lock().unwrap()).unwrap_or((1, 1));
-    let r = letterbox(stream, (c.right.max(1) as u32, c.bottom.max(1) as u32));
-    let key = ((r.right - r.left) as f64 * 16.0 / stream.0.max(1) as f64).round() as i32;
-    if (key - 16).abs() <= 1 { 16 } else { key.clamp(2, 64) }
-}
-
 /// The cursor to show over the picture: None for the local arrow, Some(None) for no cursor.
-fn remote_hcursor(hwnd: HWND) -> Option<Option<HCURSOR>> {
+/// Shown at the size the host shows it, whatever the picture's scale (as RDP and Parsec do).
+fn remote_hcursor() -> Option<Option<HCURSOR>> {
     let c = CURSORS.lock().unwrap();
     let id = match c.1 {
         Shown::Local => return None,
         Shown::Hidden => return Some(None),
         Shown::Remote(id) => id,
     };
-    let key = scale_key(hwnd);
-    BUILT.with_borrow_mut(|(k, built)| {
-        if *k != key {
-            for (_, h) in built.drain() {
-                unsafe {
-                    let _ = DestroyCursor(h);
-                }
-            }
-            *k = key;
-        }
+    BUILT.with_borrow_mut(|built| {
         if let Some(h) = built.get(&id) {
             return Some(Some(*h));
         }
-        let img = c.0.get(&id)?.scaled(key as f64 / 16.0);
-        match cursor::build(&img) {
+        let img = c.0.get(&id)?;
+        match cursor::build(img) {
             Ok(h) => {
                 if let Some(dir) = CURSOR_DUMP.get() {
-                    match cursor::dump(h, &img, &dir.join(format!("cursor-{id}.png"))) {
+                    match cursor::dump(h, img, &dir.join(format!("cursor-{id}.png"))) {
                         Ok(()) => log!("cursor {id} built at {}x{}, saved", img.width, img.height),
                         Err(e) => log!("cursor {id}: dump failed: {e:#}"),
                     }
@@ -568,14 +548,14 @@ fn refresh_cursor(hwnd: HWND) {
     }
 }
 
-fn set_cursor(hwnd: HWND, lparam: LPARAM) -> bool {
+fn set_cursor(lparam: LPARAM) -> bool {
     // Released input means the pointer is the local one again; watching
     // only (no input) still shows the host's cursor.
     let local = STATE.get().is_some_and(|s| s.input) && !captured();
     if (lparam.0 & 0xffff) as u32 != HTCLIENT || local {
         return false;
     }
-    match remote_hcursor(hwnd) {
+    match remote_hcursor() {
         Some(h) => {
             unsafe { SetCursor(h) };
             true
@@ -795,14 +775,14 @@ unsafe extern "system" fn picture_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
             remove_hook();
         }
         WM_SETCURSOR => {
-            if !set_cursor(hwnd, lparam) {
+            if !set_cursor(lparam) {
                 return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
             }
             return LRESULT(1);
         }
         WM_APP_CURSOR => {
             if CURSOR_DUMP.get().is_some() {
-                let _ = remote_hcursor(hwnd);
+                let _ = remote_hcursor();
             }
             refresh_cursor(hwnd);
         }
@@ -908,7 +888,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             remove_hook();
             WINDOW.store(0, Ordering::Relaxed);
             PICTURE.store(0, Ordering::Relaxed);
-            BUILT.with_borrow_mut(|(_, built)| {
+            BUILT.with_borrow_mut(|built| {
                 for (_, h) in built.drain() {
                     unsafe {
                         let _ = DestroyCursor(h);

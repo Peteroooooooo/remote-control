@@ -36,6 +36,10 @@ pub struct Capture {
     /// Degrees clockwise the image must be turned to look like the display:
     /// a rotated display is duplicated in its unrotated (panel) orientation.
     pub rotation: u16,
+    /// The pointer is on this display and not in the image. Windows draws it
+    /// into the image instead while a window is dragged (PeterBook,
+    /// 2026-11-19), and then reports it hidden.
+    pub pointer_apart: bool,
 }
 
 impl Capture {
@@ -64,6 +68,7 @@ impl Capture {
                 width: mode.Width,
                 height: mode.Height,
                 rotation: crate::monitors::rotation_degrees(dd.Rotation),
+                pointer_apart: true,
             })
         }
     }
@@ -82,6 +87,9 @@ impl Capture {
                 Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => return Ok(Grab::Timeout),
                 Err(e) if e.code() == DXGI_ERROR_ACCESS_LOST => return Ok(Grab::Lost),
                 Err(e) => return Err(e).context("AcquireNextFrame"),
+            }
+            if info.LastMouseUpdateTime != 0 {
+                self.pointer_apart = info.PointerPosition.Visible.as_bool();
             }
             // LastPresentTime 0 means only the mouse pointer moved.
             let fresh = info.LastPresentTime != 0;

@@ -85,8 +85,9 @@ pub struct PipeShared {
     /// since the capture loop last started.
     pub quality: Mutex<Quality>,
     pub quality_changed: AtomicBool,
-    /// Encoded width over the display's width (the cursor is scaled to match).
-    pub scale: Mutex<f64>,
+    /// The pointer is drawn into the captured image (see `Capture::pointer_apart`):
+    /// the viewer shows no cursor of its own then, or there would be two.
+    pub pointer_in_image: AtomicBool,
 }
 
 /// After a screen change, the same picture is encoded again for at most this
@@ -331,7 +332,6 @@ fn run_once(
     let fps = stream_fps(&quality, &cfg, refresh);
     let max_bps = stream_bps(&quality, &cfg, w, h, fps);
     tx.configure(fps, max_bps as f64);
-    *sh.scale.lock().unwrap() = w as f64 / cw.max(1) as f64;
     // The shader that makes the 4:4:4 picture does not turn it.
     let can444 = cfg.viewer444 && !quirks.no_hevc && !quirks.no_444 && cap.rotation == 0 && can_encode_444(&gpu);
     let yuv444 = can444 && quality.yuv444;
@@ -430,6 +430,7 @@ fn run_once(
             Err(_) if crate::desktop::switched() => return Ok(()),
             Err(e) => return Err(e),
         };
+        sh.pointer_in_image.store(!cap.pointer_apart, Ordering::Relaxed);
         match grab {
             Grab::New { present_qpc } => {
                 pending = Some(present_qpc);
