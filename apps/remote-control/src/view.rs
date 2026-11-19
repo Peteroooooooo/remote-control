@@ -312,7 +312,7 @@ fn run_connected(
     });
     let clip = {
         let _rt = rt.enter();
-        match ClipSync::start(&conn, ctrl_tx.clone(), false) {
+        match ClipSync::start(&conn, ctrl_tx.clone(), false, false) {
             Ok(c) => Some(c),
             Err(e) => {
                 log!("clipboard sharing off: {e:#}");

@@ -1941,7 +1941,7 @@ async fn serve_desktop(sh: Arc<Shared>, conn: Connection) {
     };
     log!("{name} ({}) controls this computer now", device.fmt_short());
     sh.changed();
-    let r = host::session(conn, send, recv, hello.0, sh.opts.pipe).await;
+    let r = host::session(conn, send, recv, hello.0, sh.opts.pipe, sh.opts.service).await;
     match r {
         Ok(()) => log!("{name} left"),
         Err(e) => log!("session with {name} ended: {e:#}"),

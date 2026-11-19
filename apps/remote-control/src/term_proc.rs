@@ -437,6 +437,36 @@ pub fn exec(service: bool, command: &str, cwd: Option<&Path>) -> Result<Exec> {
     Ok(Exec { proc, stdin: file(in_w), stdout: file(out_r), stderr: file(err_r) })
 }
 
+/// Runs this exe with `args` as the console user and returns what it wrote
+/// to stdout; killed after `timeout`.
+pub fn self_as_user(args: &str, timeout: std::time::Duration) -> Result<Vec<u8>> {
+    let who = who(true)?;
+    let cmd = format!("\"{}\" {args}", std::env::current_exe()?.display());
+    let (in_r, in_w) = pipe()?;
+    let (out_r, out_w) = pipe()?;
+    let (err_r, err_w) = pipe()?;
+    let theirs = [in_r.0, out_w.0, err_w.0];
+    for h in theirs {
+        unsafe { SetHandleInformation(h, HANDLE_FLAG_INHERIT.0, HANDLE_FLAG_INHERIT) }.context("SetHandleInformation")?;
+    }
+    let proc = spawn(&who, &cmd, &Stdio::Pipes(theirs))?;
+    drop((in_r, out_w, err_w, in_w, err_r));
+    let mut out = file(out_r);
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut v = Vec::new();
+        let r = std::io::Read::read_to_end(&mut out, &mut v).map(|_| v);
+        let _ = tx.send(r);
+    });
+    match rx.recv_timeout(timeout) {
+        Ok(r) => Ok(r?),
+        Err(_) => {
+            proc.kill();
+            Err(anyhow!("{args} took longer than {} ms", timeout.as_millis()))
+        }
+    }
+}
+
 fn base64(b: &[u8]) -> String {
     const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut s = String::with_capacity(b.len().div_ceil(3) * 4);

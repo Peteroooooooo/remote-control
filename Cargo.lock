@@ -4657,6 +4657,7 @@ dependencies = [
  "tracing-subscriber",
  "wgpu",
  "windows",
+ "windows-core",
  "windows-service",
  "winreg",
  "winresource",

@@ -11,8 +11,14 @@
 //! heard of from the other side (`seen`), so two copies made at the same
 //! moment on both sides are told apart from one made after the other; the
 //! host's copy wins such a tie, so both sides end up the same.
+//!
+//! Copied files go as their list (`clipfiles`); the side that pastes asks for
+//! each file on a bidirectional stream, answered from that side's last few
+//! copies only.
 
 use std::{
+    collections::VecDeque,
+    path::PathBuf,
     sync::{Arc, Mutex},
     time::Instant,
 };
@@ -22,10 +28,15 @@ use iroh::endpoint::{Connection, RecvStream};
 use tokio::{sync::mpsc, task::AbortHandle};
 
 use crate::{
-    clipboard::{Clipboard, Content, MAX_TRANSFER},
+    clipboard::{Clipboard, Content, FORMAT_FILES, MAX_TRANSFER, Remote},
+    clipfiles::{self, Source},
     log,
-    proto::{Msg, STREAM_CLIPBOARD},
+    proto::{Msg, STREAM_CLIPBOARD, STREAM_FILE},
 };
+
+/// Copies of files here whose files the other side may still read (a paste
+/// in progress can outlast a newer copy).
+const SERVED: usize = 8;
 
 /// Which copy is the newest. Seqs count each side's own copies from 1.
 #[derive(Debug)]
@@ -76,17 +87,32 @@ impl Order {
 pub struct ClipSync {
     clip: Clipboard,
     order: Mutex<Order>,
+    /// Files copied here, by copy seq: where each entry of the list sent is.
+    served: Mutex<VecDeque<(u32, Arc<Vec<PathBuf>>)>>,
+    /// Files are read as the console user (a host running as the service).
+    service: bool,
 }
 
 impl ClipSync {
     /// Starts watching the local clipboard and accepting the other side's.
     /// Runs until the connection closes. `host` decides ties.
-    pub fn start(conn: &Connection, ctrl: mpsc::UnboundedSender<Msg>, host: bool) -> Result<Arc<ClipSync>> {
+    pub fn start(conn: &Connection, ctrl: mpsc::UnboundedSender<Msg>, host: bool, service: bool) -> Result<Arc<ClipSync>> {
         let (changed_tx, changed_rx) = mpsc::unbounded_channel();
-        let sync = Arc::new(ClipSync { clip: Clipboard::start(changed_tx)?, order: Mutex::new(Order::new(host)) });
+        let sync = Arc::new(ClipSync {
+            clip: Clipboard::start(changed_tx, service)?,
+            order: Mutex::new(Order::new(host)),
+            served: Mutex::default(),
+            service,
+        });
         tokio::spawn(send_loop(conn.clone(), ctrl, changed_rx, sync.clone()));
         tokio::spawn(accept_loop(conn.clone(), sync.clone()));
+        tokio::spawn(serve_loop(conn.clone(), sync.clone()));
         Ok(sync)
+    }
+
+    fn served_path(&self, seq: u32, index: u32) -> Option<PathBuf> {
+        let s = self.served.lock().unwrap();
+        s.iter().find(|(q, _)| *q == seq).and_then(|(_, p)| p.get(index as usize).cloned())
     }
 
     pub fn on_offer(&self, seq: u32) {
@@ -102,10 +128,30 @@ async fn send_loop(
 ) {
     let mut current: Option<AbortHandle> = None;
     while let Some(content) = changed.recv().await {
-        let what = content.describe();
+        let mut what = content.describe();
         let (seq, seen) = sync.order.lock().unwrap().local_copy();
         let t0 = Instant::now();
-        let (format, data) = match tokio::task::spawn_blocking(move || content.encode()).await {
+        let encoded = match content {
+            Content::Files(roots) => {
+                let service = sync.service;
+                let listed = tokio::task::spawn_blocking(move || crate::term_proc::as_user(service, || clipfiles::scan(&roots))?).await;
+                match listed {
+                    Ok(Ok((entries, paths))) => {
+                        what = clipfiles::describe(&entries);
+                        let mut s = sync.served.lock().unwrap();
+                        s.push_back((seq, Arc::new(paths)));
+                        if s.len() > SERVED {
+                            s.pop_front();
+                        }
+                        Ok(Ok((FORMAT_FILES, clipfiles::encode_list(&entries))))
+                    }
+                    Ok(Err(e)) => Ok(Err(e)),
+                    Err(e) => Err(e),
+                }
+            }
+            content => tokio::task::spawn_blocking(move || content.encode()).await,
+        };
+        let (format, data) = match encoded {
             Ok(Ok(e)) => e,
             Ok(Err(e)) => {
                 log!("clipboard: {what} not sent: {e:#}");
@@ -160,16 +206,36 @@ async fn send_one(conn: &Connection, seq: u32, seen: u32, format: u8, data: &[u8
 
 async fn accept_loop(conn: Connection, sync: Arc<ClipSync>) {
     while let Ok(recv) = conn.accept_uni().await {
-        let sync = sync.clone();
+        let (sync, conn) = (sync.clone(), conn.clone());
         tokio::spawn(async move {
-            if let Err(e) = receive(recv, &sync).await {
+            if let Err(e) = receive(recv, &sync, &conn).await {
                 log!("clipboard: receive failed: {e:#}");
             }
         });
     }
 }
 
-async fn receive(mut r: RecvStream, sync: &ClipSync) -> Result<()> {
+/// The other side pasting files copied here asks for them one by one.
+async fn serve_loop(conn: Connection, sync: Arc<ClipSync>) {
+    while let Ok((send, mut recv)) = conn.accept_bi().await {
+        let sync = sync.clone();
+        tokio::spawn(async move {
+            let mut kind = [0u8; 1];
+            if recv.read_exact(&mut kind).await.is_err() || kind[0] != STREAM_FILE {
+                let _ = recv.stop(0u32.into());
+                return;
+            }
+            let t0 = Instant::now();
+            let lookup = |seq, index| sync.served_path(seq, index);
+            match clipfiles::serve(send, recv, lookup, sync.service).await {
+                Ok(n) => log!("clipboard: sent a pasted file ({} KB in {} ms)", n.div_ceil(1024), t0.elapsed().as_millis()),
+                Err(e) => log!("clipboard: sending a pasted file failed: {e:#}"),
+            }
+        });
+    }
+}
+
+async fn receive(mut r: RecvStream, sync: &ClipSync, conn: &Connection) -> Result<()> {
     let mut head = [0u8; 14];
     r.read_exact(&mut head).await?;
     if head[0] != STREAM_CLIPBOARD {
@@ -198,7 +264,13 @@ async fn receive(mut r: RecvStream, sync: &ClipSync) -> Result<()> {
         }
     }
     let recv_ms = t0.elapsed().as_millis();
-    let content = tokio::task::spawn_blocking(move || Content::decode(format, &data)).await??;
+    let content = if format == FORMAT_FILES {
+        let entries = Arc::new(clipfiles::decode_list(&data)?);
+        let src = Arc::new(Source { conn: conn.clone(), rt: tokio::runtime::Handle::current(), seq });
+        Content::Remote(Remote { src, entries })
+    } else {
+        tokio::task::spawn_blocking(move || Content::decode(format, &data)).await??
+    };
     if !sync.order.lock().unwrap().apply(seq, seen) {
         log!("clipboard: dropped {}, a newer copy exists", content.describe());
         return Ok(());

@@ -18,6 +18,8 @@ pub const MAX_MSG: usize = 1 << 20;
 
 /// First byte of a unidirectional stream: what it carries.
 pub const STREAM_CLIPBOARD: u8 = 1;
+/// First byte of a bidirectional stream: a file of the other side's copied files (`clipfiles`).
+pub const STREAM_FILE: u8 = 2;
 
 /// Video payload header: flags, stream width, stream height, host time from
 /// the screen update to the encoded frame in microseconds.

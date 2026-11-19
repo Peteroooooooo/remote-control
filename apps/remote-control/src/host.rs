@@ -171,15 +171,16 @@ impl Hello {
 }
 
 /// Streams to an admitted viewer until either side ends the session.
-pub async fn session(conn: Connection, send: SendStream, mut recv: RecvStream, hello: Hello, cfg: PipeConfig) -> Result<()> {
+/// `service`: this is the service's helper (files are read as the console user).
+pub async fn session(conn: Connection, send: SendStream, mut recv: RecvStream, hello: Hello, cfg: PipeConfig, service: bool) -> Result<()> {
     SESSIONS.lock().unwrap().push(conn.clone());
     let id = conn.stable_id();
-    let r = stream(&conn, send, &mut recv, hello, cfg).await;
+    let r = stream(&conn, send, &mut recv, hello, cfg, service).await;
     SESSIONS.lock().unwrap().retain(|c| c.stable_id() != id);
     r
 }
 
-async fn stream(conn: &Connection, mut send: SendStream, recv: &mut RecvStream, hello: Hello, cfg: PipeConfig) -> Result<()> {
+async fn stream(conn: &Connection, mut send: SendStream, recv: &mut RecvStream, hello: Hello, cfg: PipeConfig, service: bool) -> Result<()> {
     let hevc = cfg.hevc && hello.caps & CAN_HEVC != 0;
     let cfg = PipeConfig { hevc, viewer444: hevc && hello.caps & CAN_HEVC444 != 0, ..cfg };
     // The capture loop sets the real rate and highest bitrate before the first frame.
@@ -202,7 +203,7 @@ async fn stream(conn: &Connection, mut send: SendStream, recv: &mut RecvStream, 
         let (out, sh) = (wtx.clone(), sh.clone());
         std::thread::Builder::new().name("cursor".into()).spawn(move || cursor::watch(out, sh))?;
     }
-    let clip = match ClipSync::start(conn, wtx.clone(), true) {
+    let clip = match ClipSync::start(conn, wtx.clone(), true, service) {
         Ok(c) => Some(c),
         Err(e) => {
             log!("clipboard sharing off: {e:#}");

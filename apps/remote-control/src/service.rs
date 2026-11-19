@@ -386,3 +386,60 @@ fn send_sas() -> Result<()> {
     }
     Ok(())
 }
+
+/// Lets the console user's programs call into this process's COM objects:
+/// Explorer, pasting files the other side copied, reads them from the data
+/// object the helper (SYSTEM) put on the clipboard. COM's default lets only
+/// SYSTEM and administrators in. Local calls only, from SYSTEM,
+/// administrators and interactive users at medium integrity or above.
+/// Before any other COM use in the process.
+pub fn allow_com_from_user() -> Result<()> {
+    use windows::Win32::{
+        Security::{
+            Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityDescriptorDacl,
+            GetSecurityDescriptorGroup, GetSecurityDescriptorOwner, GetSecurityDescriptorSacl, InitializeSecurityDescriptor,
+            PSECURITY_DESCRIPTOR, PSID, SECURITY_DESCRIPTOR, SetSecurityDescriptorDacl, SetSecurityDescriptorGroup,
+            SetSecurityDescriptorOwner, SetSecurityDescriptorSacl, ACL,
+        },
+        System::Com::{
+            COINIT_MULTITHREADED, CoInitializeEx, CoInitializeSecurity, EOAC_NONE, RPC_C_AUTHN_LEVEL_DEFAULT,
+            RPC_C_IMP_LEVEL_IDENTIFY,
+        },
+    };
+    // COM_RIGHTS_EXECUTE | COM_RIGHTS_EXECUTE_LOCAL; NX: no calls from below medium.
+    let sddl = w!("O:SYG:SYD:(A;;0x3;;;SY)(A;;0x3;;;BA)(A;;0x3;;;IU)S:(ML;;NX;;;ME)");
+    unsafe {
+        CoInitializeEx(None, COINIT_MULTITHREADED).ok().context("CoInitializeEx")?;
+        let mut rel = PSECURITY_DESCRIPTOR::default();
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, 1, &mut rel, None).context("security descriptor")?;
+        // COM wants it in absolute form; both are kept for the life of the process.
+        let abs: &'static mut SECURITY_DESCRIPTOR = Box::leak(Box::default());
+        let sd = PSECURITY_DESCRIPTOR(abs as *mut SECURITY_DESCRIPTOR as *mut _);
+        InitializeSecurityDescriptor(sd, 1)?;
+        let (mut present, mut defaulted) = (BOOL(0), BOOL(0));
+        let mut acl: *mut ACL = std::ptr::null_mut();
+        GetSecurityDescriptorDacl(rel, &mut present, &mut acl, &mut defaulted)?;
+        SetSecurityDescriptorDacl(sd, true, Some(acl), false)?;
+        let mut sacl: *mut ACL = std::ptr::null_mut();
+        GetSecurityDescriptorSacl(rel, &mut present, &mut sacl, &mut defaulted)?;
+        SetSecurityDescriptorSacl(sd, present.as_bool(), Some(sacl), false)?;
+        let mut sid = PSID::default();
+        GetSecurityDescriptorOwner(rel, &mut sid, &mut defaulted)?;
+        SetSecurityDescriptorOwner(sd, Some(sid), false)?;
+        GetSecurityDescriptorGroup(rel, &mut sid, &mut defaulted)?;
+        SetSecurityDescriptorGroup(sd, Some(sid), false)?;
+        CoInitializeSecurity(
+            Some(sd),
+            -1,
+            None,
+            None,
+            RPC_C_AUTHN_LEVEL_DEFAULT,
+            RPC_C_IMP_LEVEL_IDENTIFY,
+            None,
+            EOAC_NONE,
+            None,
+        )
+        .context("CoInitializeSecurity")?;
+    }
+    Ok(())
+}

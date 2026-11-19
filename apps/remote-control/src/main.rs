@@ -10,6 +10,7 @@ mod cli;
 mod consent;
 mod ctlbar;
 mod clipboard;
+mod clipfiles;
 mod clipsync;
 mod cursor;
 mod decode;
@@ -153,6 +154,9 @@ enum Cmd {
     /// the input desktop.
     #[command(hide = true)]
     Helper(host::HostArgs),
+    /// Started by the helper as the user: print the copied files' paths.
+    #[command(hide = true)]
+    ClipFiles,
 }
 
 fn setup_process() {
@@ -216,6 +220,9 @@ fn main() -> Result<()> {
         Cmd::Helper(mut a) => {
             service::set_key(a.key.clone());
             service::redirect_output("helper")?;
+            if let Err(e) = service::allow_com_from_user() {
+                log!("helper: files copied on the other side cannot be pasted here: {e:#}");
+            }
             desktop::enable();
             goaway::install(true);
             power::stay_awake_on_mains();
@@ -226,6 +233,7 @@ fn main() -> Result<()> {
             }
             leave_after_goodbye(r)
         }
+        Cmd::ClipFiles => clipboard::print_copied_files(),
     }
 }
 

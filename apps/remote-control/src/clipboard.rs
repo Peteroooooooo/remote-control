@@ -8,12 +8,15 @@
 //! CF_DIB (24 or 32 bits per pixel), sent as PNG, and set as a 32-bit CF_DIB
 //! (Windows makes CF_DIBV5 and CF_BITMAP from it). When both are on the
 //! clipboard only the text is sent: apps such as Word put a picture of the
-//! copied text next to it.
+//! copied text next to it. Copied files and folders (CF_HDROP, what Explorer
+//! puts there) come before both; the other side's are set as an OLE data
+//! object of virtual files (`clipfiles`).
 
 use std::{
     cell::RefCell,
     hash::{DefaultHasher, Hash, Hasher},
-    sync::mpsc,
+    path::PathBuf,
+    sync::{Arc, mpsc},
     thread::JoinHandle,
     time::Duration,
 };
@@ -22,7 +25,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use tokio::sync::mpsc::UnboundedSender;
 use windows::{
     Win32::{
-        Foundation::{GlobalFree, HANDLE, HGLOBAL, HWND, LPARAM, LRESULT, WPARAM},
+        Foundation::{GlobalFree, HANDLE, HGLOBAL, HWND, LPARAM, LRESULT, S_OK, WPARAM},
         System::{
             DataExchange::{
                 AddClipboardFormatListener, CloseClipboard, EmptyClipboard, GetClipboardData, GetClipboardOwner,
@@ -30,14 +33,18 @@ use windows::{
             },
             LibraryLoader::GetModuleHandleW,
             Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock},
-            Ole::{CF_DIB, CF_DIBV5, CF_UNICODETEXT},
+            Com::IDataObject,
+            Ole::{CF_DIB, CF_DIBV5, CF_HDROP, CF_UNICODETEXT, OleInitialize, OleSetClipboard, OleUninitialize},
         },
         UI::WindowsAndMessaging::*,
     },
-    core::w,
+    core::{Interface, w},
 };
 
-use crate::log;
+use crate::{
+    clipfiles::{self, Entry, Source},
+    log,
+};
 
 /// Largest text sent, in UTF-8 bytes.
 pub const MAX_TEXT: usize = 16 << 20;
@@ -48,6 +55,8 @@ pub const MAX_TRANSFER: usize = 64 << 20;
 
 pub const FORMAT_TEXT: u8 = 1;
 pub const FORMAT_PNG: u8 = 2;
+/// A list of files and folders (`clipfiles::encode_list`); their data comes when pasted.
+pub const FORMAT_FILES: u8 = 3;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Image {
@@ -57,10 +66,41 @@ pub struct Image {
     pub rgba: Vec<u8>,
 }
 
+/// The other side's copied files, to paste here.
+#[derive(Clone)]
+pub struct Remote {
+    pub src: Arc<Source>,
+    pub entries: Arc<Vec<Entry>>,
+}
+
+impl std::fmt::Debug for Remote {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Remote(copy {}, {})", self.src.seq, clipfiles::describe(&self.entries))
+    }
+}
+
+impl PartialEq for Remote {
+    fn eq(&self, o: &Remote) -> bool {
+        Arc::ptr_eq(&self.src, &o.src)
+    }
+}
+
+impl Eq for Remote {}
+
+impl Hash for Remote {
+    fn hash<H: Hasher>(&self, h: &mut H) {
+        self.src.seq.hash(h);
+        self.entries.hash(h);
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Content {
     Text(String),
     Image(Image),
+    /// Files and folders copied here (their paths).
+    Files(Vec<PathBuf>),
+    Remote(Remote),
 }
 
 impl Content {
@@ -68,6 +108,8 @@ impl Content {
         match self {
             Content::Text(t) => format!("text ({} bytes)", t.len()),
             Content::Image(i) => format!("image {}x{}", i.width, i.height),
+            Content::Files(p) => format!("{} copied files or folders", p.len()),
+            Content::Remote(r) => clipfiles::describe(&r.entries),
         }
     }
 
@@ -77,11 +119,12 @@ impl Content {
         h.finish()
     }
 
-    /// Format byte and bytes on the wire.
+    /// Format byte and bytes on the wire (files are listed by `clipsync`).
     pub fn encode(&self) -> Result<(u8, Vec<u8>)> {
         Ok(match self {
             Content::Text(t) => (FORMAT_TEXT, t.as_bytes().to_vec()),
             Content::Image(i) => (FORMAT_PNG, png_encode(i)?),
+            Content::Files(_) | Content::Remote(_) => bail!("files are not sent as clipboard data"),
         })
     }
 
@@ -213,16 +256,30 @@ pub fn image_to_dib(img: &Image) -> Vec<u8> {
     out
 }
 
+static SERVICE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 const WM_APP_SET: u32 = WM_APP + 1;
 const DEBOUNCE_TIMER: usize = 1;
 /// Apps often update the clipboard in several steps; read once it settles.
 const DEBOUNCE: Duration = Duration::from_millis(150);
+/// Reads again when nothing known was on the clipboard (see `on_settled`).
+const RETRIES: u8 = 5;
 
 struct ThreadState {
     changed: UnboundedSender<Content>,
     incoming: mpsc::Receiver<Content>,
     /// What both sides have: last sent or last set. Not sent again.
     synced: Option<u64>,
+    /// The other side's files, as last put on the clipboard here.
+    files: Option<IDataObject>,
+    /// Reads since the last update that found nothing known.
+    retries: u8,
+}
+
+/// Whether the clipboard still holds the other side's files set here.
+fn holds_ours(ts: &ThreadState) -> bool {
+    // S_FALSE when it is not: the windows crate's wrapper calls that success.
+    windows_core::link!("ole32.dll" "system" fn OleIsCurrentClipboard(pdataobj: *mut core::ffi::c_void) -> windows_core::HRESULT);
+    ts.files.as_ref().is_some_and(|d| unsafe { OleIsCurrentClipboard(d.as_raw()) } == S_OK)
 }
 
 thread_local! {
@@ -238,10 +295,16 @@ pub struct Clipboard {
 
 impl Clipboard {
     /// Local changes arrive on `changed`.
-    pub fn start(changed: UnboundedSender<Content>) -> Result<Clipboard> {
+    pub fn start(changed: UnboundedSender<Content>, service: bool) -> Result<Clipboard> {
+        SERVICE.store(service, std::sync::atomic::Ordering::Relaxed);
         let (set_tx, set_rx) = mpsc::channel();
         let (ready_tx, ready_rx) = mpsc::channel::<Result<isize>>();
         let thread = std::thread::Builder::new().name("clipboard".into()).spawn(move || {
+            // The OLE clipboard (the other side's files) needs a single-threaded apartment.
+            let ole = unsafe { OleInitialize(None) };
+            if let Err(e) = &ole {
+                log!("clipboard: OleInitialize: {e}; files cannot be pasted here");
+            }
             let hwnd = match create_window() {
                 Ok(h) => h,
                 Err(e) => {
@@ -249,12 +312,15 @@ impl Clipboard {
                     return;
                 }
             };
-            TS.set(Some(ThreadState { changed, incoming: set_rx, synced: None }));
+            TS.set(Some(ThreadState { changed, incoming: set_rx, synced: None, files: None, retries: 0 }));
             let _ = ready_tx.send(Ok(hwnd.0 as isize));
             unsafe {
                 let mut msg = MSG::default();
                 while GetMessageW(&mut msg, None, 0, 0).as_bool() {
                     DispatchMessageW(&msg);
+                }
+                if ole.is_ok() {
+                    OleUninitialize();
                 }
             }
         })?;
@@ -337,6 +403,14 @@ fn global_bytes(h: HANDLE) -> Option<Vec<u8>> {
 fn read(hwnd: HWND) -> Result<Option<Content>> {
     open(hwnd)?;
     let r = (|| unsafe {
+        if IsClipboardFormatAvailable(CF_HDROP.0 as u32).is_ok() {
+            let b = GetClipboardData(CF_HDROP.0 as u32).ok().and_then(global_bytes).context("no file list")?;
+            let paths = clipfiles::dropfiles_paths(&b);
+            if !paths.is_empty() {
+                return Ok(Some(Content::Files(paths)));
+            }
+            log!("clipboard: an empty or unreadable list of copied files ({} bytes)", b.len());
+        }
         if IsClipboardFormatAvailable(CF_UNICODETEXT.0 as u32).is_ok() {
             let b = GetClipboardData(CF_UNICODETEXT.0 as u32).ok().and_then(global_bytes).context("no text data")?;
             let units: Vec<u16> = b.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).take_while(|&u| u != 0).collect();
@@ -361,6 +435,36 @@ fn read(hwnd: HWND) -> Result<Option<Content>> {
     r
 }
 
+/// Copied files on the clipboard, one path per line on stdout (`remote-control
+/// clip-files`). Run as the user by a host running as SYSTEM, which Windows
+/// does not show the files that programs copy through OLE (Explorer, for one).
+pub fn print_copied_files() -> Result<()> {
+    open(HWND::default())?;
+    let paths = unsafe {
+        let b = IsClipboardFormatAvailable(CF_HDROP.0 as u32).ok().and_then(|_| GetClipboardData(CF_HDROP.0 as u32).ok()).and_then(global_bytes);
+        let _ = CloseClipboard();
+        b.map(|b| clipfiles::dropfiles_paths(&b)).unwrap_or_default()
+    };
+    let out: String = paths.iter().map(|p| format!("{}\n", p.display())).collect();
+    std::io::Write::write_all(&mut std::io::stdout(), out.as_bytes())?;
+    Ok(())
+}
+
+/// Files the user copied, for a host running as SYSTEM: Windows does not show
+/// it what programs copy through OLE, nor tell it which formats those are.
+fn user_files() -> Option<Vec<PathBuf>> {
+    match crate::term_proc::self_as_user("clip-files", Duration::from_secs(3)) {
+        Ok(out) => {
+            let paths: Vec<PathBuf> = String::from_utf8_lossy(&out).lines().filter(|l| !l.is_empty()).map(PathBuf::from).collect();
+            (!paths.is_empty()).then_some(paths)
+        }
+        Err(e) => {
+            log!("clipboard: could not look for copied files as the user: {e:#}");
+            None
+        }
+    }
+}
+
 fn write(hwnd: HWND, c: &Content) -> Result<()> {
     let (format, bytes) = match c {
         Content::Text(t) => {
@@ -369,6 +473,24 @@ fn write(hwnd: HWND, c: &Content) -> Result<()> {
             (CF_UNICODETEXT.0 as u32, b)
         }
         Content::Image(i) => (CF_DIB.0 as u32, image_to_dib(i)),
+        Content::Remote(r) => {
+            let obj = clipfiles::data_object(r.src.clone(), r.entries.clone());
+            let mut tries = 0;
+            while let Err(e) = unsafe { OleSetClipboard(&obj) } {
+                tries += 1;
+                if tries == 20 {
+                    bail!("OleSetClipboard: {e}");
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            TS.with_borrow_mut(|ts| {
+                if let Some(ts) = ts {
+                    ts.files = Some(obj);
+                }
+            });
+            return Ok(());
+        }
+        Content::Files(_) => bail!("files copied here are not set here"),
     };
     open(hwnd)?;
     let r = unsafe {
@@ -397,18 +519,33 @@ fn write(hwnd: HWND, c: &Content) -> Result<()> {
 
 fn on_settled(hwnd: HWND) {
     // Our own write: the other side has it already.
-    if unsafe { GetClipboardOwner() }.is_ok_and(|o| o == hwnd) {
+    if unsafe { GetClipboardOwner() }.is_ok_and(|o| o == hwnd) || TS.with_borrow(|ts| ts.as_ref().is_some_and(holds_ours)) {
         return;
     }
-    let content = match read(hwnd) {
+    let user = SERVICE.load(std::sync::atomic::Ordering::Relaxed).then(user_files).flatten();
+    let content = match user.map(|p| Ok(Some(Content::Files(p)))).unwrap_or_else(|| read(hwnd)) {
         Ok(Some(c)) => c,
-        Ok(None) => return,
+        Ok(None) => {
+            // Programs that copy through OLE (PowerShell's Set-Clipboard, for
+            // one) list the real formats a moment after the first update, and
+            // a host running as SYSTEM is not told again: look once more.
+            let again = TS.with_borrow_mut(|ts| {
+                let ts = ts.as_mut()?;
+                ts.retries += 1;
+                (ts.retries <= RETRIES).then_some(ts.retries)
+            });
+            if let Some(n) = again {
+                unsafe { SetTimer(Some(hwnd), DEBOUNCE_TIMER, (DEBOUNCE.as_millis() as u32) << n, None) };
+            }
+            return;
+        }
         Err(e) => return log!("clipboard: not sent: {e:#}"),
     };
     let digest = content.digest();
     TS.with_borrow_mut(|ts| {
         let Some(ts) = ts else { return };
-        if ts.synced == Some(digest) {
+        // Files are listed again on each copy: they may have changed.
+        if ts.synced == Some(digest) && !matches!(content, Content::Files(_)) {
             return;
         }
         ts.synced = Some(digest);
@@ -434,6 +571,11 @@ fn on_set(hwnd: HWND) {
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
         WM_CLIPBOARDUPDATE => unsafe {
+            TS.with_borrow_mut(|ts| {
+                if let Some(ts) = ts {
+                    ts.retries = 0;
+                }
+            });
             SetTimer(Some(hwnd), DEBOUNCE_TIMER, DEBOUNCE.as_millis() as u32, None);
         },
         WM_TIMER if wparam.0 == DEBOUNCE_TIMER => {
@@ -445,6 +587,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_APP_SET => on_set(hwnd),
         WM_DESTROY => unsafe {
             let _ = RemoveClipboardFormatListener(hwnd);
+            // The other side's files cannot be pasted once the session is over.
+            if TS.with_borrow(|ts| ts.as_ref().is_some_and(holds_ours)) {
+                let _ = OleSetClipboard(None);
+            }
             TS.set(None);
             PostQuitMessage(0);
         },
