@@ -1917,7 +1917,7 @@ async fn serve_desktop(sh: Arc<Shared>, conn: Connection) {
         return log!("desktop connection from {}: no control stream", remote.fmt_short());
     };
     let hello = match tokio::time::timeout(Duration::from_secs(5), read_msg(&mut recv)).await {
-        Ok(Ok(Msg::Hello { max_kbps, fps, caps, proof })) => (host::Hello { max_kbps, fps, caps }, proof),
+        Ok(Ok(Msg::Hello { max_kbps, fps, caps, proof, quality })) => (host::Hello { max_kbps, fps, caps, quality }, proof),
         _ => {
             conn.close(net::CLOSE_NOT_MET.into(), b"expected hello");
             return;

@@ -142,6 +142,15 @@ impl RateController {
         self.minima.clear();
     }
 
+    /// A new highest rate (the viewer chose another picture). A higher one is
+    /// tried at once, as at the start of a session (a slow link cuts it within
+    /// a second); a lower one caps the rate.
+    pub fn set_max(&mut self, max_bps: f64) {
+        let max = max_bps.max(self.cfg.min_bps);
+        self.rate = if max > self.cfg.max_bps { max } else { self.rate.min(max) };
+        self.cfg.max_bps = max;
+    }
+
     /// Call about every 100 ms. Returns the new target bitrate in bits per second.
     pub fn update(&mut self, now: Instant) -> f64 {
         let mut s = std::mem::take(&mut self.rtts);
@@ -362,6 +371,23 @@ mod tests {
             c.update(t);
         }
         assert_eq!(c.bitrate(), 20.0 * MBPS);
+    }
+
+    #[test]
+    fn a_new_highest_rate_is_tried_at_once_and_a_lower_one_caps() {
+        let mut t = Instant::now();
+        let mut c = RateController::new(RateConfig::new(2.0 * MBPS, 20.0 * MBPS), t);
+        run(&mut c, &mut t, 100, 5.0, 8.0 * MBPS);
+        let low = c.bitrate();
+        assert!(low < 10.0 * MBPS, "{low}");
+        c.set_max(15.0 * MBPS);
+        assert_eq!(c.bitrate(), low, "lower than before: the link's rate stays");
+        c.set_max(40.0 * MBPS);
+        assert_eq!(c.bitrate(), 40.0 * MBPS);
+        c.set_max(5.0 * MBPS);
+        assert_eq!(c.bitrate(), 5.0 * MBPS);
+        run(&mut c, &mut t, 50, 5.0, 100.0 * MBPS);
+        assert_eq!(c.bitrate(), 5.0 * MBPS, "never above the new highest");
     }
 
     #[test]

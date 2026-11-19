@@ -38,6 +38,7 @@ mod power;
 mod present;
 mod proto;
 mod qprate;
+mod quality;
 mod service;
 mod snapshot;
 mod stats;
@@ -52,6 +53,7 @@ mod video_tx;
 mod view;
 mod vp;
 mod window;
+mod yuv444;
 
 /// `log!(...)`: one line on stdout with the seconds since start.
 #[macro_export]

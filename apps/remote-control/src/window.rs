@@ -888,10 +888,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             place_picture(hwnd);
             invalidate_caption(hwnd);
             crate::toolbar::follow();
+            crate::quality::follow_window(hwnd);
             return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
         }
         WM_MOVE => {
             crate::toolbar::follow();
+            crate::quality::follow_window(hwnd);
+            return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
+        }
+        WM_DISPLAYCHANGE => {
+            crate::quality::follow_window(hwnd);
             return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
         }
         WM_DPICHANGED => unsafe {

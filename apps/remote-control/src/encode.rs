@@ -38,6 +38,8 @@ pub struct Encoder {
     seq_header: Vec<u8>,
     pub name: String,
     pub format: Codec,
+    /// Takes AYUV and encodes 4:4:4 (see `EncOptions::yuv444`).
+    pub yuv444: bool,
     pub bitrate: u32,
     fps: u32,
     index: i64,
@@ -86,11 +88,14 @@ pub struct EncOptions {
     /// Choose the quantiser for every frame ourselves (see `qprate`) instead
     /// of letting the encoder hold a bitrate.
     pub qp_control: bool,
+    /// HEVC only: full colour resolution (Main 4:4:4 profile, AYUV input)
+    /// instead of 4:2:0 (NV12), so coloured text stays sharp.
+    pub yuv444: bool,
 }
 
 impl Default for EncOptions {
     fn default() -> Self {
-        EncOptions { codec: Codec::H264, speed: None, vbv_frames: None, layers_hint: true, scenario_hint: true, qp_control: false }
+        EncOptions { codec: Codec::H264, speed: None, vbv_frames: None, layers_hint: true, scenario_hint: true, qp_control: false, yuv444: false }
     }
 }
 
@@ -192,8 +197,10 @@ impl Encoder {
             out.SetUINT64(&MF_MT_FRAME_RATE, pack(fps, 1))?;
             out.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, pack(1, 1))?;
             out.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
+            let yuv444 = opts.yuv444 && opts.codec == Codec::Hevc;
             let profile = match opts.codec {
                 Codec::H264 => eAVEncH264VProfile_High.0 as u32,
+                Codec::Hevc if yuv444 => eAVEncH265VProfile_Main_444_8.0 as u32,
                 Codec::Hevc => eAVEncH265VProfile_Main_420_8.0 as u32,
             };
             out.SetUINT32(&MF_MT_MPEG2_PROFILE, profile)?;
@@ -201,10 +208,11 @@ impl Encoder {
             out.SetUINT32(&MF_MT_VIDEO_NOMINAL_RANGE, MFNominalRange_16_235.0 as u32)?;
             mft.SetOutputType(0, &out, 0).context("SetOutputType")?;
 
+            let format = if yuv444 { MFVideoFormat_AYUV } else { MFVideoFormat_NV12 };
             let input = (0..)
                 .map_while(|i| mft.GetInputAvailableType(0, i).ok())
-                .find(|t| mf::subtype(t) == Some(MFVideoFormat_NV12))
-                .context("encoder does not take NV12")?;
+                .find(|t| mf::subtype(t) == Some(format))
+                .with_context(|| format!("encoder does not take {}", if yuv444 { "AYUV" } else { "NV12" }))?;
             input.SetUINT64(&MF_MT_FRAME_SIZE, pack(width, height))?;
             input.SetUINT64(&MF_MT_FRAME_RATE, pack(fps, 1))?;
             mft.SetInputType(0, &input, 0).context("SetInputType")?;
@@ -222,6 +230,7 @@ impl Encoder {
                 seq_header,
                 name,
                 format: opts.codec,
+                yuv444,
                 bitrate,
                 fps,
                 index: 0,
@@ -255,7 +264,7 @@ impl Encoder {
         &self.codec
     }
 
-    /// Encodes one NV12 frame and waits up to `timeout` for the result.
+    /// Encodes one NV12 (AYUV if `yuv444`) frame and waits up to `timeout` for the result.
     /// `None` means the encoder has not produced it yet; it comes with a later call.
     /// `qp`: the quantiser for this frame, in QP-control mode.
     pub fn encode(&mut self, nv12: &ID3D11Texture2D, timeout: Duration, qp: Option<u32>) -> Result<Option<Encoded>> {

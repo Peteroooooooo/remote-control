@@ -267,11 +267,11 @@ pub fn dump(cursor: HCURSOR, img: &CursorImage, path: &Path) -> Result<()> {
 }
 
 /// Host side, on its own thread until `sh.stop`: watches the cursor and
-/// sends its shape when it changes. `max_width` as for the video, so the
-/// cursor keeps its size relative to the streamed picture.
-pub fn watch(out: UnboundedSender<Msg>, sh: Arc<PipeShared>, max_width: u32) {
+/// sends its shape when it changes. Scaled like the video (`PipeShared::scale`),
+/// so the cursor keeps its size relative to the streamed picture.
+pub fn watch(out: UnboundedSender<Msg>, sh: Arc<PipeShared>) {
     let mut ids: HashMap<u64, u32> = HashMap::new();
-    let mut last: Option<(bool, isize)> = None;
+    let mut last: Option<(bool, isize, u32)> = None;
     let mut repeats = 0u32;
     let mut follow_failed = 0u64;
     while !sh.stop.load(Ordering::Relaxed) {
@@ -288,8 +288,10 @@ pub fn watch(out: UnboundedSender<Msg>, sh: Arc<PipeShared>, max_width: u32) {
         if unsafe { GetCursorInfo(&mut ci) }.is_err() {
             continue;
         }
+        let scale = *sh.scale.lock().unwrap();
+        let scale = if scale > 0.0 && scale < 0.999 { scale } else { 1.0 };
         let showing = ci.flags.0 & CURSOR_SHOWING.0 != 0 && !ci.hCursor.is_invalid();
-        let key = (showing, if showing { ci.hCursor.0 as isize } else { 0 });
+        let key = (showing, if showing { ci.hCursor.0 as isize } else { 0 }, (scale * 1000.0).round() as u32);
         if last == Some(key) {
             continue;
         }
@@ -298,10 +300,8 @@ pub fn watch(out: UnboundedSender<Msg>, sh: Arc<PipeShared>, max_width: u32) {
             Msg::CursorHidden
         } else {
             let Some(mut img) = read(ci.hCursor) else { continue };
-            let d = *sh.display.lock().unwrap();
-            let dw = (d.right - d.left).max(1) as u32;
-            if max_width > 0 && dw > max_width {
-                img = img.scaled(max_width as f64 / dw as f64);
+            if scale < 1.0 {
+                img = img.scaled(scale);
             }
             let mut hasher = DefaultHasher::new();
             img.hash(&mut hasher);

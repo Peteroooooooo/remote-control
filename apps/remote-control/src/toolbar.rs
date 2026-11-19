@@ -1,15 +1,16 @@
 //! The viewer's controls: the line's quality ("直连 · 6 ms", a click shows
 //! the numbers), switch display, Ctrl+Alt+Del, release keyboard and mouse,
+//! 画面 (resolution, frame rate and bitrate, see quality.rs), terminal,
 //! full screen, 断开. In a window they sit in its title bar, which is drawn
 //! here along with the minimise, maximise and close buttons (window.rs hands
 //! over the title bar's painting, hit testing and mouse). In full screen they
 //! move into a bar at the top edge that shows for a moment, then slides up
 //! leaving a 4 px edge; it comes down while the pointer is at the top edge
 //! above it or on it, and goes up a moment after the pointer leaves. It stays
-//! down while the numbers are open, input is released, the picture is paused
-//! and once the session has ended.
+//! down while the numbers or the 画面 menu are open, input is released, the
+//! picture is paused and once the session has ended.
 //!
-//! The numbers, the tips and the full-screen bar are in a layered window
+//! The numbers, the 画面 menu, the tips and the full-screen bar are in a layered window
 //! owned by the session window (above it, gone with it), see-through and
 //! click-through outside its shapes. It lives on the session window's thread
 //! and message loop.
@@ -38,7 +39,9 @@ use windows::{
 
 use crate::{
     gdi::{self, Canvas, coverage, rect, rgb},
-    keys, log, theme, window,
+    keys, log,
+    quality::{self, Res},
+    theme, window,
 };
 
 /// The title bar's height (window units, 96 DPI, as below).
@@ -51,6 +54,10 @@ const RADIUS: i32 = 12;
 const HANDLE: i32 = 4;
 const STATS_W: i32 = 340;
 const ROW_H: i32 = 22;
+/// The 画面 menu: a row of chips per setting, its name on the left.
+const MENU_ROW: i32 = 34;
+const MENU_LABEL_W: i32 = 52;
+const CHIP_H: i32 = 26;
 /// The full-screen bar shows this long when full screen starts.
 const FIRST_SHOW: Duration = Duration::from_millis(1500);
 /// Goes up this long after the pointer left.
@@ -99,9 +106,39 @@ enum Part {
     Monitor,
     Cad,
     Release,
+    Quality,
     Terminal,
     Full,
     Disconnect,
+}
+
+/// A choice in the 画面 menu.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Chip {
+    Res(Res),
+    Fps(u8),
+    Mbps(u16),
+    Sharp(bool),
+}
+
+impl Chip {
+    fn on(self, c: &quality::Choice) -> bool {
+        match self {
+            Chip::Res(r) => c.res == r,
+            Chip::Fps(f) => c.fps == f,
+            Chip::Mbps(m) => c.mbps == m,
+            Chip::Sharp(s) => c.sharp == s,
+        }
+    }
+
+    fn choose(self) {
+        quality::choose(|c| match self {
+            Chip::Res(r) => c.res = r,
+            Chip::Fps(f) => c.fps = f,
+            Chip::Mbps(m) => c.mbps = m,
+            Chip::Sharp(s) => c.sharp = s,
+        });
+    }
 }
 
 /// Something under the pointer that reacts to it.
@@ -168,6 +205,11 @@ struct State {
     last_frame: Instant,
     last_near: Instant,
     stats: bool,
+    /// The 画面 menu is open; its chips in this window's pixels.
+    menu: bool,
+    chips: Vec<(Chip, RECT)>,
+    chip_hover: Option<Chip>,
+    chip_pressed: Option<Chip>,
     hover: Option<(Hot, Instant)>,
     pressed: Option<Hot>,
     tip_shown: bool,
@@ -212,9 +254,9 @@ pub fn follow() {
     post(WM_APP_FOLLOW);
 }
 
-/// The picture was clicked: the numbers close (session window's thread).
+/// The picture was clicked: the numbers and the menu close (session window's thread).
 pub fn dismiss() {
-    if with(|s| std::mem::take(&mut s.stats)).unwrap_or(false) {
+    if with(|s| std::mem::take(&mut s.stats) | std::mem::take(&mut s.menu)).unwrap_or(false) {
         changed();
     }
 }
@@ -264,6 +306,10 @@ fn open(owner: HWND) -> windows::core::Result<()> {
             last_frame: now,
             last_near: now,
             stats: false,
+            menu: false,
+            chips: Vec::new(),
+            chip_hover: None,
+            chip_pressed: None,
             hover: None,
             pressed: None,
             tip_shown: false,
@@ -319,6 +365,7 @@ fn tip(part: Part, look: &Look) -> Option<String> {
         Part::Cad => "发送 Ctrl+Alt+Del（Ctrl+Alt+End）".into(),
         Part::Release if look.released => "继续控制（点画面也行）".into(),
         Part::Release => "释放键鼠（Ctrl+Alt+Shift+Z）".into(),
+        Part::Quality => "画面：分辨率、帧率、码率".into(),
         Part::Terminal => "终端：在对方电脑上开 PowerShell".into(),
         Part::Full if look.full => "退出全屏".into(),
         Part::Full => "全屏".into(),
@@ -362,8 +409,7 @@ fn layout(px: &dyn Fn(i32) -> i32, m: &Metrics, h: i32, x0: i32, badge_w: i32, n
     if look.input {
         icons.extend([Part::Cad, Part::Release]);
     }
-    icons.push(Part::Terminal);
-    icons.push(Part::Full);
+    icons.extend([Part::Quality, Part::Terminal, Part::Full]);
     let (t, b) = span(m.icon_h);
     for p in icons {
         parts.push((p, rect(x, t, x + px(m.icon_w), b)));
@@ -411,6 +457,7 @@ struct Paint<'a> {
     hover: Option<Hot>,
     pressed: Option<Hot>,
     stats: bool,
+    menu: bool,
     /// The controls react (the bar is down).
     live: bool,
 }
@@ -442,6 +489,10 @@ fn paint_parts(c: &Canvas, lay: &Layout, dy: i32, h: i32, m: &Metrics, look: &Lo
             }
             _ => {
                 let on = *part == Part::Release && look.released;
+                let open = *part == Part::Quality && p.menu;
+                if open && !hot {
+                    c.round(&r, px(6), Some(rgb(theme::BUTTON_HOVER)), None);
+                }
                 if on {
                     c.round(&r, px(6), Some(rgb(mix(FILL, AMBER, if hot { 0.28 } else { 0.18 }))), None);
                 } else if hot {
@@ -449,7 +500,7 @@ fn paint_parts(c: &Canvas, lay: &Layout, dy: i32, h: i32, m: &Metrics, look: &Lo
                 }
                 let color = if on {
                     AMBER
-                } else if hot {
+                } else if hot || open {
                     theme::TEXT
                 } else {
                     theme::DIM
@@ -487,8 +538,9 @@ pub fn paint_caption(hwnd: HWND) {
     let left = px(12);
     c.text(&rect(left, 0, left + name_w + 2, h), &name, bold, if active { gdi::TEXT } else { gdi::DIM }, false);
     let lay = layout(&px, &IN_CAPTION, h, left + name_w + px(14), badge_w, note_w, &look);
-    let (hover, pressed, stats) = with(|s| (s.hover.map(|h| h.0), s.pressed, s.stats)).unwrap_or((None, None, false));
-    let paint = Paint { px: &px, pf: &pf, font: f, hover, pressed, stats, live: true };
+    let (hover, pressed, stats, menu) =
+        with(|s| (s.hover.map(|h| h.0), s.pressed, s.stats, s.menu)).unwrap_or((None, None, false, false));
+    let paint = Paint { px: &px, pf: &pf, font: f, hover, pressed, stats, menu, live: true };
     paint_parts(&c, &lay, 0, h, &IN_CAPTION, &look, &paint);
 
     let w = c.size.right;
@@ -686,7 +738,7 @@ fn measure(px: &dyn Fn(i32) -> i32, m: &Metrics, look: &Look, tip_text: Option<&
 
 fn due_tip(st: &State, look: &Look) -> Option<(Part, String)> {
     match st.hover {
-        Some((Hot::Part(p), since)) if since.elapsed() >= TIP_DELAY && !st.stats => tip(p, look).map(|t| (p, t)),
+        Some((Hot::Part(p), since)) if since.elapsed() >= TIP_DELAY && !st.stats && !st.menu => tip(p, look).map(|t| (p, t)),
         _ => None,
     }
 }
@@ -703,6 +755,108 @@ fn paint_panel(c: &Canvas, r: &RECT, px: &dyn Fn(i32) -> i32, f: HFONT, look: &L
         c.text(&row, k, f, gdi::DIM, false);
         c.text(&rect(row.right - value_w - 2, y, row.right, y + px(ROW_H)), v, f, gdi::TEXT, false);
     }
+}
+
+/// The 画面 menu, laid out from (0, 0).
+struct Menu {
+    size: (i32, i32),
+    labels: Vec<(&'static str, RECT)>,
+    chips: Vec<(Chip, String, RECT)>,
+    line: i32,
+    footer: (String, RECT),
+}
+
+fn mbps_text(kbps: u32) -> String {
+    let m = kbps as f64 / 1000.0;
+    if m < 10.0 { format!("{m:.1}") } else { format!("{m:.0}") }
+}
+
+/// The menu's last line: what the host streams now.
+fn menu_footer() -> String {
+    match quality::streaming() {
+        None => "等对方发来画面…".into(),
+        Some((_, None)) => "对方的软件较旧，更新后这些设置才生效".into(),
+        Some(((w, h), Some(s))) => format!(
+            "现在 {w}×{h} · {} 帧/秒 · 最高 {} Mbps{}",
+            s.fps,
+            mbps_text(s.max_kbps),
+            if s.yuv444 { " · 文字清晰" } else { "" }
+        ),
+    }
+}
+
+fn menu_layout(px: &dyn Fn(i32) -> i32) -> Menu {
+    let mut c = Canvas::offscreen(1, 1, rgb(FILL));
+    let f = c.font(px(13), false);
+    let mut rows: Vec<(&'static str, Vec<(Chip, String)>)> = vec![
+        ("分辨率", quality::RESOLUTIONS.iter().map(|(r, t)| (Chip::Res(*r), t.to_string())).collect()),
+        ("帧率", quality::FRAME_RATES.iter().map(|&v| (Chip::Fps(v), v.to_string())).collect()),
+        (
+            "码率",
+            quality::BITRATES.iter().map(|&v| (Chip::Mbps(v), if v == 0 { "自动".into() } else { format!("{v}M") })).collect(),
+        ),
+    ];
+    // Only when both computers can (YUV 4:4:4: HEVC on the graphics cards of both).
+    if matches!(quality::streaming(), Some((_, Some(s))) if s.can444) {
+        rows.push(("文字", vec![(Chip::Sharp(false), "标准".into()), (Chip::Sharp(true), "清晰".into())]));
+    }
+    let pad = px(14);
+    let (mut labels, mut chips) = (Vec::new(), Vec::new());
+    let mut y = px(8);
+    let mut right = 0;
+    for (label, row) in rows {
+        let x0 = pad + px(MENU_LABEL_W);
+        labels.push((label, rect(pad, y, x0, y + px(MENU_ROW))));
+        let mut x = x0;
+        let top = y + (px(MENU_ROW) - px(CHIP_H)) / 2;
+        for (chip, text) in row {
+            let w = c.text_width(&text, f) + px(20);
+            chips.push((chip, text, rect(x, top, x + w, top + px(CHIP_H))));
+            x += w + px(6);
+        }
+        right = right.max(x - px(6));
+        y += px(MENU_ROW);
+    }
+    y += px(6);
+    let line = y;
+    y += px(6);
+    let text = menu_footer();
+    let fw = c.text_width(&text, f);
+    let footer = (text, rect(pad, y, pad + fw + 2, y + px(ROW_H)));
+    y += px(ROW_H) + px(8);
+    let w = right.max(pad + fw + 2) + pad;
+    Menu { size: (w, y), labels, chips, line, footer }
+}
+
+/// Paints the menu at `at` (its top left in `c`); returns its chips there.
+fn paint_menu(c: &Canvas, m: &Menu, at: POINT, px: &dyn Fn(i32) -> i32, f: HFONT, st: &State) -> Vec<(Chip, RECT)> {
+    let (dx, dy) = (at.x, at.y);
+    let r = rect(dx, dy, dx + m.size.0, dy + m.size.1);
+    c.round(&r, px(10), Some(rgb(FILL)), Some((rgb(EDGE), 1)));
+    for (label, lr) in &m.labels {
+        c.text(&moved(lr, dx, dy), label, f, gdi::DIM, false);
+    }
+    let choice = quality::choice();
+    let mut hits = Vec::new();
+    for (chip, text, cr) in &m.chips {
+        let cr = moved(cr, dx, dy);
+        let on = chip.on(&choice);
+        let hot = st.chip_hover == Some(*chip);
+        let down = hot && st.chip_pressed == Some(*chip);
+        let fill = match (on, hot, down) {
+            (true, _, true) => theme::ACCENT_PRESSED,
+            (true, true, _) => theme::ACCENT_HOVER,
+            (true, false, _) => theme::ACCENT,
+            (false, true, false) => theme::BUTTON_HOVER,
+            _ => theme::BUTTON,
+        };
+        c.round(&cr, px(6), Some(rgb(fill)), if on { None } else { Some((rgb(theme::BUTTON_EDGE), 1)) });
+        c.text(&cr, text, f, if on { rgb(0xffffff) } else { gdi::TEXT }, true);
+        hits.push((*chip, cr));
+    }
+    c.fill(&rect(dx + px(14), dy + m.line, dx + m.size.0 - px(14), dy + m.line + 1), rgb(EDGE));
+    c.text(&moved(&m.footer.1, dx, dy), &m.footer.0, f, gdi::DIM, false);
+    hits
 }
 
 fn paint_tip(c: &Canvas, r: &RECT, px: &dyn Fn(i32) -> i32, f: HFONT, text: &str) {
@@ -780,6 +934,14 @@ fn draw_popups(hwnd: HWND, st: &mut State, look: &Look) {
         }
         _ => None,
     };
+    let menu = if st.menu { find(Hot::Part(Part::Quality)).map(|b| (b, menu_layout(&px))) } else { None };
+    let menu = menu.map(|(b, m)| {
+        let (w, h) = m.size;
+        // Under the button, kept inside the session window where it can be.
+        let (origin, client_w) = owner_top(owner);
+        let l = (b.left - px(6)).min(origin.x + client_w - w - px(6)).max(origin.x + px(6));
+        (rect(l, b.bottom + px(6), l + w, b.bottom + px(6) + h), m)
+    });
     let tip = tip_due.and_then(|(p, text)| {
         let r = find(Hot::Part(p))?;
         let w = tip_w + px(16);
@@ -789,7 +951,8 @@ fn draw_popups(hwnd: HWND, st: &mut State, look: &Look) {
     st.tip_shown = tip.is_some();
     st.parts.clear();
     st.panel = None;
-    let boxes: Vec<RECT> = panel.iter().copied().chain(tip.iter().map(|t| t.0)).collect();
+    st.chips.clear();
+    let boxes: Vec<RECT> = panel.iter().copied().chain(menu.iter().map(|m| m.0)).chain(tip.iter().map(|t| t.0)).collect();
     if boxes.is_empty() {
         show(hwnd, false);
         return;
@@ -802,6 +965,11 @@ fn draw_popups(hwnd: HWND, st: &mut State, look: &Look) {
     if let Some(p) = panel {
         let r = moved(&p, -at.x, -at.y);
         paint_panel(&c, &r, &px, f, look, value_w);
+        shapes.push(shape(&r, px(10)));
+    }
+    if let Some((r, m)) = &menu {
+        let r = moved(r, -at.x, -at.y);
+        st.chips = paint_menu(&c, m, POINT { x: r.left, y: r.top }, &px, f, st);
         shapes.push(shape(&r, px(10)));
     }
     if let Some((t, text)) = &tip {
@@ -825,8 +993,12 @@ fn draw_bar(hwnd: HWND, st: &mut State, look: &Look) {
     let h = px(BAR_H);
     let mut lay = layout(&px, &IN_BAR, h, px(6), badge_w, note_w, look);
     let bar_w = lay.right + if lay.note.is_some() { px(12) } else { px(6) };
-    let (panel_w, panel_h) = panel_size(&px, look, key_w, value_w);
-    let panel_h = if st.stats { panel_h } else { 0 };
+    let menu = st.menu.then(|| menu_layout(&px));
+    let (panel_w, panel_h) = match &menu {
+        Some(m) => m.size,
+        None => panel_size(&px, look, key_w, value_w),
+    };
+    let panel_h = if st.stats || st.menu { panel_h } else { 0 };
     let win_w = bar_w.max(panel_w).max(tip_w + px(40)) + 2;
     let win_h = h + px(8) + panel_h.max(px(30)) + 2;
     let left = (win_w - bar_w) / 2;
@@ -845,16 +1017,29 @@ fn draw_bar(hwnd: HWND, st: &mut State, look: &Look) {
         let cx = (left + bar_w / 2) as f32;
         c.lines(&[(cx - pf(14.0), gy), (cx + pf(14.0), gy)], pf(1.5), rgb(mix(FILL, theme::DIM, grip)));
     }
-    let paint = Paint { px: &px, pf: &pf, font: f, hover: st.hover.map(|h| h.0), pressed: st.pressed, stats: st.stats, live: st.t > 0.9 };
+    let paint = Paint {
+        px: &px,
+        pf: &pf,
+        font: f,
+        hover: st.hover.map(|h| h.0),
+        pressed: st.pressed,
+        stats: st.stats,
+        menu: st.menu,
+        live: st.t > 0.9,
+    };
     paint_parts(&c, &lay, -off, h, &IN_BAR, look, &paint);
 
     let mut shapes = vec![shape(&bar, r)];
     let mut panel = None;
-    if st.stats && st.t > 0.0 {
+    st.chips.clear();
+    if (st.stats || st.menu) && st.t > 0.0 {
         let pl = (win_w - panel_w) / 2;
         let pt = h - off + px(8);
         let pr = rect(pl, pt, pl + panel_w, pt + panel_h);
-        paint_panel(&c, &pr, &px, f, look, value_w);
+        match &menu {
+            Some(m) => st.chips = paint_menu(&c, m, POINT { x: pl, y: pt }, &px, f, st),
+            None => paint_panel(&c, &pr, &px, f, look, value_w),
+        }
         shapes.push(shape(&pr, px(10)));
         panel = Some(pr);
     }
@@ -921,6 +1106,14 @@ fn icon(c: &Canvas, part: Part, r: &RECT, pf: &dyn Fn(f32) -> f32, color: COLORR
         Part::Release => {
             line(&[(5.0, 2.5), (12.0, 9.0), (8.3, 9.0), (10.3, 13.2), (8.7, 14.0), (6.7, 9.8), (5.0, 12.0), (5.0, 2.5)]);
         }
+        Part::Quality => {
+            // Three sliders.
+            for (y, k) in [(4.0, 10.5), (8.0, 5.0), (12.0, 9.0)] {
+                line(&[(1.5, y), (k - 1.8, y)]);
+                line(&[(k + 1.8, y), (14.5, y)]);
+                frame(k - 1.8, y - 1.8, k + 1.8, y + 1.8);
+            }
+        }
         Part::Terminal => {
             frame(1.5, 2.5, 14.5, 13.5);
             line(&[(4.0, 6.0), (6.5, 8.0), (4.0, 10.0)]);
@@ -978,7 +1171,8 @@ fn watch(hwnd: HWND, st: &mut State) {
             st.last_near = now;
         }
         let look = look();
-        let open = look.hold || look.released || st.stats || now - st.started < FIRST_SHOW || now - st.last_near < LINGER;
+        let open =
+            look.hold || look.released || st.stats || st.menu || now - st.started < FIRST_SHOW || now - st.last_near < LINGER;
         if open != st.open {
             st.open = open;
             if !open {
@@ -988,7 +1182,7 @@ fn watch(hwnd: HWND, st: &mut State) {
         }
     }
     let tip_due = st.hover.is_some_and(|(k, since)| matches!(k, Hot::Part(p) if has_tip(p)) && since.elapsed() >= TIP_DELAY);
-    if tip_due && !st.tip_shown && !st.stats {
+    if tip_due && !st.tip_shown && !st.stats && !st.menu {
         draw(hwnd, st);
     }
 }
@@ -1017,10 +1211,27 @@ fn part_at(st: &State, lp: LPARAM) -> Option<Part> {
     st.parts.iter().find(|(_, r)| gdi::inside(r, x, y)).map(|(p, _)| *p)
 }
 
+/// The 画面 menu's chip at a point in this window.
+fn chip_at(st: &State, lp: LPARAM) -> Option<Chip> {
+    let (x, y) = ((lp.0 & 0xffff) as i16 as i32, ((lp.0 >> 16) & 0xffff) as i16 as i32);
+    st.chips.iter().find(|(_, r)| gdi::inside(r, x, y)).map(|(c, _)| *c)
+}
+
 fn act(part: Part) {
     match part {
         Part::Badge => {
-            with(|s| s.stats = !s.stats);
+            with(|s| {
+                s.stats = !s.stats;
+                s.menu = false;
+            });
+            changed();
+        }
+        Part::Quality => {
+            with(|s| {
+                s.menu = !s.menu;
+                s.stats = false;
+                s.chip_hover = None;
+            });
             changed();
         }
         Part::Monitor => window::pick_monitor(keys::MonitorKey::Next),
@@ -1053,7 +1264,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             WM_MOUSEACTIVATE => LRESULT(MA_NOACTIVATE as isize),
             WM_SETCURSOR => {
-                let hand = with(|s| s.hover.is_some() && s.full).unwrap_or(false);
+                let hand = with(|s| s.hover.is_some() && s.full || s.chip_hover.is_some()).unwrap_or(false);
                 if let Ok(c) = LoadCursorW(None, if hand { IDC_HAND } else { IDC_ARROW }) {
                     SetCursor(Some(c));
                 }
@@ -1062,9 +1273,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             WM_MOUSEMOVE => {
                 with(|s| {
                     let on = part_at(s, lp).map(Hot::Part);
+                    let chip = chip_at(s, lp);
+                    let mut again = chip != s.chip_hover;
+                    s.chip_hover = chip;
+                    s.chip_pressed = s.chip_pressed.filter(|c| Some(*c) == chip);
                     if s.full && on != s.hover.map(|h| h.0) {
                         s.hover = on.map(|p| (p, Instant::now()));
                         s.pressed = s.pressed.filter(|p| Some(*p) == on);
+                        again = true;
+                    }
+                    if again {
                         draw(hwnd, s);
                     }
                 });
@@ -1073,9 +1291,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             WM_MOUSELEAVE => {
                 with(|s| {
-                    if s.full && (s.hover.is_some() || s.pressed.is_some()) {
-                        s.hover = None;
-                        s.pressed = None;
+                    if s.full && (s.hover.is_some() || s.pressed.is_some()) || s.chip_hover.is_some() {
+                        if s.full {
+                            s.hover = None;
+                            s.pressed = None;
+                        }
+                        s.chip_hover = None;
+                        s.chip_pressed = None;
                         draw(hwnd, s);
                     }
                 });
@@ -1084,6 +1306,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             WM_LBUTTONDOWN | WM_LBUTTONDBLCLK => {
                 with(|s| {
                     s.pressed = part_at(s, lp).map(Hot::Part);
+                    s.chip_pressed = chip_at(s, lp);
                     draw(hwnd, s);
                 });
                 LRESULT(0)
@@ -1092,12 +1315,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 let hit = with(|s| {
                     let was = s.pressed.take();
                     let hit = was.filter(|p| part_at(s, lp).map(Hot::Part) == Some(*p));
+                    let chip = s.chip_pressed.take().filter(|c| chip_at(s, lp) == Some(*c));
                     draw(hwnd, s);
-                    hit
-                })
-                .flatten();
-                if let Some(Hot::Part(p)) = hit {
-                    act(p);
+                    (hit, chip)
+                });
+                if let Some((hit, chip)) = hit {
+                    if let Some(c) = chip {
+                        c.choose();
+                        changed();
+                    }
+                    if let Some(Hot::Part(p)) = hit {
+                        act(p);
+                    }
                 }
                 LRESULT(0)
             }

@@ -119,6 +119,26 @@ pub struct EncTestArgs {
     /// Codec API setting before the media types, `name=value` (names as in --probe).
     #[arg(long = "set", value_parser = parse_setting)]
     settings: Vec<(&'static str, GUID, u64)>,
+    /// Still-screen test: scroll at `--mbps` for `--seconds`, then encode the
+    /// last picture again `--refine-frames` times, and report size and
+    /// picture quality (Y PSNR) per frame.
+    #[arg(long)]
+    refine: bool,
+    #[arg(long, default_value_t = 30)]
+    refine_frames: u32,
+    /// With --refine: the bitrate while the picture is still (default: `--mbps`).
+    #[arg(long)]
+    refine_mbps: Option<f64>,
+    /// Colour test: encode the still screen with HEVC at `--mbps` for
+    /// `--seconds`, once in 4:2:0 and once in 4:4:4, decode both, and save
+    /// full-size crops (`--crop x,y,w,h`) of the source and both results as
+    /// BMPs into `--out`.
+    #[arg(long)]
+    yuv444: bool,
+    #[arg(long, value_delimiter = ',', default_value = "0,0,800,400")]
+    crop: Vec<u32>,
+    #[arg(long, default_value = ".")]
+    out: std::path::PathBuf,
 }
 
 /// Codec API properties enc-test can show and set.
@@ -230,6 +250,97 @@ fn scrolled(gpu: &Gpu, src: &ID3D11Texture2D, dst: &ID3D11Texture2D, w: u32, h: 
     }
 }
 
+/// The four letters of a video subtype GUID.
+fn fourcc(g: &GUID) -> String {
+    let b = g.data1.to_le_bytes();
+    if b.iter().all(|c| c.is_ascii_graphic() || *c == b' ') {
+        String::from_utf8_lossy(&b).into_owned()
+    } else {
+        format!("{:#x}", g.data1)
+    }
+}
+
+/// What this machine can do for YUV 4:4:4 (sharp coloured text): hardware
+/// encoders registered for 4:4:4 input, whether the H.264 and HEVC encoders
+/// take a 4:4:4 profile and what input they then offer, and the decoder's
+/// 4:4:4 profiles.
+fn probe_444(gpu: &Gpu) {
+    use windows::Win32::Graphics::{Direct3D11::ID3D11VideoDevice, Dxgi::Common::DXGI_FORMAT_AYUV};
+    use windows::core::Interface;
+    for c in [Codec::H264, Codec::Hevc] {
+        for (n, sub) in [("AYUV", MFVideoFormat_AYUV), ("ARGB32", MFVideoFormat_ARGB32), ("RGB32", MFVideoFormat_RGB32)] {
+            let flags = MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER;
+            let found = mf::find_mfts(MFT_CATEGORY_VIDEO_ENCODER, flags, sub, c.subtype(), Some(gpu.luid));
+            let names: Vec<String> = found.map(|l| l.iter().map(mf::friendly_name).collect()).unwrap_or_default();
+            log!("4:4:4 {:>5}: encoders registered for {n} input: {}", c.name(), if names.is_empty() { "none".into() } else { names.join(", ") });
+        }
+        let Ok(list) = mf::find_mfts(
+            MFT_CATEGORY_VIDEO_ENCODER,
+            MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER,
+            MFVideoFormat_NV12,
+            c.subtype(),
+            Some(gpu.luid),
+        ) else {
+            continue;
+        };
+        let Some(act) = list.first() else { continue };
+        let name = mf::friendly_name(act);
+        let profiles: &[(&str, u32)] = match c {
+            Codec::H264 => &[("High", eAVEncH264VProfile_High.0 as u32), ("High 4:4:4", eAVEncH264VProfile_444.0 as u32)],
+            Codec::Hevc => &[("Main", eAVEncH265VProfile_Main_420_8.0 as u32), ("Main 4:4:4", eAVEncH265VProfile_Main_444_8.0 as u32)],
+        };
+        for (pn, profile) in profiles {
+            let r: Result<Vec<String>> = (|| unsafe {
+                let mft: IMFTransform = act.ActivateObject()?;
+                let attrs = mft.GetAttributes()?;
+                if attrs.GetUINT32(&MF_TRANSFORM_ASYNC).unwrap_or(0) != 0 {
+                    attrs.SetUINT32(&MF_TRANSFORM_ASYNC_UNLOCK, 1)?;
+                }
+                let _mgr = mf::attach_device(&mft, &gpu.device)?;
+                let out = MFCreateMediaType()?;
+                out.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
+                out.SetGUID(&MF_MT_SUBTYPE, &c.subtype())?;
+                out.SetUINT32(&MF_MT_AVG_BITRATE, 20_000_000)?;
+                out.SetUINT64(&MF_MT_FRAME_SIZE, mf::pack(1920, 1080))?;
+                out.SetUINT64(&MF_MT_FRAME_RATE, mf::pack(60, 1))?;
+                out.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, mf::pack(1, 1))?;
+                out.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
+                out.SetUINT32(&MF_MT_MPEG2_PROFILE, *profile)?;
+                mft.SetOutputType(0, &out, 0).context("SetOutputType")?;
+                let inputs = (0..).map_while(|i| mft.GetInputAvailableType(0, i).ok()).filter_map(|t| mf::subtype(&t)).map(|g| fourcc(&g)).collect();
+                let _ = act.ShutdownObject();
+                Ok(inputs)
+            })();
+            match r {
+                Ok(inputs) => log!("4:4:4 {name}: profile {pn} taken; inputs then {}", inputs.join(", ")),
+                Err(e) => log!("4:4:4 {name}: profile {pn} refused ({e:#})"),
+            }
+        }
+    }
+    // DXVA_ModeHEVC_VLD_Main_444 and DXVA_ModeH264_VLD_... have no 4:4:4 for H.264.
+    const HEVC_MAIN_444: GUID = GUID::from_u128(0x4008018f_f537_4b36_98cf_61af8a2c1a33);
+    const HEVC_MAIN10_444: GUID = GUID::from_u128(0x0dabeffa_4458_4602_bc03_0795659d617c);
+    let Ok(vd) = gpu.device.cast::<ID3D11VideoDevice>() else {
+        log!("4:4:4 decode: no D3D11 video device");
+        return;
+    };
+    unsafe {
+        let n = vd.GetVideoDecoderProfileCount();
+        let mut seen = Vec::new();
+        for i in 0..n {
+            if let Ok(g) = vd.GetVideoDecoderProfile(i) {
+                seen.push(g);
+            }
+        }
+        for (pn, g) in [("HEVC Main 4:4:4", HEVC_MAIN_444), ("HEVC Main10 4:4:4", HEVC_MAIN10_444)] {
+            let has = seen.contains(&g);
+            let ayuv = has && vd.CheckVideoDecoderFormat(&g, DXGI_FORMAT_AYUV).is_ok_and(|b| b.as_bool());
+            log!("4:4:4 decode on {}: {pn} {}; AYUV output {}", gpu.name, if has { "offered" } else { "not offered" }, ayuv);
+        }
+        log!("4:4:4 decode: {} decoder profiles in all", seen.len());
+    }
+}
+
 pub fn run(a: EncTestArgs) -> Result<()> {
     mf::init_thread()?;
     let (gpu, output, _) = Gpu::for_primary_output()?;
@@ -239,6 +350,7 @@ pub fn run(a: EncTestArgs) -> Result<()> {
             let dec = Decoder::available(&gpu.device, c).map_or_else(|e| format!("no ({e:#})"), |_| "yes".into());
             log!("{:>5} on {}: hardware encoder {enc}; decoder {dec}", c.name(), gpu.name);
         }
+        probe_444(&gpu);
         return Ok(());
     }
     let mut cap = Capture::new(&gpu, &output)?;
@@ -285,6 +397,7 @@ pub fn run(a: EncTestArgs) -> Result<()> {
         layers_hint: !a.no_layers_hint,
         scenario_hint: !a.no_scenario_hint,
         qp_control: a.qp,
+        yuv444: false,
     };
     let mut enc = Encoder::new_with(&gpu.device, gpu.luid, w, h, a.fps, max, opts, &a.settings)?;
     log!(
@@ -314,6 +427,14 @@ pub fn run(a: EncTestArgs) -> Result<()> {
     if a.keys {
         let src = Source { live: a.live, scroll: a.scroll, cw, ch, moving: &moving };
         return run_keys(&a, &gpu, &mut cap, &src, &conv, &nv12, &mut enc, (w, h), full);
+    }
+    if a.yuv444 {
+        drop(enc);
+        return run_yuv444(&a, &gpu, &cap, (w, h));
+    }
+    if a.refine {
+        let src = Source { live: false, scroll: a.scroll, cw, ch, moving: &moving };
+        return run_refine(&a, &gpu, &mut cap, &src, &conv, &nv12, &mut enc, (w, h), full);
     }
     // (name, share of the top bitrate, every 10th frame at a quarter of it)
     let steps = [
@@ -559,6 +680,201 @@ fn run_keys(
     }
     if set_failed > 0 {
         log!("{set_failed} --key-set change(s) refused");
+    }
+    Ok(())
+}
+
+/// See `EncTestArgs::yuv444`.
+fn run_yuv444(a: &EncTestArgs, gpu: &Gpu, cap: &Capture, (w, h): (u32, u32)) -> Result<()> {
+    let [x, y, cw, ch] = a.crop[..] else { bail!("--crop x,y,w,h") };
+    std::fs::create_dir_all(&a.out)?;
+    // The source: BGRA, read as a plane four bytes per pixel.
+    let mut st = None;
+    let bgra = luma(gpu, &cap.image, 0, cap.width * 4, cap.height, &mut st)?;
+    let (cw, ch) = (cw.min(w - x.min(w)), ch.min(h - y.min(h)));
+    let row = (cw as usize * 3).div_ceil(4) * 4;
+    let mut px = vec![0u8; row * ch as usize];
+    for r in 0..ch as usize {
+        let line = &bgra[(y as usize + r) * cap.width as usize * 4..];
+        for c in 0..cw as usize {
+            let p = &line[(x as usize + c) * 4..];
+            px[(ch as usize - 1 - r) * row + 3 * c..][..3].copy_from_slice(&p[..3]);
+        }
+    }
+    write_bmp(&a.out.join("source.bmp"), cw, ch, &px)?;
+    let frames = (a.seconds * a.fps as f64).max(1.0) as u32;
+    for yuv444 in [false, true] {
+        let name = if yuv444 { "444" } else { "420" };
+        let opts = EncOptions { codec: Codec::Hevc, yuv444, ..Default::default() };
+        let mut enc = Encoder::new_with(&gpu.device, gpu.luid, w, h, a.fps, (a.mbps * 1e6) as u32, opts, &a.settings)?;
+        let tex = crate::pipeline::yuv_texture(gpu, w, h, yuv444)?;
+        if yuv444 {
+            crate::yuv444::ToAyuv::new(gpu, &cap.image, &tex, (w, h))?.run(gpu);
+        } else {
+            let conv = Vp::new(gpu, (cap.width, cap.height), (w, h), vp::RGB_FULL, vp::YUV_709)?;
+            conv.blt(&cap.image, 0, &tex, RECT { left: 0, top: 0, right: w as i32, bottom: h as i32 })
+                .with_context(|| format!("{name}: video processor into the encoder's picture"))?;
+        }
+        let mut dec = Decoder::new(&gpu.device, w, h, Codec::Hevc)?;
+        let (mut bytes, mut last) = (Vec::new(), None);
+        let t0 = Instant::now();
+        let mut enc_ms = Vec::new();
+        for _ in 0..frames {
+            let t = Instant::now();
+            let e = loop {
+                if let Some(e) = enc.encode(&tex, Duration::from_millis(200), None)? {
+                    break e;
+                }
+            };
+            enc_ms.push(t.elapsed().as_secs_f64() * 1000.0);
+            bytes.push(e.data.len() as f64);
+            if let Some(p) = dec.decode(&e.data).with_context(|| format!("{name}: decode"))? {
+                last = Some(p);
+            }
+        }
+        let p = last.context("nothing decoded")?;
+        let mut d = Default::default();
+        unsafe { p.tex.GetDesc(&mut d) };
+        log!(
+            "{name} with {}: {frames} frames in {:.1} s, first {:.0} KB, then p50 {:.1} KB; encode p50 {:.1} ms; decoded as {:?}",
+            enc.name,
+            t0.elapsed().as_secs_f64(),
+            bytes[0] / 1000.0,
+            percentile(&bytes[1..], 50.0) / 1000.0,
+            percentile(&enc_ms, 50.0),
+            d.Format
+        );
+        crate::snapshot::save_region(gpu, &p, (x, y, cw, ch), 1, &a.out.join(format!("{name}.bmp")))?;
+        // What the viewer shows: its video processor turns the decoded picture into BGRA.
+        let shown = bgra_texture(gpu, w, h)?;
+        Vp::new(gpu, (w, h), (w, h), vp::YUV_709, vp::RGB_FULL)?
+            .blt(&p.tex, p.slice, &shown, RECT { left: 0, top: 0, right: w as i32, bottom: h as i32 })
+            .with_context(|| format!("{name}: the viewer's video processor"))?;
+        let mut st = None;
+        let px = luma(gpu, &shown, 0, w * 4, h, &mut st)?;
+        let mut out = vec![0u8; row * ch as usize];
+        for r in 0..ch as usize {
+            let line = &px[(y as usize + r) * w as usize * 4..];
+            for c in 0..cw as usize {
+                out[(ch as usize - 1 - r) * row + 3 * c..][..3].copy_from_slice(&line[(x as usize + c) * 4..][..3]);
+            }
+        }
+        write_bmp(&a.out.join(format!("{name}-shown.bmp")), cw, ch, &out)?;
+    }
+    log!("crops in {}", a.out.display());
+    Ok(())
+}
+
+fn bgra_texture(gpu: &Gpu, w: u32, h: u32) -> Result<ID3D11Texture2D> {
+    let desc = windows::Win32::Graphics::Direct3D11::D3D11_TEXTURE2D_DESC {
+        Width: w,
+        Height: h,
+        MipLevels: 1,
+        ArraySize: 1,
+        Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM,
+        SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Usage: windows::Win32::Graphics::Direct3D11::D3D11_USAGE_DEFAULT,
+        BindFlags: windows::Win32::Graphics::Direct3D11::D3D11_BIND_RENDER_TARGET.0 as u32,
+        CPUAccessFlags: 0,
+        MiscFlags: 0,
+    };
+    let mut t = None;
+    unsafe { gpu.device.CreateTexture2D(&desc, None, Some(&mut t))? };
+    t.context("BGRA texture")
+}
+
+fn write_bmp(path: &std::path::Path, w: u32, h: u32, px: &[u8]) -> Result<()> {
+    let mut f = Vec::with_capacity(54 + px.len());
+    f.extend_from_slice(b"BM");
+    f.extend_from_slice(&((54 + px.len()) as u32).to_le_bytes());
+    f.extend_from_slice(&[0, 0, 0, 0]);
+    f.extend_from_slice(&54u32.to_le_bytes());
+    f.extend_from_slice(&40u32.to_le_bytes());
+    f.extend_from_slice(&(w as i32).to_le_bytes());
+    f.extend_from_slice(&(h as i32).to_le_bytes());
+    f.extend_from_slice(&1u16.to_le_bytes());
+    f.extend_from_slice(&24u16.to_le_bytes());
+    f.extend_from_slice(&[0u8; 24]);
+    f.extend_from_slice(px);
+    std::fs::write(path, f).with_context(|| format!("write {}", path.display()))
+}
+
+/// See `EncTestArgs::refine`.
+#[allow(clippy::too_many_arguments)]
+fn run_refine(
+    a: &EncTestArgs,
+    gpu: &Gpu,
+    cap: &mut Capture,
+    src: &Source,
+    conv: &Vp,
+    nv12: &ID3D11Texture2D,
+    enc: &mut Encoder,
+    (w, h): (u32, u32),
+    full: RECT,
+) -> Result<()> {
+    let budget = a.mbps * 1e6 / 8.0 / a.fps as f64;
+    let mut dec = Decoder::new(&gpu.device, w, h, enc.format)?;
+    let (mut st_src, mut st_dec) = (None, None);
+    let mut n = 0u32;
+    let mut still: Option<Vec<u8>> = None;
+    let mut moving_bytes = Vec::new();
+    let mut last_moving_psnr = None;
+    let frames = (a.seconds * a.fps as f64) as u32;
+    // Moving, then still: every frame is decoded (each depends on the one before).
+    for i in 0..frames + a.refine_frames {
+        let refining = i >= frames;
+        if i == frames {
+            if let Some(m) = a.refine_mbps {
+                enc.set_bitrate((m * 1e6) as u32);
+            }
+            still = Some(luma(gpu, nv12, 0, w, h, &mut st_src)?);
+        }
+        if !refining {
+            let tex = src.next(gpu, cap, &mut n)?.context("no picture")?;
+            conv.blt(&tex, 0, nv12, full)?;
+        }
+        let measure_moving = i + 1 == frames;
+        let y = if measure_moving { Some(luma(gpu, nv12, 0, w, h, &mut st_src)?) } else { None };
+        let e = loop {
+            if let Some(e) = enc.encode(nv12, Duration::from_millis(200), None)? {
+                break e;
+            }
+        };
+        let pic = dec.decode(&e.data)?;
+        let reference = if refining { still.as_ref() } else { y.as_ref() };
+        let q = match (pic, reference) {
+            (Some(p), Some(r)) => Some(psnr(r, &luma(gpu, &p.tex, p.slice, w, h, &mut st_dec)?)),
+            _ => None,
+        };
+        if !refining {
+            if !e.key {
+                moving_bytes.push(e.data.len() as f64);
+            }
+            if measure_moving {
+                last_moving_psnr = q;
+                log!(
+                    "moving: {frames} frames at {:.1} Mbps, size p50 {:.1} KB ({:.0}% of budget), last frame PSNR {} dB",
+                    a.mbps,
+                    percentile(&moving_bytes, 50.0) / 1000.0,
+                    percentile(&moving_bytes, 50.0) / budget * 100.0,
+                    q.map_or("-".into(), |v| format!("{v:.2}"))
+                );
+            }
+            continue;
+        }
+        log!(
+            "still {:>3}{}: {:>7.1} KB ({:>4.0}% of budget) QP {} PSNR {} dB{}",
+            i - frames + 1,
+            if e.key { " key" } else { "    " },
+            e.data.len() as f64 / 1000.0,
+            e.data.len() as f64 / budget * 100.0,
+            e.qp.map_or("-".into(), |v| v.to_string()),
+            q.map_or("-".into(), |v| format!("{v:.2}")),
+            match (q, last_moving_psnr) {
+                (Some(v), Some(m)) => format!(" ({:+.2})", v - m),
+                _ => String::new(),
+            }
+        );
     }
     Ok(())
 }

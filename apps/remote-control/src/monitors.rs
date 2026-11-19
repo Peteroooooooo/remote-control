@@ -162,6 +162,24 @@ pub fn message(sel: &Selection) -> Msg {
     Msg::Monitors { list: s.list.clone(), current: s.current as u8 }
 }
 
+/// The streamed display's refresh rate in Hz: the most frames it can show
+/// (60 when Windows does not say).
+pub fn refresh_hz(sel: &Selection) -> u32 {
+    use windows::{
+        Win32::Graphics::Gdi::{DEVMODEW, ENUM_CURRENT_SETTINGS, EnumDisplaySettingsW},
+        core::HSTRING,
+    };
+    let name = {
+        let s = sel.0.lock().unwrap();
+        s.list.get(s.current).map(|m| m.name.clone())
+    };
+    let Some(name) = name else { return 60 };
+    let mut dm = DEVMODEW { dmSize: size_of::<DEVMODEW>() as u16, ..Default::default() };
+    let ok = unsafe { EnumDisplaySettingsW(&HSTRING::from(name), ENUM_CURRENT_SETTINGS, &mut dm) }.as_bool();
+    // 0 and 1 mean "the hardware's default".
+    if ok && dm.dmDisplayFrequency > 1 { dm.dmDisplayFrequency } else { 60 }
+}
+
 /// The viewer asked for display `index` (0-based) of the list it was sent.
 /// True when the capture has to move to another display.
 pub fn select(sel: &Selection, index: u8) -> Result<bool> {

@@ -24,15 +24,60 @@ pub const STREAM_CLIPBOARD: u8 = 1;
 pub const FRAME_HDR: usize = 1 + 2 + 2 + 4;
 const F_KEY: u8 = 1;
 const F_HEVC: u8 = 2;
+const F_444: u8 = 4;
 
 /// Hello capability bits: what the viewer can decode besides H.264.
 pub const CAN_HEVC: u8 = 1;
+/// HEVC Main 4:4:4, decoded to AYUV and drawn (文字清晰).
+pub const CAN_HEVC444: u8 = 2;
+
+/// What the viewer wants the picture to be (its 画面 menu). The host picks
+/// the largest picture within every limit set, never larger than its display.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Quality {
+    /// Fit inside this many pixels (the viewer's screen, for 自动); 0 = no box.
+    pub fit_w: u16,
+    pub fit_h: u16,
+    /// The shorter side at most this (1440, 1080, 720); 0 = no limit.
+    pub short: u16,
+    /// Frames per second; 0 = 60.
+    pub fps: u8,
+    /// Highest bitrate in kbit/s; 0 = by picture size and frame rate.
+    pub kbps: u32,
+    /// YUV 4:4:4 if both ends can (sharp coloured text).
+    pub yuv444: bool,
+}
+
+impl Quality {
+    fn write(&self, w: &mut W) {
+        w.u16(self.fit_w).u16(self.fit_h).u16(self.short).u8(self.fps).u32(self.kbps).u8(self.yuv444 as u8);
+    }
+
+    fn read(r: &mut R) -> Result<Quality> {
+        let mut q = Quality { fit_w: r.u16()?, fit_h: r.u16()?, short: r.u16()?, fps: r.u8()?, kbps: r.u32()?, yuv444: false };
+        q.yuv444 = r.u8()? != 0;
+        Ok(q)
+    }
+}
+
+/// What the host streams now, after the viewer's `Quality`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Streaming {
+    pub fps: u8,
+    /// The highest bitrate, kbit/s.
+    pub max_kbps: u32,
+    /// Both ends can do 4:4:4 (the menu offers it).
+    pub can444: bool,
+    pub yuv444: bool,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FrameHeader {
     pub key: bool,
     /// HEVC instead of H.264.
     pub hevc: bool,
+    /// HEVC Main 4:4:4 (a new decoder for it).
+    pub yuv444: bool,
     pub width: u16,
     pub height: u16,
     pub host_us: u32,
@@ -40,7 +85,7 @@ pub struct FrameHeader {
 
 impl FrameHeader {
     pub fn write(&self, out: &mut Vec<u8>) {
-        out.push(if self.key { F_KEY } else { 0 } | if self.hevc { F_HEVC } else { 0 });
+        out.push(if self.key { F_KEY } else { 0 } | if self.hevc { F_HEVC } else { 0 } | if self.yuv444 { F_444 } else { 0 });
         out.extend_from_slice(&self.width.to_be_bytes());
         out.extend_from_slice(&self.height.to_be_bytes());
         out.extend_from_slice(&self.host_us.to_be_bytes());
@@ -53,6 +98,7 @@ impl FrameHeader {
         let h = FrameHeader {
             key: b[0] & F_KEY != 0,
             hevc: b[0] & F_HEVC != 0,
+            yuv444: b[0] & F_444 != 0,
             width: u16::from_be_bytes([b[1], b[2]]),
             height: u16::from_be_bytes([b[3], b[4]]),
             host_us: u32::from_be_bytes([b[5], b[6], b[7], b[8]]),
@@ -106,8 +152,12 @@ pub struct MonitorDesc {
 pub enum Msg {
     /// Viewer -> host, first message. caps: CAN_HEVC. `proof`: an `rcd1`
     /// device proof when the viewer connects with a session key of its own
-    /// (see `ident`), empty when it connects with its device key.
-    Hello { max_kbps: u32, fps: u8, caps: u8, proof: String },
+    /// (see `ident`), empty when it connects with its device key. `quality`
+    /// after it (an older viewer sends none: `max_kbps` and `fps` then say
+    /// all, at the display's own size).
+    Hello { max_kbps: u32, fps: u8, caps: u8, proof: String, quality: Option<Quality> },
+    /// Viewer -> host: the picture should be like this from now on.
+    Quality(Quality),
     /// Host -> viewer: the host's user is being asked to allow this session.
     Waiting,
     /// Host -> viewer: the picture stops (on) because the only way left goes
@@ -126,8 +176,9 @@ pub enum Msg {
     RequestKeyframe,
     Ping { t_us: u64 },
     Pong { t_us: u64 },
-    /// Host -> viewer, sent before the first frame and whenever the stream changes.
-    Info { width: u16, height: u16, encoder: String },
+    /// Host -> viewer, sent before the first frame and whenever the stream
+    /// changes. `streaming` after the encoder's name (none from an older host).
+    Info { width: u16, height: u16, encoder: String, streaming: Option<Streaming> },
     Stats(HostStats),
     /// Viewer -> host: move the cursor here and report where it ended up.
     Probe { x: u16, y: u16 },
@@ -230,6 +281,10 @@ impl W {
 const GRANT_MARK: u8 = 0xA7;
 /// Starts the event at the end of a welcome, after the grant.
 const EVENT_MARK: u8 = 0xA8;
+/// Starts the quality at the end of a hello.
+const QUALITY_MARK: u8 = 0xA9;
+/// Starts what is streamed at the end of an info.
+const STREAMING_MARK: u8 = 0xAA;
 
 struct R<'a>(&'a [u8]);
 
@@ -320,6 +375,7 @@ impl Msg {
             Msg::Monitors { .. } => 70,
             Msg::SelectMonitor { .. } => 71,
             Msg::Hint { .. } => 16,
+            Msg::Quality(_) => 17,
         }
     }
 
@@ -327,9 +383,14 @@ impl Msg {
     pub fn encode(&self) -> Vec<u8> {
         let mut w = W(vec![0, 0, 0, 0, self.tag()]);
         match self {
-            Msg::Hello { max_kbps, fps, caps, proof } => {
+            Msg::Hello { max_kbps, fps, caps, proof, quality } => {
                 w.u32(*max_kbps).u8(*fps).u8(*caps).long_str(proof);
+                if let Some(q) = quality {
+                    w.u8(QUALITY_MARK);
+                    q.write(&mut w);
+                }
             }
+            Msg::Quality(q) => q.write(&mut w),
             Msg::Waiting => {}
             Msg::Paused { on } => {
                 w.u8(*on as u8);
@@ -350,10 +411,13 @@ impl Msg {
             Msg::Ping { t_us } | Msg::Pong { t_us } => {
                 w.u64(*t_us);
             }
-            Msg::Info { width, height, encoder } => {
+            Msg::Info { width, height, encoder, streaming } => {
                 let name = &encoder.as_bytes()[..encoder.len().min(200)];
                 w.u16(*width).u16(*height).u8(name.len() as u8);
                 w.0.extend_from_slice(name);
+                if let Some(s) = streaming {
+                    w.u8(STREAMING_MARK).u8(s.fps).u32(s.max_kbps).u8(s.can444 as u8 | (s.yuv444 as u8) << 1);
+                }
             }
             Msg::Desktop { name } => {
                 let name = &name.as_bytes()[..name.len().min(200)];
@@ -415,7 +479,17 @@ impl Msg {
         let (&tag, body) = b.split_first().ok_or_else(|| anyhow::anyhow!("empty message"))?;
         let mut r = R(body);
         Ok(match tag {
-            1 => Msg::Hello { max_kbps: r.u32()?, fps: r.u8()?, caps: r.u8()?, proof: r.long_str()? },
+            1 => {
+                let (max_kbps, fps, caps, proof) = (r.u32()?, r.u8()?, r.u8()?, r.long_str()?);
+                let quality = if r.0.first() == Some(&QUALITY_MARK) {
+                    r.u8()?;
+                    Some(Quality::read(&mut r)?)
+                } else {
+                    None
+                };
+                Msg::Hello { max_kbps, fps, caps, proof, quality }
+            }
+            17 => Msg::Quality(Quality::read(&mut r)?),
             2 => Msg::MouseMove { x: r.u16()?, y: r.u16()? },
             3 => Msg::MouseButton { button: r.u8()?, down: r.u8()? != 0 },
             4 => Msg::Wheel { delta: r.u16()? as i16, horizontal: r.u8()? != 0 },
@@ -426,10 +500,15 @@ impl Msg {
             9 => Msg::Pong { t_us: r.u64()? },
             10 => {
                 let (width, height, n) = (r.u16()?, r.u16()?, r.u8()? as usize);
-                if r.0.len() < n {
-                    bail!("message too short");
-                }
-                Msg::Info { width, height, encoder: String::from_utf8_lossy(&r.0[..n]).into_owned() }
+                let encoder = r.text(n)?;
+                let streaming = if r.0.first() == Some(&STREAMING_MARK) {
+                    r.u8()?;
+                    let (fps, max_kbps, f) = (r.u8()?, r.u32()?, r.u8()?);
+                    Some(Streaming { fps, max_kbps, can444: f & 1 != 0, yuv444: f & 2 != 0 })
+                } else {
+                    None
+                };
+                Msg::Info { width, height, encoder, streaming }
             }
             11 => Msg::Stats(HostStats {
                 fps: r.u16()?,
@@ -529,8 +608,16 @@ mod tests {
     #[test]
     fn messages_round_trip() {
         let all = [
-            Msg::Hello { max_kbps: 20_000, fps: 60, caps: CAN_HEVC, proof: String::new() },
-            Msg::Hello { max_kbps: 20_000, fps: 60, caps: 0, proof: format!("rcd1{}", "x".repeat(300)) },
+            Msg::Hello { max_kbps: 20_000, fps: 60, caps: CAN_HEVC, proof: String::new(), quality: None },
+            Msg::Hello { max_kbps: 20_000, fps: 60, caps: 0, proof: format!("rcd1{}", "x".repeat(300)), quality: None },
+            Msg::Hello {
+                max_kbps: 20_000,
+                fps: 144,
+                caps: CAN_HEVC | CAN_HEVC444,
+                proof: "rcd1x".into(),
+                quality: Some(Quality { fit_w: 2560, fit_h: 1600, short: 0, fps: 144, kbps: 0, yuv444: true }),
+            },
+            Msg::Quality(Quality { fit_w: 0, fit_h: 0, short: 1080, fps: 30, kbps: 5_000, yuv444: false }),
             Msg::Waiting,
             Msg::Paused { on: true },
             Msg::Paused { on: false },
@@ -542,7 +629,9 @@ mod tests {
             Msg::RequestKeyframe,
             Msg::Ping { t_us: 1 << 40 },
             Msg::Pong { t_us: 7 },
-            Msg::Info { width: 2880, height: 1920, encoder: "Intel® H.264".into() },
+            Msg::Info { width: 2880, height: 1920, encoder: "Intel® H.264".into(), streaming: None },
+            Msg::Info { width: 2560, height: 1440, encoder: "NVIDIA".into(), streaming: Some(Streaming { fps: 120, max_kbps: 50_000, can444: true, yuv444: false }) },
+            Msg::Info { width: 1920, height: 1080, encoder: "NVIDIA".into(), streaming: Some(Streaming { fps: 60, max_kbps: 20_000, can444: true, yuv444: true }) },
             Msg::Stats(HostStats { fps: 60, kbps: 19_000, path: 1, host_p95_us: 9_000, rate_kbps: 20_000, size_max_pct: 340, ..Default::default() }),
             Msg::Probe { x: 100, y: 200 },
             Msg::ProbeReply { x: 101, y: 199 },
@@ -598,8 +687,25 @@ mod tests {
     }
 
     #[test]
+    fn a_hello_and_an_info_from_an_older_version_still_read() {
+        // As an older viewer wrote its hello: no quality after the proof.
+        let mut w = W(vec![0, 0, 0, 0, 1]);
+        w.u32(20_000).u8(60).u8(0).long_str("rcd1");
+        assert_eq!(
+            Msg::decode(&w.0[4..]).unwrap(),
+            Msg::Hello { max_kbps: 20_000, fps: 60, caps: 0, proof: "rcd1".into(), quality: None }
+        );
+        let mut w = W(vec![0, 0, 0, 0, 10]);
+        w.u16(1920).u16(1080).str("NVIDIA");
+        assert_eq!(
+            Msg::decode(&w.0[4..]).unwrap(),
+            Msg::Info { width: 1920, height: 1080, encoder: "NVIDIA".into(), streaming: None }
+        );
+    }
+
+    #[test]
     fn frame_header_round_trips() {
-        let h = FrameHeader { key: true, hevc: true, width: 3840, height: 2160, host_us: 4_321 };
+        let h = FrameHeader { key: true, hevc: true, yuv444: true, width: 3840, height: 2160, host_us: 4_321 };
         let mut v = Vec::new();
         h.write(&mut v);
         v.push(9);

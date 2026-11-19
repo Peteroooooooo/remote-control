@@ -1,18 +1,24 @@
 //! Viewer test aid (`shot` in `view --script`): saves the last decoded
 //! picture as a half-size BMP, so tests can see what the viewer shows
-//! without capturing this PC's screen.
+//! without capturing this PC's screen. enc-test saves full-size crops with it.
 
 use std::path::Path;
 
 use anyhow::{Context, Result};
 use windows::Win32::Graphics::{
     Direct3D11::{D3D11_CPU_ACCESS_READ, D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING},
-    Dxgi::Common::DXGI_SAMPLE_DESC,
+    Dxgi::Common::{DXGI_FORMAT_AYUV, DXGI_SAMPLE_DESC},
 };
 
 use crate::{decode::Picture, gpu::Gpu};
 
 pub fn save_bmp(gpu: &Gpu, pic: &Picture, size: (u32, u32), path: &Path) -> Result<()> {
+    save_region(gpu, pic, (0, 0, size.0, size.1), 2, path)
+}
+
+/// Saves `w` x `h` pixels from (`x`, `y`) of the picture, every `step`th
+/// pixel (1 = full size). NV12 and AYUV pictures.
+pub fn save_region(gpu: &Gpu, pic: &Picture, (x0, y0, rw, rh): (u32, u32, u32, u32), step: u32, path: &Path) -> Result<()> {
     unsafe {
         let mut desc = D3D11_TEXTURE2D_DESC::default();
         pic.tex.GetDesc(&mut desc);
@@ -34,18 +40,31 @@ pub fn save_bmp(gpu: &Gpu, pic: &Picture, size: (u32, u32), path: &Path) -> Resu
         gpu.ctx.Map(&st, 0, D3D11_MAP_READ, 0, Some(&mut m))?;
         let pitch = m.RowPitch as usize;
         let base = m.pData as *const u8;
-        let luma = std::slice::from_raw_parts(base, pitch * desc.Height as usize);
-        let chroma = std::slice::from_raw_parts(base.add(pitch * desc.Height as usize), pitch * desc.Height as usize / 2);
-        let (w, h) = ((size.0 / 2) as usize, (size.1 / 2) as usize);
+        let ayuv = desc.Format == DXGI_FORMAT_AYUV;
+        let plane = pitch * desc.Height as usize;
+        let mem = std::slice::from_raw_parts(base, if ayuv { plane } else { plane * 3 / 2 });
+        // (Y, U, V) at a pixel. AYUV is V, U, Y, A in memory.
+        let yuv = |x: usize, y: usize| -> (u8, u8, u8) {
+            if ayuv {
+                let p = &mem[y * pitch + 4 * x..];
+                (p[2], p[1], p[0])
+            } else {
+                let c = plane + (y / 2) * pitch + (x / 2) * 2;
+                (mem[y * pitch + x], mem[c], mem[c + 1])
+            }
+        };
+        let s = step.max(1) as usize;
+        let (x0, y0) = (x0 as usize, y0 as usize);
+        let w = (rw as usize).min(desc.Width as usize - x0.min(desc.Width as usize)) / s;
+        let h = (rh as usize).min(desc.Height as usize - y0.min(desc.Height as usize)) / s;
         let row = (w * 3).div_ceil(4) * 4;
         let mut px = vec![0u8; row * h];
         for y in 0..h {
             // BMP rows go bottom to top.
             let out = &mut px[(h - 1 - y) * row..][..w * 3];
             for x in 0..w {
-                let yv = luma[2 * y * pitch + 2 * x] as f32;
-                let u = chroma[y * pitch + 2 * x] as f32 - 128.0;
-                let v = chroma[y * pitch + 2 * x + 1] as f32 - 128.0;
+                let (yv, u, v) = yuv(x0 + s * x, y0 + s * y);
+                let (yv, u, v) = (yv as f32, u as f32 - 128.0, v as f32 - 128.0);
                 // BT.709, limited range (what the host's video processor writes).
                 let c = 1.164 * (yv - 16.0);
                 let clamp = |f: f32| f.clamp(0.0, 255.0) as u8;

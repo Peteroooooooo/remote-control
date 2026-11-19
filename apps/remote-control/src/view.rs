@@ -25,7 +25,7 @@ use crate::{
     mf::{self, Codec},
     net,
     present::Presenter,
-    proto::{CAN_HEVC, HostStats, Msg, read_msg},
+    proto::{CAN_HEVC, CAN_HEVC444, HostStats, Msg, read_msg},
     stats::{now_us, percentile},
     toolbar,
     video_rx::{self, Delivered, RxCounters},
@@ -54,10 +54,13 @@ pub struct ViewArgs {
     /// The host's name, for the window title.
     #[arg(long)]
     name: Option<String>,
-    #[arg(long, default_value_t = 20.0)]
-    mbps: f64,
-    #[arg(long, default_value_t = 60)]
-    fps: u8,
+    /// Highest bitrate in Mbit/s, instead of this device's choice in the 画面
+    /// menu (for tests; not saved).
+    #[arg(long)]
+    mbps: Option<f64>,
+    /// Frames per second, instead of this device's choice (for tests; not saved).
+    #[arg(long)]
+    fps: Option<u8>,
     /// Device key file (default: %APPDATA%\remote-control\device.key); the
     /// session signs its proof with it, unless --proof-stdin.
     #[arg(long)]
@@ -86,7 +89,8 @@ pub struct ViewArgs {
     /// `move X Y` and `click X Y` (fractions of the picture), `keys SCAN...`
     /// (hex scan codes, pressed in order, released in reverse), `sas`,
     /// `monitor next|prev|N` (N from 1, may be out of range), `probe` (as --probe, now),
-    /// `shot FILE.bmp` (save the picture shown now, half size).
+    /// `shot FILE.bmp` (save the picture shown now, half size), `picture res|fps|mbps V`
+    /// (as the 画面 menu, see `picture_line`).
     #[arg(long)]
     script: Option<PathBuf>,
     /// The keyboard hook also takes injected keys marked as test keys, and
@@ -205,11 +209,12 @@ fn run_inner(a: &ViewArgs) -> Result<()> {
     let t_start = Instant::now();
     crate::term::set_session(a.id, &a.name.clone().unwrap_or_else(|| a.id.fmt_short().to_string()));
     status("connecting");
-    // Whether HEVC decodes here, found out while connecting.
-    let hevc = std::thread::spawn(|| {
+    // Whether HEVC (and its 4:4:4) decodes here, found out while connecting.
+    let hevc = std::thread::spawn(|| -> Result<u8> {
         mf::init_thread()?;
         let gpu = Gpu::default_adapter()?;
-        Decoder::available(&gpu.device, Codec::Hevc)
+        Decoder::available(&gpu.device, Codec::Hevc)?;
+        Ok(CAN_HEVC | if Decoder::can_444(&gpu.device) { CAN_HEVC444 } else { 0 })
     });
     let (secret, proof) = session_key(a)?;
     crate::cc::set_pacing_gain(a.floor_pacing);
@@ -235,7 +240,7 @@ fn run_inner(a: &ViewArgs) -> Result<()> {
     };
     let r = connected.and_then(|conn| {
         let caps = match hevc.join() {
-            Ok(Ok(())) => CAN_HEVC,
+            Ok(Ok(caps)) => caps,
             Ok(Err(e)) => {
                 log!("no HEVC decoding here ({e:#}); asking for H.264");
                 0
@@ -292,7 +297,11 @@ fn run_connected(
     let (info_tx, info_rx) = std::sync::mpsc::channel::<(u32, u32, String)>();
     let closed = |what: &str, e: &dyn std::fmt::Display| anyhow!("{}", refusal(&conn).unwrap_or_else(|| format!("{what}: {e:#}")));
     let (mut send, mut recv) = rt.block_on(conn.open_bi()).map_err(|e| closed("open control stream", &e))?;
-    let hello = Msg::Hello { max_kbps: (a.mbps * 1000.0) as u32, fps: a.fps, caps, proof };
+    let (choice, quality) = crate::quality::start(&a.id.to_string(), a.fps, a.mbps);
+    crate::quality::connect(ctrl_tx.clone());
+    // Hosts before the 画面 menu read only the first two: 自动 was their 20 Mbps.
+    let old_kbps = if choice.mbps == 0 { 20_000 } else { choice.mbps as u32 * 1000 };
+    let hello = Msg::Hello { max_kbps: old_kbps, fps: choice.fps, caps, proof, quality: Some(quality) };
     rt.block_on(send.write_all(&hello.encode())).map_err(|e| closed("send hello", &e))?;
     rt.spawn(async move {
         while let Some(m) = ctrl_rx.recv().await {
@@ -317,7 +326,16 @@ fn run_connected(
             while let Ok(m) = read_msg(&mut recv).await {
                 *sh.last_heard.lock().unwrap() = Instant::now();
                 match m {
-                    Msg::Info { width, height, encoder } => {
+                    Msg::Info { width, height, encoder, streaming } => {
+                        if let Some(s) = streaming {
+                            log!(
+                                "host streams {width}x{height} at up to {} fps and {:.1} Mbps, {}",
+                                s.fps,
+                                s.max_kbps as f64 / 1000.0,
+                                if s.yuv444 { "4:4:4" } else if s.can444 { "4:2:0 (4:4:4 on offer)" } else { "4:2:0" }
+                            );
+                        }
+                        crate::quality::set_streaming((width as u32, height as u32), streaming);
                         let _ = info_tx.send((width as u32, height as u32, encoder));
                     }
                     Msg::Stats(s) => *sh.host.lock().unwrap() = Some(s),
@@ -530,7 +548,7 @@ fn render_loop(sh: &Shared, frames: Receiver<Delivered>, hwnd: HWND) -> Result<(
     let gpu = Gpu::default_adapter()?;
     let mut pres = Presenter::new(&gpu, hwnd)?;
     log!("decoding on {}", gpu.name);
-    let mut dec: Option<(Decoder, (u32, u32), Codec)> = None;
+    let mut dec: Option<(Decoder, (u32, u32), Codec, bool)> = None;
     let mut last: Option<(Picture, (u32, u32))> = None;
     let mut last_shown: Option<Instant> = None;
     while !sh.quit.load(Ordering::Relaxed) {
@@ -560,11 +578,11 @@ fn render_loop(sh: &Shared, frames: Receiver<Delivered>, hwnd: HWND) -> Result<(
         for f in batch {
             let size = (f.header.width as u32, f.header.height as u32);
             let codec = if f.header.hevc { Codec::Hevc } else { Codec::H264 };
-            if dec.as_ref().is_none_or(|d| d.1 != size || d.2 != codec) {
+            if dec.as_ref().is_none_or(|d| d.1 != size || d.2 != codec || d.3 != f.header.yuv444) {
                 if !f.header.key {
                     continue;
                 }
-                dec = Some((Decoder::new(&gpu.device, size.0, size.1, codec)?, size, codec));
+                dec = Some((Decoder::new(&gpu.device, size.0, size.1, codec)?, size, codec, f.header.yuv444));
                 if last.as_ref().is_some_and(|l| l.1 != size) {
                     log!("stream now {}x{}", size.0, size.1);
                 }
@@ -792,6 +810,29 @@ async fn script_loop(sh: &Shared, path: &std::path::Path) {
     }
 }
 
+/// `picture res auto|native|1440|1080|720`, `picture fps N`, `picture mbps N`
+/// (0 = 自动), `picture sharp on|off`: as a click in the 画面 menu.
+fn picture_line(f: &[&str]) -> bool {
+    use crate::quality::{self, Res};
+    let res = match f.get(1).copied() {
+        Some("auto") => Some(Res::Auto),
+        Some("native") => Some(Res::Native),
+        Some(v) => v.parse().ok().filter(|&v| v >= 240).map(Res::Short),
+        None => None,
+    };
+    let num = f.get(1).and_then(|v| v.parse::<u16>().ok());
+    match (f.first().copied(), res, num) {
+        (Some("res"), Some(r), _) => quality::choose(|c| c.res = r),
+        (Some("fps"), _, Some(n)) if (1..=255).contains(&n) => quality::choose(|c| c.fps = n as u8),
+        (Some("mbps"), _, Some(n)) => quality::choose(|c| c.mbps = n),
+        (Some("sharp"), _, _) if matches!(f.get(1).copied(), Some("on" | "off")) => {
+            quality::choose(|c| c.sharp = f[1] == "on")
+        }
+        _ => return false,
+    }
+    true
+}
+
 async fn script_line(sh: &Shared, line: &str) {
     let f: Vec<&str> = line.split_whitespace().collect();
     let pos = |i: usize| f.get(i)?.parse::<f64>().ok().map(|v| (v.clamp(0.0, 1.0) * 65535.0).round() as u16);
@@ -850,6 +891,7 @@ async fn script_line(sh: &Shared, line: &str) {
             run_probe(sh).await;
             true
         }
+        Some("picture") => picture_line(&f[1..]),
         _ => false,
     };
     log!("script: {line}{}", if ok { "" } else { " (not understood)" });

@@ -270,7 +270,7 @@ mod tests {
 
     fn frame(key: bool) -> Delivered {
         Delivered {
-            header: FrameHeader { key, hevc: false, width: 64, height: 64, host_us: 0 },
+            header: FrameHeader { key, hevc: false, yuv444: false, width: 64, height: 64, host_us: 0 },
             data: vec![],
             complete_at: Instant::now(),
             frame: 0,

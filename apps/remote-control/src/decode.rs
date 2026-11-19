@@ -5,11 +5,18 @@
 use anyhow::{Context, Result, bail};
 use windows::{
     Win32::{
-        Graphics::Direct3D11::{ID3D11Device, ID3D11Texture2D},
+        Graphics::{
+            Direct3D11::{
+                D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE, D3D11_VIDEO_PROCESSOR_CONTENT_DESC,
+                D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_INPUT, D3D11_VIDEO_USAGE_OPTIMAL_SPEED, ID3D11Device,
+                ID3D11Texture2D, ID3D11VideoDevice,
+            },
+            Dxgi::Common::{DXGI_FORMAT_AYUV, DXGI_RATIONAL},
+        },
         Media::MediaFoundation::*,
         System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance},
     },
-    core::Interface,
+    core::{GUID, Interface},
 };
 
 use crate::mf::{self, Codec, pack};
@@ -62,13 +69,43 @@ impl Decoder {
         Decoder::new(device, 1920, 1080, codec).map(drop)
     }
 
+    /// Whether the graphics card decodes HEVC Main 4:4:4 into AYUV and its
+    /// video processor draws AYUV (the HEVC decoder itself must be there too).
+    pub fn can_444(device: &ID3D11Device) -> bool {
+        const HEVC_MAIN_444: GUID = GUID::from_u128(0x4008018f_f537_4b36_98cf_61af8a2c1a33);
+        unsafe {
+            let Ok(vd) = device.cast::<ID3D11VideoDevice>() else { return false };
+            let has = (0..vd.GetVideoDecoderProfileCount()).any(|i| vd.GetVideoDecoderProfile(i).is_ok_and(|g| g == HEVC_MAIN_444));
+            if !has || !vd.CheckVideoDecoderFormat(&HEVC_MAIN_444, DXGI_FORMAT_AYUV).is_ok_and(|b| b.as_bool()) {
+                return false;
+            }
+            let rate = DXGI_RATIONAL { Numerator: 60, Denominator: 1 };
+            let desc = D3D11_VIDEO_PROCESSOR_CONTENT_DESC {
+                InputFrameFormat: D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
+                InputFrameRate: rate,
+                InputWidth: 1920,
+                InputHeight: 1080,
+                OutputFrameRate: rate,
+                OutputWidth: 1920,
+                OutputHeight: 1080,
+                Usage: D3D11_VIDEO_USAGE_OPTIMAL_SPEED,
+            };
+            let Ok(en) = vd.CreateVideoProcessorEnumerator(&desc) else { return false };
+            en.CheckVideoProcessorFormat(DXGI_FORMAT_AYUV)
+                .is_ok_and(|f| f & D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_INPUT.0 as u32 != 0)
+        }
+    }
+
+    /// NV12 for 4:2:0 streams; a 4:4:4 stream (HEVC Main 4:4:4) offers no
+    /// NV12 once its first frame is parsed, and comes out as AYUV.
     fn pick_output(&mut self) -> Result<()> {
         unsafe {
-            let t = (0..)
-                .map_while(|i| self.mft.GetOutputAvailableType(0, i).ok())
-                .find(|t| mf::subtype(t) == Some(MFVideoFormat_NV12))
-                .context("decoder has no NV12 output")?;
-            self.mft.SetOutputType(0, &t, 0).context("decoder SetOutputType")?;
+            let types: Vec<IMFMediaType> = (0..).map_while(|i| self.mft.GetOutputAvailableType(0, i).ok()).collect();
+            let t = [MFVideoFormat_NV12, MFVideoFormat_AYUV]
+                .iter()
+                .find_map(|f| types.iter().find(|t| mf::subtype(t) == Some(*f)))
+                .context("decoder has no NV12 or AYUV output")?;
+            self.mft.SetOutputType(0, t, 0).context("decoder SetOutputType")?;
             if let Ok(v) = t.GetUINT64(&MF_MT_FRAME_SIZE) {
                 self.size = ((v >> 32) as u32, v as u32);
             }

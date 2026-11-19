@@ -28,7 +28,7 @@ use crate::{
     mf::Codec,
     net,
     pipeline::{self, PipeConfig, PipeShared},
-    proto::{CAN_HEVC, HINT_NO_DISPLAY, HINT_NO_SAS, HINT_NONE, Msg, read_msg},
+    proto::{CAN_HEVC, CAN_HEVC444, HINT_NO_DISPLAY, HINT_NO_SAS, HINT_NONE, Msg, Quality, read_msg},
     video_tx::VideoTx,
 };
 
@@ -38,11 +38,13 @@ pub struct HostArgs {
     /// for tests): put in the device list as "my computer".
     #[arg(long)]
     pub allow: Vec<EndpointId>,
-    #[arg(long, default_value_t = 60)]
+    /// Highest frame rate to send; the viewer chooses below it (and below the
+    /// display's refresh rate).
+    #[arg(long, default_value_t = 240)]
     fps: u32,
-    /// Highest video bitrate.
-    #[arg(long, default_value_t = 20.0)]
-    mbps: f64,
+    /// Highest video bitrate in Mbit/s; default: what the viewer chose.
+    #[arg(long)]
+    mbps: Option<f64>,
     /// Scale the picture down to this width before encoding (0 = native).
     #[arg(long, default_value_t = 0)]
     max_width: u32,
@@ -103,8 +105,8 @@ impl HostArgs {
 
     pub fn pipe_config(&self) -> PipeConfig {
         PipeConfig {
-            fps: self.fps.clamp(1, 240),
-            max_bps: (self.mbps * 1e6) as u32,
+            max_fps: self.fps.clamp(1, 240),
+            max_bps: self.mbps.map(|m| (m.clamp(1.0, 1000.0) * 1e6) as u32),
             max_width: self.max_width,
             enc: EncOptions {
                 codec: Codec::H264,
@@ -113,9 +115,11 @@ impl HostArgs {
                 layers_hint: !self.no_hints,
                 scenario_hint: !self.no_hints,
                 qp_control: false,
+                yuv444: false,
             },
             shrink: self.shrink,
             hevc: self.codec == "auto",
+            viewer444: false,
         }
     }
 }
@@ -155,6 +159,15 @@ pub struct Hello {
     pub max_kbps: u32,
     pub fps: u8,
     pub caps: u8,
+    /// None from viewers before the 画面 menu: then `max_kbps` and `fps` hold.
+    pub quality: Option<Quality>,
+}
+
+impl Hello {
+    /// What the viewer wants the picture to be.
+    fn quality(&self) -> Quality {
+        self.quality.unwrap_or(Quality { fit_w: 0, fit_h: 0, short: 0, fps: self.fps, kbps: self.max_kbps, yuv444: false })
+    }
 }
 
 /// Streams to an admitted viewer until either side ends the session.
@@ -167,13 +180,10 @@ pub async fn session(conn: Connection, send: SendStream, mut recv: RecvStream, h
 }
 
 async fn stream(conn: &Connection, mut send: SendStream, recv: &mut RecvStream, hello: Hello, cfg: PipeConfig) -> Result<()> {
-    let cfg = PipeConfig {
-        fps: cfg.fps.min(hello.fps.max(1) as u32),
-        max_bps: cfg.max_bps.min(hello.max_kbps.saturating_mul(1000).max(1_000_000)),
-        hevc: cfg.hevc && hello.caps & CAN_HEVC != 0,
-        ..cfg
-    };
-    let tx = VideoTx::start(conn.clone(), cfg.fps, 1.5e6_f64.min(cfg.max_bps as f64), cfg.max_bps as f64);
+    let hevc = cfg.hevc && hello.caps & CAN_HEVC != 0;
+    let cfg = PipeConfig { hevc, viewer444: hevc && hello.caps & CAN_HEVC444 != 0, ..cfg };
+    // The capture loop sets the real rate and highest bitrate before the first frame.
+    let tx = VideoTx::start(conn.clone(), 60, 20e6);
     let (wtx, mut wrx) = mpsc::unbounded_channel::<Msg>();
     tokio::spawn(async move {
         while let Some(m) = wrx.recv().await {
@@ -183,13 +193,14 @@ async fn stream(conn: &Connection, mut send: SendStream, recv: &mut RecvStream, 
         }
     });
     let sh = Arc::new(PipeShared::default());
+    *sh.quality.lock().unwrap() = hello.quality();
     let pipe = {
         let (tx, sh, info) = (tx.clone(), sh.clone(), wtx.clone());
         std::thread::Builder::new().name("capture".into()).spawn(move || pipeline::run(cfg, tx, sh, info))?
     };
     {
         let (out, sh) = (wtx.clone(), sh.clone());
-        std::thread::Builder::new().name("cursor".into()).spawn(move || cursor::watch(out, sh, cfg.max_width))?;
+        std::thread::Builder::new().name("cursor".into()).spawn(move || cursor::watch(out, sh))?;
     }
     let clip = match ClipSync::start(conn, wtx.clone(), true) {
         Ok(c) => Some(c),
@@ -304,6 +315,14 @@ async fn control_loop(
             Msg::Key { scan, down } => inj.key(scan, down),
             Msg::ReleaseAll => inj.release_all(),
             Msg::RequestKeyframe => sh.want_key.store(true, Ordering::Relaxed),
+            Msg::Quality(q) => {
+                let mut cur = sh.quality.lock().unwrap();
+                if *cur != q {
+                    log!("viewer wants the picture {q:?}");
+                    *cur = q;
+                    sh.quality_changed.store(true, Ordering::Relaxed);
+                }
+            }
             Msg::SelectMonitor { index } => match crate::monitors::select(&sh.monitors, index) {
                 // The capture loop reopens and sends the new list itself.
                 Ok(true) => log!("viewer picked display {}", index as u32 + 1),

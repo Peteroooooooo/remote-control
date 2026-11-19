@@ -6,7 +6,7 @@ use std::{
     collections::HashMap,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -85,33 +85,50 @@ struct State {
 pub struct VideoTx {
     conn: Connection,
     st: Mutex<State>,
-    fps: u32,
+    /// Frames per second the encoder runs at now (see `configure`).
+    fps: Arc<AtomicU32>,
     pacer: mpsc::UnboundedSender<Vec<Bytes>>,
     /// Encoded frames are dropped instead of sent (see `host::watch_path`).
     pub paused: AtomicBool,
 }
 
+/// Lowest bitrate the rate controller goes down to (when the highest allows).
+const MIN_BPS: f64 = 1.5e6;
+
 impl VideoTx {
     /// Starts the pacing, feedback and rate-control tasks on the current runtime.
-    pub fn start(conn: Connection, fps: u32, min_bps: f64, max_bps: f64) -> Arc<Self> {
+    pub fn start(conn: Connection, fps: u32, max_bps: f64) -> Arc<Self> {
         let (ptx, prx) = mpsc::unbounded_channel();
+        let fps = Arc::new(AtomicU32::new(fps.max(1)));
         let tx = Arc::new(VideoTx {
             conn: conn.clone(),
             st: Mutex::new(State {
-                rc: RateController::new(RateConfig::new(min_bps, max_bps), Instant::now()),
+                rc: RateController::new(RateConfig::new(MIN_BPS.min(max_bps), max_bps), Instant::now()),
                 in_flight: HashMap::new(),
                 frame: 0,
                 sec: Second::default(),
                 own_backlog_until: None,
             }),
-            fps,
+            fps: fps.clone(),
             pacer: ptx,
             paused: AtomicBool::new(false),
         });
-        tokio::spawn(pace(conn, prx, Duration::from_secs_f64(PACE_SHARE / fps as f64)));
+        tokio::spawn(pace(conn, prx, fps));
         tokio::spawn(tx.clone().read_feedback());
         tokio::spawn(tx.clone().control());
         tx
+    }
+
+    /// The picture the capture loop streams from now on: its frame rate and
+    /// highest bitrate. Before the first frame the rate starts at the highest.
+    pub fn configure(&self, fps: u32, max_bps: f64) {
+        self.fps.store(fps.max(1), Ordering::Relaxed);
+        let mut s = self.st.lock().unwrap();
+        if s.frame == 0 {
+            s.rc = RateController::new(RateConfig::new(MIN_BPS.min(max_bps), max_bps), Instant::now());
+        } else {
+            s.rc.set_max(max_bps);
+        }
     }
 
     /// Call when a new screen image is ready, before encoding it.
@@ -123,7 +140,7 @@ impl VideoTx {
         let mut s = self.st.lock().unwrap();
         let chosen = s.rc.bitrate();
         let bits = encoder_bps as f64;
-        let normal = ((bits / 8.0 / self.fps as f64) as usize).max(1);
+        let normal = ((bits / 8.0 / self.fps.load(Ordering::Relaxed) as f64) as usize).max(1);
         let queued = SEND_BUFFER.saturating_sub(self.conn.datagram_send_buffer_space());
         s.sec.queued_max = s.sec.queued_max.max(queued);
         let link_signal = s.own_backlog_until.is_none_or(|t| Instant::now() >= t);
@@ -283,8 +300,9 @@ fn pct(ratio: f64) -> u16 {
 }
 
 /// Spreads each frame's datagrams over a quarter of the frame interval.
-async fn pace(conn: Connection, mut rx: mpsc::UnboundedReceiver<Vec<Bytes>>, spread: Duration) {
+async fn pace(conn: Connection, mut rx: mpsc::UnboundedReceiver<Vec<Bytes>>, fps: Arc<AtomicU32>) {
     while let Some(packets) = rx.recv().await {
+        let spread = Duration::from_secs_f64(PACE_SHARE / fps.load(Ordering::Relaxed).max(1) as f64);
         let plan = pacer::plan(packets.len(), spread, PACE_GAP);
         let start = tokio::time::Instant::now();
         let mut it = packets.into_iter();
