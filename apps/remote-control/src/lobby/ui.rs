@@ -217,6 +217,9 @@ pub fn run(b: Backend, hidden: bool) -> anyhow::Result<()> {
                 theme::frame(hwnd, theme::CHROME);
                 theme::set_icon(hwnd);
                 super::tray::set_window(hwnd);
+                if hidden {
+                    super::tray::start_hidden(hwnd);
+                }
             }
             let ctx = cc.egui_ctx.clone();
             b.on_change(move || ctx.request_repaint());

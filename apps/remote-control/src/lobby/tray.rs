@@ -10,6 +10,7 @@ use std::sync::{
 use windows::{
     Win32::{
         Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM},
+        Graphics::Dwm::{DWMWA_CLOAK, DwmSetWindowAttribute},
         System::LibraryLoader::GetModuleHandleW,
         UI::{
             Shell::{
@@ -19,6 +20,7 @@ use windows::{
             WindowsAndMessaging::{
                 AllowSetForegroundWindow, AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu,
                 DispatchMessageW, FindWindowW, GetCursorPos, GetMessageW, GetSystemMetrics, HICON, IMAGE_ICON, IsIconic,
+                IsWindowVisible,
                 LR_DEFAULTCOLOR, LoadImageW, MF_SEPARATOR, MF_STRING, MSG, PostMessageW, RegisterClassW,
                 RegisterWindowMessageW, SM_CXSMICON, SM_CYSMICON, SW_HIDE, SW_RESTORE, SW_SHOW, SetForegroundWindow,
                 ShowWindow, TPM_BOTTOMALIGN, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WINDOW_EX_STYLE,
@@ -26,7 +28,7 @@ use windows::{
             },
         },
     },
-    core::{HSTRING, PCWSTR, w},
+    core::{BOOL, HSTRING, PCWSTR, w},
 };
 
 const CLASS: PCWSTR = w!("remote-control-tray");
@@ -60,8 +62,45 @@ fn window() -> Option<HWND> {
     (h != 0).then_some(HWND(h as *mut _))
 }
 
+/// Started in the tray: eframe shows the window once it has drawn the first
+/// frame anyway. Until then it is cloaked (drawn, never seen), then hidden.
+static START_HIDDEN: AtomicBool = AtomicBool::new(false);
+
+fn cloak(h: HWND, on: bool) {
+    let v: BOOL = on.into();
+    let _ = unsafe { DwmSetWindowAttribute(h, DWMWA_CLOAK, &v as *const BOOL as *const _, size_of::<BOOL>() as u32) };
+}
+
+/// The window starts in the tray: call it before the window is first shown.
+pub fn start_hidden(hwnd: HWND) {
+    cloak(hwnd, true);
+    START_HIDDEN.store(true, Ordering::SeqCst);
+    let raw = hwnd.0 as isize;
+    std::thread::spawn(move || {
+        let h = HWND(raw as *mut _);
+        for _ in 0..500 {
+            if !START_HIDDEN.load(Ordering::SeqCst) || unsafe { IsWindowVisible(h) }.as_bool() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        // Not when the icon has opened the window meanwhile.
+        if START_HIDDEN.swap(false, Ordering::SeqCst) {
+            unsafe {
+                let _ = ShowWindow(h, SW_HIDE);
+            }
+            cloak(h, false);
+        }
+    });
+}
+
 /// Shows the lobby window in front, and tells the backend.
 pub fn show() {
+    if START_HIDDEN.swap(false, Ordering::SeqCst)
+        && let Some(h) = window()
+    {
+        cloak(h, false);
+    }
     if let Some(h) = window() {
         unsafe {
             let _ = ShowWindow(h, if IsIconic(h).as_bool() { SW_RESTORE } else { SW_SHOW });
