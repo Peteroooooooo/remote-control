@@ -441,7 +441,9 @@ fn resolve(text: &str, service: bool) -> Result<PathBuf> {
 async fn serve_put(open: Open, out: Sender<Frame>, mut recv: RecvStream, service: bool) -> Result<()> {
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Frame>(64);
     let job = tokio::task::spawn_blocking(move || {
-        term_proc::as_user(service, || recv_tree(&resolve(&open.text, service)?, &mut rx)).and_then(|r| r)
+        // Resolved before impersonating: as the user, the console user's token cannot be read.
+        let path = resolve(&open.text, service)?;
+        term_proc::as_user(service, || recv_tree(&path, &mut rx)).and_then(|r| r)
     });
     while let Ok(Some(f)) = read_frame(&mut recv).await {
         let end = f.0 == END;
@@ -460,7 +462,8 @@ async fn serve_put(open: Open, out: Sender<Frame>, mut recv: RecvStream, service
 async fn serve_get(open: Open, out: Sender<Frame>, service: bool) -> Result<()> {
     let tx = out.clone();
     let r = tokio::task::spawn_blocking(move || {
-        term_proc::as_user(service, || send_tree(&resolve(&open.text, service)?, &tx)).and_then(|r| r)
+        let path = resolve(&open.text, service)?;
+        term_proc::as_user(service, || send_tree(&path, &tx)).and_then(|r| r)
     })
     .await?;
     if let Err(e) = r {
