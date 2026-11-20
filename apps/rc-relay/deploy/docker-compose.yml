@@ -5,7 +5,7 @@
 #   docker build -f apps/rc-relay/Dockerfile -t ghcr.io/peteroooooooo/rc-relay:latest .
 #
 # First start: `docker logs rc-relay` shows the relay code to paste into
-# the app (设置 -> 自建中转). Manage codes & devices: `docker exec -it rc-relay rc-relay`.
+# the app (设置 -> 自建中转). Manage codes & devices: `docker exec -it rc-relay ui`.
 
 services:
   rc-relay:

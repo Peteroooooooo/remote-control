@@ -118,7 +118,7 @@ pub fn run(cfg: &Config, demo: bool) -> Result<()> {
     };
     app.reload()?;
     if !std::io::IsTerminal::is_terminal(&std::io::stdout()) {
-        bail!("管理界面需要一个终端（docker exec -it rc-relay rc-relay）；只看文字用 rc-relay codes");
+        bail!("管理界面需要一个终端（docker exec -it rc-relay ui）；只看文字用 rc-relay codes");
     }
     let mut term = ratatui::try_init().context("打开全屏界面")?;
     let r = app.main_loop(&mut term);

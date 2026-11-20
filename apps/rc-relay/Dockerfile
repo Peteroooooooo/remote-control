@@ -20,7 +20,8 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --uid 10001 --home-dir /var/lib/rc-relay rc-relay \
     && mkdir -p /var/lib/rc-relay \
-    && chown rc-relay /var/lib/rc-relay
+    && chown rc-relay /var/lib/rc-relay \
+    && ln -s /usr/local/bin/rc-relay /usr/local/bin/ui
 COPY --from=build /rc-relay /usr/local/bin/rc-relay
 ENV LANG=C.UTF-8
 USER rc-relay
