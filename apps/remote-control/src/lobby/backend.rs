@@ -271,6 +271,13 @@ impl Sh {
         }
     }
 
+    fn stop_local_handoff(&self) {
+        let old = std::mem::replace(&mut *self.mode.lock().unwrap(), Mode::Off);
+        if let Mode::Local(n) = old {
+            self.rt.block_on(n.stop_for_handoff());
+        }
+    }
+
     /// What the node knows this window by (`snapshot`, `lobby-closed`): the
     /// process and the showing.
     fn window_id(&self) -> String {
@@ -317,7 +324,7 @@ impl Sh {
                 match (running, mode) {
                     (true, 0) => {
                         log!("lobby: the service runs now: it takes over");
-                        self.stop_local();
+                        self.stop_local_handoff();
                         *self.mode.lock().unwrap() = Mode::Remote;
                     }
                     (true, 2) => *self.mode.lock().unwrap() = Mode::Remote,
@@ -529,7 +536,7 @@ impl Backend {
             if install {
                 // The service goes online with this computer's device key: this
                 // process must be offline first.
-                sh.stop_local();
+                sh.stop_local_handoff();
             }
             let update = install && install::service_running().is_some();
             let r = run_elevated(install, &sh.key);

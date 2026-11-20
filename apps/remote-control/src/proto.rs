@@ -4,7 +4,8 @@
 //! Control stream (reliable, opened by the viewer): each message is
 //! `u32 length` + `u8 type` + body, where length counts the type byte and body.
 //! Type numbers: 1-19 core, 20-29 clipboard, 30-39 cursor, 40-49 keyboard,
-//! 50-59 service mode, 60-69 meeting (on its own ALPN, see `meet`), 70-79 displays.
+//! 50-59 service mode, 60-69 meeting (on its own ALPN, see `meet`), 70-79 displays,
+//! 80-89 audio.
 
 use anyhow::{Result, bail};
 
@@ -20,6 +21,8 @@ pub const MAX_MSG: usize = 1 << 20;
 pub const STREAM_CLIPBOARD: u8 = 1;
 /// First byte of a bidirectional stream: a file of the other side's copied files (`clipfiles`).
 pub const STREAM_FILE: u8 = 2;
+/// First byte of a unidirectional stream: lossless PCM audio frames (`audio`).
+pub const STREAM_AUDIO: u8 = 3;
 
 /// Video payload header: flags, stream width, stream height, host time from
 /// the screen update to the encoded frame in microseconds.
@@ -71,6 +74,24 @@ pub struct Streaming {
     /// Both ends can do 4:4:4 (the menu offers it).
     pub can444: bool,
     pub yuv444: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AudioCfg {
+    pub enabled: bool,
+    /// 1 = mono, 2 = stereo.
+    pub channels: u8,
+    pub mute_host: bool,
+    /// false = Opus 48 kHz, true = Lossless 24-bit PCM at min(host, viewer) sample rate.
+    pub lossless: bool,
+    /// Viewer's output device native sample rate in Hz (0 = unspecified / no cap).
+    pub max_rate_hz: u32,
+}
+
+impl Default for AudioCfg {
+    fn default() -> Self {
+        Self { enabled: true, channels: 2, mute_host: false, lossless: false, max_rate_hz: 0 }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -218,6 +239,8 @@ pub enum Msg {
     /// Host -> viewer: why there is no picture now, or what did not work
     /// (`HINT_*`); `HINT_NONE` when the picture is back.
     Hint { what: u8 },
+    /// Viewer -> host: audio capture/mute preference.
+    Audio(AudioCfg),
 }
 
 pub const HINT_NONE: u8 = 0;
@@ -378,6 +401,7 @@ impl Msg {
             Msg::SelectMonitor { .. } => 71,
             Msg::Hint { .. } => 16,
             Msg::Quality(_) => 17,
+            Msg::Audio(_) => 80,
         }
     }
 
@@ -469,6 +493,13 @@ impl Msg {
             }
             Msg::SelectMonitor { index } | Msg::Hint { what: index } => {
                 w.u8(*index);
+            }
+            Msg::Audio(c) => {
+                w.u8(c.enabled as u8)
+                    .u8(c.channels.clamp(1, 2))
+                    .u8(c.mute_host as u8)
+                    .u8(c.lossless as u8)
+                    .u32(c.max_rate_hz);
             }
         }
         let len = (w.0.len() - 4) as u32;
@@ -579,6 +610,13 @@ impl Msg {
             }
             71 => Msg::SelectMonitor { index: r.u8()? },
             16 => Msg::Hint { what: r.u8()? },
+            80 => Msg::Audio(AudioCfg {
+                enabled: r.u8()? != 0,
+                channels: r.u8()?.clamp(1, 2),
+                mute_host: r.u8()? != 0,
+                lossless: r.u8().unwrap_or(0) != 0,
+                max_rate_hz: r.u32().unwrap_or(0),
+            }),
             t => bail!("unknown message type {t}"),
         })
     }
@@ -664,6 +702,8 @@ mod tests {
             },
             Msg::Monitors { list: vec![], current: 0 },
             Msg::SelectMonitor { index: 7 },
+            Msg::Audio(AudioCfg::default()),
+            Msg::Audio(AudioCfg { enabled: false, channels: 1, mute_host: true, lossless: true, max_rate_hz: 96_000 }),
         ];
         for m in all {
             let e = m.encode();

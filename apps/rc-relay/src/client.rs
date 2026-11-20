@@ -20,10 +20,14 @@ const TIMEOUT: Duration = Duration::from_secs(10);
 /// The head start of each address over the next one (Happy Eyeballs).
 const HEAD_START: Duration = Duration::from_millis(250);
 
-fn http(ca: &CaTlsConfig) -> Result<reqwest::Client> {
+fn http_with_timeout(ca: &CaTlsConfig, timeout: Duration) -> Result<reqwest::Client> {
     let tls = ca.client_config(iroh_relay::tls::default_provider()).context("TLS setup")?;
     // iroh reaches relays without the system proxy; these calls go the same way.
-    reqwest::Client::builder().tls_backend_preconfigured(tls).no_proxy().timeout(TIMEOUT).build().context("HTTP client")
+    reqwest::Client::builder().tls_backend_preconfigured(tls).no_proxy().timeout(timeout).build().context("HTTP client")
+}
+
+fn http(ca: &CaTlsConfig) -> Result<reqwest::Client> {
+    http_with_timeout(ca, TIMEOUT)
 }
 
 /// `relay` with `path` (its query, the certificate pin, stays).
@@ -257,6 +261,35 @@ pub async fn ping(relay: &[RelayUrl], ca: &CaTlsConfig) -> Result<RelayUrl> {
     Ok(race(relay, probe).await?.0)
 }
 
+/// Measures a warm HTTP `/ping` round-trip time against one of the relay's
+/// addresses (IPv6 first via `race`), using two sequential requests over the
+/// same keep-alive connection so TCP/TLS handshake and transparent proxy
+/// TCP-ack shortcuts do not skew the result.
+pub async fn ping_rtt(relay: &[RelayUrl], ca: &CaTlsConfig, timeout: Duration) -> Result<Duration> {
+    let client = http_with_timeout(ca, timeout)?;
+    let probe = |u: RelayUrl| {
+        let client = client.clone();
+        async move {
+            let target = api_url(&u, "/ping");
+            let r1 = client.get(&target).send().await.with_context(|| format!("{u}"))?;
+            if !r1.status().is_success() {
+                bail!("{u}: answered {}", r1.status());
+            }
+            let _ = r1.bytes().await.with_context(|| format!("{u}"))?;
+            let t0 = std::time::Instant::now();
+            let r2 = client.get(&target).send().await.with_context(|| format!("{u}"))?;
+            if !r2.status().is_success() {
+                bail!("{u}: answered {}", r2.status());
+            }
+            let _ = r2.bytes().await.with_context(|| format!("{u}"))?;
+            let rtt = t0.elapsed();
+            Ok(Ok(rtt))
+        }
+    };
+    let rtt = race(relay, probe).await?.1?;
+    Ok(rtt)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -309,5 +342,55 @@ mod tests {
         assert_eq!(r.unwrap_err(), Refusal::NotOwner);
         // Neither answers.
         assert!(race(&v, |_| async { Err::<Result<(), Refusal>, _>(anyhow!("down")) }).await.is_err());
+    }
+
+    #[test]
+    fn http_with_timeout_builds() {
+        assert!(http_with_timeout(&crate::tls::ca(), Duration::from_millis(500)).is_ok());
+    }
+
+    #[tokio::test]
+    async fn ping_rtt_empty_relay_errors() {
+        let err = ping_rtt(&[], &crate::tls::ca(), Duration::from_secs(1)).await;
+        assert!(err.is_err());
+    }
+
+    #[cfg(feature = "server")]
+    #[tokio::test]
+    async fn ping_rtt_loopback() {
+        use std::net::{Ipv4Addr, SocketAddr, TcpListener};
+
+        let dir = std::env::temp_dir().join(format!("rc-relay-ping-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let (relay, url) = {
+            let mut spawned = None;
+            for _ in 0..5 {
+                let port = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap().local_addr().unwrap().port();
+                let cfg = crate::config::Config {
+                    state_dir: dir.join("state"),
+                    http_bind_addr: "127.0.0.1:0".parse().unwrap(),
+                    enable_quic_addr_discovery: false,
+                    tls: crate::config::Tls {
+                        https_bind_addr: SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                };
+                let resolved = cfg.resolve(&["127.0.0.1".to_string()]).await.unwrap();
+                let url = resolved.urls[0].clone();
+                if let Ok(r) = crate::server::Relay::spawn(&cfg, resolved).await {
+                    spawned = Some((r, url));
+                    break;
+                }
+            }
+            spawned.expect("could not bind loopback relay")
+        };
+
+        let rtt = ping_rtt(std::slice::from_ref(&url), &crate::tls::ca(), Duration::from_secs(4)).await.unwrap();
+        assert!(rtt < Duration::from_secs(2), "unexpectedly slow loopback RTT: {rtt:?}");
+        drop(relay);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -2502,8 +2502,6 @@ checksum = "791930b43c0d5973160d90a8f3894509f2b273430f5c5c73b668636d0287c5c0"
 [[package]]
 name = "iroh"
 version = "1.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e3689cab508af9bcef7816c1201b403595ec6aa20e7d15e1f9683bb4be4a5b17"
 dependencies = [
  "backon",
  "blake3",
@@ -4653,6 +4651,7 @@ dependencies = [
  "rc-ident",
  "rc-relay",
  "rc-stream",
+ "rusty-opus",
  "tokio",
  "tracing-subscriber",
  "wgpu",
@@ -4892,6 +4891,12 @@ name = "rustversion"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
+
+[[package]]
+name = "rusty-opus"
+version = "1.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9e0955c164ddbc021a96621f850ea0cf893d78aaf61e76c19a5a27f063f9ce24"
 
 [[package]]
 name = "ryu"

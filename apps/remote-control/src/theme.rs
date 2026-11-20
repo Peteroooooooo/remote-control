@@ -10,7 +10,7 @@ use windows::{
         Foundation::{HWND, LPARAM, WPARAM},
         Graphics::Dwm::{
             DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR, DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE,
-            DWMWCP_ROUND, DWMWINDOWATTRIBUTE, DwmSetWindowAttribute,
+            DWMWCP_DEFAULT, DWMWCP_ROUND, DWMWINDOWATTRIBUTE, DwmSetWindowAttribute,
         },
         System::LibraryLoader::GetModuleHandleW,
         UI::{
@@ -56,6 +56,15 @@ pub fn frame(hwnd: HWND, caption: u32) {
     set(hwnd, DWMWA_CAPTION_COLOR, &rgb(caption));
     set(hwnd, DWMWA_BORDER_COLOR, &rgb(BORDER));
     set(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &DWMWCP_ROUND);
+}
+
+/// Corners as the system decides for the session window: round, except
+/// while the picture goes to the screen directly. A forced round corner makes
+/// the desktop compositor draw every frame instead (measured 2026-11-20 on a
+/// 120 Hz laptop: 15-20 ms from Present to the screen and 10% of frames never
+/// shown, against 5-11 ms and none).
+pub fn system_corners(hwnd: HWND) {
+    set(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &DWMWCP_DEFAULT);
 }
 
 /// The exe's icon resource (see build.rs).

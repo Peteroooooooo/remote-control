@@ -193,7 +193,10 @@ fn parse_setting(s: &str) -> Result<(&'static str, GUID, u64), String> {
 }
 
 fn probe(enc: &Encoder) {
-    let c = enc.codec_api();
+    let Some(c) = enc.codec_api() else {
+        log!("probe: {} is not a Media Foundation encoder (no ICodecAPI)", enc.name);
+        return;
+    };
     for (name, key) in PROPS {
         let (sup, modi) = mf::support(c, key);
         let val = mf::get_u64(c, key).map_or("-".into(), |v| format!("{v} (0x{v:x})"));
@@ -353,7 +356,7 @@ pub fn run(a: EncTestArgs) -> Result<()> {
         probe_444(&gpu);
         return Ok(());
     }
-    let mut cap = Capture::new(&gpu, &output)?;
+    let mut cap = Capture::dxgi(&gpu, &output)?;
     let (cw, ch) = (cap.width, cap.height);
     let (w, h) = encode_size(cw, ch, 0);
     let nv12 = nv12_texture(&gpu, w, h)?;
@@ -568,8 +571,11 @@ fn run_keys(
     let every = if a.key_every == 0 { 60 } else { a.key_every.max(8) };
     let budget = a.mbps * 1e6 / 8.0 / a.fps as f64;
     let mut dec = Decoder::new(&gpu.device, w, h, enc.format)?;
-    let restore: Vec<(GUID, Option<u64>)> =
-        a.key_settings.iter().map(|(_, k, _)| (*k, mf::get_u64(enc.codec_api(), k))).collect();
+    let restore: Vec<(GUID, Option<u64>)> = a
+        .key_settings
+        .iter()
+        .map(|(_, k, _)| (*k, enc.codec_api().and_then(|c| mf::get_u64(c, k))))
+        .collect();
     let mut set_failed = 0;
     let (mut st_src, mut st_dec) = (None, None);
     let mut pending: VecDeque<(u32, Option<Vec<u8>>)> = VecDeque::new();
@@ -583,8 +589,10 @@ fn run_keys(
         let forced = a.key_every > 0 && i > 0 && phase == 0;
         if forced {
             enc.request_key();
-            for (_, k, v) in &a.key_settings {
-                set_failed += mf::set_u32(enc.codec_api(), k, *v as u32).is_err() as u32;
+            if let Some(c) = enc.codec_api() {
+                for (_, k, v) in &a.key_settings {
+                    set_failed += mf::set_u32(c, k, *v as u32).is_err() as u32;
+                }
             }
         }
         conv.blt(&tex, 0, nv12, full)?;
@@ -594,9 +602,11 @@ fn run_keys(
         i += 1;
         let out = enc.encode(nv12, Duration::from_millis(200), None)?;
         if forced {
-            for (k, v) in &restore {
-                if let Some(v) = v {
-                    set_failed += mf::set_u32(enc.codec_api(), k, *v as u32).is_err() as u32;
+            if let Some(c) = enc.codec_api() {
+                for (k, v) in &restore {
+                    if let Some(v) = v {
+                        set_failed += mf::set_u32(c, k, *v as u32).is_err() as u32;
+                    }
                 }
             }
         }
@@ -752,17 +762,48 @@ fn run_yuv444(a: &EncTestArgs, gpu: &Gpu, cap: &Capture, (w, h): (u32, u32)) -> 
             .with_context(|| format!("{name}: the viewer's video processor"))?;
         let mut st = None;
         let px = luma(gpu, &shown, 0, w * 4, h, &mut st)?;
-        let mut out = vec![0u8; row * ch as usize];
-        for r in 0..ch as usize {
-            let line = &px[(y as usize + r) * w as usize * 4..];
-            for c in 0..cw as usize {
-                out[(ch as usize - 1 - r) * row + 3 * c..][..3].copy_from_slice(&line[(x as usize + c) * 4..][..3]);
+        write_bmp(&a.out.join(format!("{name}-shown.bmp")), cw, ch, &crop(&px, w, (x, y, cw, ch)))?;
+        // The viewer's shader against the video processor, at 1:1, shrunk and enlarged.
+        let mut shader = crate::torgb::ToRgb::new(gpu)?;
+        for (ow, oh) in [(w, h), (w * 3 / 4, h * 3 / 4), (w * 3 / 2, h * 3 / 2)] {
+            let full = RECT { left: 0, top: 0, right: ow as i32, bottom: oh as i32 };
+            let by_vp = bgra_texture(gpu, ow, oh)?;
+            Vp::new(gpu, (w, h), (ow, oh), vp::YUV_709, vp::RGB_FULL)?.blt(&p.tex, p.slice, &by_vp, full)?;
+            let by_shader = bgra_texture(gpu, ow, oh)?;
+            let mut rtv = None;
+            unsafe { gpu.device.CreateRenderTargetView(&by_shader, None, Some(&mut rtv))? };
+            shader.draw(gpu, &p, (w, h), rtv.as_ref().context("render target")?, full)?;
+            let va = luma(gpu, &by_vp, 0, ow * 4, oh, &mut None)?;
+            let sa = luma(gpu, &by_shader, 0, ow * 4, oh, &mut None)?;
+            let colour = |v: &[u8]| v.iter().enumerate().filter(|(i, _)| i % 4 != 3).map(|(_, &b)| b).collect::<Vec<u8>>();
+            let (va, sa) = (colour(&va), colour(&sa));
+            let diff: Vec<i32> = va.iter().zip(&sa).map(|(&p, &q)| (p as i32 - q as i32).abs()).collect();
+            log!(
+                "{name} shown {ow}x{oh}: shader against the video processor PSNR {:.1} dB, mean difference {:.2}, largest {}",
+                psnr(&va, &sa),
+                diff.iter().sum::<i32>() as f64 / diff.len().max(1) as f64,
+                diff.iter().max().unwrap_or(&0)
+            );
+            if ow == w {
+                write_bmp(&a.out.join(format!("{name}-shader.bmp")), cw, ch, &crop(&luma(gpu, &by_shader, 0, w * 4, h, &mut None)?, w, (x, y, cw, ch)))?;
             }
         }
-        write_bmp(&a.out.join(format!("{name}-shown.bmp")), cw, ch, &out)?;
     }
     log!("crops in {}", a.out.display());
     Ok(())
+}
+
+/// The `(x, y, w, h)` part of a BGRA picture `stride` pixels wide, as BMP rows (bottom up, BGR).
+fn crop(px: &[u8], stride: u32, (x, y, cw, ch): (u32, u32, u32, u32)) -> Vec<u8> {
+    let row = (cw as usize * 3).div_ceil(4) * 4;
+    let mut out = vec![0u8; row * ch as usize];
+    for r in 0..ch as usize {
+        let line = &px[(y as usize + r) * stride as usize * 4..];
+        for c in 0..cw as usize {
+            out[(ch as usize - 1 - r) * row + 3 * c..][..3].copy_from_slice(&line[(x as usize + c) * 4..][..3]);
+        }
+    }
+    out
 }
 
 fn bgra_texture(gpu: &Gpu, w: u32, h: u32) -> Result<ID3D11Texture2D> {
@@ -975,20 +1016,22 @@ fn run_churn(
             let Some(tex) = src.next(gpu, cap, &mut n)? else { continue };
             if i > 0 && i % every == 0 {
                 let r = if enc.bitrate == max { (max as f64 * a.churn_step) as u32 } else { max };
-                let c = enc.codec_api().clone();
-                let mean = || mf::set_u32(&c, &CODECAPI_AVEncCommonMeanBitRate, r).is_ok();
-                let buffer = || {
-                    let bits = (r as f64 / a.fps as f64 * a.vbv.unwrap_or(1.0)) as u32;
-                    mf::set_u32(&c, &CODECAPI_AVEncCommonBufferSize, bits).is_ok()
-                };
-                // The bitrate kept in `enc` only serves to alternate here.
-                let ok = match a.churn_what.as_str() {
-                    "both" => mean() && buffer(),
-                    "buffer" => buffer(),
-                    _ => mean(),
-                };
-                if ok {
-                    enc.bitrate = r;
+                if let Some(c) = enc.codec_api().cloned() {
+                    let mean = || mf::set_u32(&c, &CODECAPI_AVEncCommonMeanBitRate, r).is_ok();
+                    let buffer = || {
+                        let bits = (r as f64 / a.fps as f64 * a.vbv.unwrap_or(1.0)) as u32;
+                        mf::set_u32(&c, &CODECAPI_AVEncCommonBufferSize, bits).is_ok()
+                    };
+                    let ok = match a.churn_what.as_str() {
+                        "both" => mean() && buffer(),
+                        "buffer" => buffer(),
+                        _ => mean(),
+                    };
+                    if ok {
+                        enc.bitrate = r;
+                    }
+                } else {
+                    enc.set_bitrate(r);
                 }
                 changes += 1;
                 since_change = 0;

@@ -1,9 +1,12 @@
 //! remote-control: one exe that is both the viewer and the host. Without
 //! arguments it opens the lobby; the subcommands work without it.
 
+#![cfg_attr(not(test), windows_subsystem = "windows")]
+
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
+mod audio;
 mod capture;
 mod cc;
 mod cli;
@@ -33,12 +36,14 @@ mod mf;
 mod monitors;
 mod net;
 mod node;
+mod nv12;
 mod pipe;
 mod pipeline;
 mod power;
 mod present;
 mod proto;
 mod qprate;
+mod qsv;
 mod quality;
 mod service;
 mod snapshot;
@@ -48,12 +53,15 @@ mod term;
 mod term_proc;
 mod theme;
 mod toolbar;
+mod torgb;
 mod trace;
 mod video_rx;
 mod video_tx;
 mod view;
 mod vp;
+mod wgc;
 mod window;
+mod wlan;
 mod yuv444;
 
 /// `log!(...)`: one line on stdout with the seconds since start.
@@ -154,9 +162,61 @@ enum Cmd {
     /// the input desktop.
     #[command(hide = true)]
     Helper(host::HostArgs),
+    /// Started by the helper as the user: capture this display (`\\.\DISPLAY1`)
+    /// with the pointer left out, for the helper.
+    #[command(hide = true)]
+    CaptureAgent { device: String },
     /// Started by the helper as the user: print the copied files' paths.
     #[command(hide = true)]
     ClipFiles,
+    /// Started by the helper as the user: capture system audio for the helper.
+    #[command(hide = true)]
+    AudioAgent,
+}
+
+fn needs_parent_console() -> bool {
+    let mut args = std::env::args_os().skip(1);
+    let Some(first) = args.next() else {
+        return false;
+    };
+    let is_gui_or_bg = matches!(
+        first.to_str(),
+        Some("lobby" | "service" | "helper" | "capture-agent" | "clip-files" | "audio-agent")
+    );
+    if !is_gui_or_bg {
+        return true;
+    }
+    args.any(|a| a == "-h" || a == "--help" || a == "-V" || a == "--version")
+}
+
+/// Attaches to the caller's console (if any) for CLI invocations so interactive
+/// commands print to PowerShell/CMD while preserving any redirected/piped stdio.
+fn attach_parent_console() {
+    use windows::Win32::{
+        Foundation::HANDLE,
+        Storage::FileSystem::{FILE_TYPE_UNKNOWN, GetFileType},
+        System::Console::{
+            ATTACH_PARENT_PROCESS, AttachConsole, GetStdHandle, STD_ERROR_HANDLE, STD_HANDLE,
+            STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, SetStdHandle,
+        },
+    };
+    const HANDLES: [STD_HANDLE; 3] = [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE];
+    unsafe {
+        let saved: [Option<HANDLE>; 3] = HANDLES.map(|kind| {
+            let h = GetStdHandle(kind).ok()?;
+            (!h.is_invalid() && !h.0.is_null() && GetFileType(h) != FILE_TYPE_UNKNOWN).then_some(h)
+        });
+        if saved.iter().all(Option::is_some) {
+            return;
+        }
+        if AttachConsole(ATTACH_PARENT_PROCESS).is_ok() {
+            for (kind, h) in HANDLES.into_iter().zip(saved) {
+                if let Some(h) = h {
+                    let _ = SetStdHandle(kind, h);
+                }
+            }
+        }
+    }
 }
 
 fn setup_process() {
@@ -173,6 +233,9 @@ fn setup_process() {
 }
 
 fn main() -> Result<()> {
+    if needs_parent_console() {
+        attach_parent_console();
+    }
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into()),
@@ -233,7 +296,9 @@ fn main() -> Result<()> {
             }
             leave_after_goodbye(r)
         }
+        Cmd::CaptureAgent { device } => wgc::serve(&device),
         Cmd::ClipFiles => clipboard::print_copied_files(),
+        Cmd::AudioAgent => audio::agent::serve(),
     }
 }
 

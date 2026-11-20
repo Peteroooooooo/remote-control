@@ -6,7 +6,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc,
-        atomic::Ordering,
+        atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -20,6 +20,7 @@ use iroh::{
 use tokio::sync::mpsc;
 
 use crate::{
+    audio::agent::AudioHost,
     clipsync::ClipSync,
     cursor,
     encode::EncOptions,
@@ -185,14 +186,19 @@ async fn stream(conn: &Connection, mut send: SendStream, recv: &mut RecvStream, 
     let cfg = PipeConfig { hevc, viewer444: hevc && hello.caps & CAN_HEVC444 != 0, ..cfg };
     // The capture loop sets the real rate and highest bitrate before the first frame.
     let tx = VideoTx::start(conn.clone(), 60, 20e6);
+    let _ = send.set_priority(100);
     let (wtx, mut wrx) = mpsc::unbounded_channel::<Msg>();
-    tokio::spawn(async move {
-        while let Some(m) = wrx.recv().await {
-            if send.write_all(&m.encode()).await.is_err() {
-                break;
+    {
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            while let Some(m) = wrx.recv().await {
+                if send.write_all(&m.encode()).await.is_err() {
+                    break;
+                }
+                tx.notify_ctrl();
             }
-        }
-    });
+        });
+    }
     let sh = Arc::new(PipeShared::default());
     *sh.quality.lock().unwrap() = hello.quality();
     let pipe = {
@@ -203,7 +209,7 @@ async fn stream(conn: &Connection, mut send: SendStream, recv: &mut RecvStream, 
         let (out, sh) = (wtx.clone(), sh.clone());
         std::thread::Builder::new().name("cursor".into()).spawn(move || cursor::watch(out, sh))?;
     }
-    let clip = match ClipSync::start(conn, wtx.clone(), true, service) {
+    let clip = match ClipSync::start(conn, wtx.clone(), true, service, None) {
         Ok(c) => Some(c),
         Err(e) => {
             log!("clipboard sharing off: {e:#}");
@@ -223,9 +229,12 @@ async fn stream(conn: &Connection, mut send: SendStream, recv: &mut RecvStream, 
             }
         });
     }
-    tokio::spawn(watch_path(conn.clone(), tx.clone(), sh.clone(), wtx.clone()));
+    let audio_paused = Arc::new(AtomicBool::new(false));
+    let audio_host = AudioHost::start(conn.clone(), tokio::runtime::Handle::current(), audio_paused.clone());
+    tokio::spawn(watch_path(conn.clone(), tx.clone(), audio_paused, sh.clone(), wtx.clone()));
     tokio::spawn(watch_hint(conn.clone(), sh.clone(), wtx.clone()));
-    let result = control_loop(recv, &sh, &wtx, clip.as_deref()).await;
+    let result = control_loop(recv, &sh, &wtx, clip.as_deref(), &audio_host).await;
+    drop(audio_host);
     sh.stop.store(true, Ordering::Relaxed);
     let _ = tokio::task::spawn_blocking(move || pipe.join()).await;
     conn.close(0u32.into(), b"bye");
@@ -238,7 +247,13 @@ const PAUSE_LIMIT: Duration = Duration::from_secs(10);
 /// Video and input never go through a public relay: while the only way left
 /// is one, the picture pauses; if no direct way (or own relay) comes back
 /// within `PAUSE_LIMIT`, the session ends.
-async fn watch_path(conn: Connection, tx: Arc<VideoTx>, sh: Arc<PipeShared>, wtx: mpsc::UnboundedSender<Msg>) {
+async fn watch_path(
+    conn: Connection,
+    tx: Arc<VideoTx>,
+    audio_paused: Arc<AtomicBool>,
+    sh: Arc<PipeShared>,
+    wtx: mpsc::UnboundedSender<Msg>,
+) {
     let mut since: Option<Instant> = None;
     let mut tick = tokio::time::interval(Duration::from_millis(250));
     while conn.close_reason().is_none() {
@@ -250,6 +265,7 @@ async fn watch_path(conn: Connection, tx: Arc<VideoTx>, sh: Arc<PipeShared>, wtx
                 log!("only a public relay ({addr}) between us: picture paused");
                 since = Some(Instant::now());
                 tx.paused.store(true, Ordering::Relaxed);
+                audio_paused.store(true, Ordering::Relaxed);
                 let _ = wtx.send(Msg::Paused { on: true });
             }
             (true, Some(t)) if t.elapsed() > PAUSE_LIMIT => {
@@ -261,6 +277,7 @@ async fn watch_path(conn: Connection, tx: Arc<VideoTx>, sh: Arc<PipeShared>, wtx
                 log!("{} again after {:.1} s: picture goes on", kind.label(), t.elapsed().as_secs_f64());
                 since = None;
                 tx.paused.store(false, Ordering::Relaxed);
+                audio_paused.store(false, Ordering::Relaxed);
                 sh.want_key.store(true, Ordering::Relaxed);
                 let _ = wtx.send(Msg::Paused { on: false });
             }
@@ -301,6 +318,7 @@ async fn control_loop(
     sh: &PipeShared,
     wtx: &mpsc::UnboundedSender<Msg>,
     clip: Option<&ClipSync>,
+    audio_host: &AudioHost,
 ) -> Result<()> {
     let mut inj = Injector::new(*sh.display.lock().unwrap());
     let result = loop {
@@ -360,6 +378,7 @@ async fn control_loop(
                     c.on_offer(seq);
                 }
             }
+            Msg::Audio(cfg) => audio_host.configure(cfg),
             _ => {}
         }
     };

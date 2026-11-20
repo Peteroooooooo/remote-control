@@ -11,7 +11,7 @@ use std::{
     ffi::c_void,
     io::{Read, Write},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, OnceLock},
 };
 
 use anyhow::{Result, anyhow, bail};
@@ -537,6 +537,27 @@ async fn bye(conn: &Connection, ep: &iroh::Endpoint) {
     let _ = tokio::time::timeout(std::time::Duration::from_secs(1), ep.close()).await;
 }
 
+/// The connection the console handler ends.
+static ON_EXIT: OnceLock<(Connection, iroh::Endpoint, tokio::runtime::Handle)> = OnceLock::new();
+
+/// Closing the terminal window (or Ctrl+C on a command, signing out) ends the
+/// process without unwinding, so `bye` never runs and the host keeps the
+/// session, and its bar, until the idle timeout. The handler says goodbye
+/// first, then lets Windows end the process as before.
+fn bye_on_console_exit(conn: &Connection, ep: &iroh::Endpoint) {
+    unsafe extern "system" fn on_console(_ctrl: u32) -> windows::core::BOOL {
+        if let Some((conn, ep, rt)) = ON_EXIT.get() {
+            rt.block_on(bye(conn, ep));
+        }
+        false.into()
+    }
+    if ON_EXIT.set((conn.clone(), ep.clone(), tokio::runtime::Handle::current())).is_ok() {
+        unsafe {
+            let _ = windows::Win32::System::Console::SetConsoleCtrlHandler(Some(on_console), true);
+        }
+    }
+}
+
 /// Connects to `id` with a session key of its own (and the node's proof for it), as a session window does, and opens `open`.
 pub async fn connect(id: iroh::EndpointId, mut open: Open) -> Result<Session> {
     use std::time::Duration;
@@ -573,7 +594,8 @@ pub async fn connect(id: iroh::EndpointId, mut open: Open) -> Result<Session> {
         Ok(Err(e)) if !format!("{e:#}").contains("timed out") => bail!("连不上对方：{e:#}"),
         _ => bail!("连不上对方：没有回应（对方没开机、没联网、睡着了，或者找不到通路）"),
     };
-    let refused = |conn: &Connection, e: &dyn std::fmt::Display| match conn.close_reason() {
+    bye_on_console_exit(&conn, &ep);
+    let refused =|conn: &Connection, e: &dyn std::fmt::Display| match conn.close_reason() {
         Some(iroh::endpoint::ConnectionError::ApplicationClosed(c)) => anyhow!("{}", crate::view::close_text(c.error_code.into_inner() as u32)),
         _ => anyhow!("连接断开：{e}"),
     };
@@ -884,7 +906,13 @@ pub fn open_window(id: iroh::EndpointId, name: &str) -> Result<()> {
     let exe = std::env::current_exe()?;
     let id = id.to_string();
     let title = format!("{name} · 终端");
-    let wt = std::process::Command::new("wt.exe").args(["-w", "new", "new-tab", "--title", &title]).arg(&exe).args(["shell", &id]).spawn();
+    // A GUI-subsystem child does not receive ConPTY automatically; `cmd /c start /wait /b`
+    // hosts the ConPTY and waits while `remote-control shell` attaches to it.
+    let wt = std::process::Command::new("wt.exe")
+        .args(["-w", "new", "new-tab", "--title", &title, "cmd.exe", "/d", "/c", "start", "remote control", "/wait", "/b"])
+        .arg(&exe)
+        .args(["shell", &id])
+        .spawn();
     if wt.is_ok() {
         return Ok(());
     }
@@ -892,9 +920,40 @@ pub fn open_window(id: iroh::EndpointId, name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Ensures an interactive `shell` invocation has a console when launched from a
+/// GUI-subsystem parent (e.g. `CREATE_NEW_CONSOLE` without a parent console).
+/// Preserves redirected/piped stdio so non-interactive callers still get the
+/// `exec` guidance error instead of a stray console window.
+fn ensure_console() {
+    use windows::Win32::{
+        Storage::FileSystem::{FILE_TYPE_UNKNOWN, GetFileType},
+        System::Console::{
+            ATTACH_PARENT_PROCESS, AllocConsole, AttachConsole, GetConsoleWindow, GetStdHandle,
+            STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+        },
+    };
+    unsafe {
+        if !GetConsoleWindow().0.is_null() {
+            return;
+        }
+        let has_stdio = [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE].into_iter().any(|kind| {
+            GetStdHandle(kind)
+                .ok()
+                .is_some_and(|h| !h.is_invalid() && !h.0.is_null() && GetFileType(h) != FILE_TYPE_UNKNOWN)
+        });
+        if has_stdio {
+            return;
+        }
+        if AttachConsole(ATTACH_PARENT_PROCESS).is_err() {
+            let _ = AllocConsole();
+        }
+    }
+}
+
 /// `remote-control shell`: PowerShell there, in this console window. A
 /// failure stays on screen until a key, since the window closes after.
 pub fn shell(device: &str) -> Result<i32> {
+    ensure_console();
     let r = shell_inner(device);
     if let Err(e) = &r {
         eprintln!("\r\n{e:#}\r\n按回车关闭");

@@ -240,9 +240,7 @@ pub fn watch(out: UnboundedSender<Msg>, sh: Arc<PipeShared>) {
         if unsafe { GetCursorInfo(&mut ci) }.is_err() {
             continue;
         }
-        let showing = ci.flags.0 & CURSOR_SHOWING.0 != 0
-            && !ci.hCursor.is_invalid()
-            && !sh.pointer_in_image.load(Ordering::Relaxed);
+        let showing = ci.flags.0 & CURSOR_SHOWING.0 != 0 && !ci.hCursor.is_invalid();
         let key = (showing, if showing { ci.hCursor.0 as isize } else { 0 });
         if last == Some(key) {
             continue;

@@ -29,11 +29,15 @@ use crate::{
     stats::percentile,
 };
 
-/// A frame not acked within this time counts as failed.
+/// A frame not acked within this time, or within twice the path's round trip
+/// if that is longer, counts as failed. With a fixed 500 ms, every frame on a
+/// relay at 0.7-2 s round trip failed and its late ack was not counted as
+/// delivered, so the rate could only fall.
 const FRAME_TIMEOUT: Duration = Duration::from_millis(500);
 pub const REPORT_EVERY: Duration = Duration::from_millis(100);
 const PACE_GAP: Duration = Duration::from_millis(1);
-const PACE_SHARE: f64 = 0.25;
+const PACE_SHARE: f64 = 0.5;
+const PACE_MAX: Duration = Duration::from_millis(5);
 const MIN_PARITY: u16 = 2;
 const MAX_DATAGRAM: usize = 1400;
 
@@ -82,12 +86,27 @@ struct State {
     own_backlog_until: Option<Instant>,
 }
 
+/// A frame queued for the pacer task.
+struct PaceFrame {
+    packets: Vec<Bytes>,
+    bytes: usize,
+    link_bps: f64,
+    /// True when the path is a low-RTT direct LAN link (<10 ms) where QUIC's
+    /// internal microsecond BBR pacer handles normal frames with lower latency
+    /// than coarse 1 ms application-level sleeps.
+    fast_lan: bool,
+}
+
 pub struct VideoTx {
     conn: Connection,
     st: Mutex<State>,
     /// Frames per second the encoder runs at now (see `configure`).
     fps: Arc<AtomicU32>,
-    pacer: mpsc::UnboundedSender<Vec<Bytes>>,
+    pacer: mpsc::UnboundedSender<PaceFrame>,
+    /// Set by `host` whenever a control message is written so the datagram
+    /// pacer briefly lets `datagrams.outgoing` drain (in `noq-proto`,
+    /// DATAGRAM frames strictly preempt STREAM frames).
+    ctrl_pending: Arc<AtomicBool>,
     /// Encoded frames are dropped instead of sent (see `host::watch_path`).
     pub paused: AtomicBool,
 }
@@ -100,6 +119,7 @@ impl VideoTx {
     pub fn start(conn: Connection, fps: u32, max_bps: f64) -> Arc<Self> {
         let (ptx, prx) = mpsc::unbounded_channel();
         let fps = Arc::new(AtomicU32::new(fps.max(1)));
+        let ctrl_pending = Arc::new(AtomicBool::new(false));
         let tx = Arc::new(VideoTx {
             conn: conn.clone(),
             st: Mutex::new(State {
@@ -111,12 +131,19 @@ impl VideoTx {
             }),
             fps: fps.clone(),
             pacer: ptx,
+            ctrl_pending: ctrl_pending.clone(),
             paused: AtomicBool::new(false),
         });
-        tokio::spawn(pace(conn, prx, fps));
+        tokio::spawn(pace(conn, prx, fps, ctrl_pending));
         tokio::spawn(tx.clone().read_feedback());
         tokio::spawn(tx.clone().control());
         tx
+    }
+
+    /// Signals that a control stream message is queued and should not be
+    /// starved behind continuous video datagrams.
+    pub fn notify_ctrl(&self) {
+        self.ctrl_pending.store(true, Ordering::Release);
     }
 
     /// The picture the capture loop streams from now on: its frame rate and
@@ -174,7 +201,7 @@ impl VideoTx {
             return 0;
         }
         let max = self.conn.max_datagram_size().unwrap_or(1200).min(MAX_DATAGRAM);
-        let (f, packets) = {
+        let (f, packets, rate_bps) = {
             let mut s = self.st.lock().unwrap();
             let f = s.frame;
             s.frame = s.frame.wrapping_add(1);
@@ -196,9 +223,21 @@ impl VideoTx {
                 let key = crate::proto::FrameHeader::parse(payload).is_some_and(|(h, _)| h.key);
                 s.sec.big.push((payload.len(), budget, key));
             }
-            (f, packets)
+            (f, packets, s.rc.bitrate())
         };
-        let _ = self.pacer.send(packets.into_iter().map(Bytes::from).collect());
+        let bytes: usize = packets.iter().map(Vec::len).sum();
+        let link_bps = net::path_congestion(&self.conn)
+            .and_then(|(_, bw, _, _)| bw)
+            .filter(|&bw| bw > 0)
+            .map_or(rate_bps, |bw| bw as f64);
+        let (path_kind, _, path_rtt) = net::selected_path(&self.conn);
+        let fast_lan = path_kind == net::PathKind::Direct && path_rtt < 10.0;
+        let _ = self.pacer.send(PaceFrame {
+            packets: packets.into_iter().map(Bytes::from).collect(),
+            bytes,
+            link_bps,
+            fast_lan,
+        });
         f
     }
 
@@ -275,11 +314,12 @@ impl VideoTx {
         let mut last_path = net::PathKind::None;
         while self.conn.close_reason().is_none() {
             tick.tick().await;
-            let (k, _, _) = net::selected_path(&self.conn);
+            let (k, _, rtt) = net::selected_path(&self.conn);
+            let timeout = FRAME_TIMEOUT.max(Duration::from_secs_f64(rtt.max(0.0) * 2.0 / 1000.0));
             let now = Instant::now();
             let mut s = self.st.lock().unwrap();
             let before = s.in_flight.len();
-            s.in_flight.retain(|_, (at, _)| now.duration_since(*at) < FRAME_TIMEOUT);
+            s.in_flight.retain(|_, (at, _)| now.duration_since(*at) < timeout);
             for _ in 0..before - s.in_flight.len() {
                 s.rc.on_frame_failed();
             }
@@ -299,23 +339,77 @@ fn pct(ratio: f64) -> u16 {
     if ratio.is_nan() { 0 } else { (ratio * 100.0).min(65535.0) as u16 }
 }
 
-/// Spreads each frame's datagrams over a quarter of the frame interval.
-async fn pace(conn: Connection, mut rx: mpsc::UnboundedReceiver<Vec<Bytes>>, fps: Arc<AtomicU32>) {
-    while let Some(packets) = rx.recv().await {
-        let spread = Duration::from_secs_f64(PACE_SHARE / fps.load(Ordering::Relaxed).max(1) as f64);
-        let plan = pacer::plan(packets.len(), spread, PACE_GAP);
+/// Adaptive pacing spread: burst small frames and normal frames on a fast
+/// direct LAN immediately (QUIC's built-in microsecond BBR pacer handles them
+/// without coarse 1 ms sleeps), and spread giant keyframes (>64 KB) or higher-
+/// RTT Wi-Fi/WAN frames at ~1.25x the measured BBR link bandwidth (capped at
+/// half a frame interval and `PACE_MAX`).
+fn pace_spread(packets: usize, bytes: usize, fps: u32, link_bps: f64, fast_lan: bool) -> Duration {
+    if packets <= 6 || (fast_lan && bytes <= 64_000) {
+        return Duration::ZERO;
+    }
+    let max_spread = Duration::from_secs_f64(PACE_SHARE / fps.max(1) as f64).min(PACE_MAX);
+    let adaptive = Duration::from_secs_f64((bytes as f64 * 8.0) / (link_bps.max(1.0) * 1.25)).min(max_spread);
+    if adaptive < PACE_GAP { Duration::ZERO } else { adaptive }
+}
+
+/// Spreads each frame's datagrams smoothly when needed, without adding fixed
+/// delay to small frames on fast links or starving control stream messages.
+async fn pace(
+    conn: Connection,
+    mut rx: mpsc::UnboundedReceiver<PaceFrame>,
+    fps: Arc<AtomicU32>,
+    ctrl_pending: Arc<AtomicBool>,
+) {
+    while let Some(frame) = rx.recv().await {
+        let spread = pace_spread(frame.packets.len(), frame.bytes, fps.load(Ordering::Relaxed), frame.link_bps, frame.fast_lan);
+        let plan = pacer::plan(frame.packets.len(), spread, PACE_GAP);
         let start = tokio::time::Instant::now();
-        let mut it = packets.into_iter();
+        let mut it = frame.packets.into_iter();
         for (off, n) in plan {
             if !off.is_zero() {
                 tokio::time::sleep_until(start + off).await;
             }
             for p in it.by_ref().take(n) {
+                if ctrl_pending.swap(false, Ordering::AcqRel) {
+                    // `noq-proto` packs DATAGRAM frames ahead of STREAM frames;
+                    // let `datagrams.outgoing` drain briefly so control messages
+                    // (Pong, Stats, Cursor) never starve during high-bitrate motion.
+                    let deadline = tokio::time::Instant::now() + Duration::from_millis(2);
+                    while conn.datagram_send_buffer_space() < SEND_BUFFER && tokio::time::Instant::now() < deadline {
+                        tokio::time::sleep(Duration::from_micros(250)).await;
+                    }
+                    tokio::task::yield_now().await;
+                }
                 let _ = conn.send_datagram(p);
             }
         }
         if conn.close_reason().is_some() {
             return;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pace_spread_is_fast_on_lan_and_smooth_on_wifi_and_wan() {
+        // Small frame: no pacing delay regardless of link speed.
+        assert_eq!(pace_spread(5, 6_000, 60, 2e6, false), Duration::ZERO);
+        // Fast direct LAN (<10 ms RTT), normal 30 KB drag frame: immediate (QUIC BBR paces it).
+        assert_eq!(pace_spread(24, 30_000, 120, 60e6, true), Duration::ZERO);
+        // Fast direct LAN, giant 180 KB keyframe: still smoothly spread (capped at 0.5/120).
+        let lan_key = pace_spread(140, 180_000, 120, 80e6, true);
+        assert!((lan_key.as_secs_f64() - (PACE_SHARE / 120.0)).abs() < 1e-6);
+        // Higher-RTT Wi-Fi/WAN (60 Mbps BBR, 120 fps), 20 KB drag frame: ~2.13 ms.
+        let wifi = pace_spread(16, 20_000, 120, 60e6, false);
+        assert!(wifi >= Duration::from_micros(2000) && wifi <= Duration::from_micros(2300));
+        // Higher-RTT Wi-Fi/WAN, 45 KB frame: capped at 0.5 / 120 (~4.17 ms).
+        let wifi_big = pace_spread(36, 45_000, 120, 60e6, false);
+        assert!((wifi_big.as_secs_f64() - (PACE_SHARE / 120.0)).abs() < 1e-6);
+        // Slow WAN (4 Mbps, 60 fps), 20 KB frame: capped at PACE_MAX (5 ms).
+        assert_eq!(pace_spread(16, 20_000, 60, 4e6, false), PACE_MAX);
     }
 }

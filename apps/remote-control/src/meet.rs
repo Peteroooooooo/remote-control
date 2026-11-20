@@ -48,17 +48,24 @@ pub fn refusal_text(reason: u8) -> &'static str {
     }
 }
 
+const ASK_WAIT: Duration = Duration::from_secs(5);
+
 /// Sends one hello on its own stream and waits for the answer.
 pub async fn ask(conn: &Connection, hi: &Msg) -> Result<Msg> {
+    ask_within(conn, hi, ASK_WAIT).await
+}
+
+/// Sends one hello on its own stream and waits up to `wait` for the answer.
+pub async fn ask_within(conn: &Connection, hi: &Msg, wait: Duration) -> Result<Msg> {
     let (mut send, mut recv) = conn.open_bi().await?;
     send.write_all(&hi.encode()).await?;
     let _ = send.finish();
-    let m = tokio::time::timeout(Duration::from_secs(5), read_msg(&mut recv)).await;
+    let m = tokio::time::timeout(wait, read_msg(&mut recv)).await;
     match m {
         Ok(Ok(m @ (Msg::MeetWelcome { .. } | Msg::MeetRefuse { .. }))) => Ok(m),
         Ok(Ok(m)) => bail!("unexpected answer {m:?}"),
         Ok(Err(e)) => Err(e),
-        Err(_) => bail!("no answer within 5 s"),
+        Err(_) => bail!("no answer within {} s", wait.as_secs()),
     }
 }
 

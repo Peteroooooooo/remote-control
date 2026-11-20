@@ -13,8 +13,11 @@ use std::{
 
 use anyhow::{Result, anyhow, bail};
 use clap::Args;
-use iroh::{EndpointId, RelayUrl, SecretKey, endpoint::Connection};
-use tokio::sync::mpsc;
+use iroh::{
+    Endpoint, EndpointAddr, EndpointId, RelayUrl, SecretKey,
+    endpoint::{Connection, ConnectionError, RecvStream, SendStream},
+};
+use tokio::{sync::mpsc, task::AbortHandle};
 use windows::Win32::Foundation::HWND;
 
 use crate::{
@@ -58,7 +61,8 @@ pub struct ViewArgs {
     /// menu (for tests; not saved).
     #[arg(long)]
     mbps: Option<f64>,
-    /// Frames per second, instead of this device's choice (for tests; not saved).
+    /// Frames per second (0 = this screen's refresh rate), instead of this
+    /// device's choice (for tests; not saved).
     #[arg(long)]
     fps: Option<u8>,
     /// Device key file (default: %APPDATA%\remote-control\device.key); the
@@ -90,7 +94,7 @@ pub struct ViewArgs {
     /// (hex scan codes, pressed in order, released in reverse), `sas`,
     /// `monitor next|prev|N` (N from 1, may be out of range), `probe` (as --probe, now),
     /// `shot FILE.bmp` (save the picture shown now, half size), `picture res|fps|mbps V`
-    /// (as the 画面 menu, see `picture_line`).
+    /// (as the 画面 menu, see `picture_line`), `full` (full screen on or off).
     #[arg(long)]
     script: Option<PathBuf>,
     /// The keyboard hook also takes injected keys marked as test keys, and
@@ -124,6 +128,8 @@ struct RenderSecond {
 
 struct Shared {
     ctrl: mpsc::UnboundedSender<Msg>,
+    active_conn: Mutex<Connection>,
+    reconnecting: AtomicBool,
     quit: AtomicBool,
     render: Mutex<RenderSecond>,
     host: Mutex<Option<HostStats>>,
@@ -229,7 +235,7 @@ fn run_inner(a: &ViewArgs) -> Result<()> {
         }
     }
     let target = net::dial_addr(a.id, ips, &via);
-    let dial = async { tokio::time::timeout(Duration::from_secs(15), ep.connect(target, crate::proto::ALPN)).await };
+    let dial = async { tokio::time::timeout(Duration::from_secs(15), ep.connect(target.clone(), crate::proto::ALPN)).await };
     let no_answer = "连不上对方：没有回应（对方没开机、没联网、睡着了，或者找不到通路）";
     let connected = match rt.block_on(dial) {
         Ok(Ok(conn)) => Ok(conn),
@@ -247,12 +253,7 @@ fn run_inner(a: &ViewArgs) -> Result<()> {
             }
             Err(_) => 0,
         };
-        let r = run_connected(&rt, a, &conn, t_start, caps, proof);
-        rt.block_on(async {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            conn.close(0u32.into(), b"bye");
-        });
-        r
+        run_connected(&rt, a, &ep, &target, &conn, t_start, caps, proof)
     });
     rt.block_on(async {
         let _ = tokio::time::timeout(Duration::from_secs(2), ep.close()).await;
@@ -260,15 +261,138 @@ fn run_inner(a: &ViewArgs) -> Result<()> {
     r
 }
 
+fn is_handoff_close(conn: &Connection) -> bool {
+    matches!(
+        conn.close_reason(),
+        Some(ConnectionError::ApplicationClosed(c)) if c.error_code.into_inner() == u64::from(net::CLOSE_HANDOFF)
+    )
+}
+
+fn terminal_close_code(reason: &ConnectionError) -> Option<u32> {
+    if let ConnectionError::ApplicationClosed(c) = reason {
+        let code = c.error_code.into_inner() as u32;
+        if matches!(
+            code,
+            net::CLOSE_DENIED
+                | net::CLOSE_NOT_MET
+                | net::CLOSE_BUSY
+                | net::CLOSE_LOCKED
+                | net::CLOSE_DISCONNECTED
+                | net::CLOSE_STOPPED
+        ) {
+            return Some(code);
+        }
+    }
+    None
+}
+
+async fn check_terminal_refusal(conn: &Connection) -> Option<u32> {
+    if conn.close_reason().is_none() {
+        let _ = tokio::time::timeout(Duration::from_millis(300), conn.closed()).await;
+    }
+    conn.close_reason().as_ref().and_then(terminal_close_code)
+}
+
+fn make_sim(a: &ViewArgs) -> Option<crate::lossim::LossSim> {
+    (a.sim_loss > 0.0).then(|| crate::lossim::LossSim::new(a.sim_loss, a.sim_burst, now_us() ^ 0x9E37_79B9_7F4A_7C15))
+}
+
+fn spawn_ctrl_read(
+    rt: &tokio::runtime::Handle,
+    sh: Arc<Shared>,
+    mut recv: RecvStream,
+    clip: Option<Arc<ClipSync>>,
+    info_tx: mpsc::UnboundedSender<(u32, u32, String)>,
+) -> AbortHandle {
+    rt.spawn(async move {
+        while let Ok(m) = read_msg(&mut recv).await {
+            *sh.last_heard.lock().unwrap() = Instant::now();
+            match m {
+                Msg::Info { width, height, encoder, streaming } => {
+                    if let Some(s) = streaming {
+                        log!(
+                            "host streams {width}x{height} at up to {} fps and {:.1} Mbps, {}",
+                            s.fps,
+                            s.max_kbps as f64 / 1000.0,
+                            if s.yuv444 { "4:4:4" } else if s.can444 { "4:2:0 (4:4:4 on offer)" } else { "4:2:0" }
+                        );
+                    }
+                    crate::quality::set_streaming((width as u32, height as u32), streaming);
+                    let _ = info_tx.send((width as u32, height as u32, encoder));
+                }
+                Msg::Stats(s) => *sh.host.lock().unwrap() = Some(s),
+                Msg::Waiting => {
+                    sh.waiting.store(true, Ordering::SeqCst);
+                    log!("the host asks its user");
+                    status("waiting");
+                }
+                Msg::Paused { on } => {
+                    sh.paused.store(on, Ordering::SeqCst);
+                    log!("picture {}", if on { "paused by the host: only a public relay between us" } else { "goes on" });
+                    status(if on { "paused" } else { "resumed" });
+                }
+                Msg::Hint { what } if what == crate::proto::HINT_NO_SAS => {
+                    log!("the host could not press Ctrl+Alt+Del (no service there)");
+                    *sh.no_sas.lock().unwrap() = Some(Instant::now());
+                }
+                Msg::Hint { what } => {
+                    log!("host hint: {}", hint_text(what).map_or("picture back", |t| t.0));
+                    sh.hint.store(what, Ordering::SeqCst);
+                }
+                Msg::Pong { t_us } => {
+                    sh.input_rtt.lock().unwrap().push(now_us().saturating_sub(t_us) as f64 / 1000.0)
+                }
+                Msg::ProbeReply { x, y } => sh.probe.lock().unwrap().push((x, y)),
+                Msg::Desktop { name } => log!("host desktop: {name}"),
+                Msg::Monitors { list, current } => {
+                    let names: Vec<String> = list
+                        .iter()
+                        .map(|m| format!("{} {}x{} at ({}, {})", m.name, m.width, m.height, m.x, m.y))
+                        .collect();
+                    log!("host displays: {} (streaming {})", names.join("; "), current as u32 + 1);
+                    window::set_monitors(current as usize, list.len());
+                }
+                m @ (Msg::CursorShape { .. } | Msg::CursorUse { .. } | Msg::CursorHidden) => window::remote_cursor(m),
+                Msg::ClipOffer { seq, .. } => {
+                    if let Some(c) = &clip {
+                        c.on_offer(seq);
+                    }
+                }
+                _ => {}
+            }
+        }
+    })
+    .abort_handle()
+}
+
+fn spawn_watchdog(rt: &tokio::runtime::Handle, sh: Arc<Shared>, conn: Connection) -> AbortHandle {
+    rt.spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_millis(250));
+        while conn.close_reason().is_none() {
+            tick.tick().await;
+            let quiet = sh.last_heard.lock().unwrap().elapsed();
+            if quiet >= HOST_SILENT {
+                log!("nothing from the host for {:.1} s: closing", quiet.as_secs_f64());
+                sh.silent.store(true, Ordering::SeqCst);
+                conn.close(0u32.into(), b"host silent");
+            }
+        }
+    })
+    .abort_handle()
+}
+
+#[allow(clippy::too_many_arguments)]
 fn run_connected(
     rt: &tokio::runtime::Runtime,
     a: &ViewArgs,
-    conn: &Connection,
+    ep: &Endpoint,
+    target: &EndpointAddr,
+    initial_conn: &Connection,
     t_start: Instant,
     caps: u8,
     proof: String,
 ) -> Result<()> {
-    let conn = conn.clone();
+    let mut conn = initial_conn.clone();
     if let Some(dir) = &a.cursor_dump {
         std::fs::create_dir_all(dir)?;
         window::set_cursor_dump(dir.clone());
@@ -277,8 +401,92 @@ fn run_connected(
     log!("connected in {} ms via {} {addr} (rtt {rtt:.0} ms)", t_start.elapsed().as_millis(), k.label());
 
     let (ctrl_tx, mut ctrl_rx) = mpsc::unbounded_channel::<Msg>();
+    let (writer_tx, mut writer_rx) = mpsc::unbounded_channel::<Option<SendStream>>();
+    rt.spawn(async move {
+        // Coalesce high-polling-rate mouse moves (e.g. 500–1000 Hz gaming mice)
+        // to ~125 Hz during continuous motion while sending the first move
+        // after idle immediately (0 ms) and flushing any pending move right
+        // before clicks, keys, or wheels. Prevents both half-duplex Wi-Fi
+        // uplink floods and Windows 11 Explorer/WebView2 drag stutter.
+        const MOUSE_PACE: Duration = Duration::from_millis(8);
+        let mut current: Option<SendStream> = None;
+        let mut batch: Vec<Msg> = Vec::with_capacity(16);
+        let mut wire: Vec<u8> = Vec::with_capacity(256);
+        let mut pending_move: Option<(u16, u16)> = None;
+        let mut last_move_sent: Option<Instant> = None;
+        loop {
+            tokio::select! {
+                biased;
+                w = writer_rx.recv() => match w {
+                    Some(s) => {
+                        if let Some(ref stream) = s {
+                            // Prioritize input/control ahead of audio and clipboard streams.
+                            let _ = stream.set_priority(100);
+                        }
+                        current = s;
+                    }
+                    None => break,
+                },
+                m = ctrl_rx.recv() => {
+                    let Some(first) = m else { break };
+                    batch.clear();
+                    batch.push(first);
+                    while let Ok(next) = ctrl_rx.try_recv() {
+                        batch.push(next);
+                    }
+                    coalesce_ctrl(&mut batch);
+                    if batch.len() == 1
+                        && let Msg::MouseMove { x, y } = batch[0]
+                    {
+                        if last_move_sent.is_some_and(|t| t.elapsed() < MOUSE_PACE) {
+                            pending_move = Some((x, y));
+                            continue;
+                        }
+                        pending_move = None;
+                        last_move_sent = Some(Instant::now());
+                    } else {
+                        if let Some((px, py)) = pending_move.take()
+                            && !matches!(batch.first(), Some(Msg::MouseMove { .. }))
+                        {
+                            batch.insert(0, Msg::MouseMove { x: px, y: py });
+                        }
+                        if batch.iter().any(|m| matches!(m, Msg::MouseMove { .. })) {
+                            last_move_sent = Some(Instant::now());
+                        }
+                    }
+                    if let Some(s) = current.as_mut() {
+                        wire.clear();
+                        for msg in batch.drain(..) {
+                            wire.extend_from_slice(&msg.encode());
+                        }
+                        if s.write_all(&wire).await.is_err() {
+                            current = None;
+                        }
+                    } else {
+                        batch.clear();
+                    }
+                }
+                _ = async {
+                    let due = last_move_sent.map_or_else(Instant::now, |t| t + MOUSE_PACE);
+                    tokio::time::sleep_until(tokio::time::Instant::from_std(due)).await;
+                }, if pending_move.is_some() => {
+                    if let Some((x, y)) = pending_move.take() {
+                        last_move_sent = Some(Instant::now());
+                        if let Some(s) = current.as_mut()
+                            && s.write_all(&Msg::MouseMove { x, y }.encode()).await.is_err()
+                        {
+                            current = None;
+                        }
+                    }
+                }
+            }
+        }
+    });
+
     let sh = Arc::new(Shared {
         ctrl: ctrl_tx.clone(),
+        active_conn: Mutex::new(conn.clone()),
+        reconnecting: AtomicBool::new(false),
         quit: AtomicBool::new(false),
         render: Mutex::default(),
         host: Mutex::default(),
@@ -294,122 +502,150 @@ fn run_connected(
         hint: Default::default(),
         no_sas: Mutex::default(),
     });
-    let (info_tx, info_rx) = std::sync::mpsc::channel::<(u32, u32, String)>();
-    let closed = |what: &str, e: &dyn std::fmt::Display| anyhow!("{}", refusal(&conn).unwrap_or_else(|| format!("{what}: {e:#}")));
-    let (mut send, mut recv) = rt.block_on(conn.open_bi()).map_err(|e| closed("open control stream", &e))?;
-    let (choice, quality) = crate::quality::start(&a.id.to_string(), a.fps, a.mbps);
+    let (_, init_quality) = crate::quality::start(&a.id.to_string(), a.fps, a.mbps);
+    let init_screen = crate::quality::screen();
     crate::quality::connect(ctrl_tx.clone());
-    // Hosts before the 画面 menu read only the first two: 自动 was their 20 Mbps.
-    let old_kbps = if choice.mbps == 0 { 20_000 } else { choice.mbps as u32 * 1000 };
-    let hello = Msg::Hello { max_kbps: old_kbps, fps: choice.fps, caps, proof, quality: Some(quality) };
-    rt.block_on(send.write_all(&hello.encode())).map_err(|e| closed("send hello", &e))?;
-    rt.spawn(async move {
-        while let Some(m) = ctrl_rx.recv().await {
-            if send.write_all(&m.encode()).await.is_err() {
-                break;
-            }
-        }
-    });
-    let clip = {
-        let _rt = rt.enter();
-        match ClipSync::start(&conn, ctrl_tx.clone(), false, false) {
-            Ok(c) => Some(c),
-            Err(e) => {
-                log!("clipboard sharing off: {e:#}");
-                None
-            }
-        }
+    let _init_audio = crate::audio::config::start(&a.id.to_string());
+    crate::audio::config::connect(ctrl_tx.clone());
+    let (audio_tx, audio_rx) = mpsc::unbounded_channel::<bytes::Bytes>();
+    let audio_stop = Arc::new(AtomicBool::new(false));
+    let audio_player = {
+        let stop = audio_stop.clone();
+        std::thread::Builder::new().name("audio-play".into()).spawn(move || {
+            crate::audio::wasapi::Player::run(audio_rx, stop);
+        })?
     };
-    {
-        let sh = sh.clone();
-        rt.spawn(async move {
-            while let Ok(m) = read_msg(&mut recv).await {
-                *sh.last_heard.lock().unwrap() = Instant::now();
-                match m {
-                    Msg::Info { width, height, encoder, streaming } => {
-                        if let Some(s) = streaming {
-                            log!(
-                                "host streams {width}x{height} at up to {} fps and {:.1} Mbps, {}",
-                                s.fps,
-                                s.max_kbps as f64 / 1000.0,
-                                if s.yuv444 { "4:4:4" } else if s.can444 { "4:2:0 (4:4:4 on offer)" } else { "4:2:0" }
-                            );
-                        }
-                        crate::quality::set_streaming((width as u32, height as u32), streaming);
-                        let _ = info_tx.send((width as u32, height as u32, encoder));
-                    }
-                    Msg::Stats(s) => *sh.host.lock().unwrap() = Some(s),
-                    Msg::Waiting => {
-                        sh.waiting.store(true, Ordering::SeqCst);
-                        log!("the host asks its user");
-                        status("waiting");
-                    }
-                    Msg::Paused { on } => {
-                        sh.paused.store(on, Ordering::SeqCst);
-                        log!("picture {}", if on { "paused by the host: only a public relay between us" } else { "goes on" });
-                        status(if on { "paused" } else { "resumed" });
-                    }
-                    Msg::Hint { what } if what == crate::proto::HINT_NO_SAS => {
-                        log!("the host could not press Ctrl+Alt+Del (no service there)");
-                        *sh.no_sas.lock().unwrap() = Some(Instant::now());
-                    }
-                    Msg::Hint { what } => {
-                        log!("host hint: {}", hint_text(what).map_or("picture back", |t| t.0));
-                        sh.hint.store(what, Ordering::SeqCst);
-                    }
-                    Msg::Pong { t_us } => {
-                        sh.input_rtt.lock().unwrap().push(now_us().saturating_sub(t_us) as f64 / 1000.0)
-                    }
-                    Msg::ProbeReply { x, y } => sh.probe.lock().unwrap().push((x, y)),
-                    Msg::Desktop { name } => log!("host desktop: {name}"),
-                    Msg::Monitors { list, current } => {
-                        let names: Vec<String> = list
-                            .iter()
-                            .map(|m| format!("{} {}x{} at ({}, {})", m.name, m.width, m.height, m.x, m.y))
-                            .collect();
-                        log!("host displays: {} (streaming {})", names.join("; "), current as u32 + 1);
-                        window::set_monitors(current as usize, list.len());
-                    }
-                    m @ (Msg::CursorShape { .. } | Msg::CursorUse { .. } | Msg::CursorHidden) => window::remote_cursor(m),
-                    Msg::ClipOffer { seq, .. } => {
-                        if let Some(c) = &clip {
-                            c.on_offer(seq);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        });
-    }
+
     let (frames_tx, frames_rx) = std::sync::mpsc::channel::<Delivered>();
     let counters = Arc::new(Mutex::new(RxCounters::default()));
-    let sim = (a.sim_loss > 0.0).then(|| crate::lossim::LossSim::new(a.sim_loss, a.sim_burst, now_us() ^ 0x9E37_79B9_7F4A_7C15));
+    let sim = make_sim(a);
     if let Some(s) = &sim {
         log!("simulated loss: {} of the video datagrams", s.describe());
     }
-    rt.spawn(video_rx::run(conn.clone(), frames_tx, ctrl_tx.clone(), counters.clone(), sim));
 
     // Without a confirmation the picture information comes within a second;
     // with one, after the host's user answered (30 s at most). A host that
     // says why no picture can come (locked, no display) gets the window at
     // once, at a size of its own until the picture comes.
-    let asked = Instant::now();
-    let (sw, sh_, encoder) = loop {
-        match info_rx.recv_timeout(Duration::from_millis(250)) {
-            Ok(i) => break i,
-            Err(RecvTimeoutError::Disconnected) => {}
-            Err(RecvTimeoutError::Timeout) => {}
+    let mut handoff_deadline: Option<Instant> = None;
+    let (sw, sh_, encoder, mut read_handle, mut video_handle) = loop {
+        let mut open_err: Option<String> = None;
+        let streams = match rt.block_on(conn.open_bi()) {
+            Ok((mut send, recv)) => {
+                let choice = crate::quality::choice();
+                // Hosts before the 画面 menu read only the first two: 自动 was their 20 Mbps.
+                let old_kbps = if choice.mbps == 0 { 20_000 } else { choice.mbps as u32 * 1000 };
+                let hello = Msg::Hello {
+                    max_kbps: old_kbps,
+                    fps: init_quality.fps,
+                    caps,
+                    proof: proof.clone(),
+                    quality: Some(choice.quality(init_screen)),
+                };
+                match rt.block_on(async {
+                    send.write_all(&hello.encode()).await?;
+                    send.write_all(&Msg::Audio(crate::audio::config::choice()).encode()).await
+                }) {
+                    Ok(()) => Some((send, recv)),
+                    Err(e) => {
+                        open_err = Some(format!("send hello: {e:#}"));
+                        None
+                    }
+                }
+            }
+            Err(e) => {
+                open_err = Some(format!("open control stream: {e:#}"));
+                None
+            }
+        };
+
+        let mut got: Option<(u32, u32, String, AbortHandle, AbortHandle)> = None;
+        if let Some((send, recv)) = streams {
+            sh.hint.store(crate::proto::HINT_NONE, Ordering::SeqCst);
+            sh.waiting.store(false, Ordering::SeqCst);
+            sh.paused.store(false, Ordering::SeqCst);
+            let (info_tx, mut info_rx) = mpsc::unbounded_channel::<(u32, u32, String)>();
+            let clip = {
+                let _rt = rt.enter();
+                match ClipSync::start(&conn, ctrl_tx.clone(), false, false, Some(audio_tx.clone())) {
+                    Ok(c) => Some(c),
+                    Err(e) => {
+                        log!("clipboard sharing off: {e:#}");
+                        None
+                    }
+                }
+            };
+            let r_handle = spawn_ctrl_read(rt.handle(), sh.clone(), recv, clip, info_tx);
+            let v_handle = rt.spawn(video_rx::run(conn.clone(), frames_tx.clone(), ctrl_tx.clone(), counters.clone(), make_sim(a), Some(audio_tx.clone()))).abort_handle();
+            let asked = Instant::now();
+            let res = rt.block_on(async {
+                loop {
+                    if sh.hint.load(Ordering::SeqCst) != crate::proto::HINT_NONE {
+                        break Ok((1280, 720, String::new()));
+                    }
+                    let limit = if sh.waiting.load(Ordering::SeqCst) { 40 } else { 10 };
+                    if conn.close_reason().is_some() || asked.elapsed() > Duration::from_secs(limit) {
+                        tokio::time::sleep(Duration::from_millis(300)).await;
+                        break Err(format!("对方 {limit} 秒内没有发来画面"));
+                    }
+                    tokio::select! {
+                        r = info_rx.recv() => {
+                            if let Some(i) = r {
+                                break Ok(i);
+                            }
+                        }
+                        _ = conn.closed() => {}
+                        _ = tokio::time::sleep(Duration::from_millis(250)) => {}
+                    }
+                }
+            });
+            match res {
+                Ok((w, h, enc)) => {
+                    *sh.active_conn.lock().unwrap() = conn.clone();
+                    *sh.last_heard.lock().unwrap() = Instant::now();
+                    let _ = writer_tx.send(Some(send));
+                    got = Some((w, h, enc, r_handle, v_handle));
+                }
+                Err(fallback_why) => {
+                    r_handle.abort();
+                    v_handle.abort();
+                    open_err = Some(fallback_why);
+                }
+            }
+        } else {
+            rt.block_on(async {
+                if conn.close_reason().is_none() {
+                    let _ = tokio::time::timeout(Duration::from_millis(300), conn.closed()).await;
+                }
+            });
         }
-        if sh.hint.load(Ordering::SeqCst) != crate::proto::HINT_NONE {
-            break (1280, 720, String::new());
+
+        if let Some((w, h, enc, r_h, v_h)) = got {
+            break (w, h, enc, r_h, v_h);
         }
-        let limit = if sh.waiting.load(Ordering::SeqCst) { 40 } else { 10 };
-        if conn.close_reason().is_some() || asked.elapsed() > Duration::from_secs(limit) {
-            // A refusal arrives as a close; give it a moment.
-            std::thread::sleep(Duration::from_millis(300));
-            bail!("{}", refusal(&conn).unwrap_or_else(|| format!("对方 {limit} 秒内没有发来画面")));
+
+        if is_handoff_close(&conn) {
+            let dl = *handoff_deadline.get_or_insert_with(|| Instant::now() + Duration::from_secs(45));
+            log!("host is handing off during initial connect; retrying...");
+            conn = rt.block_on(async {
+                loop {
+                    let now = Instant::now();
+                    if now >= dl {
+                        return Err(anyhow!("{}", close_text(net::CLOSE_HANDOFF)));
+                    }
+                    tokio::time::sleep(Duration::from_secs(1).min(dl - now)).await;
+                    match tokio::time::timeout(Duration::from_secs(5), ep.connect(target.clone(), crate::proto::ALPN)).await {
+                        Ok(Ok(c)) => return Ok(c),
+                        Ok(Err(e)) => log!("initial handoff reconnect dial failed: {e:#}"),
+                        Err(_) => log!("initial handoff reconnect dial timed out"),
+                    }
+                }
+            })?;
+            continue;
         }
+        bail!("{}", refusal(&conn).or(open_err).unwrap_or_else(|| "连接失败".into()));
     };
+
     log!("stream {sw}x{sh_}, host encoder {encoder}");
     status("connected");
     let wstate = WindowState::new(ctrl_tx.clone(), (sw, sh_), !a.view_only, a.hook_test);
@@ -436,41 +672,223 @@ fn run_connected(
         });
     }
     {
-        let (sh, conn, wstate) = (sh.clone(), conn.clone(), wstate.clone());
+        let (sh, wstate, counters) = (sh.clone(), wstate.clone(), counters.clone());
         let (csv, seconds, probe) = (a.csv.clone(), a.seconds, a.probe);
         rt.spawn(async move {
-            if let Err(e) = stats_loop(sh, conn, wstate, counters, encoder, csv, seconds, probe).await {
+            if let Err(e) = stats_loop(sh, wstate, counters, encoder, csv, seconds, probe).await {
                 log!("stats: {e:#}");
             }
         });
     }
     {
-        let (sh, conn) = (sh.clone(), conn.clone());
+        let (sh, wstate, ep, target, proof, ctrl_tx, writer_tx, frames_tx, counters, audio_tx) = (
+            sh.clone(),
+            wstate.clone(),
+            ep.clone(),
+            target.clone(),
+            proof.clone(),
+            ctrl_tx.clone(),
+            writer_tx.clone(),
+            frames_tx.clone(),
+            counters.clone(),
+            audio_tx.clone(),
+        );
+        let sim_loss = a.sim_loss;
+        let sim_burst = a.sim_burst;
+        let rt_handle = rt.handle().clone();
         rt.spawn(async move {
-            let mut tick = tokio::time::interval(Duration::from_millis(250));
-            while conn.close_reason().is_none() {
-                tick.tick().await;
-                let quiet = sh.last_heard.lock().unwrap().elapsed();
-                if quiet >= HOST_SILENT {
-                    log!("nothing from the host for {:.1} s: closing", quiet.as_secs_f64());
-                    sh.silent.store(true, Ordering::SeqCst);
-                    conn.close(0u32.into(), b"host silent");
+            let mut watchdog_handle = spawn_watchdog(&rt_handle, sh.clone(), conn.clone());
+            loop {
+                let reason = conn.closed().await;
+                let silent = sh.silent.load(Ordering::SeqCst);
+                let handoff = !silent
+                    && !sh.quit.load(Ordering::Relaxed)
+                    && !wstate.closed.load(Ordering::Relaxed)
+                    && matches!(
+                        &reason,
+                        ConnectionError::ApplicationClosed(c) if c.error_code.into_inner() == u64::from(net::CLOSE_HANDOFF)
+                    );
+                if !handoff {
+                    let why = if silent { Some(SILENT_TEXT) } else { why_closed(&reason) };
+                    let Some(why) = why else { return };
+                    let since = sh.last_picture.lock().unwrap().map_or(f64::NAN, |t| t.elapsed().as_secs_f64());
+                    log!("connection closed: {reason} ({why}); last picture {since:.2} s before");
+                    status(&format!("closed\t{why}"));
+                    crate::toolbar::closed(why);
+                    tokio::time::sleep(CLOSED_NOTICE).await;
+                    window::close();
+                    return;
                 }
+
+                log!("host is handing off (CLOSE_HANDOFF); reconnecting...");
+                sh.reconnecting.store(true, Ordering::SeqCst);
+                status("connecting");
+                crate::toolbar::update(crate::toolbar::Tone::Fair, "对方正在切换后台服务，正在重连…".into(), vec![], true);
+                let _ = writer_tx.send(None);
+                read_handle.abort();
+                video_handle.abort();
+                watchdog_handle.abort();
+
+                let deadline = Instant::now() + Duration::from_secs(45);
+                let mut terminal_code: Option<u32> = None;
+                let mut reconnected: Option<(Connection, SendStream, AbortHandle)> = None;
+                loop {
+                    if sh.quit.load(Ordering::Relaxed) || wstate.closed.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    let now = Instant::now();
+                    if now >= deadline {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_secs(1).min(deadline - now)).await;
+                    if sh.quit.load(Ordering::Relaxed) || wstate.closed.load(Ordering::Relaxed) {
+                        return;
+                    }
+
+                    let new_conn = match tokio::time::timeout(Duration::from_secs(5), ep.connect(target.clone(), crate::proto::ALPN)).await {
+                        Ok(Ok(c)) => c,
+                        Ok(Err(e)) => {
+                            log!("reconnect dial failed: {e:#}");
+                            continue;
+                        }
+                        Err(_) => {
+                            log!("reconnect dial timed out");
+                            continue;
+                        }
+                    };
+                    let (mut new_send, new_recv) = match tokio::time::timeout(Duration::from_secs(5), new_conn.open_bi()).await {
+                        Ok(Ok(s)) => s,
+                        Ok(Err(e)) => {
+                            log!("reconnect open_bi failed: {e:#}");
+                            if let Some(code) = check_terminal_refusal(&new_conn).await {
+                                terminal_code = Some(code);
+                                break;
+                            }
+                            new_conn.close(0u32.into(), b"retry");
+                            continue;
+                        }
+                        Err(_) => {
+                            log!("reconnect open_bi timed out");
+                            new_conn.close(0u32.into(), b"retry");
+                            continue;
+                        }
+                    };
+
+                    let choice = crate::quality::choice();
+                    let old_kbps = if choice.mbps == 0 { 20_000 } else { choice.mbps as u32 * 1000 };
+                    let screen = match crate::quality::screen() {
+                        s if s.size == (0, 0) => init_screen,
+                        s => s,
+                    };
+                    let quality = choice.quality(screen);
+                    let hello = Msg::Hello {
+                        max_kbps: old_kbps,
+                        fps: quality.fps,
+                        caps,
+                        proof: proof.clone(),
+                        quality: Some(quality),
+                    };
+                    if let Err(e) = async {
+                        new_send.write_all(&hello.encode()).await?;
+                        new_send.write_all(&Msg::Audio(crate::audio::config::choice()).encode()).await
+                    }
+                    .await
+                    {
+                        log!("reconnect send hello failed: {e:#}");
+                        if let Some(code) = check_terminal_refusal(&new_conn).await {
+                            terminal_code = Some(code);
+                            break;
+                        }
+                        new_conn.close(0u32.into(), b"retry");
+                        continue;
+                    }
+
+                    sh.hint.store(crate::proto::HINT_NONE, Ordering::SeqCst);
+                    sh.waiting.store(false, Ordering::SeqCst);
+                    sh.paused.store(false, Ordering::SeqCst);
+                    let (info_tx, mut info_rx) = mpsc::unbounded_channel::<(u32, u32, String)>();
+                    let new_clip = match ClipSync::start(&new_conn, ctrl_tx.clone(), false, false, Some(audio_tx.clone())) {
+                        Ok(c) => Some(c),
+                        Err(e) => {
+                            log!("clipboard sharing off: {e:#}");
+                            None
+                        }
+                    };
+                    let new_read = spawn_ctrl_read(&rt_handle, sh.clone(), new_recv, new_clip, info_tx);
+                    let info_deadline = Instant::now() + Duration::from_secs(10);
+                    let ready = loop {
+                        if sh.quit.load(Ordering::Relaxed) || wstate.closed.load(Ordering::Relaxed) {
+                            new_read.abort();
+                            new_conn.close(0u32.into(), b"bye");
+                            return;
+                        }
+                        if sh.hint.load(Ordering::SeqCst) != crate::proto::HINT_NONE {
+                            break true;
+                        }
+                        let rem = info_deadline.saturating_duration_since(Instant::now());
+                        if rem.is_zero() {
+                            break false;
+                        }
+                        tokio::select! {
+                            r = info_rx.recv() => {
+                                break r.is_some();
+                            }
+                            _ = new_conn.closed() => {
+                                break false;
+                            }
+                            _ = tokio::time::sleep(rem.min(Duration::from_millis(100))) => {}
+                        }
+                    };
+                    if ready {
+                        reconnected = Some((new_conn, new_send, new_read));
+                        break;
+                    }
+                    new_read.abort();
+                    if let Some(code) = check_terminal_refusal(&new_conn).await {
+                        terminal_code = Some(code);
+                        break;
+                    }
+                    new_conn.close(0u32.into(), b"retry");
+                }
+
+                if let Some(code) = terminal_code {
+                    let why = close_text(code);
+                    log!("reconnect refused with close code {code} ({why})");
+                    status(&format!("closed\t{why}"));
+                    crate::toolbar::closed(why);
+                    tokio::time::sleep(CLOSED_NOTICE).await;
+                    window::close();
+                    return;
+                }
+                let Some((new_conn, new_send, new_read)) = reconnected else {
+                    if !sh.quit.load(Ordering::Relaxed) && !wstate.closed.load(Ordering::Relaxed) {
+                        log!("reconnect timed out after 45 s");
+                        status("closed\t重连超时");
+                        crate::toolbar::closed("重连超时，连接已断开");
+                        tokio::time::sleep(CLOSED_NOTICE).await;
+                        window::close();
+                    }
+                    return;
+                };
+
+                let (k, addr, rtt) = net::selected_path(&new_conn);
+                log!("reconnected via {} {addr} (rtt {rtt:.0} ms)", k.label());
+                *sh.active_conn.lock().unwrap() = new_conn.clone();
+                let _ = writer_tx.send(Some(new_send));
+                *sh.last_heard.lock().unwrap() = Instant::now();
+                sh.silent.store(false, Ordering::SeqCst);
+                sh.reconnecting.store(false, Ordering::SeqCst);
+                status("connected");
+                crate::toolbar::update(crate::toolbar::Tone::Good, "已重连".into(), vec![], false);
+                let sim = (sim_loss > 0.0).then(|| crate::lossim::LossSim::new(sim_loss, sim_burst, now_us() ^ 0x9E37_79B9_7F4A_7C15));
+                let new_video = tokio::spawn(video_rx::run(new_conn.clone(), frames_tx.clone(), ctrl_tx.clone(), counters.clone(), sim, Some(audio_tx.clone()))).abort_handle();
+                let new_watchdog = spawn_watchdog(&rt_handle, sh.clone(), new_conn.clone());
+
+                conn = new_conn;
+                read_handle = new_read;
+                video_handle = new_video;
+                watchdog_handle = new_watchdog;
             }
-        });
-    }
-    {
-        let (sh, conn) = (sh.clone(), conn.clone());
-        rt.spawn(async move {
-            let reason = conn.closed().await;
-            let why = if sh.silent.load(Ordering::SeqCst) { Some(SILENT_TEXT) } else { why_closed(&reason) };
-            let Some(why) = why else { return };
-            let since = sh.last_picture.lock().unwrap().map_or(f64::NAN, |t| t.elapsed().as_secs_f64());
-            log!("connection closed: {reason} ({why}); last picture {since:.2} s before");
-            status(&format!("closed\t{why}"));
-            crate::toolbar::closed(why);
-            tokio::time::sleep(CLOSED_NOTICE).await;
-            window::close();
         });
     }
     if let Some(path) = a.script.clone() {
@@ -479,8 +897,15 @@ fn run_connected(
     }
     window::run_loop();
     sh.quit.store(true, Ordering::SeqCst);
+    audio_stop.store(true, Ordering::SeqCst);
     let _ = ctrl_tx.send(Msg::ReleaseAll);
     let _ = render.join();
+    let _ = audio_player.join();
+    let final_conn = sh.active_conn.lock().unwrap().clone();
+    rt.block_on(async {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        final_conn.close(0u32.into(), b"bye");
+    });
     Ok(())
 }
 
@@ -508,6 +933,7 @@ pub fn close_text(code: u32) -> &'static str {
         net::CLOSE_LOCKED => "对方锁屏了",
         net::CLOSE_NO_DIRECT => "找不到直连",
         net::CLOSE_DISCONNECTED => "对方点了断开",
+        net::CLOSE_HANDOFF => "对方正在切换后台服务",
         _ => "对方结束了会话",
     }
 }
@@ -545,6 +971,7 @@ fn show(pres: &mut Presenter, gpu: &Gpu, p: &Picture, size: (u32, u32), hwnd: HW
 /// Decodes every frame (delta frames depend on each other) and presents the newest.
 fn render_loop(sh: &Shared, frames: Receiver<Delivered>, hwnd: HWND) -> Result<()> {
     mf::init_thread()?;
+    let _wlan = crate::wlan::LowLatency::enter();
     let gpu = Gpu::default_adapter()?;
     let mut pres = Presenter::new(&gpu, hwnd)?;
     log!("decoding on {}", gpu.name);
@@ -639,7 +1066,6 @@ const CSV_HEADER: &str = "t_s,fps,mbps,rate_mbps,path,path_rtt_ms,frame_rtt_p50_
 #[allow(clippy::too_many_arguments)]
 async fn stats_loop(
     sh: Arc<Shared>,
-    conn: iroh::endpoint::Connection,
     wstate: Arc<WindowState>,
     counters: Arc<Mutex<RxCounters>>,
     encoder: String,
@@ -664,11 +1090,18 @@ async fn stats_loop(
     tick.tick().await;
     for t in 1u64.. {
         tick.tick().await;
-        // The task waiting on `closed()` shows why and closes the window.
-        if conn.close_reason().is_some() {
+        if sh.quit.load(Ordering::Relaxed) || wstate.closed.load(Ordering::Relaxed) {
             return Ok(());
         }
-        if sh.quit.load(Ordering::Relaxed) || wstate.closed.load(Ordering::Relaxed) {
+        if sh.reconnecting.load(Ordering::Relaxed) {
+            continue;
+        }
+        let conn = sh.active_conn.lock().unwrap().clone();
+        // The task waiting on `closed()` shows why and closes the window.
+        if conn.close_reason().is_some() {
+            if is_handoff_close(&conn) {
+                continue;
+            }
             return Ok(());
         }
         let r = std::mem::take(&mut *sh.render.lock().unwrap());
@@ -810,7 +1243,7 @@ async fn script_loop(sh: &Shared, path: &std::path::Path) {
     }
 }
 
-/// `picture res auto|native|1440|1080|720`, `picture fps N`, `picture mbps N`
+/// `picture res auto|native|1440|1080|720`, `picture fps auto|N`, `picture mbps N`
 /// (0 = 自动), `picture sharp on|off`: as a click in the 画面 menu.
 fn picture_line(f: &[&str]) -> bool {
     use crate::quality::{self, Res};
@@ -823,7 +1256,8 @@ fn picture_line(f: &[&str]) -> bool {
     let num = f.get(1).and_then(|v| v.parse::<u16>().ok());
     match (f.first().copied(), res, num) {
         (Some("res"), Some(r), _) => quality::choose(|c| c.res = r),
-        (Some("fps"), _, Some(n)) if (1..=255).contains(&n) => quality::choose(|c| c.fps = n as u8),
+        (Some("fps"), Some(Res::Auto), _) => quality::choose(|c| c.fps = 0),
+        (Some("fps"), _, Some(n)) if n <= 255 => quality::choose(|c| c.fps = n as u8),
         (Some("mbps"), _, Some(n)) => quality::choose(|c| c.mbps = n),
         (Some("sharp"), _, _) if matches!(f.get(1).copied(), Some("on" | "off")) => {
             quality::choose(|c| c.sharp = f[1] == "on")
@@ -892,7 +1326,60 @@ async fn script_line(sh: &Shared, line: &str) {
             true
         }
         Some("picture") => picture_line(&f[1..]),
+        Some("full") => {
+            window::toggle_fullscreen();
+            true
+        }
         _ => false,
     };
     log!("script: {line}{}", if ok { "" } else { " (not understood)" });
 }
+
+/// Coalesces consecutive `Msg::MouseMove` entries in a queued control batch to
+/// the latest pointer coordinate while preserving strict ordering around clicks,
+/// keys, wheels, and every other control message.
+fn coalesce_ctrl(batch: &mut Vec<Msg>) {
+    if batch.len() <= 1 {
+        return;
+    }
+    let mut write = 0usize;
+    for read in 0..batch.len() {
+        let is_move = matches!(batch[read], Msg::MouseMove { .. });
+        if is_move && write > 0 && matches!(batch[write - 1], Msg::MouseMove { .. }) {
+            batch.swap(write - 1, read);
+        } else {
+            if write != read {
+                batch.swap(write, read);
+            }
+            write += 1;
+        }
+    }
+    batch.truncate(write);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn coalesce_ctrl_merges_adjacent_mouse_moves_only() {
+        let mut batch = vec![
+            Msg::MouseMove { x: 10, y: 10 },
+            Msg::MouseMove { x: 20, y: 20 },
+            Msg::MouseMove { x: 30, y: 30 },
+            Msg::MouseButton { button: 0, down: true },
+            Msg::MouseMove { x: 40, y: 40 },
+            Msg::MouseMove { x: 50, y: 50 },
+            Msg::MouseButton { button: 0, down: false },
+            Msg::MouseMove { x: 60, y: 60 },
+        ];
+        coalesce_ctrl(&mut batch);
+        assert_eq!(batch.len(), 5);
+        assert!(matches!(batch[0], Msg::MouseMove { x: 30, y: 30 }));
+        assert!(matches!(batch[1], Msg::MouseButton { button: 0, down: true }));
+        assert!(matches!(batch[2], Msg::MouseMove { x: 50, y: 50 }));
+        assert!(matches!(batch[3], Msg::MouseButton { button: 0, down: false }));
+        assert!(matches!(batch[4], Msg::MouseMove { x: 60, y: 60 }));
+    }
+}
+

@@ -24,6 +24,7 @@ use std::{
 };
 
 use anyhow::{Result, bail};
+use bytes::Bytes;
 use iroh::endpoint::{Connection, RecvStream};
 use tokio::{sync::mpsc, task::AbortHandle};
 
@@ -31,7 +32,7 @@ use crate::{
     clipboard::{Clipboard, Content, FORMAT_FILES, MAX_TRANSFER, Remote},
     clipfiles::{self, Source},
     log,
-    proto::{Msg, STREAM_CLIPBOARD, STREAM_FILE},
+    proto::{Msg, STREAM_AUDIO, STREAM_CLIPBOARD, STREAM_FILE},
 };
 
 /// Copies of files here whose files the other side may still read (a paste
@@ -96,7 +97,13 @@ pub struct ClipSync {
 impl ClipSync {
     /// Starts watching the local clipboard and accepting the other side's.
     /// Runs until the connection closes. `host` decides ties.
-    pub fn start(conn: &Connection, ctrl: mpsc::UnboundedSender<Msg>, host: bool, service: bool) -> Result<Arc<ClipSync>> {
+    pub fn start(
+        conn: &Connection,
+        ctrl: mpsc::UnboundedSender<Msg>,
+        host: bool,
+        service: bool,
+        audio_tx: Option<mpsc::UnboundedSender<Bytes>>,
+    ) -> Result<Arc<ClipSync>> {
         let (changed_tx, changed_rx) = mpsc::unbounded_channel();
         let sync = Arc::new(ClipSync {
             clip: Clipboard::start(changed_tx, service)?,
@@ -105,7 +112,7 @@ impl ClipSync {
             service,
         });
         tokio::spawn(send_loop(conn.clone(), ctrl, changed_rx, sync.clone()));
-        tokio::spawn(accept_loop(conn.clone(), sync.clone()));
+        tokio::spawn(accept_loop(conn.clone(), sync.clone(), audio_tx));
         tokio::spawn(serve_loop(conn.clone(), sync.clone()));
         Ok(sync)
     }
@@ -204,12 +211,31 @@ async fn send_one(conn: &Connection, seq: u32, seen: u32, format: u8, data: &[u8
     Ok(())
 }
 
-async fn accept_loop(conn: Connection, sync: Arc<ClipSync>) {
-    while let Ok(recv) = conn.accept_uni().await {
-        let (sync, conn) = (sync.clone(), conn.clone());
+async fn accept_loop(conn: Connection, sync: Arc<ClipSync>, audio_tx: Option<mpsc::UnboundedSender<Bytes>>) {
+    while let Ok(mut recv) = conn.accept_uni().await {
+        let (sync, conn, audio_tx) = (sync.clone(), conn.clone(), audio_tx.clone());
         tokio::spawn(async move {
-            if let Err(e) = receive(recv, &sync, &conn).await {
-                log!("clipboard: receive failed: {e:#}");
+            let mut kind = [0u8; 1];
+            if recv.read_exact(&mut kind).await.is_err() {
+                return;
+            }
+            match kind[0] {
+                STREAM_CLIPBOARD => {
+                    if let Err(e) = receive_clipboard(recv, &sync, &conn).await {
+                        log!("clipboard: receive failed: {e:#}");
+                    }
+                }
+                STREAM_AUDIO => {
+                    if let Some(tx) = audio_tx {
+                        crate::audio::wasapi::recv_lossless_stream(recv, tx).await;
+                    } else {
+                        let _ = recv.stop(0u32.into());
+                    }
+                }
+                other => {
+                    let _ = recv.stop(0u32.into());
+                    log!("uni stream: unknown kind {other}");
+                }
             }
         });
     }
@@ -235,15 +261,11 @@ async fn serve_loop(conn: Connection, sync: Arc<ClipSync>) {
     }
 }
 
-async fn receive(mut r: RecvStream, sync: &ClipSync, conn: &Connection) -> Result<()> {
-    let mut head = [0u8; 14];
+async fn receive_clipboard(mut r: RecvStream, sync: &ClipSync, conn: &Connection) -> Result<()> {
+    let mut head = [0u8; 13];
     r.read_exact(&mut head).await?;
-    if head[0] != STREAM_CLIPBOARD {
-        let _ = r.stop(0u32.into());
-        bail!("unknown stream kind {}", head[0]);
-    }
     let be = |i: usize| u32::from_be_bytes(head[i..i + 4].try_into().expect("4 bytes"));
-    let (seq, seen, format, len) = (be(1), be(5), head[9], be(10) as usize);
+    let (seq, seen, format, len) = (be(0), be(4), head[8], be(9) as usize);
     if len > MAX_TRANSFER {
         let _ = r.stop(0u32.into());
         bail!("{len} bytes is over the limit");

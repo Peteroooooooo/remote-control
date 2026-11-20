@@ -222,6 +222,11 @@ impl Proc {
         }
     }
 
+    /// The process handle, for calls on it; it stays ours.
+    pub fn handle(&self) -> HANDLE {
+        self.process.0
+    }
+
     /// Ends the whole tree.
     pub fn kill(&self) {
         unsafe {
@@ -437,9 +442,9 @@ pub fn exec(service: bool, command: &str, cwd: Option<&Path>) -> Result<Exec> {
     Ok(Exec { proc, stdin: file(in_w), stdout: file(out_r), stderr: file(err_r) })
 }
 
-/// Runs this exe with `args` as the console user and returns what it wrote
-/// to stdout; killed after `timeout`.
-pub fn self_as_user(args: &str, timeout: std::time::Duration) -> Result<Vec<u8>> {
+/// Starts this exe with `args` as the console user (SYSTEM when nobody is
+/// signed in), with pipes for its standard handles.
+pub fn self_piped(args: &str) -> Result<Exec> {
     let who = who(true)?;
     let cmd = format!("\"{}\" {args}", std::env::current_exe()?.display());
     let (in_r, in_w) = pipe()?;
@@ -450,8 +455,15 @@ pub fn self_as_user(args: &str, timeout: std::time::Duration) -> Result<Vec<u8>>
         unsafe { SetHandleInformation(h, HANDLE_FLAG_INHERIT.0, HANDLE_FLAG_INHERIT) }.context("SetHandleInformation")?;
     }
     let proc = spawn(&who, &cmd, &Stdio::Pipes(theirs))?;
-    drop((in_r, out_w, err_w, in_w, err_r));
-    let mut out = file(out_r);
+    drop((in_r, out_w, err_w));
+    Ok(Exec { proc, stdin: file(in_w), stdout: file(out_r), stderr: file(err_r) })
+}
+
+/// Runs this exe with `args` as the console user and returns what it wrote
+/// to stdout; killed after `timeout`.
+pub fn self_as_user(args: &str, timeout: std::time::Duration) -> Result<Vec<u8>> {
+    let Exec { proc, stdin, stdout: mut out, stderr } = self_piped(args)?;
+    drop((stdin, stderr));
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let mut v = Vec::new();

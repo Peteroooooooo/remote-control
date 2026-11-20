@@ -11,6 +11,8 @@
 pub const T_SHARD: u8 = 0x10;
 pub const T_ACK: u8 = 0x11;
 pub const T_REPORT: u8 = 0x12;
+pub const T_AUDIO: u8 = 0x13;
+pub const T_AUDIO_PCM24: u8 = 0x14;
 
 pub const SHARD_HDR: usize = 1 + 4 + 2 + 2 + 2 + 4;
 pub const ACK_LEN: usize = 1 + 4 + 1;

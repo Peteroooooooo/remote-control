@@ -29,18 +29,25 @@ pub struct LobbyArgs {
     hidden: bool,
 }
 
-/// Started from Explorer, the console window is this process's alone: hide
-/// it and log to `lobby.log` instead. Redirected output stays as it is.
+/// Started from Explorer, the console window is this process's alone (or absent
+/// with `windows_subsystem = "windows"`): hide it if any and log to `lobby.log`
+/// instead. Redirected output stays as it is.
 fn leave_own_console(log: &std::path::Path) {
     use windows::Win32::{
-        Storage::FileSystem::{FILE_TYPE_CHAR, GetFileType},
+        Storage::FileSystem::{FILE_TYPE_CHAR, FILE_TYPE_UNKNOWN, GetFileType},
         System::Console::{FreeConsole, GetConsoleProcessList, GetStdHandle, STD_OUTPUT_HANDLE},
     };
     let mut pids = [0u32; 4];
     unsafe {
-        let console_out = GetStdHandle(STD_OUTPUT_HANDLE).is_ok_and(|h| GetFileType(h) == FILE_TYPE_CHAR);
-        if console_out && GetConsoleProcessList(&mut pids) == 1 {
+        let out_type = GetStdHandle(STD_OUTPUT_HANDLE)
+            .ok()
+            .filter(|h| !h.is_invalid() && !h.0.is_null())
+            .map(|h| GetFileType(h))
+            .unwrap_or(FILE_TYPE_UNKNOWN);
+        if out_type == FILE_TYPE_CHAR && GetConsoleProcessList(&mut pids) == 1 {
             let _ = FreeConsole();
+            let _ = crate::service::redirect_to(log);
+        } else if out_type == FILE_TYPE_UNKNOWN {
             let _ = crate::service::redirect_to(log);
         }
     }
@@ -50,46 +57,69 @@ fn leave_own_console(log: &std::path::Path) {
 /// another window (each counts as the lobby reopened, see `node`), or go
 /// online with the same key. Started again, the lobby shows the running
 /// one's window (also when it is in the tray) instead. Returns false then.
-fn first_lobby(key: &std::path::Path) -> bool {
+///
+/// If a previous lobby is still finishing shutdown (stopping the service after
+/// removing its tray icon), we wait for it to release the mutex and then start
+/// cleanly on the first click instead of exiting silently.
+fn first_lobby(key: &std::path::Path, log: &std::path::Path) -> bool {
+    use std::time::{Duration, Instant};
     use windows::{
         Win32::{
-            Foundation::{ERROR_ALREADY_EXISTS, GetLastError},
+            Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError},
             System::Threading::CreateMutexW,
             UI::WindowsAndMessaging::{FindWindowW, IsIconic, SW_RESTORE, SetForegroundWindow, ShowWindow},
         },
         core::{HSTRING, w},
     };
-    let name = format!(r"Local\remote-control-lobby-{}", key.to_string_lossy().to_lowercase().replace('\\', "/"));
+    let name = HSTRING::from(format!(
+        r"Local\remote-control-lobby-{}",
+        key.to_string_lossy().to_lowercase().replace('\\', "/")
+    ));
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let mut left_console = false;
     unsafe {
-        // The handle stays open (never closed) as long as this process runs.
-        if CreateMutexW(None, false, &HSTRING::from(name)).is_err() {
-            return true;
-        }
-        if GetLastError() != ERROR_ALREADY_EXISTS {
-            return true;
-        }
-        if tray::open_running() {
-            return false;
-        }
-        if let Ok(h) = FindWindowW(None, w!("remote control")) {
-            if IsIconic(h).as_bool() {
-                let _ = ShowWindow(h, SW_RESTORE);
+        loop {
+            let Ok(h) = CreateMutexW(None, false, &name) else {
+                return true;
+            };
+            if GetLastError() != ERROR_ALREADY_EXISTS {
+                // Keep the handle open for the lifetime of this process.
+                return true;
             }
-            let _ = SetForegroundWindow(h);
+            let _ = CloseHandle(h);
+            if tray::open_running() {
+                return false;
+            }
+            if Instant::now() >= deadline {
+                if let Ok(win) = FindWindowW(None, w!("remote control")) {
+                    if IsIconic(win).as_bool() {
+                        let _ = ShowWindow(win, SW_RESTORE);
+                    }
+                    let _ = SetForegroundWindow(win);
+                }
+                return false;
+            }
+            if !left_console {
+                // Hide the console while waiting for a previous instance to finish
+                // shutting down (or starting up), so no black window lingers.
+                leave_own_console(log);
+                left_console = true;
+            }
+            std::thread::sleep(Duration::from_millis(80));
         }
     }
-    false
 }
 
 pub fn run(a: LobbyArgs) -> Result<()> {
     let key = a.key.unwrap_or_else(net::default_key_path);
-    if !first_lobby(&key) {
-        return Ok(());
-    }
     if let Some(dir) = key.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    leave_own_console(&key.with_file_name("lobby.log"));
+    let log = key.with_file_name("lobby.log");
+    if !first_lobby(&key, &log) {
+        return Ok(());
+    }
+    leave_own_console(&log);
     crate::goaway::install(false);
     let view_args = a.view_args.map(|s| s.split_whitespace().map(String::from).collect()).unwrap_or_default();
     let b = backend::Backend::start(key, view_args, !a.no_lan, !a.hidden)?;

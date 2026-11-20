@@ -8,6 +8,7 @@
 use std::{
     cell::RefCell,
     sync::atomic::{AtomicBool, Ordering},
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail};
@@ -30,8 +31,8 @@ pub fn enabled() -> bool {
 }
 
 thread_local! {
-    /// The desktop this thread was last attached to by `follow`, and its name.
-    static CURRENT: RefCell<Option<(isize, String)>> = const { RefCell::new(None) };
+    /// The desktop this thread was last attached to by `follow`, its name, and when it was last verified.
+    static CURRENT: RefCell<Option<(isize, String, Instant)>> = const { RefCell::new(None) };
 }
 
 /// Opens the input desktop; the caller closes the handle.
@@ -58,11 +59,34 @@ fn open_input() -> Result<(HDESK, String)> {
 /// Returns the input desktop's name, or None when following is off.
 /// Fails while the thread owns windows or hooks (Windows refuses the switch).
 pub fn follow() -> Result<Option<String>> {
+    follow_cached(Duration::ZERO)
+}
+
+/// Like `follow()`, but skips `OpenInputDesktop` when this thread already
+/// attached to a desktop and checked within `max_age`. Callers that see
+/// `SendInput` fail should immediately fall back to `follow()`.
+pub fn follow_cached(max_age: Duration) -> Result<Option<String>> {
     if !enabled() {
         return Ok(None);
     }
+    if !max_age.is_zero()
+        && let Some(name) = CURRENT.with(|c| {
+            c.borrow().as_ref().and_then(|(_, n, checked)| (checked.elapsed() < max_age).then(|| n.clone()))
+        })
+    {
+        return Ok(Some(name));
+    }
     let (d, name) = open_input()?;
-    let same = CURRENT.with(|c| c.borrow().as_ref().is_some_and(|(_, n)| *n == name));
+    let now = Instant::now();
+    let same = CURRENT.with(|c| {
+        if let Some((_, n, checked)) = c.borrow_mut().as_mut()
+            && *n == name
+        {
+            *checked = now;
+            return true;
+        }
+        false
+    });
     unsafe {
         if same {
             let _ = CloseDesktop(d);
@@ -74,7 +98,7 @@ pub fn follow() -> Result<Option<String>> {
             bail!("SetThreadDesktop({name}): {e}");
         }
     }
-    if let Some((old, _)) = CURRENT.with(|c| c.borrow_mut().replace((d.0 as isize, name.clone()))) {
+    if let Some((old, _, _)) = CURRENT.with(|c| c.borrow_mut().replace((d.0 as isize, name.clone(), now))) {
         unsafe {
             let _ = CloseDesktop(HDESK(old as *mut _));
         }
@@ -108,7 +132,7 @@ pub fn switched() -> bool {
     unsafe {
         let _ = CloseDesktop(d);
     }
-    CURRENT.with(|c| c.borrow().as_ref().is_none_or(|(_, n)| *n != name))
+    CURRENT.with(|c| c.borrow().as_ref().is_none_or(|(_, n, _)| *n != name))
 }
 
 /// Without the service, why the screen cannot be captured now: a UAC

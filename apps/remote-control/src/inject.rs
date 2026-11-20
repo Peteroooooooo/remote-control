@@ -3,7 +3,10 @@
 //! that display's place on the virtual desktop. Keys use scan codes, so the
 //! host's keyboard layout decides what a key types, like a real keyboard.
 
-use std::collections::HashSet;
+use std::{
+    collections::HashSet,
+    time::{Duration, Instant},
+};
 
 use windows::Win32::{
     Foundation::{POINT, RECT},
@@ -25,6 +28,10 @@ use windows::Win32::{
 pub struct Injector {
     /// The streamed display in desktop pixels.
     display: RECT,
+    /// Cached virtual desktop bounds (refreshed every 1 s to avoid 4x
+    /// `GetSystemMetrics` syscalls on every mouse move).
+    virt: RECT,
+    virt_at: Instant,
     keys: HashSet<u16>,
     buttons: [bool; 5],
 }
@@ -32,11 +39,17 @@ pub struct Injector {
 static REFUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// In service mode, input goes to whatever desktop the calling thread is on:
-/// attach it to the input desktop first. Input arrives on any tokio worker
-/// thread, so this runs before every call.
-fn follow_desktop() {
+/// attach it to the input desktop first. Cache the desktop check briefly per
+/// thread so high-rate mouse moves do not hammer `OpenInputDesktop`, and force
+/// a re-check immediately if `SendInput` fails (e.g. UAC / Winlogon switch).
+fn follow_desktop(force: bool) {
     static FAILED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    if let Err(e) = crate::desktop::follow() {
+    let r = if force {
+        crate::desktop::follow()
+    } else {
+        crate::desktop::follow_cached(Duration::from_millis(100))
+    };
+    if let Err(e) = r {
         let count = FAILED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
         if count.is_power_of_two() {
             crate::log!("input: cannot follow the input desktop ({count} times): {e:#}");
@@ -49,8 +62,13 @@ fn follow_desktop() {
 /// from a non-administrator host is dropped without any report (seen on
 /// test laptop 2026-11-06), so the host should run as administrator.
 fn send(inputs: &[INPUT]) {
-    follow_desktop();
-    let n = unsafe { SendInput(inputs, size_of::<INPUT>() as i32) };
+    follow_desktop(false);
+    let mut n = unsafe { SendInput(inputs, size_of::<INPUT>() as i32) };
+    if n as usize != inputs.len() && crate::desktop::enabled() {
+        // Desktop may have just switched (e.g. UAC prompt or lock screen); re-attach and retry once.
+        follow_desktop(true);
+        n = unsafe { SendInput(inputs, size_of::<INPUT>() as i32) };
+    }
     if n as usize != inputs.len() {
         let err = windows::core::Error::from_thread();
         let count = REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
@@ -74,9 +92,27 @@ pub fn nudge() {
     send(&[mouse(1, 0, 0, MOUSEEVENTF_MOVE), mouse(-1, 0, 0, MOUSEEVENTF_MOVE)]);
 }
 
+fn query_virtual_desktop() -> RECT {
+    unsafe {
+        let (vx, vy) = (GetSystemMetrics(SM_XVIRTUALSCREEN), GetSystemMetrics(SM_YVIRTUALSCREEN));
+        RECT {
+            left: vx,
+            top: vy,
+            right: vx + GetSystemMetrics(SM_CXVIRTUALSCREEN).max(2),
+            bottom: vy + GetSystemMetrics(SM_CYVIRTUALSCREEN).max(2),
+        }
+    }
+}
+
 impl Injector {
     pub fn new(display: RECT) -> Injector {
-        Injector { display, keys: HashSet::new(), buttons: [false; 5] }
+        Injector {
+            display,
+            virt: query_virtual_desktop(),
+            virt_at: Instant::now(),
+            keys: HashSet::new(),
+            buttons: [false; 5],
+        }
     }
 
     pub fn set_display(&mut self, display: RECT) {
@@ -88,18 +124,13 @@ impl Injector {
         stream_to_desktop(&self.display, x, y)
     }
 
-    pub fn move_to(&self, x: u16, y: u16) {
+    pub fn move_to(&mut self, x: u16, y: u16) {
         let (px, py) = self.to_desktop(x, y);
-        let virt = unsafe {
-            let (vx, vy) = (GetSystemMetrics(SM_XVIRTUALSCREEN), GetSystemMetrics(SM_YVIRTUALSCREEN));
-            RECT {
-                left: vx,
-                top: vy,
-                right: vx + GetSystemMetrics(SM_CXVIRTUALSCREEN).max(2),
-                bottom: vy + GetSystemMetrics(SM_CYVIRTUALSCREEN).max(2),
-            }
-        };
-        let (ax, ay) = desktop_to_absolute(&virt, px, py);
+        if self.virt_at.elapsed() >= Duration::from_secs(1) {
+            self.virt = query_virtual_desktop();
+            self.virt_at = Instant::now();
+        }
+        let (ax, ay) = desktop_to_absolute(&self.virt, px, py);
         send(&[mouse(ax, ay, 0, MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK)]);
     }
 
@@ -167,7 +198,7 @@ impl Injector {
 
     /// Where the pointer is, as a stream position.
     pub fn cursor(&self) -> (u16, u16) {
-        follow_desktop();
+        follow_desktop(false);
         let mut p = POINT::default();
         unsafe {
             let _ = GetCursorPos(&mut p);

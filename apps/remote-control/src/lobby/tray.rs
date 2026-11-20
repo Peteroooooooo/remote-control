@@ -19,10 +19,10 @@ use windows::{
             },
             WindowsAndMessaging::{
                 AllowSetForegroundWindow, AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu,
-                DispatchMessageW, FindWindowW, GetCursorPos, GetMessageW, GetSystemMetrics, HICON, IMAGE_ICON, IsIconic,
-                IsWindowVisible,
-                LR_DEFAULTCOLOR, LoadImageW, MF_SEPARATOR, MF_STRING, MSG, PostMessageW, RegisterClassW,
-                RegisterWindowMessageW, SM_CXSMICON, SM_CYSMICON, SW_HIDE, SW_RESTORE, SW_SHOW, SetForegroundWindow,
+                DestroyWindow, DispatchMessageW, FindWindowW, GetCursorPos, GetMessageW, GetSystemMetrics, HICON,
+                IMAGE_ICON, IsIconic, IsWindowVisible, LR_DEFAULTCOLOR, LoadImageW, MF_SEPARATOR, MF_STRING, MSG,
+                PostMessageW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SM_CXSMICON, SM_CYSMICON,
+                SMTO_ABORTIFHUNG, SMTO_BLOCK, SW_HIDE, SW_RESTORE, SW_SHOW, SendMessageTimeoutW, SetForegroundWindow,
                 ShowWindow, TPM_BOTTOMALIGN, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WINDOW_EX_STYLE,
                 WM_APP, WM_COMMAND, WM_CONTEXTMENU, WM_LBUTTONUP, WM_NULL, WM_RBUTTONUP, WNDCLASSW, WS_POPUP,
             },
@@ -44,6 +44,7 @@ static LOBBY: AtomicIsize = AtomicIsize::new(0);
 /// The icon's window, once it is up.
 static ICON: AtomicIsize = AtomicIsize::new(0);
 static TOLD: AtomicBool = AtomicBool::new(false);
+static QUITTING: AtomicBool = AtomicBool::new(false);
 
 struct Handlers {
     shown: Box<dyn Fn() + Send + Sync>,
@@ -137,13 +138,24 @@ pub fn hide() {
     }
 }
 
-/// Asks the lobby already running to show its window; false if there is none.
+/// Asks the lobby already running to show its window; false if there is none
+/// or it is currently shutting down.
 pub fn open_running() -> bool {
     unsafe {
         let Ok(h) = FindWindowW(CLASS, None) else { return false };
         // The running lobby may come to the front: this process was just started by the user.
         let _ = AllowSetForegroundWindow(u32::MAX);
-        PostMessageW(Some(h), WM_OPEN, WPARAM(0), LPARAM(0)).is_ok()
+        let mut res = 0usize;
+        let ok = SendMessageTimeoutW(
+            h,
+            WM_OPEN,
+            WPARAM(0),
+            LPARAM(0),
+            SMTO_ABORTIFHUNG | SMTO_BLOCK,
+            500,
+            Some(&mut res),
+        );
+        ok.0 != 0 && res == 1
     }
 }
 
@@ -199,14 +211,35 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
             WM_RBUTTONUP | WM_CONTEXTMENU => menu(hwnd),
             _ => {}
         },
-        WM_OPEN => show(),
-        WM_COMMAND if wp.0 & 0xffff == CMD_OPEN => show(),
-        WM_COMMAND if wp.0 & 0xffff == CMD_QUIT => unsafe {
-            let _ = Shell_NotifyIconW(NIM_DELETE, &icon_data(hwnd));
-            if let Some(hs) = HANDLERS.get() {
-                (hs.quit)();
+        WM_OPEN => {
+            if QUITTING.load(Ordering::SeqCst) {
+                return LRESULT(0);
             }
-        },
+            show();
+            return LRESULT(1);
+        }
+        WM_COMMAND if wp.0 & 0xffff == CMD_OPEN => show(),
+        WM_COMMAND if wp.0 & 0xffff == CMD_QUIT => {
+            if !QUITTING.swap(true, Ordering::SeqCst) {
+                unsafe {
+                    let _ = Shell_NotifyIconW(NIM_DELETE, &icon_data(hwnd));
+                    ICON.store(0, Ordering::SeqCst);
+                    if let Some(h) = window() {
+                        let _ = ShowWindow(h, SW_HIDE);
+                    }
+                    let _ = DestroyWindow(hwnd);
+                    PostQuitMessage(0);
+                }
+                if HANDLERS.get().is_some() {
+                    std::thread::spawn(|| {
+                        if let Some(hs) = HANDLERS.get() {
+                            (hs.quit)();
+                        }
+                    });
+                }
+            }
+            return LRESULT(0);
+        }
         // Explorer restarted: the icon is gone from the new taskbar.
         m if Some(&m) == TASKBAR_CREATED.get() => unsafe {
             let _ = Shell_NotifyIconW(NIM_ADD, &icon_data(hwnd));

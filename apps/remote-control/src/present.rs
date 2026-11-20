@@ -1,19 +1,32 @@
-//! Shows decoded frames in the viewer window: a flip-model swap chain, the
-//! video processor converting NV12 straight into the back buffer, and
-//! presenting without waiting for vsync (tearing allowed) for the lowest delay.
+//! Shows decoded frames in the viewer window: a flip-model swap chain, a
+//! pixel shader (`torgb.rs`) drawing the picture into the back buffer, and
+//! Present. If the shader cannot run, the video processor draws instead.
+//!
+//! In full screen the frame goes to the screen directly (the compositor
+//! skips the window), at the next refresh, a newer frame replacing one still
+//! waiting: measured 2026-11-20 on a 120 Hz laptop, 11 ms from Present to
+//! the screen and no frame lost, against 15 ms and 11% in a window. Tearing
+//! is never asked for: in full screen it would cut the picture across.
+//!
+//! In a window the desktop compositor takes the newest frame at each
+//! refresh, so two frames within one refresh lose the first. There each
+//! frame waits for a refresh of its own, Present holding the render thread
+//! while the frame before still waits (one refresh at most; frames that came
+//! meanwhile give way to the newest). Not when frames come faster than the
+//! screen shows them: then every frame would wait a refresh and some would
+//! be lost all the same.
 
 use anyhow::{Context, Result};
 use windows::{
     Win32::{
         Foundation::{HWND, RECT},
         Graphics::{
-            Direct3D11::ID3D11Texture2D,
+            Direct3D11::{ID3D11RenderTargetView, ID3D11Texture2D},
             Dxgi::{
                 Common::{DXGI_ALPHA_MODE_IGNORE, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC},
-                DXGI_FEATURE_PRESENT_ALLOW_TEARING, DXGI_MWA_NO_ALT_ENTER, DXGI_PRESENT, DXGI_PRESENT_ALLOW_TEARING,
-                DXGI_SCALING_NONE, DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_CHAIN_FLAG, DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING,
+                DXGI_MWA_NO_ALT_ENTER, DXGI_PRESENT, DXGI_SCALING_NONE, DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_CHAIN_FLAG,
                 DXGI_SWAP_EFFECT_FLIP_DISCARD, DXGI_USAGE_RENDER_TARGET_OUTPUT, IDXGIDevice1, IDXGIFactory2,
-                IDXGIFactory5, IDXGISwapChain1,
+                IDXGISwapChain1,
             },
         },
         UI::WindowsAndMessaging::GetClientRect,
@@ -24,14 +37,17 @@ use windows::{
 use crate::{
     decode::Picture,
     gpu::Gpu,
+    torgb::ToRgb,
     vp::{self, Vp},
 };
 
 pub struct Presenter {
     hwnd: HWND,
     swap: IDXGISwapChain1,
-    tearing: bool,
     size: (u32, u32),
+    /// None once it failed: the video processor draws from then on.
+    shader: Option<ToRgb>,
+    rtv: Option<ID3D11RenderTargetView>,
     vp: Option<Vp>,
 }
 
@@ -47,14 +63,6 @@ impl Presenter {
     pub fn new(gpu: &Gpu, hwnd: HWND) -> Result<Presenter> {
         unsafe {
             let factory: IDXGIFactory2 = gpu.adapter.GetParent()?;
-            let mut allow = 0i32;
-            let tearing = factory
-                .cast::<IDXGIFactory5>()
-                .and_then(|f| {
-                    f.CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING, &mut allow as *mut i32 as *mut _, 4)
-                })
-                .is_ok()
-                && allow != 0;
             let size = client_size(hwnd);
             let desc = DXGI_SWAP_CHAIN_DESC1 {
                 Width: size.0,
@@ -66,7 +74,6 @@ impl Presenter {
                 Scaling: DXGI_SCALING_NONE,
                 SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
                 AlphaMode: DXGI_ALPHA_MODE_IGNORE,
-                Flags: if tearing { DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING.0 as u32 } else { 0 },
                 ..Default::default()
             };
             let swap = factory
@@ -76,7 +83,8 @@ impl Presenter {
             if let Ok(d) = gpu.device.cast::<IDXGIDevice1>() {
                 let _ = d.SetMaximumFrameLatency(1);
             }
-            Ok(Presenter { hwnd, swap, tearing, size, vp: None })
+            let shader = ToRgb::new(gpu).inspect_err(|e| crate::log!("picture shader: {e:#}; the video processor draws")).ok();
+            Ok(Presenter { hwnd, swap, size, shader, rtv: None, vp: None })
         }
     }
 
@@ -86,20 +94,42 @@ impl Presenter {
             let now = client_size(self.hwnd);
             if now != self.size {
                 self.vp = None;
-                let flags = if self.tearing { DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING } else { DXGI_SWAP_CHAIN_FLAG(0) };
-                self.swap.ResizeBuffers(0, now.0, now.1, DXGI_FORMAT_UNKNOWN, flags).context("ResizeBuffers")?;
+                self.rtv = None;
+                self.swap.ResizeBuffers(0, now.0, now.1, DXGI_FORMAT_UNKNOWN, DXGI_SWAP_CHAIN_FLAG(0)).context("ResizeBuffers")?;
                 self.size = now;
             }
-            if self.vp.as_ref().is_none_or(|v| v.input != stream) {
-                self.vp = Some(Vp::new(gpu, stream, self.size, vp::YUV_709, vp::RGB_FULL)?);
-            }
-            let vp = self.vp.as_ref().expect("set above");
+            let dest = vp::letterbox(stream, self.size);
             let back: ID3D11Texture2D = self.swap.GetBuffer(0)?;
-            vp.blt(&pic.tex, pic.slice, &back, vp::letterbox(stream, self.size))?;
+            if !self.shade(gpu, pic, stream, &back, dest) {
+                if self.vp.as_ref().is_none_or(|v| v.input != stream) {
+                    self.vp = Some(Vp::new(gpu, stream, self.size, vp::YUV_709, vp::RGB_FULL)?);
+                }
+                self.vp.as_ref().expect("set above").blt(&pic.tex, pic.slice, &back, dest)?;
+            }
             drop(back);
-            let flags = if self.tearing { DXGI_PRESENT_ALLOW_TEARING } else { DXGI_PRESENT(0) };
-            self.swap.Present(0, flags).ok().context("Present")
+            let own_refresh = !crate::window::fullscreen() && crate::quality::frames_fit_screen();
+            self.swap.Present(u32::from(own_refresh), DXGI_PRESENT(0)).ok().context("Present")
         }
+    }
+
+    /// Draws with the shader; false if there is none (any more).
+    fn shade(&mut self, gpu: &Gpu, pic: &Picture, stream: (u32, u32), back: &ID3D11Texture2D, dest: RECT) -> bool {
+        let Some(shader) = self.shader.as_mut() else { return false };
+        let r = (|| {
+            if self.rtv.is_none() {
+                let mut v = None;
+                unsafe { gpu.device.CreateRenderTargetView(back, None, Some(&mut v)) }.context("CreateRenderTargetView")?;
+                self.rtv = v;
+            }
+            shader.draw(gpu, pic, stream, self.rtv.as_ref().context("no render target")?, dest)
+        })();
+        if let Err(e) = r {
+            crate::log!("picture shader: {e:#}; the video processor draws");
+            self.shader = None;
+            self.rtv = None;
+            return false;
+        }
+        true
     }
 
     /// The window's client area no longer matches the back buffers.

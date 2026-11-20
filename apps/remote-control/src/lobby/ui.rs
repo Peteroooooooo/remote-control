@@ -9,14 +9,15 @@
 //! `backend::Snap` and calls `Backend`.
 
 use std::{
-    sync::Arc,
+    collections::HashMap,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
 use eframe::egui::{
     self, Align, Align2, Color32, CornerRadius, FontData, FontFamily, FontId, Frame, Galley, Id, Layout, Margin,
     Order, Pos2, Rect, RectAlign, RichText, Sense, Shadow, Stroke, StrokeKind, TextEdit, UiBuilder, Vec2, WidgetInfo,
-    WidgetType, emath::easing, pos2, text::LayoutJob, vec2,
+    WidgetType, emath::easing, pos2, text::{LayoutJob, TextFormat}, vec2,
 };
 use iroh::EndpointId;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -24,7 +25,7 @@ use rc_ident::conn_code::ConnCode;
 use windows::Win32::{
     Foundation::HWND,
     UI::WindowsAndMessaging::{
-        SPI_GETWHEELSCROLLLINES, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SystemParametersInfoW,
+        IsWindowVisible, SPI_GETWHEELSCROLLLINES, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SystemParametersInfoW,
     },
 };
 
@@ -115,6 +116,7 @@ mod ic {
     pub const SERVICE: char = '\u{E912}';
     pub const BOLT: char = '\u{E945}';
     pub const ERR: char = '\u{EA39}';
+    pub const REFRESH: char = '\u{E72C}';
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -162,8 +164,152 @@ struct Confirm {
     there: bool,
 }
 
+const RELAY_PROBE_INTERVAL: Duration = Duration::from_secs(5);
+const RELAY_PROBE_TIMEOUT: Duration = Duration::from_secs(4);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProbeState {
+    Probing,
+    Ok(Duration),
+    Fail,
+}
+
+#[derive(Default)]
+struct ProbeShared {
+    wave: u64,
+    in_flight: bool,
+    results: HashMap<String, ProbeState>,
+}
+
+#[derive(Default)]
+struct RelayProbe {
+    shared: Arc<Mutex<ProbeShared>>,
+    last_started: Option<Instant>,
+    last_urls: Vec<String>,
+    active: bool,
+    cancel: Option<tokio::sync::watch::Sender<bool>>,
+}
+
+impl RelayProbe {
+    fn stop(&mut self) {
+        if let Some(tx) = self.cancel.take() {
+            let _ = tx.send(true);
+        }
+        if !self.active && self.last_started.is_none() && self.last_urls.is_empty() {
+            return;
+        }
+        self.active = false;
+        self.last_started = None;
+        self.last_urls.clear();
+        let mut sh = self.shared.lock().unwrap();
+        sh.wave += 1;
+        sh.in_flight = false;
+        sh.results.clear();
+    }
+
+    fn snapshot(&self) -> (bool, HashMap<String, ProbeState>) {
+        let sh = self.shared.lock().unwrap();
+        (sh.in_flight, sh.results.clone())
+    }
+
+    fn start_wave(&mut self, ctx: &egui::Context, urls: &[String]) {
+        if let Some(tx) = self.cancel.take() {
+            let _ = tx.send(true);
+        }
+        let wave_id = {
+            let mut sh = self.shared.lock().unwrap();
+            sh.wave += 1;
+            sh.in_flight = true;
+            sh.results.retain(|k, _| urls.iter().any(|u| u == k));
+            for u in urls {
+                sh.results.entry(u.clone()).or_insert(ProbeState::Probing);
+            }
+            sh.wave
+        };
+        self.active = true;
+        self.last_started = Some(Instant::now());
+        self.last_urls = urls.to_vec();
+
+        let (cancel_tx, mut cancel_rx) = tokio::sync::watch::channel(false);
+        self.cancel = Some(cancel_tx);
+
+        let shared = self.shared.clone();
+        let ctx = ctx.clone();
+        let targets = urls.to_vec();
+        let spawned = std::thread::Builder::new().name("relay-probe".into()).spawn(move || {
+            let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
+                let mut sh = shared.lock().unwrap();
+                if sh.wave == wave_id {
+                    sh.in_flight = false;
+                    for u in targets {
+                        sh.results.insert(u, ProbeState::Fail);
+                    }
+                    ctx.request_repaint();
+                }
+                return;
+            };
+            rt.block_on(async move {
+                let ca = rc_relay::tls::ca();
+                let mut set = tokio::task::JoinSet::new();
+                for raw_url in targets {
+                    let ca = ca.clone();
+                    set.spawn(async move {
+                        let parsed: Vec<iroh::RelayUrl> = raw_url
+                            .split(',')
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .filter_map(|s| s.parse().ok())
+                            .collect();
+                        let res = rc_relay::client::ping_rtt(&parsed, &ca, RELAY_PROBE_TIMEOUT).await;
+                        (raw_url, res)
+                    });
+                }
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = cancel_rx.changed() => {
+                            set.abort_all();
+                            break;
+                        }
+                        res = set.join_next() => {
+                            let Some(res) = res else { break };
+                            if let Ok((raw_url, ping_res)) = res {
+                                let state = match ping_res {
+                                    Ok(d) => ProbeState::Ok(d),
+                                    Err(_) => ProbeState::Fail,
+                                };
+                                let mut sh = shared.lock().unwrap();
+                                if sh.wave != wave_id {
+                                    break;
+                                }
+                                sh.results.insert(raw_url, state);
+                                ctx.request_repaint();
+                            }
+                        }
+                    }
+                }
+                let mut sh = shared.lock().unwrap();
+                if sh.wave == wave_id {
+                    sh.in_flight = false;
+                    ctx.request_repaint();
+                }
+            });
+        });
+        if spawned.is_err() {
+            let mut sh = self.shared.lock().unwrap();
+            if sh.wave == wave_id {
+                sh.in_flight = false;
+                for u in urls {
+                    sh.results.insert(u.clone(), ProbeState::Fail);
+                }
+            }
+        }
+    }
+}
+
 pub struct App {
     b: Backend,
+    hwnd: Option<isize>,
     page: Page,
     paste: String,
     copied: Option<Instant>,
@@ -187,6 +333,7 @@ pub struct App {
     saved: Option<Instant>,
     adding_relay: bool,
     relay_paste: String,
+    relay_probe: RelayProbe,
 }
 
 /// `hidden`: started at sign-in, with only the icon in the tray.
@@ -210,9 +357,11 @@ pub fn run(b: Backend, hidden: bool) -> anyhow::Result<()> {
             setup(&cc.egui_ctx);
             // eframe keeps the window hidden until the first frame is drawn,
             // so the frame gets its colours before anyone sees it.
+            let mut raw_hwnd = None;
             if let Ok(h) = cc.window_handle()
                 && let RawWindowHandle::Win32(w) = h.as_raw()
             {
+                raw_hwnd = Some(w.hwnd.get());
                 let hwnd = HWND(w.hwnd.get() as *mut _);
                 theme::frame(hwnd, theme::CHROME);
                 theme::set_icon(hwnd);
@@ -225,6 +374,7 @@ pub fn run(b: Backend, hidden: bool) -> anyhow::Result<()> {
             b.on_change(move || ctx.request_repaint());
             Ok(Box::new(App {
                 b,
+                hwnd: raw_hwnd,
                 page: Page::Devices,
                 paste: String::new(),
                 copied: None,
@@ -243,6 +393,7 @@ pub fn run(b: Backend, hidden: bool) -> anyhow::Result<()> {
                 relay_paste: String::new(),
                 service_other: None,
                 update_later: false,
+                relay_probe: RelayProbe::default(),
             }))
         }),
     )
@@ -600,6 +751,11 @@ fn banner(ui: &mut egui::Ui, tint: Tint, lead: Lead, text: &str, buttons: impl F
 
 /// A section's title, with a note after it.
 fn section_head(ui: &mut egui::Ui, title: &str, note: Option<&str>) {
+    section_head_with(ui, title, note, |_| {});
+}
+
+/// A section's title, with a note after it and optional controls on the right.
+fn section_head_with(ui: &mut egui::Ui, title: &str, note: Option<&str>, right: impl FnOnce(&mut egui::Ui)) {
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 8.0;
         ui.add_space(4.0);
@@ -607,6 +763,7 @@ fn section_head(ui: &mut egui::Ui, title: &str, note: Option<&str>) {
         if let Some(n) = note {
             ui.label(RichText::new(n).size(12.0).color(DIM));
         }
+        ui.with_layout(Layout::right_to_left(Align::Center), right);
     });
 }
 
@@ -625,6 +782,7 @@ struct Item<'a> {
     title: &'a str,
     title_font: FontId,
     desc: Option<(&'a str, Color32)>,
+    desc_suffix: Option<(String, Color32)>,
     lead: Lead,
     /// The card's first line: no divider above.
     first: bool,
@@ -633,7 +791,7 @@ struct Item<'a> {
 
 impl<'a> Item<'a> {
     fn new(lead: Lead, title: &'a str) -> Self {
-        Item { title, title_font: font(14.0), desc: None, lead, first: false, enabled: true }
+        Item { title, title_font: font(14.0), desc: None, desc_suffix: None, lead, first: false, enabled: true }
     }
 
     fn desc(mut self, d: &'a str) -> Self {
@@ -660,7 +818,15 @@ impl<'a> Item<'a> {
         let text_w = (w - 2.0 * PAD.x - RIGHT - indent).max(160.0);
         let fade = if self.enabled { 1.0 } else { 0.45 };
         let title = ui.painter().layout(self.title.to_string(), self.title_font, TEXT.gamma_multiply(fade), text_w);
-        let desc = self.desc.map(|(d, c)| ui.painter().layout(d.to_string(), font(12.0), c.gamma_multiply(fade), text_w));
+        let desc = self.desc.map(|(d, c)| {
+            let mut job = LayoutJob::default();
+            job.wrap.max_width = text_w;
+            job.append(d, 0.0, TextFormat::simple(font(12.0), c.gamma_multiply(fade)));
+            if let Some((suf, sc)) = self.desc_suffix {
+                job.append(&suf, 0.0, TextFormat::simple(font(12.0), sc.gamma_multiply(fade)));
+            }
+            ui.painter().layout_job(job)
+        });
         let text_h = title.size().y + desc.as_ref().map_or(0.0, |g| g.size().y + 1.0);
         let h = (text_h + 2.0 * PAD.y).max(62.0);
         let (rect, _) = ui.allocate_exact_size(vec2(w, h), Sense::hover());
@@ -837,6 +1003,7 @@ impl eframe::App for App {
     }
 
     fn on_exit(&mut self) {
+        self.relay_probe.stop();
         for (_, what) in std::mem::take(&mut self.pending) {
             self.carry_out(what);
         }
@@ -892,6 +1059,9 @@ impl eframe::App for App {
             })
             .response
             .rect;
+        if self.page != Page::Settings || !self.is_visible(&ctx) {
+            self.relay_probe.stop();
+        }
         self.toasts(&ctx, content);
         self.confirm_dialog(&ctx);
         ctx.request_repaint_after(Duration::from_secs(1));
@@ -899,8 +1069,14 @@ impl eframe::App for App {
 }
 
 impl App {
+    fn is_visible(&self, ctx: &egui::Context) -> bool {
+        let shown = self.hwnd.is_none_or(|h| unsafe { IsWindowVisible(HWND(h as *mut _)).as_bool() });
+        shown && !ctx.input(|i| i.viewport().minimized.unwrap_or(false))
+    }
+
     /// Closing the window: it goes to the tray, and counts as closed.
     fn hide_to_tray(&mut self) {
+        self.relay_probe.stop();
         for (_, what) in std::mem::take(&mut self.pending) {
             self.carry_out(what);
         }
@@ -1200,6 +1376,7 @@ impl App {
         self.banners(ui, snap);
 
         let sessions = self.b.sessions();
+        let at_own_relay = snap.relays.iter().any(|r| r.state == "home");
         type Kind = (&'static str, &'static str, fn(&Dev) -> bool);
         let kinds: [Kind; 3] = [
             ("我的电脑", "控制本机不用问", |d| d.listed && d.auto),
@@ -1217,7 +1394,7 @@ impl App {
             let last = ds.len() - 1;
             group(ui, |ui| {
                 for (i, d) in ds.into_iter().enumerate() {
-                    self.row(ui, d, sessions.get(&d.id).map(|s| s.1), i == 0, i == last);
+                    self.row(ui, d, sessions.get(&d.id).map(|s| s.1), i == 0, i == last, at_own_relay);
                 }
             });
             ui.add_space(12.0);
@@ -1285,7 +1462,9 @@ impl App {
     /// One device: its picture (what it is to this computer, a dot for its
     /// status), its name and what is going on, its buttons. Double-click:
     /// control it; double-click the name of a remembered one: rename it.
-    fn row(&mut self, ui: &mut egui::Ui, d: &Dev, session: Option<SessionState>, first: bool, last: bool) {
+    /// `at_own_relay`: this computer is at its own relay, so a device it
+    /// cannot get through to is not at that relay.
+    fn row(&mut self, ui: &mut egui::Ui, d: &Dev, session: Option<SessionState>, first: bool, last: bool, at_own_relay: bool) {
         let online = matches!(d.status, Status::Online { .. });
         let unreachable = d.status == Status::Unreachable;
         let asked = d.ask == Ask::In;
@@ -1414,7 +1593,12 @@ impl App {
             Frame::new().inner_margin(Margin { left: ROW_TEXT as i8, right: 14, top: 0, bottom: 14 }).show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.spacing_mut().item_spacing.y = 8.0;
-                ui.label(RichText::new("找不到直连。打开路由器的 IPv6，或者加一台自建中转。").size(13.0).color(DIM));
+                let why = if at_own_relay {
+                    "对方连不上你的自建中转，也找不到直连。可能是它那边的网络连不到中转服务器。"
+                } else {
+                    "找不到直连。打开路由器的 IPv6，或者加一台自建中转。"
+                };
+                ui.label(RichText::new(why).size(13.0).color(DIM));
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 6.0;
                     if Btn::new("重试").show(ui).clicked() {
@@ -1664,7 +1848,45 @@ impl App {
             self.b.clear_job();
         }
         let relays: Vec<_> = snap.relays.iter().filter(|r| !self.hidden_relay(&r.url)).cloned().collect();
-        section_head(ui, "自建中转", Some("从上往下用，第一台连不上时下一台临时顶替"));
+        let urls: Vec<String> = relays.iter().map(|r| r.url.clone()).collect();
+        let visible = self.is_visible(ui.ctx());
+        let (mut in_flight, _) = self.relay_probe.snapshot();
+        if visible && !urls.is_empty() {
+            let need_now = !self.relay_probe.active
+                || self.relay_probe.last_urls != urls
+                || (!in_flight && self.relay_probe.last_started.is_none_or(|t| t.elapsed() >= RELAY_PROBE_INTERVAL));
+            if need_now {
+                self.relay_probe.start_wave(ui.ctx(), &urls);
+            } else if !in_flight && let Some(t) = self.relay_probe.last_started {
+                ui.ctx().request_repaint_after(RELAY_PROBE_INTERVAL.saturating_sub(t.elapsed()));
+            }
+            in_flight = self.relay_probe.snapshot().0;
+        } else {
+            self.relay_probe.stop();
+            in_flight = false;
+        }
+
+        let mut manual_refresh = false;
+        section_head_with(ui, "自建中转", Some("从上往下用，第一台连不上时下一台临时顶替"), |ui| {
+            if urls.is_empty() {
+                return;
+            }
+            if in_flight {
+                let (rect, r) = ui.allocate_exact_size(Vec2::splat(22.0), Sense::hover());
+                r.widget_info(|| WidgetInfo::labeled(WidgetType::Button, false, "重新测速"));
+                glyph(ui.painter(), rect.center(), ic::REFRESH, 13.0, FAINT);
+                r.on_hover_text("重新测速");
+            } else if icon_button(ui, ic::REFRESH, 22.0, 13.0, "重新测速", false)
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .clicked()
+            {
+                manual_refresh = true;
+            }
+        });
+        if manual_refresh && visible && !urls.is_empty() && !in_flight {
+            self.relay_probe.start_wave(ui.ctx(), &urls);
+        }
+        let (_, probe_results) = self.relay_probe.snapshot();
         group(ui, |ui| {
             for (i, r) in relays.iter().enumerate() {
                 let (state, color) = match r.state.as_str() {
@@ -1674,11 +1896,27 @@ impl App {
                     "idle" => ("未使用，名单照常同步", GONE),
                     _ => ("正在连接…", GONE),
                 };
+                let desc_suffix = match probe_results.get(&r.url).copied() {
+                    Some(ProbeState::Probing) | None => Some((" · 测速中…".to_string(), DIM)),
+                    Some(ProbeState::Ok(d)) => {
+                        let ms = d.as_millis().max(1);
+                        let sc = if ms >= 200 { AMBER_TEXT } else { DIM };
+                        Some((format!(" · {ms} ms"), sc))
+                    }
+                    Some(ProbeState::Fail) => {
+                        if state == "连不上" {
+                            None
+                        } else {
+                            Some((" · 超时".to_string(), AMBER_TEXT))
+                        }
+                    }
+                };
                 let host = host_of(&r.url);
                 let (mut remove, mut pick) = (false, false);
                 let line = Item {
                     title_font: FontId::monospace(13.0),
                     desc: Some((state, if color == AMBER { AMBER_TEXT } else { DIM })),
+                    desc_suffix,
                     ..Item::new(Lead::Dot(color), &host).first(i == 0)
                 };
                 line.show(ui, |ui| {

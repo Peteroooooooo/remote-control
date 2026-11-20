@@ -34,7 +34,10 @@ use windows::Win32::{
     Foundation::RECT,
     Graphics::{
         Direct3D11::{D3D11_BIND_RENDER_TARGET, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, ID3D11Texture2D},
-        Dxgi::Common::{DXGI_FORMAT_AYUV, DXGI_FORMAT_NV12, DXGI_SAMPLE_DESC},
+        Dxgi::{
+            Common::{DXGI_FORMAT_AYUV, DXGI_FORMAT_NV12, DXGI_SAMPLE_DESC},
+            IDXGIOutput1,
+        },
     },
     System::{
         Performance::{QueryPerformanceCounter, QueryPerformanceFrequency},
@@ -85,18 +88,36 @@ pub struct PipeShared {
     /// since the capture loop last started.
     pub quality: Mutex<Quality>,
     pub quality_changed: AtomicBool,
-    /// The pointer is drawn into the captured image (see `Capture::pointer_apart`):
-    /// the viewer shows no cursor of its own then, or there would be two.
-    pub pointer_in_image: AtomicBool,
 }
 
 /// After a screen change, the same picture is encoded again for at most this
 /// long (see the module notes)...
 const REFINE: Duration = Duration::from_secs(4);
+/// ...waiting this long after the last real screen update before starting to
+/// re-encode the still picture, so refining never races a live 60 Hz drag or
+/// scroll and steals its encode slot.
+const REFINE_IDLE: Duration = Duration::from_millis(80);
 /// ...or until this many frames in a row came out nearly empty
 /// (`REFINE_DONE`). The NVIDIA encoder above paused for up to 10 nearly
 /// empty frames before it went on refining.
 const REFINE_TINY_RUN: u32 = 20;
+
+/// How long to wait in `cap.grab` given whether a frame is already pending and
+/// when the still-frame refiner should next run.
+fn capture_wait(has_pending: bool, refine_armed: bool, since_new: Duration, next_slot: Duration) -> Duration {
+    if has_pending {
+        return next_slot;
+    }
+    if refine_armed {
+        if since_new >= REFINE_IDLE {
+            return next_slot.max(Duration::from_millis(1));
+        }
+        return REFINE_IDLE
+            .saturating_sub(since_new)
+            .clamp(Duration::from_millis(1), Duration::from_millis(50));
+    }
+    Duration::from_millis(50)
+}
 
 /// A frame this small adds nothing: a tenth of its budget, at least 1 KB.
 fn refine_done(bytes: usize, budget: usize) -> bool {
@@ -188,6 +209,66 @@ pub fn yuv_texture(gpu: &Gpu, w: u32, h: u32, yuv444: bool) -> Result<ID3D11Text
     t.context("CreateTexture2D for the encoder")
 }
 
+/// Raises process priority, disables Windows 11 EcoQoS power throttling, and
+/// opts out of Windows 11 background timer-resolution ignoring while a
+/// streaming session is active, restoring defaults on drop.
+/// Background/service processes on hybrid CPUs (e.g. Intel Core Ultra) are
+/// otherwise scheduled on LP-E cores with half-clock VDBOX (~2x slower encode).
+pub(crate) struct StreamingBoost;
+
+impl StreamingBoost {
+    pub(crate) fn enter() -> Self {
+        use windows::Win32::System::Threading::{
+            GetCurrentProcess, HIGH_PRIORITY_CLASS, PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+            PROCESS_POWER_THROTTLING_EXECUTION_SPEED, PROCESS_POWER_THROTTLING_STATE, ProcessPowerThrottling,
+            SetPriorityClass, SetProcessInformation,
+        };
+        // Win11 22H2+ (processthreadsapi.h): keep timeBeginPeriod(1) effective
+        // even when this process has no foreground window.
+        const IGNORE_TIMER_RESOLUTION: u32 = 0x4;
+        unsafe {
+            let p = GetCurrentProcess();
+            let _ = SetPriorityClass(p, HIGH_PRIORITY_CLASS);
+            let state = PROCESS_POWER_THROTTLING_STATE {
+                Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+                ControlMask: PROCESS_POWER_THROTTLING_EXECUTION_SPEED | IGNORE_TIMER_RESOLUTION,
+                StateMask: 0,
+            };
+            let _ = SetProcessInformation(
+                p,
+                ProcessPowerThrottling,
+                &state as *const _ as *const _,
+                std::mem::size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32,
+            );
+        }
+        StreamingBoost
+    }
+}
+
+impl Drop for StreamingBoost {
+    fn drop(&mut self) {
+        use windows::Win32::System::Threading::{
+            GetCurrentProcess, NORMAL_PRIORITY_CLASS, PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+            PROCESS_POWER_THROTTLING_STATE, ProcessPowerThrottling, SetPriorityClass, SetProcessInformation,
+        };
+        unsafe {
+            let p = GetCurrentProcess();
+            let _ = SetPriorityClass(p, NORMAL_PRIORITY_CLASS);
+            let state = PROCESS_POWER_THROTTLING_STATE {
+                Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+                ControlMask: 0,
+                StateMask: 0,
+            };
+            let _ = SetProcessInformation(
+                p,
+                ProcessPowerThrottling,
+                &state as *const _ as *const _,
+                std::mem::size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32,
+            );
+        }
+    }
+}
+
 /// Runs until `sh.stop` is set. Rebuilds everything after a desktop switch,
 /// mode change or error.
 pub fn run(cfg: PipeConfig, tx: Arc<VideoTx>, sh: Arc<PipeShared>, info: UnboundedSender<Msg>) {
@@ -195,6 +276,8 @@ pub fn run(cfg: PipeConfig, tx: Arc<VideoTx>, sh: Arc<PipeShared>, info: Unbound
         log!("media foundation: {e:#}");
         return;
     }
+    let _boost = StreamingBoost::enter();
+    let _wlan = crate::wlan::LowLatency::enter();
     // Keep the machine and its screen awake while someone is connected.
     unsafe {
         SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED);
@@ -233,6 +316,30 @@ struct RateQuirks {
     no_hevc: bool,
     /// 4:4:4 failed: 4:2:0 for the rest of the session.
     no_444: bool,
+    /// WGC failed: DXGI duplication until then (see `open_capture`).
+    wgc_after: Option<Instant>,
+}
+
+/// After WGC fails, how long to capture with DXGI before trying it again.
+const WGC_RETRY: Duration = Duration::from_secs(30);
+
+/// WGC where it can be used, so the pointer stays out of the image; DXGI
+/// duplication on the Winlogon desktop and for a while after WGC failed.
+/// `desktop` is the input desktop the service's helper follows: there WGC
+/// runs in an agent as the console user (see `wgc`).
+fn open_capture(gpu: &Gpu, output: &IDXGIOutput1, desktop: Option<&str>, wgc_after: &mut Option<Instant>) -> Result<Capture> {
+    let users_desktop = desktop.is_none_or(|d| d.eq_ignore_ascii_case("Default"));
+    if users_desktop && wgc_after.is_none_or(|t| Instant::now() >= t) {
+        let r = if desktop.is_some() { Capture::agent(gpu, output) } else { Capture::wgc(gpu, output) };
+        match r {
+            Ok(c) => return Ok(c),
+            Err(e) => {
+                log!("WGC: {e:#}; DXGI duplication for at least {} s", WGC_RETRY.as_secs());
+                *wgc_after = Some(Instant::now() + WGC_RETRY);
+            }
+        }
+    }
+    Capture::dxgi(gpu, output)
 }
 
 /// Whether this graphics card encodes HEVC 4:4:4 from AYUV and can make the
@@ -243,7 +350,7 @@ fn can_encode_444(gpu: &Gpu) -> bool {
     if let Some(&(_, ok)) = SEEN.lock().unwrap().iter().find(|(l, _)| *l == id) {
         return ok;
     }
-    let ok = crate::encode::encoder_name(gpu.luid, Codec::Hevc).is_some_and(|n| hevc_trusted(&n))
+    let ok = crate::encode::encoder_name(gpu.luid, Codec::Hevc).is_some_and(|n| !n.contains("Intel"))
         && crate::yuv444::can_write(gpu)
         && {
             let opts = EncOptions { codec: Codec::Hevc, yuv444: true, ..Default::default() };
@@ -261,16 +368,60 @@ fn can_encode_444(gpu: &Gpu) -> bool {
 
 /// The picture for the encoder, made from the captured image.
 enum Convert {
-    Vp(Vp),
+    /// Zero-copy path for `wgc::Agent`: runs `ToNv12` straight from the
+    /// acquired shared ring texture into `pic` during grab (no intermediate
+    /// 22 MB BGRA copy into `cap.image`).
+    Nv12Agent(crate::nv12::ToNv12, Vec<crate::nv12::Nv12Views>),
+    Nv12(crate::nv12::ToNv12, crate::nv12::Nv12Views),
+    Vp(Vp, vp::VpViews),
     Ayuv(crate::yuv444::ToAyuv),
 }
 
-/// Whether to use this HEVC encoder when both ends can. Not Intel's (Arc,
-/// driver 31.0.101.5382): in sessions it dies within half a second, bitrate
-/// changes or not, and H.264 encoders made in the same process afterwards
-/// keep dying too (P1-2).
+/// Minimum spacing between encoded frames. When streaming at the display's
+/// full refresh rate, capture already paces to VSync, so a looser guard avoids
+/// slipping a frame whenever the previous encode finishes slightly late. When
+/// down-sampling (e.g. 60 fps on a 120 Hz display), keep a tight guard so
+/// intermediate VSync frames are cleanly skipped.
+fn frame_min_gap(fps: u32, refresh_hz: u32) -> Duration {
+    let frac = if fps >= refresh_hz { 0.5 } else { 0.85 };
+    Duration::from_secs_f64(frac / fps.max(1) as f64)
+}
+
+/// When the next frame may start encoding. Below the display's refresh rate
+/// the slots are a frame interval apart: the guard alone let 128 frames a
+/// second through when 120 were asked of a 180 Hz display (measured
+/// 2026-11-20), more than the viewer's 120 Hz screen shows. A late frame
+/// moves the slots on, by no more than the guard.
+struct Pace {
+    interval: Duration,
+    guard: Duration,
+    slots: bool,
+}
+
+impl Pace {
+    fn new(fps: u32, refresh_hz: u32) -> Pace {
+        Pace {
+            interval: Duration::from_secs_f64(1.0 / fps.max(1) as f64),
+            guard: frame_min_gap(fps, refresh_hz),
+            slots: fps < refresh_hz,
+        }
+    }
+
+    /// A frame starts now; `due` was its slot.
+    fn next(&self, due: Option<Instant>, now: Instant) -> Instant {
+        match due {
+            Some(d) if self.slots => (d + self.interval).max(now + self.guard),
+            _ => now + self.guard,
+        }
+    }
+}
+
+/// Whether to use this HEVC encoder when both ends can. Intel's Media
+/// Foundation HEVC MFT (Arc, driver 31.0.101.5382) dies within half a second
+/// in sessions and poisons later H.264 encoders (P1-2), whereas native Intel
+/// oneVPL QSV bypasses that MFT cleanly and encodes ~2x faster than H.264.
 fn hevc_trusted(encoder: &str) -> bool {
-    !encoder.contains("Intel")
+    !encoder.contains("Intel") || encoder.contains("oneVPL")
 }
 
 /// `bitrate` is the starting rate; the rate buffer is sized for it. With
@@ -323,7 +474,7 @@ fn run_once(
     sh.no_display.store(false, Ordering::Relaxed);
     *sh.display.lock().unwrap() = rect;
     let _ = info.send(crate::monitors::message(&sh.monitors));
-    let mut cap = Capture::new(&gpu, &output)?;
+    let mut cap = open_capture(&gpu, &output, desktop.as_deref(), &mut quirks.wgc_after)?;
     let (cw, ch) = cap.upright_size();
     let quality = *sh.quality.lock().unwrap();
     sh.quality_changed.store(false, Ordering::Relaxed);
@@ -345,12 +496,35 @@ fn run_once(
                 return Ok(());
             }
         }
+    } else if cap.rotation == 0 {
+        let nv12_res = crate::nv12::ToNv12::new(&gpu, (w, h)).and_then(|shader| {
+            if let Some(ring) = cap.agent_ring() {
+                let views = ring
+                    .iter()
+                    .map(|t| shader.make_views(&gpu, t, &pic))
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(Convert::Nv12Agent(shader, views))
+            } else {
+                let views = shader.make_views(&gpu, &cap.image, &pic)?;
+                Ok(Convert::Nv12(shader, views))
+            }
+        });
+        match nv12_res {
+            Ok(c) => c,
+            Err(e) => {
+                log!("nv12 shader: {e:#}; falling back to VideoProcessor");
+                let vp = Vp::new(&gpu, (cap.width, cap.height), (w, h), vp::RGB_FULL, vp::YUV_709)?;
+                let views = vp.make_views(&cap.image, 0, &pic)?;
+                Convert::Vp(vp, views)
+            }
+        }
     } else {
         let vp = Vp::new(&gpu, (cap.width, cap.height), (w, h), vp::RGB_FULL, vp::YUV_709)?;
         if !vp.rotate(cap.rotation) {
             log!("this video processor cannot rotate: the {}° display is sent sideways", cap.rotation);
         }
-        Convert::Vp(vp)
+        let views = vp.make_views(&cap.image, 0, &pic)?;
+        Convert::Vp(vp, views)
     };
     let mut enc = match new_encoder(&gpu, w, h, fps, &cfg, quirks, max_bps, yuv444) {
         Err(e) if yuv444 => {
@@ -361,10 +535,11 @@ fn run_once(
         r => r?,
     };
     log!(
-        "capturing {}x{} at {refresh} Hz on {}, encoding {w}x{h} {} at up to {fps} fps and {:.1} Mbps with {} ({quality:?})",
+        "capturing {}x{} at {refresh} Hz on {} with {}, encoding {w}x{h} {} at up to {fps} fps and {:.1} Mbps with {} ({quality:?})",
         cap.width,
         cap.height,
         gpu.name,
+        cap.kind(),
         if yuv444 { "4:4:4" } else { "4:2:0" },
         max_bps as f64 / 1e6,
         enc.name
@@ -379,7 +554,7 @@ fn run_once(
     sh.want_key.store(true, Ordering::Relaxed);
 
     let freq = qpc_freq();
-    let min_gap = Duration::from_secs_f64(0.95 / fps as f64);
+    let pace = Pace::new(fps, refresh);
     let full = RECT { left: 0, top: 0, right: w as i32, bottom: h as i32 };
     let mut pending: Option<i64> = None;
     let mut have_image = false;
@@ -390,7 +565,8 @@ fn run_once(
     let mut refining = false;
     // This round of refining so far: frames, bytes, since when (for the log).
     let mut refined = (0u32, 0usize, Instant::now());
-    let mut last_start: Option<Instant> = None;
+    let mut due: Option<Instant> = None;
+    let mut last_new_frame = Instant::now();
     let mut last_change = Instant::now();
     let mut tried = quirks.rekeys || quirks.dies;
     // When the encoder's bitrate was last changed in place.
@@ -416,25 +592,34 @@ fn run_once(
             log_refined(&refined, "time up");
             refine_until = None;
         }
-        let refine_due = refine_until.is_some();
-        let next_slot = || last_start.map_or(Duration::ZERO, |t| (t + min_gap).saturating_duration_since(Instant::now()));
-        let wait = match pending {
-            Some(_) => next_slot(),
-            None if refine_due => next_slot().max(Duration::from_millis(1)),
-            None => Duration::from_millis(50),
+        let refine_armed = refine_until.is_some();
+        let since_new = last_new_frame.elapsed();
+        let next_slot = || due.map_or(Duration::ZERO, |d| d.saturating_duration_since(Instant::now()));
+        let wait = capture_wait(pending.is_some(), refine_armed, since_new, next_slot());
+        let wait_ms = wait.as_micros().div_ceil(1000) as u32;
+        let grab_res = match &conv {
+            Convert::Nv12Agent(shader, views) => cap
+                .grab_agent_with(wait_ms, |slot| shader.run(&gpu, &views[slot]))
+                .expect("Nv12Agent is only constructed for Agent capture"),
+            _ => cap.grab(&gpu, wait_ms),
         };
-        let grab = match cap.grab(&gpu, wait.as_micros().div_ceil(1000) as u32) {
+        let grab = match grab_res {
             Ok(g) => g,
             // Leaving Winlogon ends its duplication with DXGI_ERROR_INVALID_CALL
             // (test laptop 2026-11-08): rebuild now rather than after the error pause.
             Err(_) if crate::desktop::switched() => return Ok(()),
+            Err(e) if cap.is_wgc() => {
+                log!("WGC: {e:#}; DXGI duplication for at least {} s", WGC_RETRY.as_secs());
+                quirks.wgc_after = Some(Instant::now() + WGC_RETRY);
+                return Ok(());
+            }
             Err(e) => return Err(e),
         };
-        sh.pointer_in_image.store(!cap.pointer_apart, Ordering::Relaxed);
         match grab {
             Grab::New { present_qpc } => {
                 pending = Some(present_qpc);
                 have_image = true;
+                last_new_frame = Instant::now();
                 refining = false;
             }
             Grab::Timeout => {}
@@ -444,18 +629,24 @@ fn run_once(
             // A key frame was asked for while the screen is still: send the last image again.
             pending = Some(qpc());
         }
-        if pending.is_none() && have_image && refine_due {
+        if pending.is_none() && have_image && refine_armed && last_new_frame.elapsed() >= REFINE_IDLE {
             pending = Some(qpc());
             refining = true;
         }
         let Some(shown_at) = pending else { continue };
-        if last_start.is_some_and(|t| t.elapsed() < min_gap) {
+        if due.is_some_and(|d| Instant::now() < d) {
             continue;
         }
-        last_start = Some(Instant::now());
         let expensive = enc.rekeys_on_rate_change || quirks.dies;
         let shrink = cfg.shrink && !expensive;
-        let Plan::Encode { chosen, bitrate, normal, shrunk } = tx.plan(enc.bitrate, shrink) else { continue };
+        let Plan::Encode { chosen, bitrate, normal, shrunk } = tx.plan(enc.bitrate, shrink) else {
+            // Drop this frame slot and pace to the next frame interval so we
+            // don't spin-call tx.plan() while the send buffer drains.
+            pending = None;
+            due = Some(pace.next(due, Instant::now()));
+            continue;
+        };
+        due = Some(pace.next(due, Instant::now()));
         if enc.rekeys_on_rate_change && !quirks.rekeys {
             quirks.rekeys = true;
             // Possibly found on a frame shrunk for that frame only: back to
@@ -490,7 +681,9 @@ fn run_once(
         let t_enc = Instant::now();
         let enc_start_qpc = qpc();
         match &conv {
-            Convert::Vp(v) => v.blt(&cap.image, 0, &pic, full)?,
+            Convert::Nv12Agent(_, _) => {}
+            Convert::Nv12(s, views) => s.run(&gpu, views),
+            Convert::Vp(v, views) => v.blt_views(views, full)?,
             Convert::Ayuv(a) => a.run(&gpu),
         }
         pending = None;
@@ -596,7 +789,7 @@ fn should_change(current: u32, wanted: u32, since_last: Duration, expensive: boo
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn encode_size_is_even_and_scaled() {
@@ -640,6 +833,21 @@ mod tests {
     }
 
     #[test]
+    fn refine_waits_for_motion_to_settle() {
+        let ms = Duration::from_millis;
+        // During active 60 Hz motion (e.g. 16 ms since last new frame), do not
+        // wake up at next_slot (~2 ms) to re-encode a stale frame: wait for
+        // either a new DWM frame or the remaining idle window (capped at 50 ms).
+        assert_eq!(super::capture_wait(false, true, ms(16), ms(2)), ms(50));
+        assert_eq!(super::capture_wait(false, true, ms(60), ms(2)), ms(20));
+        // Once idle >= REFINE_IDLE, pace refine frames by next_slot (min 1 ms).
+        assert_eq!(super::capture_wait(false, true, ms(80), ms(0)), ms(1));
+        assert_eq!(super::capture_wait(false, true, ms(120), ms(12)), ms(12));
+        // Pending real frames always honor next_slot directly.
+        assert_eq!(super::capture_wait(true, true, ms(5), ms(4)), ms(4));
+    }
+
+    #[test]
     fn expensive_rate_changes_are_rare_and_large() {
         let s = |n| Duration::from_secs(n);
         let change = super::should_change;
@@ -650,5 +858,44 @@ mod tests {
         assert!(change(20_000_000, 15_000_000, s(1), true));
         assert!(!change(10_000_000, 13_000_000, s(2), true));
         assert!(change(10_000_000, 13_000_000, s(3), true));
+    }
+
+    #[test]
+    fn frame_min_gap_avoids_phase_slip_at_native_refresh() {
+        // Streaming at native 120 Hz: allows a slightly late frame without
+        // delaying the next VSync (8.33 ms) frame.
+        let g120 = super::frame_min_gap(120, 120);
+        assert!(g120 < Duration::from_millis(5));
+        // Down-sampling 60 fps on a 120 Hz screen: still skips the 8.33 ms
+        // intermediate VSync frame and encodes every 16.67 ms frame.
+        let g60 = super::frame_min_gap(60, 120);
+        assert!(g60 > Duration::from_millis(12) && g60 < Duration::from_millis(16));
+    }
+
+    /// Frames sent in 10 s from a display showing a new image at every
+    /// refresh: an image waits for its slot unless the next image comes first.
+    fn sent_per_second(fps: u32, hz: u32) -> f64 {
+        let pace = super::Pace::new(fps, hz);
+        let t0 = Instant::now();
+        let refresh = Duration::from_secs_f64(1.0 / hz as f64);
+        let (mut due, mut sent) = (None, 0);
+        for k in 0..hz * 10 {
+            let image = t0 + refresh * k;
+            let at = due.map_or(image, |d: Instant| d.max(image));
+            if at < image + refresh {
+                due = Some(pace.next(due, at));
+                sent += 1;
+            }
+        }
+        sent as f64 / 10.0
+    }
+
+    #[test]
+    fn pacing_keeps_to_the_frame_rate() {
+        for (fps, hz) in [(120, 180), (60, 120), (30, 60), (90, 144), (120, 120), (144, 120)] {
+            let want = fps.min(hz) as f64;
+            let got = sent_per_second(fps, hz);
+            assert!((got - want).abs() <= 1.0, "{fps} fps from a {hz} Hz display: {got} a second");
+        }
     }
 }

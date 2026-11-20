@@ -1,21 +1,29 @@
 //! The viewer's 画面 menu: resolution, frame rate, highest bitrate and
 //! 文字清晰 (YUV 4:4:4, offered when both ends can), kept per device in
 //! `%APPDATA%\remote-control\quality.txt`, one line per device
-//! (`<id>\t<resolution>\t<fps>\t<mbps>\t<sharp 0|1>`); a device without a
-//! line gets the defaults (自动, 60, 自动, off). A choice goes to the host at once
-//! (`Msg::Quality`); the host answers with what it streams now
-//! (`Msg::Info`'s `Streaming`), which the menu shows.
+//! (`<id>\t<resolution>\t<fps>\t<mbps>\t<sharp 0|1>`, 0 for 自动); a device
+//! without a line gets the defaults (自动 everywhere, off). A choice goes to
+//! the host at once (`Msg::Quality`); the host answers with what it streams
+//! now (`Msg::Info`'s `Streaming`), which the menu shows.
 //!
 //! 自动 resolution fits the screen the session window is on: the host never
-//! sends more pixels than this screen can show, nor more than it has.
+//! sends more pixels than this screen can show, nor more than it has. 自动
+//! frame rate is that screen's refresh rate (at most `AUTO_FPS_MAX`); the
+//! host sends no more frames than its own screen shows.
 
 use std::{path::PathBuf, sync::Mutex};
 
 use tokio::sync::mpsc::UnboundedSender;
-use windows::Win32::{
-    Foundation::{HWND, POINT},
-    Graphics::Gdi::{GetMonitorInfoW, HMONITOR, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint, MonitorFromWindow},
-    UI::WindowsAndMessaging::GetCursorPos,
+use windows::{
+    Win32::{
+        Foundation::{HWND, POINT},
+        Graphics::Gdi::{
+            DEVMODEW, ENUM_CURRENT_SETTINGS, EnumDisplaySettingsW, GetMonitorInfoW, HMONITOR, MONITOR_DEFAULTTONEAREST,
+            MONITORINFO, MONITORINFOEXW, MonitorFromPoint, MonitorFromWindow,
+        },
+        UI::WindowsAndMessaging::GetCursorPos,
+    },
+    core::PCWSTR,
 };
 
 use crate::{
@@ -36,6 +44,7 @@ pub enum Res {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Choice {
     pub res: Res,
+    /// 0 = 自动.
     pub fps: u8,
     /// 0 = 自动.
     pub mbps: u16,
@@ -45,23 +54,34 @@ pub struct Choice {
 
 impl Default for Choice {
     fn default() -> Self {
-        Choice { res: Res::Auto, fps: 60, mbps: 0, sharp: false }
+        Choice { res: Res::Auto, fps: 0, mbps: 0, sharp: false }
     }
 }
 
-/// The menu's chips, in order.
+/// The menu's chips, in order (0 = 自动).
 pub const RESOLUTIONS: [(Res, &str); 5] =
     [(Res::Auto, "自动"), (Res::Native, "原生"), (Res::Short(1440), "1440p"), (Res::Short(1080), "1080p"), (Res::Short(720), "720p")];
-pub const FRAME_RATES: [u8; 4] = [30, 60, 120, 144];
+pub const FRAME_RATES: [u8; 5] = [0, 30, 60, 120, 144];
 pub const BITRATES: [u16; 6] = [0, 5, 10, 20, 40, 80];
+
+/// 自动 frame rate on faster screens: the highest the menu offers.
+const AUTO_FPS_MAX: u8 = 144;
+
+/// The screen the session window is on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Screen {
+    /// In pixels.
+    pub size: (u16, u16),
+    /// Refresh rate; 0 if Windows did not say.
+    pub hz: u16,
+}
 
 struct State {
     device: String,
     choice: Choice,
     /// Kept in the file; not when the command line chose (tests).
     save: bool,
-    /// The screen the session window is on, in pixels.
-    fit: (u16, u16),
+    screen: Screen,
     ctrl: Option<UnboundedSender<Msg>>,
     /// What the host streams now: picture size and the rest. None from a
     /// host that does not know the menu (it keeps its own settings).
@@ -71,14 +91,23 @@ struct State {
 static STATE: Mutex<Option<State>> = Mutex::new(None);
 
 impl Choice {
-    /// What to ask the host for, on a screen of `fit` pixels.
-    pub fn quality(&self, fit: (u16, u16)) -> Quality {
-        let (fit_w, fit_h) = if self.res == Res::Auto { fit } else { (0, 0) };
+    /// The frame rate to ask for on `screen`.
+    pub fn fps_on(&self, screen: Screen) -> u8 {
+        match self.fps {
+            0 if screen.hz > 1 => screen.hz.min(AUTO_FPS_MAX as u16) as u8,
+            0 => 60,
+            f => f,
+        }
+    }
+
+    /// What to ask the host for, on `screen`.
+    pub fn quality(&self, screen: Screen) -> Quality {
+        let (fit_w, fit_h) = if self.res == Res::Auto { screen.size } else { (0, 0) };
         let short = match self.res {
             Res::Short(s) => s,
             _ => 0,
         };
-        Quality { fit_w, fit_h, short, fps: self.fps, kbps: self.mbps as u32 * 1000, yuv444: self.sharp }
+        Quality { fit_w, fit_h, short, fps: self.fps_on(screen), kbps: self.mbps as u32 * 1000, yuv444: self.sharp }
     }
 
     fn line(&self, device: &str) -> String {
@@ -107,7 +136,7 @@ impl Choice {
             "1" => true,
             _ => return None,
         };
-        Some((device, Choice { res, fps: fps.parse().ok().filter(|&v| v > 0)?, mbps: mbps.parse().ok()?, sharp }))
+        Some((device, Choice { res, fps: fps.parse().ok()?, mbps: mbps.parse().ok()?, sharp }))
     }
 }
 
@@ -139,33 +168,37 @@ fn store(device: &str, choice: &Choice) -> std::io::Result<()> {
     std::fs::rename(&tmp, &path)
 }
 
-fn monitor_size(m: HMONITOR) -> (u16, u16) {
-    let mut mi = MONITORINFO { cbSize: size_of::<MONITORINFO>() as u32, ..Default::default() };
-    if !unsafe { GetMonitorInfoW(m, &mut mi) }.as_bool() {
-        return (0, 0);
+fn screen_of(m: HMONITOR) -> Screen {
+    let mut mi = MONITORINFOEXW::default();
+    mi.monitorInfo.cbSize = size_of::<MONITORINFOEXW>() as u32;
+    if !unsafe { GetMonitorInfoW(m, &mut mi as *mut MONITORINFOEXW as *mut MONITORINFO) }.as_bool() {
+        return Screen { size: (0, 0), hz: 0 };
     }
-    let r = mi.rcMonitor;
-    ((r.right - r.left).clamp(0, 65535) as u16, (r.bottom - r.top).clamp(0, 65535) as u16)
+    let r = mi.monitorInfo.rcMonitor;
+    let size = ((r.right - r.left).clamp(0, 65535) as u16, (r.bottom - r.top).clamp(0, 65535) as u16);
+    let mut dm = DEVMODEW { dmSize: size_of::<DEVMODEW>() as u16, ..Default::default() };
+    let ok = unsafe { EnumDisplaySettingsW(PCWSTR(mi.szDevice.as_ptr()), ENUM_CURRENT_SETTINGS, &mut dm) }.as_bool();
+    Screen { size, hz: if ok { dm.dmDisplayFrequency.min(1000) as u16 } else { 0 } }
 }
 
 /// The session with `device` starts: its saved choice, or the command
 /// line's frame rate and bitrate (not saved). Before the window exists the
-/// screen to fit is the one under the pointer. Returns what to ask for in the hello.
+/// screen is the one under the pointer. Returns what to ask for in the hello.
 pub fn start(device: &str, fps: Option<u8>, mbps: Option<f64>) -> (Choice, Quality) {
     let mut choice = load(device).unwrap_or_default();
     let save = fps.is_none() && mbps.is_none();
     if let Some(f) = fps {
-        choice.fps = f.max(1);
+        choice.fps = f;
     }
     if let Some(m) = mbps {
         choice.mbps = m.clamp(1.0, 1000.0).round() as u16;
     }
     let mut p = POINT::default();
     let _ = unsafe { GetCursorPos(&mut p) };
-    let fit = monitor_size(unsafe { MonitorFromPoint(p, MONITOR_DEFAULTTONEAREST) });
-    log!("picture: {choice:?} on a {}x{} screen", fit.0, fit.1);
-    *STATE.lock().unwrap() = Some(State { device: device.to_string(), choice, save, fit, ctrl: None, streaming: None });
-    (choice, choice.quality(fit))
+    let screen = screen_of(unsafe { MonitorFromPoint(p, MONITOR_DEFAULTTONEAREST) });
+    log!("picture: {choice:?} on a {}x{} screen at {} Hz", screen.size.0, screen.size.1, screen.hz);
+    *STATE.lock().unwrap() = Some(State { device: device.to_string(), choice, save, screen, ctrl: None, streaming: None });
+    (choice, choice.quality(screen))
 }
 
 /// Where to send later choices.
@@ -177,6 +210,11 @@ pub fn connect(ctrl: UnboundedSender<Msg>) {
 
 pub fn choice() -> Choice {
     STATE.lock().unwrap().as_ref().map(|s| s.choice).unwrap_or_default()
+}
+
+/// The screen the session window is on (the one under the pointer before it opens).
+pub fn screen() -> Screen {
+    STATE.lock().unwrap().as_ref().map_or(Screen { size: (0, 0), hz: 0 }, |s| s.screen)
 }
 
 /// The menu changed the choice: keep it and tell the host.
@@ -199,25 +237,27 @@ pub fn choose(f: impl FnOnce(&mut Choice)) {
 
 fn send(s: &State) {
     if let Some(c) = &s.ctrl {
-        let _ = c.send(Msg::Quality(s.choice.quality(s.fit)));
+        let _ = c.send(Msg::Quality(s.choice.quality(s.screen)));
     }
 }
 
-/// The session window moved or changed size (its thread): with 自动, a
-/// screen of another size asks the host for another picture.
+/// The session window moved or changed size, or a display changed (its
+/// thread): with 自动, another screen size or refresh rate asks the host for
+/// another picture.
 pub fn follow_window(hwnd: HWND) {
-    let fit = monitor_size(unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) });
-    if fit.0 == 0 {
+    let screen = screen_of(unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) });
+    if screen.size.0 == 0 {
         return;
     }
     let mut g = STATE.lock().unwrap();
     let Some(s) = g.as_mut() else { return };
-    if s.fit == fit {
+    if s.screen == screen {
         return;
     }
-    s.fit = fit;
-    if s.choice.res == Res::Auto {
-        log!("picture: now on a {}x{} screen", fit.0, fit.1);
+    let before = s.choice.quality(s.screen);
+    s.screen = screen;
+    if s.choice.quality(screen) != before {
+        log!("picture: now on a {}x{} screen at {} Hz", screen.size.0, screen.size.1, screen.hz);
         send(s);
     }
 }
@@ -235,6 +275,18 @@ pub fn streaming() -> Option<((u32, u32), Option<Streaming>)> {
     STATE.lock().unwrap().as_ref().and_then(|s| s.streaming)
 }
 
+/// Frames come no faster than the screen the session window is on shows
+/// them: what the host said it streams, else what was asked for.
+pub fn frames_fit_screen() -> bool {
+    let g = STATE.lock().unwrap();
+    let Some(s) = g.as_ref() else { return false };
+    let fps = match s.streaming {
+        Some((_, Some(st))) => st.fps,
+        _ => s.choice.fps_on(s.screen),
+    };
+    s.screen.hz > 1 && u16::from(fps) <= s.screen.hz
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -250,20 +302,33 @@ mod tests {
             assert_eq!(Choice::parse(&line), Some(("abc", c)), "{line}");
         }
         assert_eq!(Choice::parse("abc\t100\t60\t0"), None, "no such resolution");
-        assert_eq!(Choice::parse("abc\tauto\t0\t0"), None);
         assert_eq!(Choice::parse("abc\tauto\t60"), None);
+        let auto = Choice { res: Res::Auto, fps: 0, mbps: 0, sharp: false };
+        assert_eq!(Choice::parse("abc\tauto\t0\t0"), Some(("abc", auto)));
         let before_sharp = Choice { res: Res::Short(720), fps: 30, mbps: 5, sharp: false };
         assert_eq!(Choice::parse("abc\t720\t30\t5"), Some(("abc", before_sharp)));
     }
 
     #[test]
     fn what_the_host_is_asked_for() {
-        let fit = (2560, 1440);
-        let q = Choice::default().quality(fit);
-        assert_eq!((q.fit_w, q.fit_h, q.short, q.fps, q.kbps, q.yuv444), (2560, 1440, 0, 60, 0, false));
-        let q = Choice { res: Res::Short(720), fps: 30, mbps: 10, sharp: true }.quality(fit);
+        let screen = Screen { size: (2560, 1440), hz: 165 };
+        let q = Choice::default().quality(screen);
+        assert_eq!((q.fit_w, q.fit_h, q.short, q.fps, q.kbps, q.yuv444), (2560, 1440, 0, 144, 0, false));
+        let q = Choice { res: Res::Short(720), fps: 30, mbps: 10, sharp: true }.quality(screen);
         assert_eq!((q.fit_w, q.fit_h, q.short, q.fps, q.kbps, q.yuv444), (0, 0, 720, 30, 10_000, true));
-        let q = Choice { res: Res::Native, fps: 120, mbps: 0, sharp: false }.quality(fit);
+        let q = Choice { res: Res::Native, fps: 120, mbps: 0, sharp: false }.quality(screen);
         assert_eq!((q.fit_w, q.fit_h, q.short), (0, 0, 0));
+    }
+
+    #[test]
+    fn auto_frame_rate_follows_the_screen() {
+        let auto = Choice::default();
+        assert_eq!(auto.fps_on(Screen { size: (2880, 1920), hz: 120 }), 120);
+        assert_eq!(auto.fps_on(Screen { size: (1920, 1080), hz: 59 }), 59);
+        assert_eq!(auto.fps_on(Screen { size: (1920, 1080), hz: 240 }), 144, "at most the menu's highest");
+        assert_eq!(auto.fps_on(Screen { size: (1920, 1080), hz: 0 }), 60, "unknown");
+        assert_eq!(auto.fps_on(Screen { size: (1920, 1080), hz: 1 }), 60, "the hardware's default");
+        let fixed = Choice { fps: 30, ..auto };
+        assert_eq!(fixed.fps_on(Screen { size: (1920, 1080), hz: 120 }), 30);
     }
 }

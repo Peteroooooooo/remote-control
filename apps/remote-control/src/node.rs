@@ -21,6 +21,11 @@
 //! the relay its home. When no own relay answers for a while, the public
 //! relays help instead, if allowed (`fallback_loop`).
 //!
+//! A computer with no own relay in use stays at the self-hosted relay of
+//! each device online there (`keep_loop`), so that device can reach it
+//! through its relay when no direct way works; the relay is still not its
+//! home and not told to others.
+//!
 //! A relay is this computer's own once it joined it with one of the relay's
 //! codes; nothing hands a relay on to other computers. Hellos and welcomes
 //! still carry an empty `grant`, so an older version on the other side
@@ -29,7 +34,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     net::{IpAddr, SocketAddr},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -118,6 +123,25 @@ struct Peer {
     ask: Ask,
     /// Its request was refused here; the next hello or welcome says so.
     say_no: bool,
+    /// A second meet connection to it, over its self-hosted relay (`keep_loop`).
+    keeper: Option<Keeper>,
+    /// No new keeper before this: one is on its way, or the last one failed.
+    keep_after: Option<Instant>,
+    keep_wait: Duration,
+    /// Bumped when a freshly pasted code supplies new addresses/relay/token so
+    /// an in-flight dial or stale connection is dropped and redialed at once.
+    redial: u64,
+}
+
+/// A meet connection that only holds a path through a device's self-hosted
+/// relay (it says no hello), so this computer stays at that relay.
+struct Keeper {
+    conn: Connection,
+    /// The relay's addresses it was opened for.
+    relay: Vec<RelayUrl>,
+    since: Instant,
+    /// Its path through the relay came up.
+    held: bool,
 }
 
 impl Peer {
@@ -138,12 +162,28 @@ impl Peer {
             running: false,
             ask: Ask::None,
             say_no: false,
+            keeper: None,
+            keep_after: None,
+            keep_wait: KEEP_WAIT,
+            redial: 0,
         }
     }
 
     fn on_lan(&self) -> bool {
         self.lan.is_some_and(|(_, t)| t.elapsed() < LAN_FORGET)
     }
+
+    fn on_lan_conn(&self) -> bool {
+        self.conn.as_ref().is_some_and(is_lan_conn)
+    }
+
+    fn lan_active(&self) -> bool {
+        self.on_lan() || self.on_lan_conn()
+    }
+}
+
+fn is_lan_conn(c: &Connection) -> bool {
+    c.close_reason().is_none() && net::direct_addr(c).is_some_and(|a| net::is_lan(a.ip()))
 }
 
 struct Issued {
@@ -202,6 +242,8 @@ struct St {
     relay_ok: BTreeMap<String, bool>,
     /// The own relay standing in while the chosen one does not answer.
     using: Option<Vec<RelayUrl>>,
+    /// Active hosting authorization carried across service handoff.
+    handoff_host: Option<(EndpointId, String, Instant)>,
 }
 
 struct Shared {
@@ -248,6 +290,10 @@ const LAN_FORGET: Duration = Duration::from_secs(10);
 const STATUS_EVERY: Duration = Duration::from_secs(2);
 /// A connected device is said hello to again every this many `STATUS_EVERY`.
 const HELLO_AGAIN: u32 = 5;
+/// A LAN-only temporary peer is probed more often with a shorter wait so a
+/// silent disconnect on the LAN is detected in ~4-6 s instead of ~10-15 s.
+const LAN_HELLO_AGAIN: u32 = 2;
+const LAN_ASK_WAIT: Duration = Duration::from_secs(2);
 /// How often a device that is not connected is tried again (`target-plan` 2.2).
 const REFIND_EVERY: Duration = Duration::from_secs(15);
 const CONNECT_WAIT: Duration = Duration::from_secs(10);
@@ -264,6 +310,14 @@ const LOBBY_GONE: Duration = Duration::from_secs(4);
 const FALLBACK_AFTER: Duration = Duration::from_secs(10);
 /// While they do, how often the own relays are asked whether they are back.
 const FALLBACK_RECHECK: Duration = Duration::from_secs(30);
+/// How often `keep_loop` looks at the devices.
+const KEEP_EVERY: Duration = Duration::from_secs(5);
+/// A new connection gets this long for its path through the relay to come up.
+const KEEP_OPEN: Duration = Duration::from_secs(10);
+/// After a keeper that did not get through, the next one waits this long,
+/// twice as long after each one more, up to `KEEP_WAIT_MAX`.
+const KEEP_WAIT: Duration = Duration::from_secs(15);
+const KEEP_WAIT_MAX: Duration = Duration::from_secs(300);
 
 fn short(id: &EndpointId) -> String {
     format!("设备 {}", &id.to_string()[..6])
@@ -283,11 +337,6 @@ fn unhex8(s: &str) -> Option<[u8; 8]> {
         *o = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok()?;
     }
     Some(out)
-}
-
-/// Every address of every own relay.
-fn own_urls(s: &Settings) -> Vec<RelayUrl> {
-    s.relays.iter().flatten().cloned().collect()
 }
 
 /// The own relay `url` is an address of.
@@ -445,7 +494,7 @@ impl Shared {
         self.lobby_open(st)
             && match p.met {
                 Some(Met::Code) => true,
-                Some(Met::Lan) => p.on_lan() || matches!(p.status, Status::Online { .. } | Status::Unreachable),
+                Some(Met::Lan) => p.lan_active(),
                 None => false,
             }
     }
@@ -660,6 +709,11 @@ impl Shared {
         }
         let mut seen = BTreeSet::new();
         addrs.retain(|a| seen.insert(*a));
+        // A LAN-only temporary peer stays on the LAN; never dial it via relays.
+        if d.is_none() && p.is_some_and(|p| p.met == Some(Met::Lan)) {
+            addrs.retain(|a| net::is_lan(a.ip()));
+            return (addrs, Vec::new());
+        }
         let public_ok = st.settings.public_relays;
         let mut relays: Vec<RelayUrl> = Vec::new();
         let home: Vec<RelayUrl> = match p.map(|p| &p.home).filter(|h| !h.is_empty()) {
@@ -667,7 +721,7 @@ impl Shared {
             None => d.map(|d| d.relays.clone()).unwrap_or_default(),
         };
         relays.extend(home.iter().filter(|h| public_ok || net::public_index(h).is_none()).cloned());
-        relays.extend(own_urls(&st.settings));
+        relays.extend(current_group(&st.settings, &st.using).unwrap_or_default());
         if public_ok && (home.is_empty() || round % 2 == 1) {
             relays.extend(net::public_relays());
         }
@@ -797,6 +851,24 @@ impl Shared {
     /// `event`: where this computer stands in its list (see `heard`).
     #[allow(clippy::too_many_arguments)]
     fn welcomed(self: &Arc<Self>, st: &mut St, id: &EndpointId, conn: &Connection, name: String, home: String, sent: u8, event: u8) {
+        if sent == meet::EVENT_FORGET {
+            // Re-added (e.g. a freshly pasted connection code) while this delete
+            // was in flight: keep the new peer state intact.
+            if !st.store.is_forgotten(id) {
+                return;
+            }
+            log!("{} knows it was deleted here", id.fmt_short());
+            st.store.remove(id);
+            self.save(st);
+            if let Some(p) = st.peers.get_mut(id) {
+                p.lan = None;
+                p.met = None;
+                p.conn = None;
+                p.since = None;
+                p.status = Status::Offline;
+            }
+            return;
+        }
         let name = clean(&name);
         let home = relay_urls(&home);
         if let Some(p) = st.peers.get_mut(id) {
@@ -816,11 +888,6 @@ impl Shared {
             }
         }
         match sent {
-            meet::EVENT_FORGET => {
-                log!("{} knows it was deleted here", id.fmt_short());
-                st.store.remove(id);
-                self.save(st);
-            }
             meet::EVENT_REMEMBER => {
                 if let Some(d) = st.store.get_mut(id) {
                     d.tell = false;
@@ -897,7 +964,13 @@ impl Shared {
     /// Whether a hello from `id` is welcome without a code: it is in the
     /// device list, or it was met while the lobby is open.
     fn knows(&self, st: &St, id: &EndpointId) -> bool {
-        st.store.get(id).is_some() || (self.lobby_open(st) && st.peers.get(id).is_some_and(|p| p.met.is_some()))
+        st.store.get(id).is_some()
+            || (self.lobby_open(st)
+                && st.peers.get(id).is_some_and(|p| match p.met {
+                    Some(Met::Code) => true,
+                    Some(Met::Lan) => p.lan_active(),
+                    None => false,
+                }))
     }
 
     /// The answer to a hello from `from` (see `meet`).
@@ -910,7 +983,7 @@ impl Shared {
             event,
         };
         let name = clean(&name);
-        if event == meet::EVENT_FORGET {
+        if event == meet::EVENT_FORGET && token.is_none() {
             log!("{} deleted this computer: deleting it too", from.fmt_short());
             let shown = self.shown_name(&st, &from);
             let mut had = st.store.get(&from).is_some();
@@ -920,6 +993,7 @@ impl Shared {
             }
             if let Some(p) = st.peers.get_mut(&from) {
                 had |= p.met.is_some();
+                p.lan = None;
                 p.met = None;
                 p.ask = Ask::None;
                 p.say_no = false;
@@ -964,12 +1038,16 @@ impl Shared {
             return Msg::MeetRefuse { reason: meet::REFUSE_FORGOTTEN };
         }
         if !known(&st) {
-            let lan = st.peers.get(&from).is_some_and(|p| p.on_lan())
-                || net::direct_addr(conn).is_some_and(|a| net::is_lan(a.ip()));
+            let lan_direct = net::direct_addr(conn).filter(|a| net::is_lan(a.ip()));
+            let lan = st.peers.get(&from).is_some_and(|p| p.on_lan()) || lan_direct.is_some();
             if !(open && lan && st.settings.lan_visible) {
                 return Msg::MeetRefuse { reason: meet::REFUSE_UNKNOWN };
             }
-            st.peers.entry(from).or_insert_with(Peer::new).met = Some(Met::Lan);
+            let p = st.peers.entry(from).or_insert_with(Peer::new);
+            p.met = Some(Met::Lan);
+            if let Some(a) = lan_direct {
+                p.reached_at = Some(a);
+            }
         }
         {
             let p = st.peers.entry(from).or_insert_with(Peer::new);
@@ -998,6 +1076,176 @@ impl Shared {
         self.changed();
         w
     }
+}
+
+const HANDOFF_TTL_SECS: u64 = 90;
+
+struct HandoffData {
+    hosting: Option<(EndpointId, String, u64)>,
+    peers: Vec<(EndpointId, Peer)>,
+    codes: Vec<Issued>,
+}
+
+fn handoff_path(key: &Path) -> PathBuf {
+    key.with_file_name("handoff.txt")
+}
+
+fn save_handoff(path: &Path, st: &St) -> Result<()> {
+    save_handoff_at(path, st, rc_ident::proof::unix_now())
+}
+
+fn save_handoff_at(path: &Path, st: &St, now_unix: u64) -> Result<()> {
+    let hosting = st
+        .hosting
+        .as_ref()
+        .filter(|h| !h.cut.load(std::sync::atomic::Ordering::SeqCst))
+        .map(|h| (h.id, h.name.as_str()));
+    write_handoff(path, hosting, &st.peers, &st.store, &st.codes, now_unix)
+}
+
+fn write_handoff(
+    path: &Path,
+    hosting: Option<(EndpointId, &str)>,
+    peers: &BTreeMap<EndpointId, Peer>,
+    store: &Store,
+    codes: &[Issued],
+    now_unix: u64,
+) -> Result<()> {
+    let expires_unix = now_unix.saturating_add(HANDOFF_TTL_SECS);
+    let mut text = format!("# remote-control handoff v1\nexpires\t{expires_unix}\n");
+    if let Some((id, name)) = hosting {
+        text += &format!("hosting\t{id}\t{}\t{expires_unix}\n", clean(name));
+    }
+    for (id, p) in peers {
+        if p.met != Some(Met::Code) || store.get(id).is_some() || store.is_forgotten(id) {
+            continue;
+        }
+        let mut addrs: Vec<SocketAddr> = Vec::new();
+        if let Some(a) = p.reached_at {
+            addrs.push(a);
+        }
+        for &a in &p.code_addrs {
+            if !addrs.contains(&a) {
+                addrs.push(a);
+            }
+        }
+        let addrs_str: Vec<String> = addrs.iter().map(|a| a.to_string()).collect();
+        let token = p.token.map(|t| hex(&t)).unwrap_or_default();
+        let invite = p.invite.as_deref().map(url_list).unwrap_or_default();
+        text += &format!(
+            "peer\t{id}\t{}\t{}\t{}\t{token}\t{invite}\n",
+            clean(&p.name),
+            url_list(&p.home),
+            addrs_str.join(",")
+        );
+    }
+    for c in codes {
+        if c.expired() {
+            continue;
+        }
+        let code_text = c.text.replace(['\t', '\r', '\n'], "");
+        let by = c.by.map(|id| id.to_string()).unwrap_or_default();
+        text += &format!("code\t{}\t{code_text}\t{}\t{}\t{by}\n", hex(&c.token), c.expires, c.made.elapsed().as_secs());
+    }
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+    }
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, text).with_context(|| format!("write {}", tmp.display()))?;
+    std::fs::rename(&tmp, path).with_context(|| format!("write {}", path.display()))
+}
+
+fn load_handoff(path: &Path) -> Option<HandoffData> {
+    load_handoff_at(path, rc_ident::proof::unix_now())
+}
+
+fn load_handoff_at(path: &Path, now_unix: u64) -> Option<HandoffData> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let _ = std::fs::remove_file(path);
+    parse_handoff(&text, now_unix)
+}
+
+fn parse_handoff(text: &str, now_unix: u64) -> Option<HandoffData> {
+    let mut expires: Option<u64> = None;
+    let mut hosting: Option<(EndpointId, String, u64)> = None;
+    let mut peers: Vec<(EndpointId, Peer)> = Vec::new();
+    let mut codes: Vec<Issued> = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let f: Vec<&str> = line.split('\t').collect();
+        match f[0] {
+            "expires" => {
+                let exp: u64 = f.get(1)?.trim().parse().ok()?;
+                expires = Some(exp);
+            }
+            "hosting" => {
+                if f.len() < 4 {
+                    return None;
+                }
+                let id: EndpointId = f[1].trim().parse().ok()?;
+                let name = clean(f[2]);
+                let h_exp: u64 = f[3].trim().parse().ok()?;
+                if now_unix < h_exp {
+                    let rem = (h_exp - now_unix).min(HANDOFF_TTL_SECS);
+                    hosting = Some((id, name, rem));
+                }
+            }
+            "peer" => {
+                if f.len() < 7 {
+                    return None;
+                }
+                let id: EndpointId = f[1].trim().parse().ok()?;
+                let mut p = Peer::new();
+                p.name = clean(f[2]);
+                p.met = Some(Met::Code);
+                p.home = relay_urls(f[3]);
+                p.code_addrs = f[4]
+                    .split(',')
+                    .filter(|s| !s.trim().is_empty())
+                    .filter_map(|s| s.trim().parse::<SocketAddr>().ok())
+                    .collect();
+                p.token = if f[5].trim().is_empty() { None } else { Some(unhex8(f[5])?) };
+                p.invite = if f[6].trim().is_empty() {
+                    None
+                } else {
+                    let inv = relay_urls(f[6]);
+                    (!inv.is_empty()).then_some(inv)
+                };
+                peers.push((id, p));
+            }
+            "code" => {
+                if f.len() < 6 {
+                    return None;
+                }
+                let token = unhex8(f[1])?;
+                let code_text = f[2].trim().to_string();
+                if code_text.is_empty() {
+                    return None;
+                }
+                let code_expires: u64 = f[3].trim().parse().ok()?;
+                let age_s: u64 = f[4].trim().parse().ok()?;
+                let by = if f[5].trim().is_empty() {
+                    None
+                } else {
+                    Some(f[5].trim().parse::<EndpointId>().ok()?)
+                };
+                let made = Instant::now().checked_sub(Duration::from_secs(age_s)).unwrap_or_else(Instant::now);
+                let issued = Issued { token, text: code_text, made, expires: code_expires, by };
+                if !issued.expired() {
+                    codes.push(issued);
+                }
+            }
+            _ => return None,
+        }
+    }
+    let exp = expires?;
+    if now_unix >= exp {
+        return None;
+    }
+    Some(HandoffData { hosting, peers, codes })
 }
 
 impl Node {
@@ -1034,6 +1282,7 @@ impl Node {
         if dirty {
             store.save()?;
         }
+        let handoff = load_handoff(&handoff_path(&opts.key));
         let detoured = net::ipv6_detour().is_some();
         let ep = net::endpoint(secret.clone(), &relays_of(&settings, &None), true).await?;
         let me = ep.id();
@@ -1047,22 +1296,44 @@ impl Node {
         {
             log!("set auto start: {e:#}");
         }
+        let mut peers = BTreeMap::new();
+        let mut codes = Vec::new();
+        let mut handoff_host = None;
+        let (mut lobby_seen, mut lobby_was_open) = (None, !opts.service);
+        if let Some(h) = handoff {
+            log!(
+                "node: loaded handoff state ({} peer(s), {} code(s), hosting: {})",
+                h.peers.len(),
+                h.codes.len(),
+                h.hosting.is_some()
+            );
+            for (id, p) in h.peers {
+                if store.get(&id).is_none() && !store.is_forgotten(&id) {
+                    peers.insert(id, p);
+                }
+            }
+            codes = h.codes;
+            handoff_host = h.hosting.map(|(id, name, rem)| (id, name, Instant::now() + Duration::from_secs(rem)));
+            lobby_seen = Some(Instant::now());
+            lobby_was_open = true;
+        }
         let st = St {
             settings,
             store,
-            peers: BTreeMap::new(),
-            codes: Vec::new(),
+            peers,
+            codes,
             asking: None,
             hosting: None,
-            lobby_seen: None,
+            lobby_seen,
             lobby_window: None,
             closed_window: None,
-            lobby_was_open: !opts.service,
+            lobby_was_open,
             notice: None,
             notice_seq: 0,
             suggest: None,
             relay_ok: BTreeMap::new(),
             using: None,
+            handoff_host,
         };
         let sh = Arc::new(Shared { opts, secret, me, ep: std::sync::RwLock::new(ep.clone()), st: Mutex::new(st), repaint: Mutex::default(), rt: tokio::runtime::Handle::current(),
             detoured: detoured.into(),
@@ -1078,7 +1349,7 @@ impl Node {
         });
         {
             let mut st = sh.st.lock().unwrap();
-            let ids: Vec<EndpointId> = st.store.devices.iter().map(|d| d.id).collect();
+            let ids: Vec<EndpointId> = st.store.devices.iter().map(|d| d.id).chain(st.peers.keys().copied()).collect();
             for id in ids {
                 sh.ensure(&mut st, id);
             }
@@ -1090,6 +1361,7 @@ impl Node {
         tokio::spawn(housekeeping(sh.clone()));
         tokio::spawn(guests_loop(sh.clone()));
         tokio::spawn(fallback_loop(sh.clone()));
+        tokio::spawn(keep_loop(sh.clone()));
         tokio::spawn(v6_loop(sh.clone()));
         Ok(Node { sh })
     }
@@ -1105,6 +1377,32 @@ impl Node {
         self.sh.st.lock().unwrap().hosting = None;
         self.sh.lock.lock().unwrap().take();
         log!("node stopped");
+    }
+
+    /// Goes offline temporarily to hand off to the background service: saves
+    /// transient state to `handoff.txt`, closes peers/sessions with
+    /// `CLOSE_HANDOFF`, keeps own-relay guests/invites, and frees `IdLock`.
+    pub async fn stop_for_handoff(&self) {
+        {
+            let st = self.sh.st.lock().unwrap();
+            if let Err(e) = save_handoff(&handoff_path(&self.sh.opts.key), &st) {
+                log!("handoff save failed: {e:#}");
+            }
+        }
+        for c in std::mem::take(&mut *self.sh.meets.lock().unwrap()) {
+            c.close(net::CLOSE_HANDOFF.into(), b"handoff");
+        }
+        self.sh.stopped.store(true, std::sync::atomic::Ordering::SeqCst);
+        for p in self.sh.st.lock().unwrap().peers.values() {
+            p.wake.notify_one();
+        }
+        let n = host::session_count();
+        log!("node handing off (close code {}): closing {n} session(s)", net::CLOSE_HANDOFF);
+        host::close_sessions(net::CLOSE_HANDOFF);
+        let _ = tokio::time::timeout(Duration::from_millis(1500), self.sh.ep().close()).await;
+        self.sh.st.lock().unwrap().hosting = None;
+        self.sh.lock.lock().unwrap().take();
+        log!("node stopped for handoff");
     }
 
     /// Ends hosted sessions with `code` and closes the endpoint. The own
@@ -1307,7 +1605,7 @@ impl Node {
             }
             let shown = match p.met {
                 Some(Met::Code) => !matches!(p.status, Status::Refused(_)),
-                Some(Met::Lan) => p.on_lan() || matches!(p.status, Status::Online { .. } | Status::Unreachable),
+                Some(Met::Lan) => p.lan_active(),
                 None => false,
             };
             if shown {
@@ -1363,6 +1661,12 @@ impl Node {
             return Err(anyhow!("这是本机发出的连接码，要发给对方用"));
         }
         let mut st = self.sh.st.lock().unwrap();
+        // A fresh code cancels any undelivered delete of this device; otherwise
+        // our next hello would send EVENT_FORGET instead of redeeming the token.
+        if st.store.is_forgotten(&code.device) {
+            st.store.remove(&code.device);
+            self.sh.save(&mut st);
+        }
         let p = st.peers.entry(code.device).or_insert_with(Peer::new);
         p.token = Some(code.token);
         p.code_addrs = code.addrs.clone();
@@ -1379,9 +1683,14 @@ impl Node {
         // Found on the LAN before: its code makes it a device met with a code
         // (it stays when the LAN no longer shows it).
         p.met = Some(Met::Code);
-        if !matches!(p.status, Status::Online { .. }) {
-            p.status = Status::Checking;
+        p.redial = p.redial.wrapping_add(1);
+        // Drop any stale connection so peer_loop dials the new code's addresses
+        // and relay right away instead of waiting for `hello` to time out.
+        if let Some(old) = p.conn.take() {
+            p.since = None;
+            old.close(0u32.into(), b"redial");
         }
+        p.status = Status::Checking;
         log!("pasted a connection code of {}", code.device.fmt_short());
         self.sh.ensure(&mut st, code.device);
         Ok(code.device.to_string())
@@ -1628,11 +1937,14 @@ fn row(st: &St, id: &EndpointId, listed: bool, auto: bool, name: &str) -> String
 async fn peer_loop(sh: Arc<Shared>, id: EndpointId, wake: Arc<Notify>) {
     let mut round = 0u32;
     loop {
-        let (addrs, relays, invite) = {
+        let (addrs, relays, invite, redial) = {
             let mut st = sh.st.lock().unwrap();
             if !sh.wanted(&st, &id) {
                 if let Some(p) = st.peers.get_mut(&id) {
                     p.running = false;
+                    if p.met == Some(Met::Lan) {
+                        p.met = None;
+                    }
                     if let Some(c) = p.conn.take() {
                         c.close(0u32.into(), b"forgotten");
                     }
@@ -1643,7 +1955,12 @@ async fn peer_loop(sh: Arc<Shared>, id: EndpointId, wake: Arc<Notify>) {
                 return;
             }
             let (addrs, relays) = sh.dial_plan(&st, &id, round);
-            (addrs, relays, st.peers.get(&id).and_then(|p| Some((p.invite.clone()?, p.token?))))
+            (
+                addrs,
+                relays,
+                st.peers.get(&id).and_then(|p| Some((p.invite.clone()?, p.token?))),
+                st.peers.get(&id).map_or(0, |p| p.redial),
+            )
         };
         if let Some((relay, token)) = invite {
             sh.bring_code(id, &relay, token, round).await;
@@ -1654,14 +1971,27 @@ async fn peer_loop(sh: Arc<Shared>, id: EndpointId, wake: Arc<Notify>) {
         let blocked = live::NO_DIAL.lock().unwrap().contains(&sh.me);
         #[cfg(not(test))]
         let blocked = false;
-        let r = tokio::time::timeout(CONNECT_WAIT, async {
+        let mut dial = std::pin::pin!(tokio::time::timeout(CONNECT_WAIT, async {
             if blocked {
                 std::future::pending().await
             } else {
                 sh.ep().connect(target, meet::ALPN).await
             }
-        })
-        .await;
+        }));
+        let r = loop {
+            tokio::select! {
+                res = &mut dial => break Some(res),
+                _ = wake.notified() => {
+                    if sh.st.lock().unwrap().peers.get(&id).is_some_and(|p| p.redial != redial) {
+                        break None;
+                    }
+                }
+            }
+        };
+        let Some(r) = r else {
+            round = 0;
+            continue;
+        };
         let conn = match r {
             Ok(Ok(c)) => c,
             other => {
@@ -1692,7 +2022,22 @@ async fn peer_loop(sh: Arc<Shared>, id: EndpointId, wake: Arc<Notify>) {
                     }
                 }
                 sh.changed();
-                let _ = tokio::time::timeout(REFIND_EVERY, wake.notified()).await;
+                let retry = {
+                    let st = sh.st.lock().unwrap();
+                    if st.peers.get(&id).is_some_and(|p| p.redial != redial) {
+                        Duration::ZERO
+                    } else if round == 1 && st.peers.get(&id).is_some_and(|p| p.met == Some(Met::Code) && p.token.is_some()) {
+                        Duration::from_secs(2)
+                    } else {
+                        REFIND_EVERY
+                    }
+                };
+                if !retry.is_zero() {
+                    let _ = tokio::time::timeout(retry, wake.notified()).await;
+                }
+                if sh.st.lock().unwrap().peers.get(&id).is_some_and(|p| p.redial != redial) {
+                    round = 0;
+                }
                 continue;
             }
         };
@@ -1720,36 +2065,54 @@ async fn peer_loop(sh: Arc<Shared>, id: EndpointId, wake: Arc<Notify>) {
             }
         }
         sh.changed();
+        if !refused && sh.st.lock().unwrap().peers.get(&id).is_some_and(|p| p.redial != redial || p.token.is_some()) {
+            round = 0;
+            continue;
+        }
         let pause = if refused { REFIND_EVERY } else { Duration::from_secs(1) };
         let _ = tokio::time::timeout(pause, wake.notified()).await;
     }
 }
 
+fn is_lan_temp(st: &St, id: &EndpointId) -> bool {
+    !st.store.devices.iter().any(|d| d.id == *id)
+        && st.peers.get(id).is_some_and(|p| p.met == Some(Met::Lan))
+}
+
 /// Says hello on `conn` (again whenever woken, and every `HELLO_AGAIN`
-/// status rounds), keeping the status fresh, until the connection ends.
-/// Returns whether the other side refused.
+/// status rounds, or `LAN_HELLO_AGAIN` for LAN-only temporary peers), keeping
+/// the status fresh, until the connection ends. Returns whether the other side refused.
 async fn talk(sh: &Arc<Shared>, id: EndpointId, conn: &Connection, wake: &Notify) -> bool {
     loop {
-        let (hi, sent) = {
+        let (hi, sent, lan_temp) = {
             let st = sh.st.lock().unwrap();
             if !sh.wanted(&st, &id) {
                 return false;
             }
-            sh.hello(&st, &id)
+            let (hi, sent) = sh.hello(&st, &id);
+            (hi, sent, is_lan_temp(&st, &id))
         };
-        match meet::ask(conn, &hi).await {
+        let reply = if lan_temp {
+            meet::ask_within(conn, &hi, LAN_ASK_WAIT).await
+        } else {
+            meet::ask(conn, &hi).await
+        };
+        match reply {
             Ok(Msg::MeetWelcome { name, home, event, .. }) => {
-                let first = {
+                let (first, done) = {
                     let mut st = sh.st.lock().unwrap();
-                    let first = st.peers.get(&id).is_none_or(|p| p.conn.is_none());
+                    let first = sent != meet::EVENT_FORGET && st.peers.get(&id).is_none_or(|p| p.conn.is_none());
                     sh.welcomed(&mut st, &id, conn, name.clone(), home, sent, event);
-                    first
+                    (first, sent == meet::EVENT_FORGET || !sh.wanted(&st, &id))
                 };
                 if first {
                     let (k, addr, rtt) = net::selected_path(conn);
                     log!("met {} ({name}) via {} {addr}, {rtt:.0} ms", id.fmt_short(), k.label());
                 }
                 sh.changed();
+                if done {
+                    return false;
+                }
             }
             Ok(Msg::MeetRefuse { reason }) => {
                 let mut st = sh.st.lock().unwrap();
@@ -1775,10 +2138,11 @@ async fn talk(sh: &Arc<Shared>, id: EndpointId, conn: &Connection, wake: &Notify
                         return false;
                     }
                     sh.path_status(&mut st, &id);
+                    let every = if is_lan_temp(&st, &id) { LAN_HELLO_AGAIN } else { HELLO_AGAIN };
                     drop(st);
                     sh.changed();
                     rounds += 1;
-                    if rounds >= HELLO_AGAIN {
+                    if rounds >= every {
                         break;
                     }
                 }
@@ -1830,10 +2194,14 @@ async fn serve_meet(sh: Arc<Shared>, conn: Connection) {
     loop {
         match meet::next_hi(&conn).await {
             Ok(Some((Msg::MeetHi { name, home, token, event, .. }, send))) => {
+                let forget = event == meet::EVENT_FORGET && token.is_none();
                 let reply = sh.on_hi(from, &conn, name, home, token, event);
                 let welcomed = matches!(reply, Msg::MeetWelcome { .. });
                 if let Err(e) = meet::answer(send, &reply).await {
                     log!("answer to {}: {e:#}", from.fmt_short());
+                    break;
+                }
+                if forget {
                     break;
                 }
                 if welcomed && !watching {
@@ -1864,7 +2232,8 @@ async fn watch_incoming(sh: Arc<Shared>, conn: Connection) {
     loop {
         {
             let mut st = sh.st.lock().unwrap();
-            if sh.is_stopped() || !sh.knows(&st, &from) {
+            let lan_ok = st.peers.get(&from).is_some_and(|p| p.met == Some(Met::Lan)) && is_lan_conn(&conn);
+            if sh.is_stopped() || (!sh.knows(&st, &from) && !(sh.lobby_open(&st) && lan_ok)) {
                 drop(st);
                 conn.close(0u32.into(), b"forgotten");
                 break;
@@ -2011,6 +2380,13 @@ async fn admit(sh: &Arc<Shared>, device: EndpointId, conn: &Connection, send: &m
                 return Ok(name);
             }
             None => {}
+        }
+        if st.handoff_host.as_ref().is_some_and(|(hid, _, deadline)| *hid == device && Instant::now() < *deadline) {
+            let (_, hname, _) = st.handoff_host.take().unwrap();
+            let shown = if hname.is_empty() { name } else { hname };
+            start_hosting(sh, &mut st, device, &shown);
+            log!("resumed hosting {shown} ({}) after service handoff", device.fmt_short());
+            return Ok(shown);
         }
         let listed = st.store.get(&device).cloned();
         if !st.settings.lock_control && !desktop::user_desktop_shown() {
@@ -2169,6 +2545,9 @@ async fn housekeeping(sh: Arc<Shared>) {
         }
         let mut st = sh.st.lock().unwrap();
         st.codes.retain(|c| c.by.is_some() || c.made.elapsed() < CODE_KEEP);
+        if st.handoff_host.as_ref().is_some_and(|(_, _, deadline)| Instant::now() >= *deadline) {
+            st.handoff_host = None;
+        }
         let over = hosting_over(&mut st);
         let lapsed = lapse_asks(&sh, &mut st);
         if sh.lobby_check(&mut st) || over || lapsed {
@@ -2315,9 +2694,14 @@ async fn guests_loop(sh: Arc<Shared>) {
         };
         let removed: Vec<Vec<RelayUrl>> = tracked.keys().filter(|r| !relays.contains(r)).cloned().collect();
         for old in removed {
-            let _ = tokio::time::timeout(Duration::from_secs(2), sh.send_guests(&old, &[])).await;
-            if tracked[&old].invites.sent.as_ref().is_none_or(|i| !i.is_empty()) {
-                let _ = tokio::time::timeout(Duration::from_secs(2), sh.send_invites(&old, &[])).await;
+            // The same relay at other addresses (`choose_relay`) gets the
+            // lists below: empty ones first would cut its guests off meanwhile.
+            let moved = relays.iter().any(|g| old.iter().any(|u| same_relay(u, g)));
+            if !moved {
+                let _ = tokio::time::timeout(Duration::from_secs(2), sh.send_guests(&old, &[])).await;
+                if tracked[&old].invites.sent.as_ref().is_none_or(|i| !i.is_empty()) {
+                    let _ = tokio::time::timeout(Duration::from_secs(2), sh.send_invites(&old, &[])).await;
+                }
             }
             tracked.remove(&old);
             sh.st.lock().unwrap().relay_ok.remove(&old[0].to_string());
@@ -2549,6 +2933,118 @@ fn wake_all(sh: &Shared) {
     }
 }
 
+/// `p`'s self-hosted relay (its home as last heard), if it is at one.
+fn their_relay(p: &Peer, d: Option<&store::Device>) -> Option<Vec<RelayUrl>> {
+    let home = if p.home.is_empty() { d.map(|d| d.relays.clone()).unwrap_or_default() } else { p.home.clone() };
+    let own: Vec<RelayUrl> = home.into_iter().filter(|u| net::public_index(u).is_none()).collect();
+    (!own.is_empty()).then_some(own)
+}
+
+/// Without an own relay in use (none, or none answers), this computer is
+/// reachable only at public relays, which carry no video. So while a device
+/// at a self-hosted relay is online, this computer stays at that relay too
+/// (`target-plan` 5.2), without making it its home or telling others of it:
+/// the relay only forwards between the two.
+///
+/// iroh keeps a relay that is not its home only while it sends through it,
+/// so a meet connection with a path through the relay holds it there (each
+/// path is pinged every few seconds). The device's own connection usually
+/// has one; when it has none (the relay restarted, or the device moved to
+/// another relay), a keeper opens one: a second meet connection that says no
+/// hello. Tried again later and later while it does not get through.
+async fn keep_loop(sh: Arc<Shared>) {
+    loop {
+        tokio::time::sleep(KEEP_EVERY).await;
+        if sh.is_stopped() {
+            return;
+        }
+        let ep = sh.ep();
+        let mut dial = Vec::new();
+        {
+            let mut guard = sh.st.lock().unwrap();
+            let St { settings, store, peers, .. } = &mut *guard;
+            let at_own = net::home_relay(&ep).is_some_and(|h| group_of(settings, &h).is_some());
+            for (id, p) in peers.iter_mut() {
+                let want = {
+                    let listed_or_code = store.get(id).is_some() || p.met == Some(Met::Code);
+                    let main = p.conn.as_ref().filter(|c| c.close_reason().is_none());
+                    match main {
+                        Some(c) if !at_own && listed_or_code => their_relay(p, store.get(id)).filter(|r| {
+                            !net::through_relay(c, r) && p.since.is_some_and(|t| t.elapsed() >= KEEP_OPEN)
+                        }),
+                        _ => None,
+                    }
+                };
+                if let (Some(r), Some(k)) = (&want, &mut p.keeper)
+                    && k.relay == *r
+                    && k.conn.close_reason().is_none()
+                {
+                    if net::through_relay(&k.conn, r) {
+                        if !k.held {
+                            k.held = true;
+                            p.keep_wait = KEEP_WAIT;
+                            log!("staying at the relay of {} ({}) over a second connection", id.fmt_short(), r[0]);
+                        }
+                        continue;
+                    }
+                    if k.since.elapsed() < KEEP_OPEN {
+                        continue;
+                    }
+                }
+                if let Some(k) = p.keeper.take() {
+                    k.conn.close(0u32.into(), b"bye");
+                    match &want {
+                        Some(_) if k.held => log!("the second connection to {} lost its path through {}", id.fmt_short(), k.relay[0]),
+                        Some(_) => log!("the second connection to {} got no path through {} within {} s", id.fmt_short(), k.relay[0], KEEP_OPEN.as_secs()),
+                        None => {}
+                    }
+                }
+                if let Some(r) = want
+                    && p.keep_after.is_none_or(|t| Instant::now() >= t)
+                {
+                    p.keep_after = Some(Instant::now() + p.keep_wait);
+                    p.keep_wait = (p.keep_wait * 2).min(KEEP_WAIT_MAX);
+                    dial.push((*id, r));
+                }
+            }
+        }
+        for (id, relay) in dial {
+            tokio::spawn(keep_dial(sh.clone(), ep.clone(), id, relay));
+        }
+    }
+}
+
+/// Opens a keeper to `id` over `relay` (see `keep_loop`).
+async fn keep_dial(sh: Arc<Shared>, ep: Endpoint, id: EndpointId, relay: Vec<RelayUrl>) {
+    let target = net::dial_addr(id, &[], &relay);
+    let r = tokio::time::timeout(CONNECT_WAIT, ep.connect(target, meet::ALPN)).await;
+    let mut st = sh.st.lock().unwrap();
+    match r {
+        Ok(Ok(conn)) => match st.peers.get_mut(&id) {
+            Some(p) if p.keeper.is_none() => p.keeper = Some(Keeper { conn, relay, since: Instant::now(), held: false }),
+            _ => conn.close(0u32.into(), b"bye"),
+        },
+        Ok(Err(e)) => log!("second connection to {} over {}: {e:#}", id.fmt_short(), relay[0]),
+        Err(_) => log!("second connection to {} over {}: no answer within {} s", id.fmt_short(), relay[0], CONNECT_WAIT.as_secs()),
+    }
+}
+
+fn on_addr_change(sh: &Shared, ips_changed: bool) {
+    {
+        let mut st = sh.st.lock().unwrap();
+        for p in st.peers.values_mut() {
+            if ips_changed {
+                p.lan = None;
+            }
+            // Another network: a relay that did not answer may answer now.
+            p.keep_after = None;
+            p.keep_wait = KEEP_WAIT;
+        }
+    }
+    wake_all(sh);
+    sh.changed();
+}
+
 /// When this computer's addresses or home relay change (another network,
 /// a new IP, the relay reconnected), every device is tried again at once
 /// instead of at its next round, and hears where this computer is now.
@@ -2571,15 +3067,15 @@ async fn network_loop(sh: Arc<Shared>, ep: Endpoint) {
         }
         let ips = |a: &iroh::EndpointAddr| a.ip_addrs().copied().collect::<BTreeSet<SocketAddr>>();
         let relays = |a: &iroh::EndpointAddr| a.relay_urls().cloned().collect::<BTreeSet<RelayUrl>>();
-        if ips(&now) != ips(&last) {
+        let ips_changed = ips(&now) != ips(&last);
+        if ips_changed {
             log!("addresses now: {}", ips(&now).iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", "));
         }
         if relays(&now) != relays(&last) {
             log!("home relay now: {}", relays(&now).iter().map(|u| u.to_string()).collect::<Vec<_>>().join(", "));
         }
         last = now;
-        wake_all(&sh);
-        sh.changed();
+        on_addr_change(&sh, ips_changed);
     }
 }
 
@@ -3249,6 +3745,291 @@ mod live {
         wait("both remember", &|| listed(&na, idb) && listed(&nb, ida));
         std::thread::sleep(Duration::from_secs(3));
         assert!(listed(&na, idb) && listed(&nb, ida));
+        rt.block_on(async {
+            na.goodbye(0).await;
+            nb.goodbye(0).await;
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod handoff_tests {
+    use super::*;
+
+    fn id(n: u8) -> EndpointId {
+        SecretKey::from_bytes(&[n; 32]).public()
+    }
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("rc-handoff-test-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn round_trip_hosting_peers_and_codes() {
+        let dir = temp_dir("rt");
+        let path = handoff_path(&dir.join("device.key"));
+        let mut store = Store::empty(&store::devices_path(&dir.join("device.key")));
+        store.add(id(10)).name = "listed".into();
+
+        let mut peers = BTreeMap::new();
+        // Listed device met with code should NOT be serialized as a temp peer
+        let mut p_listed = Peer::new();
+        p_listed.name = "listed".into();
+        p_listed.met = Some(Met::Code);
+        peers.insert(id(10), p_listed);
+
+        // LAN-only peer should NOT be serialized
+        let mut p_lan = Peer::new();
+        p_lan.name = "lan".into();
+        p_lan.met = Some(Met::Lan);
+        peers.insert(id(11), p_lan);
+
+        // Temporary Met::Code peer SHOULD be serialized
+        let mut p_code = Peer::new();
+        p_code.name = "书房\t电脑\n".into();
+        p_code.met = Some(Met::Code);
+        p_code.home = vec!["https://203.0.113.7:7843/?rc-cert=abc".parse().unwrap()];
+        p_code.reached_at = Some("192.168.1.10:5000".parse().unwrap());
+        p_code.code_addrs = vec!["192.168.1.10:5000".parse().unwrap(), "10.0.0.2:6000".parse().unwrap()];
+        p_code.token = Some([0xab; 8]);
+        p_code.invite = Some(vec!["https://203.0.113.8:7843/?rc-cert=def".parse().unwrap()]);
+        peers.insert(id(12), p_code);
+
+        let codes = vec![
+            Issued {
+                token: [1; 8],
+                text: "rc1unused".into(),
+                made: Instant::now().checked_sub(Duration::from_secs(120)).unwrap_or_else(Instant::now),
+                expires: 2_000_000_000,
+                by: None,
+            },
+            Issued {
+                token: [2; 8],
+                text: "rc1used".into(),
+                made: Instant::now().checked_sub(Duration::from_secs(300)).unwrap_or_else(Instant::now),
+                expires: 2_000_000_000,
+                by: Some(id(12)),
+            },
+            // Expired unused code should NOT be serialized
+            Issued {
+                token: [3; 8],
+                text: "rc1expired".into(),
+                made: Instant::now().checked_sub(CODE_LIFETIME + Duration::from_secs(60)).unwrap_or_else(Instant::now),
+                expires: 1_000,
+                by: None,
+            },
+        ];
+
+        let now = 1_700_000_000u64;
+        write_handoff(&path, Some((id(12), "书房\t控制端")), &peers, &store, &codes, now).unwrap();
+        assert!(path.exists());
+
+        let loaded = load_handoff_at(&path, now + 10).expect("valid handoff");
+        // Immediately deleted on read
+        assert!(!path.exists());
+
+        let (hid, hname, rem) = loaded.hosting.expect("hosting");
+        assert_eq!(hid, id(12));
+        assert_eq!(hname, "书房 控制端");
+        assert_eq!(rem, HANDOFF_TTL_SECS - 10);
+
+        assert_eq!(loaded.peers.len(), 1);
+        let (pid, rp) = &loaded.peers[0];
+        assert_eq!(*pid, id(12));
+        assert_eq!(rp.name, "书房 电脑");
+        assert_eq!(rp.met, Some(Met::Code));
+        assert_eq!(rp.home, vec!["https://203.0.113.7:7843/?rc-cert=abc".parse::<RelayUrl>().unwrap()]);
+        assert_eq!(
+            rp.code_addrs,
+            vec!["192.168.1.10:5000".parse::<SocketAddr>().unwrap(), "10.0.0.2:6000".parse::<SocketAddr>().unwrap()]
+        );
+        assert_eq!(rp.token, Some([0xab; 8]));
+        assert_eq!(rp.invite, Some(vec!["https://203.0.113.8:7843/?rc-cert=def".parse::<RelayUrl>().unwrap()]));
+
+        assert_eq!(loaded.codes.len(), 2);
+        assert_eq!(loaded.codes[0].token, [1; 8]);
+        assert_eq!(loaded.codes[0].text, "rc1unused");
+        assert_eq!(loaded.codes[0].by, None);
+        assert_eq!(loaded.codes[1].token, [2; 8]);
+        assert_eq!(loaded.codes[1].by, Some(id(12)));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn expired_missing_and_malformed_handoff_are_ignored() {
+        let dir = temp_dir("exp");
+        let path = handoff_path(&dir.join("device.key"));
+        assert!(load_handoff_at(&path, 1_700_000_000).is_none());
+
+        let store = Store::empty(&store::devices_path(&dir.join("device.key")));
+        let peers = BTreeMap::new();
+        let now = 1_700_000_000u64;
+        write_handoff(&path, Some((id(1), "host")), &peers, &store, &[], now).unwrap();
+        // Past expires_unix -> ignored and deleted
+        assert!(load_handoff_at(&path, now + HANDOFF_TTL_SECS).is_none());
+        assert!(!path.exists());
+
+        // Malformed file -> ignored and deleted
+        std::fs::write(&path, "expires\tnot-a-number\n").unwrap();
+        assert!(load_handoff_at(&path, now).is_none());
+        assert!(!path.exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn lan_temp_peer_stays_strictly_on_lan_and_never_uses_relays() {
+        let dir = temp_dir("lan_only");
+        std::fs::write(dir.join("settings.txt"), "public_relays=1\nlan_visible=1\n").unwrap();
+        let mut o = host::HostArgs::defaults().node_options(false);
+        o.key = dir.join("device.key");
+        o.lan = false;
+        let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+        let node = rt.block_on(Node::start(o)).unwrap();
+
+        let peer = id(42);
+        {
+            let mut st = node.sh.st.lock().unwrap();
+            let mut p = Peer::new();
+            p.met = Some(Met::Lan);
+            p.lan = Some(("192.168.1.50:5555".parse().unwrap(), Instant::now()));
+            p.reached_at = Some("203.0.113.9:4444".parse().unwrap());
+            p.home = vec!["https://203.0.113.7:7843/?rc-cert=abc".parse().unwrap()];
+            p.status = Status::Unreachable;
+            st.peers.insert(peer, p);
+
+            // While seen on the LAN: wanted, knows, and dials ONLY LAN addresses with no relays.
+            assert!(node.sh.wanted(&st, &peer));
+            assert!(node.sh.knows(&st, &peer));
+            let (addrs, relays) = node.sh.dial_plan(&st, &peer, 1);
+            assert_eq!(addrs, vec!["192.168.1.50:5555".parse::<SocketAddr>().unwrap()]);
+            assert!(relays.is_empty());
+
+            // Once no longer seen on the LAN (and no live LAN connection): disappears even if
+            // status was Unreachable or Online via public relay.
+            st.peers.get_mut(&peer).unwrap().lan = None;
+            assert!(!node.sh.wanted(&st, &peer));
+            assert!(!node.sh.knows(&st, &peer));
+            st.peers.get_mut(&peer).unwrap().status = Status::Online { rtt_ms: 500.0, path: PathKind::Public };
+            assert!(!node.sh.wanted(&st, &peer));
+            assert!(!node.sh.knows(&st, &peer));
+        }
+
+        // Only unlisted Met::Lan peers use the faster LAN probe cadence.
+        {
+            let mut st = node.sh.st.lock().unwrap();
+            assert!(is_lan_temp(&st, &peer));
+
+            let code_peer = id(43);
+            let mut pc = Peer::new();
+            pc.met = Some(Met::Code);
+            st.peers.insert(code_peer, pc);
+            assert!(!is_lan_temp(&st, &code_peer));
+
+            let listed_lan = id(44);
+            st.store.add(listed_lan).name = "listed".into();
+            let mut pl = Peer::new();
+            pl.met = Some(Met::Lan);
+            pl.lan = Some(("192.168.1.51:5555".parse().unwrap(), Instant::now()));
+            st.peers.insert(listed_lan, pl);
+            assert!(!is_lan_temp(&st, &listed_lan));
+
+            st.peers.get_mut(&peer).unwrap().lan = Some(("192.168.1.50:5555".parse().unwrap(), Instant::now()));
+        }
+
+        // Relay-only address change keeps `lan`; IP change clears `lan` for all peers.
+        on_addr_change(&node.sh, false);
+        assert!(node.sh.st.lock().unwrap().peers[&peer].lan.is_some());
+        on_addr_change(&node.sh, true);
+        {
+            let st = node.sh.st.lock().unwrap();
+            assert!(st.peers[&peer].lan.is_none());
+            assert!(st.peers[&id(44)].lan.is_none());
+            assert!(!node.sh.wanted(&st, &peer));
+        }
+
+        rt.block_on(node.goodbye(0));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression test: pasting a fresh connection code while an earlier delete
+    /// (`forgotten`) is still pending must clear `forgotten`, drop any stale
+    /// connection, and redeem the new code on the first paste so both sides
+    /// show each other online without dropping.
+    #[test]
+    fn paste_after_pending_forgotten_succeeds_first_try() {
+        let dir = temp_dir("paste_after_forget");
+        let (a, b) = (dir.join("a"), dir.join("b"));
+        for d in [&a, &b] {
+            std::fs::create_dir_all(d).unwrap();
+            std::fs::write(d.join("settings.txt"), "public_relays=0\nlan_visible=0\n").unwrap();
+        }
+        let opts = |d: &std::path::Path| {
+            let mut o = host::HostArgs::defaults().node_options(false);
+            o.key = d.join("device.key");
+            o.lan = false;
+            o
+        };
+        let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+        let na = rt.block_on(Node::start(opts(&a))).unwrap();
+        let nb = rt.block_on(Node::start(opts(&b))).unwrap();
+        let (ida, idb) = (na.sh.me, nb.sh.me);
+        let ask = |n: &Node, req: &str| {
+            let r = n.request(req);
+            r.strip_prefix("ok\t").unwrap_or_else(|| panic!("{req}: {r}")).to_string()
+        };
+        let row = |n: &Node, id: EndpointId| {
+            ask(n, "snapshot").lines().find(|l| l.starts_with(&format!("dev\t{id}\t"))).map(str::to_string)
+        };
+        let wait = |what: &str, ok: &dyn Fn() -> bool| {
+            let t = Instant::now();
+            while !ok() {
+                assert!(t.elapsed() < Duration::from_secs(20), "{what}");
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        };
+
+        // Simulate an undelivered prior delete of A left in B's store (and A
+        // does not know B), plus an in-flight dial on B.
+        {
+            let mut st = nb.sh.st.lock().unwrap();
+            st.store.add(ida).name = "A".into();
+            st.store.forget(&ida);
+            assert!(st.store.is_forgotten(&ida));
+        }
+        live::NO_DIAL.lock().unwrap().insert(idb);
+        {
+            let _g = rt.enter();
+            let mut st = nb.sh.st.lock().unwrap();
+            nb.sh.ensure(&mut st, ida);
+        }
+        std::thread::sleep(Duration::from_millis(150));
+
+        // Now unblock B and paste A's fresh connection code once.
+        live::NO_DIAL.lock().unwrap().remove(&idb);
+        wait("A code with addresses", &|| ConnCode::find(&ask(&na, "code")).is_some_and(|(c, _)| !c.addrs.is_empty()));
+        let code = ask(&na, "code");
+        ask(&nb, &format!("paste\t{code}"));
+
+        // `forgotten` is cleared immediately, wish is not EVENT_FORGET, and
+        // both sides come online on the very first paste and stay online.
+        {
+            let st = nb.sh.st.lock().unwrap();
+            assert!(!st.store.is_forgotten(&ida));
+            assert_eq!(nb.sh.wish(&st, &ida), meet::EVENT_NONE);
+            assert_eq!(st.peers[&ida].redial, 1);
+        }
+        wait("B sees A online", &|| row(&nb, ida).is_some_and(|r| r.contains("\tonline\t")));
+        wait("A sees B online", &|| row(&na, idb).is_some_and(|r| r.contains("\tonline\t")));
+        std::thread::sleep(Duration::from_secs(2));
+        assert!(row(&nb, ida).is_some_and(|r| r.contains("\tonline\t")), "B dropped A");
+        assert!(row(&na, idb).is_some_and(|r| r.contains("\tonline\t")), "A dropped B");
+
         rt.block_on(async {
             na.goodbye(0).await;
             nb.goodbye(0).await;

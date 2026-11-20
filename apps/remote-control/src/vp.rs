@@ -103,9 +103,9 @@ impl Vp {
         true
     }
 
-    /// Draws array slice `slice` of `src` into `dest` of `dst`; the rest of
-    /// `dst` becomes black.
-    pub fn blt(&self, src: &ID3D11Texture2D, slice: u32, dst: &ID3D11Texture2D, dest: RECT) -> Result<()> {
+    /// Pre-built views for a fixed `(src, slice) -> dst` pair (such as the host
+    /// capture loop), avoiding per-frame COM view creation/destruction.
+    pub fn make_views(&self, src: &ID3D11Texture2D, slice: u32, dst: &ID3D11Texture2D) -> Result<VpViews> {
         unsafe {
             let iv_desc = D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC {
                 FourCC: 0,
@@ -118,6 +118,7 @@ impl Vp {
             self.vdev
                 .CreateVideoProcessorInputView(src, &self.en, &iv_desc, Some(&mut iv))
                 .context("CreateVideoProcessorInputView")?;
+            let iv = iv.context("no input view")?;
             let ov_desc = D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC {
                 ViewDimension: D3D11_VPOV_DIMENSION_TEXTURE2D,
                 Anonymous: D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0 { Texture2D: D3D11_TEX2D_VPOV { MipSlice: 0 } },
@@ -127,6 +128,12 @@ impl Vp {
                 .CreateVideoProcessorOutputView(dst, &self.en, &ov_desc, Some(&mut ov))
                 .context("CreateVideoProcessorOutputView")?;
             let ov = ov.context("no output view")?;
+            Ok(VpViews { iv, ov })
+        }
+    }
+
+    pub fn blt_views(&self, views: &VpViews, dest: RECT) -> Result<()> {
+        unsafe {
             let src_rect = RECT { left: 0, top: 0, right: self.input.0 as i32, bottom: self.input.1 as i32 };
             let full = RECT { left: 0, top: 0, right: self.output.0 as i32, bottom: self.output.1 as i32 };
             self.vctx.VideoProcessorSetStreamSourceRect(&self.vp, 0, true, Some(&src_rect));
@@ -134,14 +141,26 @@ impl Vp {
             self.vctx.VideoProcessorSetOutputTargetRect(&self.vp, true, Some(&full));
             let mut stream = D3D11_VIDEO_PROCESSOR_STREAM {
                 Enable: true.into(),
-                pInputSurface: ManuallyDrop::new(iv),
+                pInputSurface: ManuallyDrop::new(Some(views.iv.clone())),
                 ..Default::default()
             };
-            let r = self.vctx.VideoProcessorBlt(&self.vp, &ov, 0, std::slice::from_ref(&stream));
+            let r = self.vctx.VideoProcessorBlt(&self.vp, &views.ov, 0, std::slice::from_ref(&stream));
             ManuallyDrop::drop(&mut stream.pInputSurface);
             r.context("VideoProcessorBlt")
         }
     }
+
+    /// Draws array slice `slice` of `src` into `dest` of `dst`; the rest of
+    /// `dst` becomes black.
+    pub fn blt(&self, src: &ID3D11Texture2D, slice: u32, dst: &ID3D11Texture2D, dest: RECT) -> Result<()> {
+        let views = self.make_views(src, slice, dst)?;
+        self.blt_views(&views, dest)
+    }
+}
+
+pub struct VpViews {
+    iv: ID3D11VideoProcessorInputView,
+    ov: ID3D11VideoProcessorOutputView,
 }
 
 /// The largest rectangle with the aspect of `src` that fits in `dst`, centred.

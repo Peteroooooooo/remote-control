@@ -74,6 +74,8 @@ pub const CLOSE_LOCKED: u32 = 7;
 pub const CLOSE_NO_DIRECT: u32 = 8;
 /// The host's user clicked "disconnect".
 pub const CLOSE_DISCONNECTED: u32 = 9;
+/// The host node is handing off to/from the background service and will be back shortly.
+pub const CLOSE_HANDOFF: u32 = 10;
 
 /// BBR (phase 0: far less queueing than Cubic on WiFi) kept from collapsing
 /// on a still screen (see `cc`), and a datagram queue that never drops a key frame.
@@ -401,6 +403,12 @@ pub fn selected_path(conn: &Connection) -> (PathKind, String, f64) {
 /// Whether the connection has a direct path open, selected or not.
 pub fn has_direct_path(conn: &Connection) -> bool {
     conn.paths().iter().any(|p| matches!(p.remote_addr(), TransportAddr::Ip(_)))
+}
+
+/// Whether the connection has a path open through one of `relay`'s addresses.
+pub fn through_relay(conn: &Connection, relay: &[RelayUrl]) -> bool {
+    let same = |a: &RelayUrl, b: &RelayUrl| a.host_str() == b.host_str() && a.port_or_known_default() == b.port_or_known_default();
+    conn.paths().iter().any(|p| matches!(p.remote_addr(), TransportAddr::Relay(u) if relay.iter().any(|r| same(r, u))))
 }
 
 /// The direct address the peer is talking from, if it talks directly.

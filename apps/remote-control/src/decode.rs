@@ -7,11 +7,12 @@ use windows::{
     Win32::{
         Graphics::{
             Direct3D11::{
+                D3D11_BIND_DECODER, D3D11_BIND_SHADER_RESOURCE, D3D11_FORMAT_SUPPORT_SHADER_SAMPLE,
                 D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE, D3D11_VIDEO_PROCESSOR_CONTENT_DESC,
                 D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_INPUT, D3D11_VIDEO_USAGE_OPTIMAL_SPEED, ID3D11Device,
                 ID3D11Texture2D, ID3D11VideoDevice,
             },
-            Dxgi::Common::{DXGI_FORMAT_AYUV, DXGI_RATIONAL},
+            Dxgi::Common::{DXGI_FORMAT_AYUV, DXGI_FORMAT_NV12, DXGI_RATIONAL},
         },
         Media::MediaFoundation::*,
         System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance},
@@ -32,6 +33,7 @@ pub struct Picture {
 pub struct Decoder {
     mft: IMFTransform,
     _mgr: IMFDXGIDeviceManager,
+    device: ID3D11Device,
     size: (u32, u32),
     index: i64,
 }
@@ -55,7 +57,7 @@ impl Decoder {
             input.SetUINT64(&MF_MT_FRAME_RATE, pack(60, 1))?;
             input.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
             mft.SetInputType(0, &input, 0).context("decoder SetInputType")?;
-            let mut d = Decoder { mft, _mgr: mgr, size: (width, height), index: 0 };
+            let mut d = Decoder { mft, _mgr: mgr, device: device.clone(), size: (width, height), index: 0 };
             d.pick_output()?;
             d.mft.ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0)?;
             d.mft.ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0)?;
@@ -101,10 +103,17 @@ impl Decoder {
     fn pick_output(&mut self) -> Result<()> {
         unsafe {
             let types: Vec<IMFMediaType> = (0..).map_while(|i| self.mft.GetOutputAvailableType(0, i).ok()).collect();
-            let t = [MFVideoFormat_NV12, MFVideoFormat_AYUV]
+            let (t, format) = [(MFVideoFormat_NV12, DXGI_FORMAT_NV12), (MFVideoFormat_AYUV, DXGI_FORMAT_AYUV)]
                 .iter()
-                .find_map(|f| types.iter().find(|t| mf::subtype(t) == Some(*f)))
+                .find_map(|(f, d)| types.iter().find(|t| mf::subtype(t) == Some(*f)).map(|t| (t, *d)))
                 .context("decoder has no NV12 or AYUV output")?;
+            // Pictures the viewer's shader can read without a copy, where the
+            // graphics card allows it.
+            let readable = self.device.CheckFormatSupport(format).is_ok_and(|s| s & D3D11_FORMAT_SUPPORT_SHADER_SAMPLE.0 as u32 != 0);
+            let bind = D3D11_BIND_DECODER.0 as u32 | if readable { D3D11_BIND_SHADER_RESOURCE.0 as u32 } else { 0 };
+            if let Ok(a) = self.mft.GetOutputStreamAttributes(0) {
+                let _ = a.SetUINT32(&MF_SA_D3D11_BINDFLAGS, bind);
+            }
             self.mft.SetOutputType(0, t, 0).context("decoder SetOutputType")?;
             if let Ok(v) = t.GetUINT64(&MF_MT_FRAME_SIZE) {
                 self.size = ((v >> 32) as u32, v as u32);

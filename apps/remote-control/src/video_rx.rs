@@ -12,7 +12,7 @@ use std::{
 use iroh::endpoint::Connection;
 use rc_stream::{
     fec::Assembler,
-    wire::{Ack, ShardHeader, T_SHARD},
+    wire::{Ack, ShardHeader, T_AUDIO, T_SHARD},
 };
 use tokio::sync::mpsc;
 
@@ -23,17 +23,23 @@ use crate::{
 
 /// How long the FEC assembler keeps a frame open after its latest shard.
 const FRAME_LINGER: Duration = Duration::from_millis(150);
-/// A later frame is complete but this one is not: give it this long.
-const GAP_WAIT: Duration = Duration::from_millis(30);
+/// A later frame is complete but this one is not: give it this long. The host
+/// sends frames one after another, so only the network can reorder them, by
+/// a few milliseconds at most; every millisecond more is frozen picture.
+const GAP_WAIT: Duration = Duration::from_millis(12);
 /// No shard of an incomplete frame for this long, and nothing came after it.
 /// Counted from the latest shard, so a large frame on a slow link may take
 /// as long as it needs.
 const STUCK_WAIT: Duration = Duration::from_millis(120);
+/// Repeats of a key frame request wait this long, or twice the round trip if
+/// that is longer: no key frame can come back sooner. On a relay at 1-2 s
+/// round trip, a repeat every 300 ms had the host send three key frames a
+/// second, which filled the 2-3 Mbps link on their own (2026-11-20).
 const KEY_REQUEST_GAP: Duration = Duration::from_millis(300);
 /// How often missing frames are looked for. Every millisecond here is a
 /// millisecond of frozen picture after a loss (the report interval, 100 ms,
 /// made the freeze about 50 ms longer on average).
-const CHECK_EVERY: Duration = Duration::from_millis(10);
+const CHECK_EVERY: Duration = Duration::from_millis(4);
 
 pub struct Delivered {
     pub header: FrameHeader,
@@ -62,6 +68,8 @@ pub struct Reorder {
     pub recovered: Option<(Duration, Option<Duration>)>,
     pub key_requests: u64,
     pub lost: u64,
+    /// The path's round trip (see `KEY_REQUEST_GAP`).
+    pub rtt: Duration,
 }
 
 impl Reorder {
@@ -143,7 +151,8 @@ impl Reorder {
         }
         let no_start = self.next.is_none() && self.first_seen.is_some_and(|t| now.duration_since(t) > STUCK_WAIT);
         let want = self.need_key || no_start;
-        if want && self.last_request.is_none_or(|t| now.duration_since(t) >= KEY_REQUEST_GAP) {
+        let gap = KEY_REQUEST_GAP.max(self.rtt * 2);
+        if want && self.last_request.is_none_or(|t| now.duration_since(t) >= gap) {
             self.last_request = Some(now);
             self.key_requests += 1;
             return true;
@@ -177,6 +186,7 @@ pub async fn run(
     ctrl: mpsc::UnboundedSender<Msg>,
     counters: Arc<Mutex<RxCounters>>,
     mut sim: Option<crate::lossim::LossSim>,
+    audio: Option<mpsc::UnboundedSender<bytes::Bytes>>,
 ) {
     let mut asm = Assembler::new(FRAME_LINGER);
     let mut ro = Reorder::default();
@@ -188,6 +198,12 @@ pub async fn run(
         tokio::select! {
             d = conn.read_datagram() => {
                 let Ok(d) = d else { return };
+                if d.first() == Some(&T_AUDIO) {
+                    if let Some(a) = &audio {
+                        let _ = a.send(d);
+                    }
+                    continue;
+                }
                 if d.first() != Some(&T_SHARD) {
                     continue;
                 }
@@ -214,6 +230,12 @@ pub async fn run(
                 crate::trace::mark(c.frame, "complete", None);
                 let _ = conn.send_datagram(Ack { frame: c.frame, recovered: c.recovered }.encode().into());
                 let Some((header, body)) = FrameHeader::parse(&c.data) else { continue };
+                if crate::trace::on() {
+                    // Capture-to-send time on the host and the frame's size, so
+                    // capture cadence and network jitter can be told apart.
+                    crate::trace::value(c.frame, "host_us", header.host_us as i64);
+                    crate::trace::value(c.frame, "bytes", c.data.len() as i64);
+                }
                 {
                     let mut k = counters.lock().unwrap();
                     k.frames += 1;
@@ -250,6 +272,7 @@ pub async fn run(
             }
             _ = tick.tick() => {
                 let now = Instant::now();
+                ro.rtt = Duration::from_secs_f64(crate::net::selected_path(&conn).2.max(0.0) / 1000.0);
                 asm.expire(now);
                 let r = asm.take_report();
                 if r.shards_expected > 0 {
@@ -310,7 +333,8 @@ mod tests {
         r.push(0, frame(true), t);
         r.on_shard(1, t);
         assert!(r.push(2, frame(false), t).is_empty());
-        assert!(r.tick(t + Duration::from_millis(50)));
+        assert!(!r.tick(t + Duration::from_millis(5)), "the network may reorder a little");
+        assert!(r.tick(t + Duration::from_millis(20)));
         assert_eq!(r.lost, 1);
         assert!(r.push(3, frame(false), t).is_empty(), "delta frames are useless until a key frame");
         assert!(!r.tick(t + Duration::from_millis(100)), "requests are spaced out");
@@ -318,6 +342,19 @@ mod tests {
         assert_eq!(r.push(5, frame(true), t).len(), 1);
         assert_eq!(r.push(6, frame(false), t).len(), 1);
         assert_eq!(r.lost, 1);
+    }
+
+    #[test]
+    fn repeats_wait_for_the_round_trip() {
+        let mut r = Reorder { rtt: Duration::from_secs(1), ..Default::default() };
+        let t = Instant::now();
+        let ms = |n| t + Duration::from_millis(n);
+        r.push(0, frame(true), t);
+        r.on_shard(1, t);
+        r.push(2, frame(false), t);
+        assert!(r.tick(ms(20)));
+        assert!(!r.tick(ms(1000)), "the key frame cannot be back yet");
+        assert!(r.tick(ms(2020)));
     }
 
     #[test]

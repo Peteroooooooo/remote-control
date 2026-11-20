@@ -114,6 +114,8 @@ thread_local! {
     static ROUTER: RefCell<KeyRouter> = RefCell::default();
     /// Buttons whose press recaptured input; their release is not sent either.
     static SKIP_UP: Cell<u8> = const { Cell::new(0) };
+    /// Suppresses WM_CAPTURECHANGED when we call ReleaseCapture ourselves.
+    static RELEASING_CAPTURE: Cell<bool> = const { Cell::new(false) };
     /// Cursors built from the host's images, by id.
     static BUILT: RefCell<HashMap<u32, HCURSOR>> = RefCell::default();
 }
@@ -266,6 +268,7 @@ pub fn create(state: Arc<WindowState>, title: &str, client: (u32, u32)) -> Resul
         PICTURE.store(pic.0 as isize, Ordering::Relaxed);
         // Coloured while still hidden, so the light frame never flashes.
         theme::frame(hwnd, theme::CHROME);
+        theme::system_corners(hwnd);
         let _ = SetWindowPos(hwnd, None, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
         crate::toolbar::create(hwnd);
         place_picture(hwnd);
@@ -361,11 +364,6 @@ pub fn send_sas() {
     send(Msg::SendSas);
 }
 
-/// Keyboard and mouse back to this computer, or to the host again.
-pub fn toggle_capture() {
-    if captured() { release() } else { capture() }
-}
-
 /// Ends the session.
 pub fn disconnect() {
     send(Msg::ReleaseAll);
@@ -449,6 +447,10 @@ pub fn captured() -> bool {
     STATE.get().is_some_and(|s| s.input && s.captured.load(Ordering::Relaxed))
 }
 
+fn active() -> bool {
+    captured() && unsafe { GetForegroundWindow() } == hwnd()
+}
+
 fn hook_on() -> bool {
     HOOK.get().is_some()
 }
@@ -488,6 +490,14 @@ fn capture() {
     refresh_cursor(pic);
 }
 
+fn release_mouse_capture() {
+    RELEASING_CAPTURE.set(true);
+    unsafe {
+        let _ = ReleaseCapture();
+    }
+    RELEASING_CAPTURE.set(false);
+}
+
 /// Ctrl+Alt+Shift+Z: the host lets go of everything, the local system gets keys and mouse back.
 fn release() {
     if let Some(s) = STATE.get() {
@@ -496,11 +506,27 @@ fn release() {
     send(Msg::ReleaseAll);
     ROUTER.with_borrow_mut(KeyRouter::clear);
     remove_hook();
-    unsafe {
-        let _ = ReleaseCapture();
-    }
+    release_mouse_capture();
     log!("input released");
     show_title(hwnd());
+    refresh_cursor(picture());
+}
+
+/// The session window lost foreground/activation: release held input, clear
+/// local hook/capture, and restore captured state so switching back resumes control.
+fn deactivate() {
+    send(Msg::ReleaseAll);
+    ROUTER.with_borrow_mut(KeyRouter::clear);
+    remove_hook();
+    release_mouse_capture();
+    crate::toolbar::dismiss();
+    if let Some(s) = STATE.get()
+        && s.input
+    {
+        s.captured.store(true, Ordering::Relaxed);
+    }
+    invalidate_caption(hwnd());
+    crate::toolbar::refresh();
     refresh_cursor(picture());
 }
 
@@ -549,9 +575,9 @@ fn refresh_cursor(hwnd: HWND) {
 }
 
 fn set_cursor(lparam: LPARAM) -> bool {
-    // Released input means the pointer is the local one again; watching
+    // Inactive or released input means the pointer is the local one again; watching
     // only (no input) still shows the host's cursor.
-    let local = STATE.get().is_some_and(|s| s.input) && !captured();
+    let local = STATE.get().is_some_and(|s| s.input) && !active();
     if (lparam.0 & 0xffff) as u32 != HTCLIENT || local {
         return false;
     }
@@ -577,14 +603,11 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
 
 /// True to keep the event from the local system.
 fn hook_key(kb: &KBDLLHOOKSTRUCT) -> bool {
-    let hwnd = HWND(WINDOW.load(Ordering::Relaxed) as *mut _);
+    let hwnd = hwnd();
     let test = STATE.get().is_some_and(|s| s.hook_test) && kb.dwExtraInfo == HOOK_TEST_MARK;
     // Injected events include a host on this same computer replaying our own
     // keys; sending them again would loop.
-    if (kb.flags.0 & (LLKHF_INJECTED.0 | LLKHF_LOWER_IL_INJECTED.0) != 0 && !test)
-        || !captured()
-        || unsafe { GetForegroundWindow() } != hwnd
-    {
+    if (kb.flags.0 & (LLKHF_INJECTED.0 | LLKHF_LOWER_IL_INJECTED.0) != 0 && !test) || !active() {
         return false;
     }
     let down = kb.flags.0 & LLKHF_UP.0 == 0;
@@ -638,7 +661,7 @@ fn hook_key(kb: &KBDLLHOOKSTRUCT) -> bool {
 }
 
 fn mouse_move(hwnd: HWND, lparam: LPARAM) {
-    if !captured() {
+    if !active() {
         return;
     }
     let (x, y) = to_stream(hwnd, lparam);
@@ -683,7 +706,7 @@ fn button(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) {
             SetCapture(hwnd);
         } else if wparam.0 & 0x73 == 0 {
             // No button left down (MK_LBUTTON | MK_RBUTTON | MK_MBUTTON | MK_XBUTTON1 | MK_XBUTTON2).
-            let _ = ReleaseCapture();
+            release_mouse_capture();
         }
     }
     send(Msg::MouseButton { button: b, down: pressed });
@@ -705,7 +728,7 @@ fn key(wparam: WPARAM, lparam: LPARAM, pressed: bool) -> bool {
         pick_monitor(m);
         return true;
     }
-    if !captured() {
+    if !active() {
         return false;
     }
     if hook_on() {
@@ -751,7 +774,7 @@ unsafe extern "system" fn picture_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
             }
         }
         WM_MOUSEWHEEL | WM_MOUSEHWHEEL => {
-            if captured() {
+            if active() {
                 let delta = ((wparam.0 >> 16) & 0xffff) as u16 as i16;
                 send(Msg::Wheel { delta, horizontal: msg == WM_MOUSEHWHEEL });
             }
@@ -773,6 +796,14 @@ unsafe extern "system" fn picture_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
             send(Msg::ReleaseAll);
             ROUTER.with_borrow_mut(KeyRouter::clear);
             remove_hook();
+            release_mouse_capture();
+            refresh_cursor(hwnd);
+        }
+        WM_CAPTURECHANGED => {
+            if !RELEASING_CAPTURE.get() && STATE.get().is_some_and(|s| s.input) {
+                send(Msg::ReleaseAll);
+                ROUTER.with_borrow_mut(KeyRouter::clear);
+            }
         }
         WM_SETCURSOR => {
             if !set_cursor(lparam) {
@@ -856,7 +887,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_PAINT => crate::toolbar::paint_caption(hwnd),
         WM_ERASEBKGND => return LRESULT(1),
         WM_ACTIVATE => {
+            if (wparam.0 & 0xffff) as u32 == WA_INACTIVE {
+                deactivate();
+            } else {
+                refresh_cursor(picture());
+            }
             invalidate_caption(hwnd);
+            return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
+        }
+        WM_ACTIVATEAPP => {
+            if wparam.0 == 0 {
+                deactivate();
+            }
             return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
         }
         WM_SETFOCUS => unsafe {

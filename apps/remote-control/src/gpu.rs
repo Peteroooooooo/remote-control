@@ -10,7 +10,7 @@ use windows::{
                 D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_SDK_VERSION,
                 D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Multithread,
             },
-            Dxgi::{CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1, IDXGIOutput1},
+            Dxgi::{CreateDXGIFactory1, IDXGIAdapter1, IDXGIDevice, IDXGIFactory1, IDXGIOutput1},
         },
     },
     core::Interface,
@@ -46,6 +46,11 @@ impl Gpu {
             let device: ID3D11Device = device.context("no device")?;
             let ctx = ctx.context("no context")?;
             let _ = device.cast::<ID3D11Multithread>()?.SetMultithreadProtected(true);
+            // Ask WDDM for high GPU scheduling priority (like Sunshine/OBS) so
+            // hardware encode/decode is not throttled behind background work.
+            if let Ok(dxgi) = device.cast::<IDXGIDevice>() {
+                let _ = dxgi.SetGPUThreadPriority(7);
+            }
             let desc = adapter.GetDesc1()?;
             let len = desc.Description.iter().position(|&c| c == 0).unwrap_or(desc.Description.len());
             let name = String::from_utf16_lossy(&desc.Description[..len]);

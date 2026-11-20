@@ -28,7 +28,7 @@ pub struct Encoded {
     pub padding: usize,
 }
 
-pub struct Encoder {
+struct MfEncoder {
     mft: IMFTransform,
     events: IMFMediaEventGenerator,
     codec: ICodecAPI,
@@ -36,11 +36,7 @@ pub struct Encoder {
     credits: u32,
     ready: std::collections::VecDeque<Encoded>,
     seq_header: Vec<u8>,
-    pub name: String,
-    pub format: Codec,
-    /// Takes AYUV and encodes 4:4:4 (see `EncOptions::yuv444`).
-    pub yuv444: bool,
-    pub bitrate: u32,
+    format: Codec,
     fps: u32,
     index: i64,
     key_next: bool,
@@ -48,9 +44,23 @@ pub struct Encoder {
     /// Per frame given to the encoder and not yet out: (key frame asked for,
     /// bitrate changed just before it).
     inputs: std::collections::VecDeque<(bool, bool)>,
+}
+
+enum Backend {
+    Mf(MfEncoder),
+    Qsv(Box<crate::qsv::QsvEncoder>),
+}
+
+pub struct Encoder {
+    backend: Backend,
+    pub name: String,
+    pub format: Codec,
+    /// Takes AYUV and encodes 4:4:4 (see `EncOptions::yuv444`).
+    pub yuv444: bool,
+    pub bitrate: u32,
     /// The encoder answered a bitrate change with a key frame nobody asked
-    /// for (Intel Quick Sync does). Bitrate changes are then expensive: a key
-    /// frame costs several normal frames' worth of quality.
+    /// for (Intel Quick Sync MFT does). Bitrate changes are then expensive: a
+    /// key frame costs several normal frames' worth of quality.
     pub rekeys_on_rate_change: bool,
 }
 
@@ -67,7 +77,11 @@ fn find_encoders(luid: LUID, codec: Codec) -> Result<Vec<IMFActivate>> {
 
 /// The name of the hardware encoder for `codec` on that adapter, if it has one.
 pub fn encoder_name(luid: LUID, codec: Codec) -> Option<String> {
-    find_encoders(luid, codec).ok()?.first().map(mf::friendly_name)
+    let mf_name = find_encoders(luid, codec).ok()?.first().map(mf::friendly_name)?;
+    if crate::qsv::is_available(luid) {
+        return Some(format!("Intel QSV {} (oneVPL)", codec.name()));
+    }
+    Some(mf_name)
 }
 
 /// Settings that can be tried per machine.
@@ -134,6 +148,25 @@ impl Encoder {
         opts: EncOptions,
         extra: &[(&'static str, GUID, u64)],
     ) -> Result<Encoder> {
+        if extra.is_empty() && !opts.yuv444 && !opts.qp_control && crate::qsv::is_available(luid) {
+            match crate::qsv::QsvEncoder::try_new(device, luid, width, height, fps, bitrate, opts) {
+                Ok(qsv) => {
+                    let name = qsv.name.clone();
+                    let format = qsv.format;
+                    return Ok(Encoder {
+                        backend: Backend::Qsv(Box::new(qsv)),
+                        name,
+                        format,
+                        yuv444: false,
+                        bitrate,
+                        rekeys_on_rate_change: false,
+                    });
+                }
+                Err(e) => {
+                    crate::log!("oneVPL QSV {} unavailable ({e:#}); falling back to Media Foundation", opts.codec.name());
+                }
+            }
+        }
         mf::init_thread()?;
         let list = find_encoders(luid, opts.codec)?;
         let Some(act) = list.first() else { bail!("no hardware {} encoder on this graphics adapter", opts.codec.name()) };
@@ -174,11 +207,10 @@ impl Encoder {
             let scenario =
                 hint(opts.scenario_hint, &CODECAPI_AVScenarioInfo, eAVScenarioInfo_DisplayRemoting.0 as u32);
             crate::log!("encoder hints: one temporal layer {layers}, desktop streaming {scenario}");
-            if let Some(s) = opts.speed {
-                match mf::set_u32(&codec, &CODECAPI_AVEncCommonQualityVsSpeed, s.min(100)) {
-                    Ok(()) => crate::log!("encoder quality-vs-speed set to {s}"),
-                    Err(e) => crate::log!("encoder ignores quality-vs-speed: {e}"),
-                }
+            let speed = opts.speed.unwrap_or(0).min(100);
+            match mf::set_u32(&codec, &CODECAPI_AVEncCommonQualityVsSpeed, speed) {
+                Ok(()) => crate::log!("encoder quality-vs-speed set to {speed}"),
+                Err(e) => crate::log!("encoder ignores quality-vs-speed: {e}"),
             }
             for (n, key, v) in extra {
                 let r = if *v > u32::MAX as u64 || *key == CODECAPI_AVEncVideoEncodeFrameTypeQP {
@@ -220,7 +252,7 @@ impl Encoder {
             mft.ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0)?;
             mft.ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0)?;
             let seq_header = sequence_header(&mft);
-            Ok(Encoder {
+            let mf_enc = MfEncoder {
                 mft,
                 events,
                 codec,
@@ -228,49 +260,77 @@ impl Encoder {
                 credits: 0,
                 ready: Default::default(),
                 seq_header,
-                name,
                 format: opts.codec,
-                yuv444,
-                bitrate,
                 fps,
                 index: 0,
                 key_next: true,
                 rate_changed: false,
                 inputs: Default::default(),
+            };
+            Ok(Encoder {
+                backend: Backend::Mf(mf_enc),
+                name,
+                format: opts.codec,
+                yuv444,
+                bitrate,
                 rekeys_on_rate_change: false,
             })
         }
     }
 
     /// Takes effect from the next frame (if the encoder honours it; see P1-2).
-    /// Only the mean bitrate changes; the rate buffer stays as sized for the
-    /// starting (highest) bitrate: on Intel Quick Sync every rate buffer
-    /// change starts a key frame. NVIDIA ignores rate buffer changes while
-    /// running. Intel's encoders can still die on a bitrate change (an error
-    /// event, see `pump`); its HEVC encoder does on the first or second one.
     pub fn set_bitrate(&mut self, bps: u32) {
-        if mf::set_u32(&self.codec, &CODECAPI_AVEncCommonMeanBitRate, bps).is_ok() {
-            self.bitrate = bps;
-            self.rate_changed = true;
+        match &mut self.backend {
+            Backend::Qsv(q) => {
+                q.set_bitrate(bps);
+                self.bitrate = q.bitrate;
+            }
+            Backend::Mf(m) => {
+                if mf::set_u32(&m.codec, &CODECAPI_AVEncCommonMeanBitRate, bps).is_ok() {
+                    self.bitrate = bps;
+                    m.rate_changed = true;
+                }
+            }
         }
     }
 
     pub fn request_key(&mut self) {
-        self.key_next = true;
+        match &mut self.backend {
+            Backend::Qsv(q) => q.request_key(),
+            Backend::Mf(m) => m.key_next = true,
+        }
     }
 
-    /// For enc-test experiments with settings the session does not use.
-    pub fn codec_api(&self) -> &ICodecAPI {
-        &self.codec
+    /// For enc-test experiments with Media Foundation settings.
+    pub fn codec_api(&self) -> Option<&ICodecAPI> {
+        match &self.backend {
+            Backend::Mf(m) => Some(&m.codec),
+            Backend::Qsv(_) => None,
+        }
     }
 
     /// Encodes one NV12 (AYUV if `yuv444`) frame and waits up to `timeout` for the result.
     /// `None` means the encoder has not produced it yet; it comes with a later call.
     /// `qp`: the quantiser for this frame, in QP-control mode.
     pub fn encode(&mut self, nv12: &ID3D11Texture2D, timeout: Duration, qp: Option<u32>) -> Result<Option<Encoded>> {
+        match &mut self.backend {
+            Backend::Qsv(q) => q.encode(nv12, timeout, qp),
+            Backend::Mf(m) => m.encode(nv12, timeout, qp, &mut self.rekeys_on_rate_change),
+        }
+    }
+}
+
+impl MfEncoder {
+    fn encode(
+        &mut self,
+        nv12: &ID3D11Texture2D,
+        timeout: Duration,
+        qp: Option<u32>,
+        rekeys_on_rate_change: &mut bool,
+    ) -> Result<Option<Encoded>> {
         let deadline = Instant::now() + timeout;
         while self.credits == 0 {
-            if !self.pump(Some(deadline))? {
+            if !self.pump(Some(deadline), rekeys_on_rate_change)? {
                 return Ok(self.ready.pop_front());
             }
         }
@@ -293,7 +353,7 @@ impl Encoder {
                 Err(e) if e.code() == MF_E_NOTACCEPTING => {
                     self.credits = 0;
                     while self.credits == 0 {
-                        if !self.pump(Some(deadline))? {
+                        if !self.pump(Some(deadline), rekeys_on_rate_change)? {
                             return Ok(self.ready.pop_front());
                         }
                     }
@@ -304,7 +364,7 @@ impl Encoder {
         self.credits -= 1;
         self.inputs.push_back((asked, std::mem::take(&mut self.rate_changed)));
         while self.ready.is_empty() {
-            if !self.pump(Some(deadline))? {
+            if !self.pump(Some(deadline), rekeys_on_rate_change)? {
                 break;
             }
         }
@@ -313,7 +373,7 @@ impl Encoder {
 
     /// Handles one event. With a deadline, waits for it; returns false when the
     /// deadline passed without an event.
-    fn pump(&mut self, deadline: Option<Instant>) -> Result<bool> {
+    fn pump(&mut self, deadline: Option<Instant>, rekeys_on_rate_change: &mut bool) -> Result<bool> {
         loop {
             let ev = match unsafe { self.events.GetEvent(MF_EVENT_FLAG_NO_WAIT) } {
                 Ok(ev) => ev,
@@ -330,7 +390,7 @@ impl Encoder {
             if t == METransformNeedInput.0 as u32 {
                 self.credits += 1;
             } else if t == METransformHaveOutput.0 as u32 {
-                self.pull()?;
+                self.pull(rekeys_on_rate_change)?;
             } else if t == MEError.0 as u32 {
                 // Intel sends this, with a status that says success, after a
                 // bitrate change it cannot take. The frame in flight never
@@ -343,7 +403,7 @@ impl Encoder {
         }
     }
 
-    fn pull(&mut self) -> Result<()> {
+    fn pull(&mut self, rekeys_on_rate_change: &mut bool) -> Result<()> {
         unsafe {
             let mut buf = [MFT_OUTPUT_DATA_BUFFER { dwStreamID: 0, ..Default::default() }];
             let mut status = 0u32;
@@ -365,8 +425,8 @@ impl Encoder {
             let key = sample.GetUINT32(&MFSampleExtension_CleanPoint).unwrap_or(0) != 0;
             let qp = sample.GetUINT64(&MFSampleExtension_VideoEncodeQP).ok().map(|q| (q & 0xffff) as u32);
             let (asked, after_change) = self.inputs.pop_front().unwrap_or_default();
-            if key && !asked && after_change && !self.rekeys_on_rate_change {
-                self.rekeys_on_rate_change = true;
+            if key && !asked && after_change && !*rekeys_on_rate_change {
+                *rekeys_on_rate_change = true;
                 crate::log!("encoder starts a key frame on every bitrate change; changing the bitrate rarely from now on");
             }
             let mut data = mf::bytes_from_sample(&sample)?;
@@ -387,7 +447,7 @@ impl Encoder {
     }
 }
 
-impl Drop for Encoder {
+impl Drop for MfEncoder {
     fn drop(&mut self) {
         unsafe {
             let _ = self.mft.ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
