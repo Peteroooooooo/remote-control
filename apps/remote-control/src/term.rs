@@ -11,7 +11,10 @@ use std::{
     ffi::c_void,
     io::{Read, Write},
     path::{Path, PathBuf},
-    sync::{Arc, OnceLock},
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use anyhow::{Result, anyhow, bail};
@@ -205,11 +208,23 @@ pub fn resize(cols: u16, rows: u16) -> Vec<u8> {
 /// relative to its parent with `/` between, then `END`. Blocking: runs on a
 /// thread of its own (the host's impersonates its user there). The number of files.
 pub fn send_tree(src: &Path, out: &Sender<Frame>) -> Result<u64> {
+    const MAX_DEPTH: usize = 64;
     let name = src.file_name().ok_or_else(|| anyhow!("{} 不是文件或文件夹", src.display()))?.to_string_lossy().into_owned();
     let send = |kind: u8, payload: Vec<u8>| out.blocking_send((kind, payload)).map_err(|_| anyhow!("连接断开了"));
     let mut files = 0u64;
-    fn walk(path: &Path, rel: &str, send: &dyn Fn(u8, Vec<u8>) -> Result<()>, files: &mut u64) -> Result<()> {
-        let meta = std::fs::metadata(path).map_err(|e| anyhow!("{}：{e}", path.display()))?;
+    fn walk(path: &Path, rel: &str, depth: usize, send: &dyn Fn(u8, Vec<u8>) -> Result<()>, files: &mut u64) -> Result<()> {
+        if depth > MAX_DEPTH {
+            bail!("{} 目录层级超过 {MAX_DEPTH} 层", path.display());
+        }
+        let meta = if depth == 0 {
+            std::fs::metadata(path)
+        } else {
+            std::fs::symlink_metadata(path)
+        }
+        .map_err(|e| anyhow!("{}：{e}", path.display()))?;
+        if depth > 0 && meta.file_type().is_symlink() {
+            return Ok(());
+        }
         let mut head = Vec::new();
         put_str(&mut head, rel);
         if meta.is_dir() {
@@ -217,7 +232,7 @@ pub fn send_tree(src: &Path, out: &Sender<Frame>) -> Result<u64> {
             let mut entries: Vec<_> = std::fs::read_dir(path)?.filter_map(|e| e.ok()).collect();
             entries.sort_by_key(|e| e.file_name());
             for e in entries {
-                walk(&e.path(), &format!("{rel}/{}", e.file_name().to_string_lossy()), send, files)?;
+                walk(&e.path(), &format!("{rel}/{}", e.file_name().to_string_lossy()), depth + 1, send, files)?;
             }
             return Ok(());
         }
@@ -237,7 +252,7 @@ pub fn send_tree(src: &Path, out: &Sender<Frame>) -> Result<u64> {
         *files += 1;
         Ok(())
     }
-    walk(src, &name, &send, &mut files)?;
+    walk(src, &name, 0, &send, &mut files)?;
     send(END, Vec::new())?;
     Ok(files)
 }
@@ -304,12 +319,40 @@ fn writer(mut send: SendStream) -> Sender<Frame> {
 }
 
 /// Copies a pipe to frames of `kind` on a thread; ends at the pipe's end.
-fn pump(mut from: std::fs::File, kind: u8, out: Sender<Frame>) -> std::thread::JoinHandle<()> {
+/// When `cancel` is set (or the receiver closes), drops `out` so the writer
+/// task exits and continues draining `from` to EOF so `ClosePseudoConsole` never deadlocks.
+fn pump(mut from: std::fs::File, kind: u8, out: Sender<Frame>, cancel: Arc<AtomicBool>) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
+        let mut out = Some(out);
         let mut buf = vec![0u8; CHUNK];
         while let Ok(n) = from.read(&mut buf) {
-            if n == 0 || out.blocking_send((kind, buf[..n].to_vec())).is_err() {
+            if n == 0 {
                 break;
+            }
+            if cancel.load(Ordering::Relaxed) {
+                out = None;
+                continue;
+            }
+            if let Some(tx) = out.as_ref() {
+                let mut frame = Some((kind, buf[..n].to_vec()));
+                loop {
+                    if cancel.load(Ordering::Relaxed) {
+                        out = None;
+                        break;
+                    }
+                    let f = frame.take().unwrap();
+                    match tx.try_send(f) {
+                        Ok(()) => break,
+                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                            out = None;
+                            break;
+                        }
+                        Err(tokio::sync::mpsc::error::TrySendError::Full(f)) => {
+                            frame = Some(f);
+                            std::thread::sleep(std::time::Duration::from_millis(5));
+                        }
+                    }
+                }
             }
         }
     })
@@ -320,7 +363,7 @@ pub async fn serve(open: Open, conn: Connection, send: SendStream, recv: RecvStr
     let out = writer(send);
     out.send((READY, Vec::new())).await?;
     match open.what {
-        What::Shell => serve_shell(open, out, recv, service).await,
+        What::Shell => serve_shell(open, conn, out, recv, service).await,
         What::Exec => serve_exec(open, conn, out, recv, service).await,
         What::Put => serve_put(open, out, recv, service).await,
         What::Get => serve_get(open, out, service).await,
@@ -331,10 +374,11 @@ fn exit_frame(code: u32) -> Frame {
     (EXIT, code.to_be_bytes().to_vec())
 }
 
-async fn serve_shell(open: Open, out: Sender<Frame>, mut recv: RecvStream, service: bool) -> Result<()> {
+async fn serve_shell(open: Open, conn: Connection, out: Sender<Frame>, mut recv: RecvStream, service: bool) -> Result<()> {
     let (pty, io) = tokio::task::spawn_blocking(move || Pty::spawn(service, open.cols, open.rows)).await??;
     let pty = Arc::new(pty);
-    let reader = pump(io.output, OUTPUT, out.clone());
+    let cancel = Arc::new(AtomicBool::new(false));
+    let reader = pump(io.output, OUTPUT, out.clone(), cancel.clone());
     let (keys, keys_rx) = std::sync::mpsc::channel::<Vec<u8>>();
     let mut input = io.input;
     std::thread::spawn(move || {
@@ -355,6 +399,14 @@ async fn serve_shell(open: Open, out: Sender<Frame>, mut recv: RecvStream, servi
                 out.send(exit_frame(code.unwrap_or(1))).await?;
                 return Ok(());
             }
+            _ = conn.closed() => {
+                cancel.store(true, Ordering::Relaxed);
+                drop(out);
+                pty.kill();
+                let _ = waiter.await;
+                let _ = tokio::task::spawn_blocking(move || reader.join()).await;
+                return Ok(());
+            }
             f = read_frame(&mut recv) => match f {
                 Ok(Some((INPUT, b))) => {
                     let _ = keys.send(b);
@@ -367,8 +419,11 @@ async fn serve_shell(open: Open, out: Sender<Frame>, mut recv: RecvStream, servi
                 }
                 Ok(Some(_)) => {}
                 _ => {
+                    cancel.store(true, Ordering::Relaxed);
+                    drop(out);
                     pty.kill();
                     let _ = waiter.await;
+                    let _ = tokio::task::spawn_blocking(move || reader.join()).await;
                     return Ok(());
                 }
             }
@@ -381,7 +436,8 @@ async fn serve_exec(open: Open, conn: Connection, out: Sender<Frame>, mut recv: 
     let text = open.text.clone();
     let e = tokio::task::spawn_blocking(move || term_proc::exec(service, &text, cwd.as_deref())).await??;
     let proc = Arc::new(e.proc);
-    let pumps = [pump(e.stdout, OUTPUT, out.clone()), pump(e.stderr, STDERR, out.clone())];
+    let cancel = Arc::new(AtomicBool::new(false));
+    let pumps = [pump(e.stdout, OUTPUT, out.clone(), cancel.clone()), pump(e.stderr, STDERR, out.clone(), cancel.clone())];
     let (keys, keys_rx) = std::sync::mpsc::channel::<Vec<u8>>();
     let mut stdin = e.stdin;
     std::thread::spawn(move || {
@@ -405,8 +461,11 @@ async fn serve_exec(open: Open, conn: Connection, out: Sender<Frame>, mut recv: 
                 return Ok(());
             }
             _ = conn.closed() => {
+                cancel.store(true, Ordering::Relaxed);
+                drop(out);
                 proc.kill();
                 let _ = waiter.await;
+                let _ = tokio::task::spawn_blocking(move || pumps.map(|p| p.join())).await;
                 return Ok(());
             }
             f = read_frame(&mut recv), if !client_done => match f {
@@ -419,8 +478,11 @@ async fn serve_exec(open: Open, conn: Connection, out: Sender<Frame>, mut recv: 
                 Ok(Some(_)) => {}
                 Ok(None) => client_done = true,
                 Err(_) => {
+                    cancel.store(true, Ordering::Relaxed);
+                    drop(out);
                     proc.kill();
                     let _ = waiter.await;
+                    let _ = tokio::task::spawn_blocking(move || pumps.map(|p| p.join())).await;
                     return Ok(());
                 }
             }
@@ -900,16 +962,17 @@ pub fn open_for_session() {
 }
 
 /// A terminal window with `remote-control shell` to `id`: Windows Terminal, else a console window.
-pub fn open_window(id: iroh::EndpointId, name: &str) -> Result<()> {
+pub fn open_window(id: iroh::EndpointId, _name: &str) -> Result<()> {
     use std::os::windows::process::CommandExt;
     const CREATE_NEW_CONSOLE: u32 = 0x10;
     let exe = std::env::current_exe()?;
     let id = id.to_string();
-    let title = format!("{name} · 终端");
+    // Pass a fixed title to wt.exe because wt parses `;` in `--title` as a subcommand separator;
+    // `shell_inner` sets the sanitized `{name} · 终端` title via OSC 0 once connected.
     // A GUI-subsystem child does not receive ConPTY automatically; `cmd /c start /wait /b`
     // hosts the ConPTY and waits while `remote-control shell` attaches to it.
     let wt = std::process::Command::new("wt.exe")
-        .args(["-w", "new", "new-tab", "--title", &title, "cmd.exe", "/d", "/c", "start", "remote control", "/wait", "/b"])
+        .args(["-w", "new", "new-tab", "--title", "终端", "cmd.exe", "/d", "/c", "start", "remote control", "/wait", "/b"])
         .arg(&exe)
         .args(["shell", &id])
         .spawn();
@@ -918,6 +981,10 @@ pub fn open_window(id: iroh::EndpointId, name: &str) -> Result<()> {
     }
     std::process::Command::new(&exe).args(["shell", &id]).creation_flags(CREATE_NEW_CONSOLE).spawn()?;
     Ok(())
+}
+
+fn clean_title(s: &str) -> String {
+    s.chars().filter(|&c| !c.is_control() && !('\u{007f}'..='\u{009f}').contains(&c)).collect()
 }
 
 /// Ensures an interactive `shell` invocation has a console when launched from a
@@ -967,10 +1034,11 @@ fn shell_inner(device: &str) -> Result<i32> {
     let rt = runtime()?;
     rt.block_on(async {
         let (id, name) = find(device)?;
+        let safe_name = clean_title(&name);
         let raw = RawConsole::new()?;
         let (cols, rows) = raw.size();
-        print!("\x1b]0;{name} · 终端\x07");
-        eprintln!("正在连接「{name}」……\r");
+        print!("\x1b]0;{safe_name} · 终端\x07");
+        eprintln!("正在连接「{safe_name}」……\r");
         let open = Open { proof: String::new(), what: What::Shell, cols, rows, text: String::new(), cwd: String::new() };
         let Session { ep, conn, mut send, mut recv } = connect(id, open).await?;
         let (tx, mut keys) = tokio::sync::mpsc::channel::<Vec<u8>>(64);

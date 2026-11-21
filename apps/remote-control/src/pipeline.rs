@@ -76,7 +76,7 @@ pub struct PipeConfig {
 
 #[derive(Default)]
 pub struct PipeShared {
-    pub want_key: AtomicBool,
+    pub want_key: Arc<AtomicBool>,
     pub stop: AtomicBool,
     /// The captured display in desktop pixels, for mapping input.
     pub display: Mutex<RECT>,
@@ -214,7 +214,9 @@ pub fn yuv_texture(gpu: &Gpu, w: u32, h: u32, yuv444: bool) -> Result<ID3D11Text
 /// streaming session is active, restoring defaults on drop.
 /// Background/service processes on hybrid CPUs (e.g. Intel Core Ultra) are
 /// otherwise scheduled on LP-E cores with half-clock VDBOX (~2x slower encode).
-pub(crate) struct StreamingBoost;
+pub(crate) struct StreamingBoost {
+    _timer: crate::audio::TimerPeriodGuard,
+}
 
 impl StreamingBoost {
     pub(crate) fn enter() -> Self {
@@ -226,6 +228,7 @@ impl StreamingBoost {
         // Win11 22H2+ (processthreadsapi.h): keep timeBeginPeriod(1) effective
         // even when this process has no foreground window.
         const IGNORE_TIMER_RESOLUTION: u32 = 0x4;
+        let _timer = crate::audio::TimerPeriodGuard::enter(1);
         unsafe {
             let p = GetCurrentProcess();
             let _ = SetPriorityClass(p, HIGH_PRIORITY_CLASS);
@@ -241,7 +244,7 @@ impl StreamingBoost {
                 std::mem::size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32,
             );
         }
-        StreamingBoost
+        StreamingBoost { _timer }
     }
 }
 
@@ -476,19 +479,36 @@ fn run_once(
     let _ = info.send(crate::monitors::message(&sh.monitors));
     let mut cap = open_capture(&gpu, &output, desktop.as_deref(), &mut quirks.wgc_after)?;
     let (cw, ch) = cap.upright_size();
-    let quality = *sh.quality.lock().unwrap();
-    sh.quality_changed.store(false, Ordering::Relaxed);
+    let quality = {
+        let g = sh.quality.lock().unwrap();
+        sh.quality_changed.store(false, Ordering::Release);
+        *g
+    };
     let (w, h) = picture_size(cw, ch, &quality, cfg.max_width);
     let refresh = crate::monitors::refresh_hz(&sh.monitors);
     let fps = stream_fps(&quality, &cfg, refresh);
     let max_bps = stream_bps(&quality, &cfg, w, h, fps);
     tx.configure(fps, max_bps as f64);
     // The shader that makes the 4:4:4 picture does not turn it.
-    let can444 = cfg.viewer444 && !quirks.no_hevc && !quirks.no_444 && cap.rotation == 0 && can_encode_444(&gpu);
+    let mut can444 = cfg.viewer444 && !quirks.no_hevc && !quirks.no_444 && cap.rotation == 0 && can_encode_444(&gpu);
     let yuv444 = can444 && quality.yuv444;
-    let pic = yuv_texture(&gpu, w, h, yuv444)?;
+    let mut enc = match new_encoder(&gpu, w, h, fps, &cfg, quirks, max_bps, yuv444) {
+        Err(e) if yuv444 => {
+            log!("4:4:4 encoder: {e:#}; 4:2:0 from now on");
+            quirks.no_444 = true;
+            return Ok(());
+        }
+        r => r?,
+    };
+    if !yuv444 && cfg.hevc && enc.format != Codec::Hevc {
+        // HEVC encoder was unavailable or refused on this adapter; don't advertise 4:4:4 HEVC.
+        can444 = false;
+    }
+    let (pic_w, pic_h) = if yuv444 { (w, h) } else { enc.preferred_input_size().unwrap_or((w, h)) };
+    let pic = yuv_texture(&gpu, pic_w, pic_h, yuv444)?;
     let conv = if yuv444 {
-        match crate::yuv444::ToAyuv::new(&gpu, &cap.image, &pic, (w, h)) {
+        let img = cap.image(&gpu)?;
+        match crate::yuv444::ToAyuv::new(&gpu, img, &pic, (w, h)) {
             Ok(c) => Convert::Ayuv(c),
             Err(e) => {
                 log!("4:4:4: {e:#}; 4:2:0 from now on");
@@ -505,7 +525,8 @@ fn run_once(
                     .collect::<Result<Vec<_>>>()?;
                 Ok(Convert::Nv12Agent(shader, views))
             } else {
-                let views = shader.make_views(&gpu, &cap.image, &pic)?;
+                let img = cap.image(&gpu)?;
+                let views = shader.make_views(&gpu, img, &pic)?;
                 Ok(Convert::Nv12(shader, views))
             }
         });
@@ -514,7 +535,8 @@ fn run_once(
             Err(e) => {
                 log!("nv12 shader: {e:#}; falling back to VideoProcessor");
                 let vp = Vp::new(&gpu, (cap.width, cap.height), (w, h), vp::RGB_FULL, vp::YUV_709)?;
-                let views = vp.make_views(&cap.image, 0, &pic)?;
+                let img = cap.image(&gpu)?;
+                let views = vp.make_views(img, 0, &pic)?;
                 Convert::Vp(vp, views)
             }
         }
@@ -523,16 +545,9 @@ fn run_once(
         if !vp.rotate(cap.rotation) {
             log!("this video processor cannot rotate: the {}° display is sent sideways", cap.rotation);
         }
-        let views = vp.make_views(&cap.image, 0, &pic)?;
+        let img = cap.image(&gpu)?;
+        let views = vp.make_views(img, 0, &pic)?;
         Convert::Vp(vp, views)
-    };
-    let mut enc = match new_encoder(&gpu, w, h, fps, &cfg, quirks, max_bps, yuv444) {
-        Err(e) if yuv444 => {
-            log!("4:4:4 encoder: {e:#}; 4:2:0 from now on");
-            quirks.no_444 = true;
-            return Ok(());
-        }
-        r => r?,
     };
     log!(
         "capturing {}x{} at {refresh} Hz on {} with {}, encoding {w}x{h} {} at up to {fps} fps and {:.1} Mbps with {} ({quality:?})",
@@ -544,9 +559,13 @@ fn run_once(
         max_bps as f64 / 1e6,
         enc.name
     );
-    let streaming = Some(Streaming { fps: fps.min(255) as u8, max_kbps: max_bps / 1000, can444, yuv444 });
-    let info_msg = |enc: &Encoder| Msg::Info { width: w as u16, height: h as u16, encoder: enc.name.clone(), streaming };
-    let _ = info.send(info_msg(&enc));
+    let info_msg = |enc: &Encoder, can444: bool| Msg::Info {
+        width: w as u16,
+        height: h as u16,
+        encoder: enc.name.clone(),
+        streaming: Some(Streaming { fps: fps.min(255) as u8, max_kbps: max_bps / 1000, can444, yuv444 }),
+    };
+    let _ = info.send(info_msg(&enc, can444));
     if let Some(name) = desktop {
         log!("capturing desktop {name}");
         let _ = info.send(Msg::Desktop { name });
@@ -576,7 +595,7 @@ fn run_once(
     let mut frames = 0u64;
     let mut desktop_checked = Instant::now();
     while !sh.stop.load(Ordering::Relaxed) {
-        if sh.quality_changed.load(Ordering::Relaxed) {
+        if sh.quality_changed.load(Ordering::Acquire) {
             log!("the viewer chose another picture");
             return Ok(());
         }
@@ -587,6 +606,14 @@ fn run_once(
             if crate::desktop::switched() || crate::monitors::should_reopen(&sh.monitors) {
                 return Ok(());
             }
+        }
+        if tx.is_paused() {
+            pending = None;
+            refine_until = None;
+            no_output_since = None;
+            due = None;
+            std::thread::sleep(Duration::from_millis(50));
+            continue;
         }
         if refine_until.is_some_and(|t| Instant::now() >= t) {
             log_refined(&refined, "time up");
@@ -707,7 +734,10 @@ fn run_once(
                 changed_at = None;
                 no_output_since = None;
                 enc = new_encoder(&gpu, w, h, fps, &cfg, quirks, enc.bitrate, false)?;
-                let _ = info.send(info_msg(&enc));
+                if enc.preferred_input_size().unwrap_or((w, h)) != (pic_w, pic_h) {
+                    return Ok(());
+                }
+                let _ = info.send(info_msg(&enc, false));
                 pending = Some(shown_at);
                 continue;
             }
@@ -718,6 +748,9 @@ fn run_once(
                 no_output_since = None;
                 tried = true;
                 enc = new_encoder(&gpu, w, h, fps, &cfg, quirks, enc.bitrate, yuv444)?;
+                if !yuv444 && enc.preferred_input_size().unwrap_or((w, h)) != (pic_w, pic_h) {
+                    return Ok(());
+                }
                 last_change = Instant::now();
                 pending = Some(shown_at);
                 continue;

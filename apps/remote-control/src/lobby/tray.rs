@@ -20,7 +20,7 @@ use windows::{
             WindowsAndMessaging::{
                 AllowSetForegroundWindow, AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu,
                 DestroyWindow, DispatchMessageW, FindWindowW, GetCursorPos, GetMessageW, GetSystemMetrics, HICON,
-                IMAGE_ICON, IsIconic, IsWindowVisible, LR_DEFAULTCOLOR, LoadImageW, MF_SEPARATOR, MF_STRING, MSG,
+                IMAGE_ICON, IsIconic, LR_DEFAULTCOLOR, LR_SHARED, LoadImageW, MF_SEPARATOR, MF_STRING, MSG,
                 PostMessageW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SM_CXSMICON, SM_CYSMICON,
                 SMTO_ABORTIFHUNG, SMTO_BLOCK, SW_HIDE, SW_RESTORE, SW_SHOW, SendMessageTimeoutW, SetForegroundWindow,
                 ShowWindow, TPM_BOTTOMALIGN, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WINDOW_EX_STYLE,
@@ -64,8 +64,10 @@ fn window() -> Option<HWND> {
 }
 
 /// Started in the tray: eframe shows the window once it has drawn the first
-/// frame anyway. Until then it is cloaked (drawn, never seen), then hidden.
+/// frame anyway. Until then it is cloaked (drawn, never seen), then hidden
+/// on the UI thread once the first frame completes.
 static START_HIDDEN: AtomicBool = AtomicBool::new(false);
+static WANT_VISIBLE: AtomicBool = AtomicBool::new(false);
 
 fn cloak(h: HWND, on: bool) {
     let v: BOOL = on.into();
@@ -74,29 +76,38 @@ fn cloak(h: HWND, on: bool) {
 
 /// The window starts in the tray: call it before the window is first shown.
 pub fn start_hidden(hwnd: HWND) {
+    WANT_VISIBLE.store(false, Ordering::SeqCst);
     cloak(hwnd, true);
     START_HIDDEN.store(true, Ordering::SeqCst);
-    let raw = hwnd.0 as isize;
-    std::thread::spawn(move || {
-        let h = HWND(raw as *mut _);
-        for _ in 0..500 {
-            if !START_HIDDEN.load(Ordering::SeqCst) || unsafe { IsWindowVisible(h) }.as_bool() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
+}
+
+pub fn is_start_hidden() -> bool {
+    START_HIDDEN.load(Ordering::SeqCst)
+}
+
+/// Called on the UI thread after the first frame: hides the cloaked startup
+/// window and uncloaks it unless `show()` was already requested.
+pub fn finish_start_hidden() {
+    if START_HIDDEN.swap(false, Ordering::SeqCst)
+        && !WANT_VISIBLE.load(Ordering::SeqCst)
+        && let Some(h) = window()
+    {
+        unsafe {
+            let _ = ShowWindow(h, SW_HIDE);
         }
-        // Not when the icon has opened the window meanwhile.
-        if START_HIDDEN.swap(false, Ordering::SeqCst) {
+        cloak(h, false);
+        if WANT_VISIBLE.load(Ordering::SeqCst) {
             unsafe {
-                let _ = ShowWindow(h, SW_HIDE);
+                let _ = ShowWindow(h, if IsIconic(h).as_bool() { SW_RESTORE } else { SW_SHOW });
+                let _ = SetForegroundWindow(h);
             }
-            cloak(h, false);
         }
-    });
+    }
 }
 
 /// Shows the lobby window in front, and tells the backend.
 pub fn show() {
+    WANT_VISIBLE.store(true, Ordering::SeqCst);
     if START_HIDDEN.swap(false, Ordering::SeqCst)
         && let Some(h) = window()
     {
@@ -116,6 +127,7 @@ pub fn show() {
 /// Hides the lobby window (the icon stays). The first time, a notification
 /// says where it went.
 pub fn hide() {
+    WANT_VISIBLE.store(false, Ordering::SeqCst);
     if let Some(h) = window() {
         unsafe {
             let _ = ShowWindow(h, SW_HIDE);
@@ -123,7 +135,7 @@ pub fn hide() {
     }
     let icon = ICON.load(Ordering::SeqCst);
     if icon != 0 && !TOLD.swap(true, Ordering::SeqCst) {
-        let mut nid = icon_data(HWND(icon as *mut _));
+        let mut nid = notify_data(HWND(icon as *mut _));
         nid.uFlags = NIF_INFO;
         nid.dwInfoFlags = NIIF_INFO;
         let copy = |dst: &mut [u16], s: &str| {
@@ -159,17 +171,22 @@ pub fn open_running() -> bool {
     }
 }
 
-fn icon_data(hwnd: HWND) -> NOTIFYICONDATAW {
-    let mut nid = NOTIFYICONDATAW {
+fn notify_data(hwnd: HWND) -> NOTIFYICONDATAW {
+    NOTIFYICONDATAW {
         cbSize: size_of::<NOTIFYICONDATAW>() as u32,
         hWnd: hwnd,
         uID: 1,
-        uFlags: NIF_MESSAGE | NIF_ICON | NIF_TIP,
-        uCallbackMessage: WM_TRAY,
         ..Default::default()
-    };
+    }
+}
+
+fn icon_data(hwnd: HWND) -> NOTIFYICONDATAW {
+    let mut nid = notify_data(hwnd);
+    nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+    nid.uCallbackMessage = WM_TRAY;
     unsafe {
         // Id 1: the exe's icon (build.rs), at the size the tray draws.
+        // LR_SHARED reuses the shared icon handle without leaking GDI handles.
         if let Ok(m) = GetModuleHandleW(None)
             && let Ok(icon) = LoadImageW(
                 Some(m.into()),
@@ -177,7 +194,7 @@ fn icon_data(hwnd: HWND) -> NOTIFYICONDATAW {
                 IMAGE_ICON,
                 GetSystemMetrics(SM_CXSMICON),
                 GetSystemMetrics(SM_CYSMICON),
-                LR_DEFAULTCOLOR,
+                LR_DEFAULTCOLOR | LR_SHARED,
             )
         {
             nid.hIcon = HICON(icon.0);
@@ -222,7 +239,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
         WM_COMMAND if wp.0 & 0xffff == CMD_QUIT => {
             if !QUITTING.swap(true, Ordering::SeqCst) {
                 unsafe {
-                    let _ = Shell_NotifyIconW(NIM_DELETE, &icon_data(hwnd));
+                    let _ = Shell_NotifyIconW(NIM_DELETE, &notify_data(hwnd));
                     ICON.store(0, Ordering::SeqCst);
                     if let Some(h) = window() {
                         let _ = ShowWindow(h, SW_HIDE);

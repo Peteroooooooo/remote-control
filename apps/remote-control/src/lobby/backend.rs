@@ -7,7 +7,10 @@ use std::{
     collections::BTreeMap,
     io::{BufRead, Write},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -167,6 +170,13 @@ pub enum SessionState {
     Paused,
 }
 
+/// A deletion that waits for its toast to go (or for the window/app to close).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Undoable {
+    Revoke(String),
+    Relay(String),
+}
+
 enum Mode {
     Local(node::Node),
     /// The service's helper runs the node.
@@ -182,6 +192,9 @@ struct Sh {
     rt: tokio::runtime::Runtime,
     mode: Mutex<Mode>,
     snap: Mutex<Snap>,
+    /// Bumped before mutations and explicit refreshes so older in-flight polls
+    /// never overwrite fresher snapshots.
+    snap_gen: AtomicU64,
     /// Why there is no snapshot now.
     trouble: Mutex<Option<String>>,
     repaint: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
@@ -191,11 +204,15 @@ struct Sh {
     /// The lobby's own messages (sessions, install), not yet shown.
     notes: Mutex<Vec<Note>>,
     job: Mutex<Option<Job>>,
+    undoables: Mutex<Vec<(u64, Undoable)>>,
+    /// Cached SCM status so UI frames never block on SCM RPCs.
+    service_installed: AtomicBool,
+    service_other: AtomicBool,
     /// Whether the window shows (not only the tray icon).
-    visible: std::sync::atomic::AtomicBool,
+    visible: AtomicBool,
     /// Counts the window's showings: the node takes a window shown again as
     /// a lobby opened again (`window_id`).
-    shown: std::sync::atomic::AtomicU32,
+    shown: AtomicU32,
 }
 
 /// A request that waits for the network (the own relay), run on a thread.
@@ -281,7 +298,28 @@ impl Sh {
     /// What the node knows this window by (`snapshot`, `lobby-closed`): the
     /// process and the showing.
     fn window_id(&self) -> String {
-        format!("{}-{}", std::process::id(), self.shown.load(std::sync::atomic::Ordering::SeqCst))
+        format!("{}-{}", std::process::id(), self.shown.load(Ordering::SeqCst))
+    }
+
+    fn snapshot_query(&self) -> String {
+        if self.visible.load(Ordering::SeqCst) {
+            format!("snapshot\t{}", self.window_id())
+        } else {
+            "peek".to_string()
+        }
+    }
+
+    fn refresh_service_cache(&self) -> bool {
+        let state = install::service_running();
+        let installed = state.is_some();
+        let running = state == Some(true);
+        let other = installed && install::service_elsewhere().is_some();
+        let prev_installed = self.service_installed.swap(installed, Ordering::SeqCst);
+        let prev_other = self.service_other.swap(other, Ordering::SeqCst);
+        if prev_installed != installed || prev_other != other {
+            self.changed();
+        }
+        running
     }
 
     /// While the service runs this exe, the lobby starts hidden at logon if
@@ -314,7 +352,7 @@ impl Sh {
             }
             if last_mode_check.elapsed() >= Duration::from_secs(1) {
                 last_mode_check = Instant::now();
-                let running = install::service_running() == Some(true);
+                let running = self.refresh_service_cache();
                 let busy = self.busy.lock().unwrap().is_some();
                 let mode = match &*self.mode.lock().unwrap() {
                     Mode::Local(_) => 0,
@@ -341,18 +379,15 @@ impl Sh {
                 }
             }
             // Hidden in the tray, the window does not count as open (`node::lobby_open`).
-            let ask = if self.visible.load(std::sync::atomic::Ordering::SeqCst) {
-                format!("snapshot\t{}", self.window_id())
-            } else {
-                "peek".to_string()
-            };
+            let ask = self.snapshot_query();
+            let seq = self.snap_gen.load(Ordering::SeqCst);
             match self.request(&ask) {
                 Ok(text) => {
                     remote_failing = None;
                     *self.trouble.lock().unwrap() = None;
                     let s = parse(&text);
                     let mut cur = self.snap.lock().unwrap();
-                    if *cur != s {
+                    if self.snap_gen.load(Ordering::SeqCst) == seq && *cur != s {
                         *cur = s;
                         drop(cur);
                         self.changed();
@@ -386,12 +421,16 @@ impl Backend {
             rt,
             mode: Mutex::new(Mode::Off),
             snap: Mutex::default(),
+            snap_gen: AtomicU64::new(0),
             trouble: Mutex::new(Some("正在启动…".into())),
             repaint: Mutex::default(),
             sessions: Mutex::default(),
             busy: Mutex::default(),
             notes: Mutex::default(),
             job: Mutex::default(),
+            undoables: Mutex::default(),
+            service_installed: AtomicBool::new(false),
+            service_other: AtomicBool::new(false),
             visible: visible.into(),
             shown: Default::default(),
         });
@@ -401,6 +440,7 @@ impl Backend {
         } else {
             sh.start_local();
         }
+        sh.refresh_service_cache();
         let s2 = sh.clone();
         std::thread::Builder::new().name("lobby-poll".into()).spawn(move || s2.poll())?;
         // `remote-control ctl` reaches the node in this process here.
@@ -452,6 +492,7 @@ impl Backend {
 
     /// A request whose answer only matters if it failed (shown as a notice).
     pub fn act(&self, line: &str) {
+        self.sh.snap_gen.fetch_add(1, Ordering::SeqCst);
         if let Err(e) = self.sh.request(line) {
             self.sh.note(Tone::Err, format!("{e:#}"));
         }
@@ -459,6 +500,7 @@ impl Backend {
     }
 
     pub fn request(&self, line: &str) -> Result<String> {
+        self.sh.snap_gen.fetch_add(1, Ordering::SeqCst);
         let r = self.sh.request(line);
         self.refresh();
         r
@@ -471,6 +513,7 @@ impl Backend {
         self.sh.changed();
         let b = self.clone();
         let r = std::thread::Builder::new().name("job".into()).spawn(move || {
+            b.sh.snap_gen.fetch_add(1, Ordering::SeqCst);
             let r = b.sh.request(&line).map_err(|e| format!("{e:#}"));
             if let Some(j) = b.sh.job.lock().unwrap().as_mut() {
                 j.answer = Some(r);
@@ -494,10 +537,56 @@ impl Backend {
         }
     }
 
+    pub fn defer_undoable(&self, id: u64, item: Undoable) {
+        self.sh.undoables.lock().unwrap().push((id, item));
+    }
+
+    pub fn cancel_undoable(&self, id: u64) {
+        self.sh.undoables.lock().unwrap().retain(|(p, _)| *p != id);
+    }
+
+    pub fn commit_undoable(&self, id: u64) {
+        let item = {
+            let mut u = self.sh.undoables.lock().unwrap();
+            u.iter().position(|(p, _)| *p == id).map(|i| u.remove(i).1)
+        };
+        if let Some(what) = item {
+            self.carry_out_undoable(what);
+        }
+    }
+
+    pub fn flush_undoables(&self) {
+        let items = std::mem::take(&mut *self.sh.undoables.lock().unwrap());
+        for (_, what) in items {
+            self.carry_out_undoable(what);
+        }
+    }
+
+    pub fn has_pending_code(&self, token: &str) -> bool {
+        self.sh.undoables.lock().unwrap().iter().any(|(_, w)| matches!(w, Undoable::Revoke(t) if t == token))
+    }
+
+    pub fn has_pending_relay(&self, url: &str) -> bool {
+        self.sh.undoables.lock().unwrap().iter().any(|(_, w)| matches!(w, Undoable::Relay(u) if u == url))
+    }
+
+    fn carry_out_undoable(&self, what: Undoable) {
+        match what {
+            Undoable::Revoke(token) => self.act(&format!("revoke\t{token}")),
+            Undoable::Relay(url) => self.act(&format!("relay-remove\t{url}")),
+        }
+    }
+
     /// Takes a new snapshot now rather than at the next poll.
     fn refresh(&self) {
-        if let Ok(t) = self.sh.request(&format!("snapshot\t{}", std::process::id())) {
-            *self.sh.snap.lock().unwrap() = parse(&t);
+        let seq = self.sh.snap_gen.fetch_add(1, Ordering::SeqCst) + 1;
+        let ask = self.sh.snapshot_query();
+        if let Ok(t) = self.sh.request(&ask) {
+            let s = parse(&t);
+            let mut cur = self.sh.snap.lock().unwrap();
+            if self.sh.snap_gen.load(Ordering::SeqCst) == seq {
+                *cur = s;
+            }
         }
         self.sh.changed();
     }
@@ -522,6 +611,8 @@ impl Backend {
             sh.changed();
         });
         if let Err(e) = r {
+            self.sh.sessions.lock().unwrap().remove(&id);
+            self.sh.changed();
             self.sh.note(Tone::Err, format!("{e}"));
         }
     }
@@ -549,25 +640,30 @@ impl Backend {
                 sh.stop_local();
                 *sh.mode.lock().unwrap() = Mode::Off;
             }
+            sh.refresh_service_cache();
             *sh.busy.lock().unwrap() = None;
             sh.changed();
         });
     }
 
     pub fn service_installed(&self) -> bool {
-        install::service_running().is_some()
+        self.sh.service_installed.load(Ordering::SeqCst)
+    }
+
+    pub fn service_other(&self) -> bool {
+        self.sh.service_other.load(Ordering::SeqCst)
     }
 
     /// The window shows (`true`) or went to the tray. Hidden, it does not
     /// count as open: connection codes are void and the temporary devices
     /// forgotten, as when it closed before there was a tray.
     pub fn set_visible(&self, on: bool) {
-        use std::sync::atomic::Ordering::SeqCst;
-        if self.sh.visible.swap(on, SeqCst) == on {
+        if self.sh.visible.swap(on, Ordering::SeqCst) == on {
             return;
         }
+        self.sh.snap_gen.fetch_add(1, Ordering::SeqCst);
         if on {
-            self.sh.shown.fetch_add(1, SeqCst);
+            self.sh.shown.fetch_add(1, Ordering::SeqCst);
         } else {
             let _ = self.sh.request(&format!("lobby-closed\t{}", self.sh.window_id()));
         }
@@ -578,6 +674,7 @@ impl Backend {
     /// service stops too (it starts again with the lobby, or with Windows),
     /// so nothing runs the exe any more.
     pub fn quit(&self) {
+        self.flush_undoables();
         let remote = matches!(*self.sh.mode.lock().unwrap(), Mode::Remote);
         self.goodbye(net::CLOSE_STOPPED);
         if remote {
@@ -676,7 +773,7 @@ fn session(sh: &Arc<Sh>, id: EndpointId, name: &str) -> Result<()> {
         args.push("--no-public".into());
     }
     args.extend(sh.view_args.iter().cloned());
-    let log_path = sh.key.with_file_name("session.log");
+    let log_path = sh.key.with_file_name(format!("session-{}.log", id.fmt_short()));
     log!("lobby: session to {name}: {}", args.join(" "));
     let mut log_file = std::fs::File::create(&log_path)?;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;

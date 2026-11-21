@@ -29,7 +29,7 @@ use windows::Win32::{
     },
 };
 
-use super::backend::{Ask, Backend, Dev, SessionState, Snap, Status, Tone};
+use super::backend::{Ask, Backend, Dev, SessionState, Snap, Status, Tone, Undoable};
 use crate::{meet, net::PathKind, theme};
 
 const fn hex(c: u32) -> Color32 {
@@ -123,12 +123,6 @@ mod ic {
 enum Page {
     Devices,
     Settings,
-}
-
-/// A deletion that waits for its toast to go (or for the window to close).
-enum Undoable {
-    Revoke(String),
-    Relay(String),
 }
 
 struct Toast {
@@ -310,18 +304,16 @@ impl RelayProbe {
 pub struct App {
     b: Backend,
     hwnd: Option<isize>,
+    start_hidden_step: u8,
     page: Page,
     paste: String,
     copied: Option<Instant>,
     toasts: Vec<Toast>,
-    pending: Vec<(u64, Undoable)>,
     next_id: u64,
     last_frame: Instant,
     /// The node's notice already shown.
     seen_notice: Option<String>,
     cards: Cards,
-    /// Whether the service runs another exe than this window, and when that was looked at.
-    service_other: Option<(Instant, bool)>,
     /// 「以后」 on the banner saying so, until the window closes.
     update_later: bool,
     renaming: Option<(EndpointId, String)>,
@@ -375,11 +367,11 @@ pub fn run(b: Backend, hidden: bool) -> anyhow::Result<()> {
             Ok(Box::new(App {
                 b,
                 hwnd: raw_hwnd,
+                start_hidden_step: if hidden { 1 } else { 0 },
                 page: Page::Devices,
                 paste: String::new(),
                 copied: None,
                 toasts: Vec::new(),
-                pending: Vec::new(),
                 next_id: 1,
                 last_frame: Instant::now(),
                 seen_notice: None,
@@ -391,7 +383,6 @@ pub fn run(b: Backend, hidden: bool) -> anyhow::Result<()> {
                 saved: None,
                 adding_relay: false,
                 relay_paste: String::new(),
-                service_other: None,
                 update_later: false,
                 relay_probe: RelayProbe::default(),
             }))
@@ -730,22 +721,33 @@ fn banner(ui: &mut egui::Ui, tint: Tint, lead: Lead, text: &str, buttons: impl F
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.spacing_mut().interact_size.y = 32.0;
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 12.0;
-                let (r, _) = ui.allocate_exact_size(Vec2::splat(18.0), Sense::hover());
-                match lead {
-                    Lead::Icon(c) => glyph(ui.painter(), r.center(), c, 18.0, fg),
-                    Lead::Spin => spin(ui, r.center(), 7.0, 2.0, LINK),
-                    Lead::Dot(c) => {
-                        ui.painter().circle_filled(r.center(), 4.0, c);
-                    }
+            let full = ui.available_rect_before_wrap();
+            let mut acts = ui.new_child(
+                UiBuilder::new()
+                    .max_rect(Rect::from_min_size(full.min, vec2(full.width(), 32.0)))
+                    .layout(Layout::right_to_left(Align::Center)),
+            );
+            acts.spacing_mut().item_spacing.x = 6.0;
+            buttons(&mut acts);
+            let btn_left = if acts.min_rect().width() > 0.0 { acts.min_rect().left() - 12.0 } else { full.right() };
+            let icon_r = Rect::from_min_size(full.min, vec2(18.0, 32.0));
+            match lead {
+                Lead::Icon(c) => glyph(ui.painter(), icon_r.center(), c, 18.0, fg),
+                Lead::Spin => spin(ui, icon_r.center(), 7.0, 2.0, LINK),
+                Lead::Dot(c) => {
+                    ui.painter().circle_filled(icon_r.center(), 4.0, c);
                 }
-                ui.label(RichText::new(text).size(14.0));
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.spacing_mut().item_spacing.x = 6.0;
-                    buttons(ui)
-                });
-            });
+            }
+            let text_x = full.left() + 18.0 + 12.0;
+            let label_w = (btn_left - text_x).max(40.0);
+            let g_h = ui.painter().layout(text.to_string(), font(14.0), TEXT, label_w).size().y;
+            let top_pad = ((32.0 - g_h) / 2.0).max(0.0);
+            let mut left = ui.new_child(
+                UiBuilder::new().max_rect(Rect::from_min_size(pos2(text_x, full.top() + top_pad), vec2(label_w, f32::INFINITY))),
+            );
+            left.add(egui::Label::new(RichText::new(text).size(14.0)).wrap());
+            let total_h = (top_pad + left.min_rect().height()).max(acts.min_rect().height()).max(32.0);
+            ui.allocate_exact_size(vec2(full.width(), total_h), Sense::hover());
         });
 }
 
@@ -787,11 +789,12 @@ struct Item<'a> {
     /// The card's first line: no divider above.
     first: bool,
     enabled: bool,
+    right_width: f32,
 }
 
 impl<'a> Item<'a> {
     fn new(lead: Lead, title: &'a str) -> Self {
-        Item { title, title_font: font(14.0), desc: None, desc_suffix: None, lead, first: false, enabled: true }
+        Item { title, title_font: font(14.0), desc: None, desc_suffix: None, lead, first: false, enabled: true, right_width: 260.0 }
     }
 
     fn desc(mut self, d: &'a str) -> Self {
@@ -809,13 +812,17 @@ impl<'a> Item<'a> {
         self
     }
 
+    fn right_width(mut self, w: f32) -> Self {
+        self.right_width = w;
+        self
+    }
+
     fn show(self, ui: &mut egui::Ui, right: impl FnOnce(&mut egui::Ui)) {
         const PAD: Vec2 = Vec2::new(14.0, 10.0);
-        /// Kept for the controls on the right.
-        const RIGHT: f32 = 260.0;
+        let right_w = self.right_width;
         let w = ui.available_width();
         let indent = 34.0;
-        let text_w = (w - 2.0 * PAD.x - RIGHT - indent).max(160.0);
+        let text_w = (w - 2.0 * PAD.x - right_w - indent).max(160.0);
         let fade = if self.enabled { 1.0 } else { 0.45 };
         let title = ui.painter().layout(self.title.to_string(), self.title_font, TEXT.gamma_multiply(fade), text_w);
         let desc = self.desc.map(|(d, c)| {
@@ -848,7 +855,7 @@ impl<'a> Item<'a> {
         if let Some(g) = desc {
             p.galley(pos2(x + indent, y + title.size().y + 1.0), g, DIM);
         }
-        let right_rect = Rect::from_min_max(pos2(rect.right() - PAD.x - RIGHT, rect.top()), pos2(rect.right() - PAD.x, rect.bottom()));
+        let right_rect = Rect::from_min_max(pos2(rect.right() - PAD.x - right_w, rect.top()), pos2(rect.right() - PAD.x, rect.bottom()));
         ui.scope_builder(UiBuilder::new().max_rect(right_rect).layout(Layout::right_to_left(Align::Center)), |ui| {
             ui.spacing_mut().item_spacing.x = 8.0;
             if !self.enabled {
@@ -1004,13 +1011,30 @@ impl eframe::App for App {
 
     fn on_exit(&mut self) {
         self.relay_probe.stop();
-        for (_, what) in std::mem::take(&mut self.pending) {
-            self.carry_out(what);
-        }
+        self.b.flush_undoables();
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        match self.start_hidden_step {
+            1 => {
+                if super::tray::is_start_hidden() {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                    ctx.request_repaint();
+                    self.start_hidden_step = 2;
+                } else {
+                    self.start_hidden_step = 0;
+                }
+            }
+            2 => {
+                self.start_hidden_step = 0;
+                if super::tray::is_start_hidden() {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                }
+                super::tray::finish_start_hidden();
+            }
+            _ => {}
+        }
         if ctx.input(|i| i.viewport().close_requested()) {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.hide_to_tray();
@@ -1025,6 +1049,9 @@ impl eframe::App for App {
             self.confirm = None;
         } else if esc && self.page == Page::Settings {
             self.page = Page::Devices;
+        }
+        if self.page != Page::Devices {
+            self.renaming = None;
         }
         egui::Panel::left("me")
             .resizable(false)
@@ -1077,9 +1104,7 @@ impl App {
     /// Closing the window: it goes to the tray, and counts as closed.
     fn hide_to_tray(&mut self) {
         self.relay_probe.stop();
-        for (_, what) in std::mem::take(&mut self.pending) {
-            self.carry_out(what);
-        }
+        self.b.flush_undoables();
         self.toasts.clear();
         self.renaming = None;
         self.confirm = None;
@@ -1113,15 +1138,8 @@ impl App {
     /// unless 撤回 was clicked.
     fn undoable(&mut self, what: Undoable, text: String) {
         let id = self.new_id();
-        self.pending.push((id, what));
+        self.b.defer_undoable(id, what);
         self.push_toast(Tone::Info, text, Some(id));
-    }
-
-    fn carry_out(&self, what: Undoable) {
-        match what {
-            Undoable::Revoke(token) => self.b.act(&format!("revoke\t{token}")),
-            Undoable::Relay(url) => self.b.act(&format!("relay-remove\t{url}")),
-        }
     }
 
     /// Deleting a device takes effect at once, on both sides: waiting for an
@@ -1136,11 +1154,11 @@ impl App {
     }
 
     fn hidden_code(&self, token: &str) -> bool {
-        self.pending.iter().any(|(_, w)| matches!(w, Undoable::Revoke(t) if t == token))
+        self.b.has_pending_code(token)
     }
 
     fn hidden_relay(&self, url: &str) -> bool {
-        self.pending.iter().any(|(_, w)| matches!(w, Undoable::Relay(u) if u == url))
+        self.b.has_pending_relay(url)
     }
 
     /// Messages of the node and of the backend become toasts.
@@ -1220,6 +1238,7 @@ impl App {
             self.page = Page::Devices;
         }
         if nav(ui, ic::GEAR, "设置", self.page == Page::Settings, None).clicked() {
+            self.renaming = None;
             self.page = Page::Settings;
         }
 
@@ -1306,7 +1325,7 @@ impl App {
             })
         });
 
-        let other = self.service_other() && !self.update_later;
+        let other = self.b.service_other() && !self.update_later;
         let mut later = false;
         reveal(ui, Id::new("card-update"), other, GAP, |ui| {
             banner(ui, Tint::Blue, Lead::Icon(ic::SERVICE), "后台服务用的是另一个位置的程序，改用这个", |ui| {
@@ -1317,16 +1336,6 @@ impl App {
             })
         });
         self.update_later |= later;
-    }
-
-    /// Whether the service runs another exe (`install::service_elsewhere`),
-    /// looked at every few seconds.
-    fn service_other(&mut self) -> bool {
-        if self.service_other.is_none_or(|(t, _)| t.elapsed() >= Duration::from_secs(5)) {
-            let other = self.b.service_installed() && crate::install::service_elsewhere().is_some();
-            self.service_other = Some((Instant::now(), other));
-        }
-        self.service_other.is_some_and(|(_, other)| other)
     }
 
     fn devices(&mut self, ui: &mut egui::Ui, snap: &Snap) {
@@ -1566,8 +1575,10 @@ impl App {
                 self.renaming = None;
             } else if e.lost_focus() {
                 let (id, text) = self.renaming.take().unwrap();
-                if !text.trim().is_empty() && text.trim() != d.name {
-                    self.b.act(&format!("rename\t{id}\t{}", text.replace(['\t', '\n'], " ")));
+                let cleaned = text.replace(['\t', '\r', '\n'], " ");
+                let trimmed = cleaned.trim();
+                if !trimmed.is_empty() && trimmed != d.name {
+                    self.b.act(&format!("rename\t{id}\t{trimmed}"));
                 }
             }
         } else {
@@ -1610,6 +1621,7 @@ impl App {
         });
         if to_settings {
             self.why = None;
+            self.renaming = None;
             self.page = Page::Settings;
         }
     }
@@ -1717,14 +1729,21 @@ impl App {
         group(ui, |ui| {
             let name = &mut self.name;
             let saved = &mut self.saved;
-            Item::new(Lead::Icon(ic::RENAME), "名字").desc("对方看到的名字").first(true).show(ui, |ui| {
-                let e = ui.add(TextEdit::singleline(name).hint_text(&snap.name).desired_width(200.0).margin(FIELD_MARGIN));
+            Item::new(Lead::Icon(ic::RENAME), "名字").desc("对方看到的名字").first(true).right_width(276.0).show(ui, |ui| {
+                let e = ui.add(TextEdit::singleline(name).hint_text(&snap.name).desired_width(170.0).margin(FIELD_MARGIN));
                 if !e.has_focus() && !e.lost_focus() {
                     name.clone_from(&snap.set_name);
                 }
-                if e.lost_focus() && name.trim() != snap.set_name {
-                    b.act(&format!("set-name\t{}", name.replace(['\t', '\n'], " ")));
-                    *saved = Some(Instant::now());
+                if e.lost_focus() {
+                    let cleaned = name.replace(['\t', '\r', '\n'], " ");
+                    let trimmed = cleaned.trim().to_string();
+                    if trimmed != *name {
+                        *name = trimmed.clone();
+                    }
+                    if trimmed != snap.set_name {
+                        b.act(&format!("set-name\t{trimmed}"));
+                        *saved = Some(Instant::now());
+                    }
                 }
                 if let Some(t) = *saved {
                     let a = 1.0 - ((t.elapsed().as_secs_f32() - 1.4) / 0.3).clamp(0.0, 1.0);
@@ -1757,7 +1776,7 @@ impl App {
         self.relays(ui, snap);
 
         ui.add_space(12.0);
-        let other = self.service_other();
+        let other = self.b.service_other();
         section_head(ui, "后台服务", None);
         group(ui, |ui| {
             let installed = b.service_installed();
@@ -2000,7 +2019,7 @@ impl App {
             return;
         }
         ctx.request_repaint();
-        let max_text = (area.width() - 160.0).clamp(160.0, 420.0);
+        let max_text = (area.width() - 180.0).clamp(80.0, 420.0);
         let mut y = area.top() + 14.0;
         let mut undone = Vec::new();
         for t in &mut self.toasts {
@@ -2059,7 +2078,7 @@ impl App {
             y += (r.response.rect.height() + 8.0) * (1.0 - exit);
         }
         for id in undone {
-            self.pending.retain(|(p, _)| *p != id);
+            self.b.cancel_undoable(id);
         }
         // Gone: a deletion without 撤回 is carried out now.
         let mut gone = Vec::new();
@@ -2074,10 +2093,7 @@ impl App {
             !done
         });
         for id in gone {
-            if let Some(i) = self.pending.iter().position(|(p, _)| *p == id) {
-                let (_, what) = self.pending.remove(i);
-                self.carry_out(what);
-            }
+            self.b.commit_undoable(id);
         }
     }
 }

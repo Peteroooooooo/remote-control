@@ -105,11 +105,23 @@ pub struct EncOptions {
     /// HEVC only: full colour resolution (Main 4:4:4 profile, AYUV input)
     /// instead of 4:2:0 (NV12), so coloured text stays sharp.
     pub yuv444: bool,
+    /// Allow activating Media Foundation HEVC on Intel GPUs (only for `enc-test`;
+    /// production paths forbid it because Intel's MF HEVC MFT hangs/poisons).
+    pub allow_untrusted_hevc: bool,
 }
 
 impl Default for EncOptions {
     fn default() -> Self {
-        EncOptions { codec: Codec::H264, speed: None, vbv_frames: None, layers_hint: true, scenario_hint: true, qp_control: false, yuv444: false }
+        EncOptions {
+            codec: Codec::H264,
+            speed: None,
+            vbv_frames: None,
+            layers_hint: true,
+            scenario_hint: true,
+            qp_control: false,
+            yuv444: false,
+            allow_untrusted_hevc: false,
+        }
     }
 }
 
@@ -153,6 +165,7 @@ impl Encoder {
                 Ok(qsv) => {
                     let name = qsv.name.clone();
                     let format = qsv.format;
+                    let bitrate = qsv.bitrate;
                     return Ok(Encoder {
                         backend: Backend::Qsv(Box::new(qsv)),
                         name,
@@ -169,7 +182,17 @@ impl Encoder {
         }
         mf::init_thread()?;
         let list = find_encoders(luid, opts.codec)?;
-        let Some(act) = list.first() else { bail!("no hardware {} encoder on this graphics adapter", opts.codec.name()) };
+        let untrusted_intel_hevc = |a: &IMFActivate| {
+            opts.codec == Codec::Hevc
+                && !opts.allow_untrusted_hevc
+                && (crate::qsv::is_intel_adapter(luid) || mf::friendly_name(a).contains("Intel"))
+        };
+        let Some(act) = list.iter().find(|a| !untrusted_intel_hevc(a)) else {
+            if list.is_empty() {
+                bail!("no hardware {} encoder on this graphics adapter", opts.codec.name());
+            }
+            bail!("refusing untrusted Intel Media Foundation HEVC MFT");
+        };
         let name = mf::friendly_name(act);
         let vbv_frames = opts.vbv_frames.unwrap_or_else(|| default_vbv_frames(&name));
         unsafe {
@@ -309,12 +332,20 @@ impl Encoder {
         }
     }
 
+    /// Preferred NV12 input dimensions (16-aligned for QSV zero-copy, `None` for MF).
+    pub fn preferred_input_size(&self) -> Option<(u32, u32)> {
+        match &self.backend {
+            Backend::Qsv(q) => Some(q.aligned_size()),
+            Backend::Mf(_) => None,
+        }
+    }
+
     /// Encodes one NV12 (AYUV if `yuv444`) frame and waits up to `timeout` for the result.
     /// `None` means the encoder has not produced it yet; it comes with a later call.
     /// `qp`: the quantiser for this frame, in QP-control mode.
     pub fn encode(&mut self, nv12: &ID3D11Texture2D, timeout: Duration, qp: Option<u32>) -> Result<Option<Encoded>> {
         match &mut self.backend {
-            Backend::Qsv(q) => q.encode(nv12, timeout, qp),
+            Backend::Qsv(q) => q.encode(nv12, timeout, qp, &mut self.rekeys_on_rate_change),
             Backend::Mf(m) => m.encode(nv12, timeout, qp, &mut self.rekeys_on_rate_change),
         }
     }

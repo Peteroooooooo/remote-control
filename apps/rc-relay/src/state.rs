@@ -14,6 +14,7 @@ use std::{
     collections::BTreeMap,
     io::Write,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -146,6 +147,11 @@ impl Store {
 
     /// A new code with the smallest number not in use.
     pub fn new_code(&self, name: &str) -> Result<Code> {
+        let _lock = self.lock()?;
+        self.new_code_locked(name)
+    }
+
+    fn new_code_locked(&self, name: &str) -> Result<Code> {
         let mut codes = self.codes()?;
         let n = (1..).find(|n| !codes.iter().any(|c| c.n == *n)).expect("a free number");
         let c = Code { n, key: random_key(), name: clean(name) };
@@ -156,6 +162,7 @@ impl Store {
     }
 
     pub fn rename_code(&self, n: u32, name: &str) -> Result<()> {
+        let _lock = self.lock()?;
         let mut codes = self.codes()?;
         let c = codes.iter_mut().find(|c| c.n == n).ok_or_else(|| anyhow!("no code {n}"))?;
         c.name = clean(name);
@@ -164,23 +171,26 @@ impl Store {
 
     /// Deletes code `n` and everyone who joined with it. Returns those devices.
     pub fn delete_code(&self, n: u32) -> Result<Vec<EndpointId>> {
+        let _lock = self.lock()?;
         let mut codes = self.codes()?;
         let before = codes.len();
         codes.retain(|c| c.n != n);
         if codes.len() == before {
             bail!("no code {n}");
         }
+        // Remove the code first so concurrent claims cannot revive it while owners are cleaned up.
+        self.save_codes(&codes)?;
         let gone: Vec<EndpointId> = self.owners()?.iter().filter(|o| o.code == n).map(|o| o.id).collect();
         for id in &gone {
-            self.remove_owner(id)?;
+            self.remove_owner_locked(id)?;
         }
-        self.save_codes(&codes)?;
         Ok(gone)
     }
 
     /// Restores a previously deleted code (keeping its `n` if still free, or
     /// picking the smallest free one) along with its owners and their guests.
     pub fn restore_code(&self, code: &Code, owners: &[Owner], guests: &BTreeMap<EndpointId, Vec<Guest>>) -> Result<Code> {
+        let _lock = self.lock()?;
         let mut codes = self.codes()?;
         let n = if codes.iter().any(|c| c.n == code.n) {
             (1..).find(|n| !codes.iter().any(|c| c.n == *n)).expect("a free number")
@@ -195,13 +205,18 @@ impl Store {
             let mut o = o.clone();
             o.code = n;
             let gs = guests.get(&o.id).map(Vec::as_slice).unwrap_or(&[]);
-            self.restore_owner(&o, gs)?;
+            self.restore_owner_locked(&o, gs)?;
         }
         Ok(restored)
     }
 
     /// Restores a previously removed owner (if its code exists) and its guests.
     pub fn restore_owner(&self, owner: &Owner, guests: &[Guest]) -> Result<()> {
+        let _lock = self.lock()?;
+        self.restore_owner_locked(owner, guests)
+    }
+
+    fn restore_owner_locked(&self, owner: &Owner, guests: &[Guest]) -> Result<()> {
         let mut owners = self.owners()?;
         if let Some(cur) = owners.iter_mut().find(|o| o.id == owner.id) {
             cur.code = owner.code;
@@ -218,7 +233,7 @@ impl Store {
         }
         self.save_owners(&owners)?;
         if !guests.is_empty() {
-            self.set_guests(&owner.id, guests)?;
+            self.set_guests_locked(&owner.id, guests)?;
         }
         Ok(())
     }
@@ -230,6 +245,7 @@ impl Store {
     /// The first code; one is made if there is none and no owner either
     /// (a new relay). `None` when every code was deleted on purpose.
     pub fn first_code(&self) -> Result<Option<Code>> {
+        let _lock = self.lock()?;
         let codes = self.codes()?;
         if let Some(c) = codes.into_iter().next() {
             return Ok(Some(c));
@@ -237,7 +253,7 @@ impl Store {
         if self.codes_path().exists() || !self.owners()?.is_empty() {
             return Ok(None);
         }
-        Ok(Some(self.new_code("")?))
+        Ok(Some(self.new_code_locked("")?))
     }
 
     /// Lines: device id, code number, added (Unix seconds), name. A missing
@@ -267,6 +283,7 @@ impl Store {
     /// `id` joined with code `code` as `name`: it is an owner in that code's
     /// group (moved there if it was in another; its name updated).
     pub fn join(&self, id: EndpointId, code: u32, name: &str) -> Result<()> {
+        let _lock = self.lock()?;
         let mut owners = self.owners()?;
         let name = clean(name);
         match owners.iter_mut().find(|o| o.id == id) {
@@ -286,6 +303,11 @@ impl Store {
 
     /// Removes the owner `id`, with its guest list and connection codes.
     pub fn remove_owner(&self, id: &EndpointId) -> Result<bool> {
+        let _lock = self.lock()?;
+        self.remove_owner_locked(id)
+    }
+
+    fn remove_owner_locked(&self, id: &EndpointId) -> Result<bool> {
         let mut owners = self.owners()?;
         let before = owners.len();
         owners.retain(|o| o.id != *id);
@@ -293,8 +315,8 @@ impl Store {
             return Ok(false);
         }
         self.save_owners(&owners)?;
-        self.set_guests(id, &[])?;
-        self.set_invites(id, &[])?;
+        self.set_guests_locked(id, &[])?;
+        self.set_invites_locked(id, &[])?;
         let mut kicked = self.kicked()?;
         let kb = kicked.len();
         kicked.retain(|k| k.owner != *id);
@@ -309,6 +331,7 @@ impl Store {
     /// code of their own (`旧的主人`), the keys are dropped (a key printed
     /// before was the first code, and nobody joins with it any more).
     pub fn upgrade(&self) -> Result<()> {
+        let _lock = self.lock()?;
         if self.codes_path().exists() {
             return Ok(());
         }
@@ -328,7 +351,7 @@ impl Store {
             let _ = std::fs::remove_file(&claims);
             return Ok(());
         }
-        let c = self.new_code("旧的主人")?;
+        let c = self.new_code_locked("旧的主人")?;
         let owners: Vec<Owner> = old.into_iter().map(|(id, added)| Owner { id, code: c.n, added, name: String::new() }).collect();
         self.save_owners(&owners)?;
         let _ = std::fs::remove_file(&claims);
@@ -369,6 +392,11 @@ impl Store {
 
     /// Replaces `owner`'s guests.
     pub fn set_guests(&self, owner: &EndpointId, guests: &[Guest]) -> Result<()> {
+        let _lock = self.lock()?;
+        self.set_guests_locked(owner, guests)
+    }
+
+    fn set_guests_locked(&self, owner: &EndpointId, guests: &[Guest]) -> Result<()> {
         let mut m = self.guests()?;
         let cleaned: Vec<Guest> = guests.iter().map(|g| Guest { id: g.id, name: clean(&g.name), kind: g.kind }).collect();
         let old = m.remove(owner).unwrap_or_default();
@@ -417,6 +445,7 @@ impl Store {
     /// Kicks `guest` from `owner`: adds to `kicked.txt` (so forwarding stops and
     /// `owner`'s client will be told to drop it) and removes it from `guests.txt`.
     pub fn kick(&self, owner: EndpointId, guest: EndpointId) -> Result<bool> {
+        let _lock = self.lock()?;
         let mut list = self.kicked()?;
         let added = if list.iter().any(|k| k.owner == owner && k.guest == guest) {
             false
@@ -429,7 +458,7 @@ impl Store {
             let before = gs.len();
             gs.retain(|g| g.id != guest);
             if gs.len() != before {
-                self.set_guests(&owner, &gs)?;
+                self.set_guests_locked(&owner, &gs)?;
             }
         }
         Ok(added)
@@ -437,6 +466,11 @@ impl Store {
 
     /// Undoes a kick of `guest` under `owner` (if still pending).
     pub fn unkick(&self, owner: &EndpointId, guest: &EndpointId) -> Result<bool> {
+        let _lock = self.lock()?;
+        self.unkick_locked(owner, guest)
+    }
+
+    fn unkick_locked(&self, owner: &EndpointId, guest: &EndpointId) -> Result<bool> {
         let mut list = self.kicked()?;
         let before = list.len();
         list.retain(|k| !(k.owner == *owner && k.guest == *guest));
@@ -449,12 +483,13 @@ impl Store {
 
     /// Restores a kicked guest under `owner`.
     pub fn restore_guest(&self, owner: &EndpointId, guest: &Guest, add_to_list: bool) -> Result<()> {
-        self.unkick(owner, &guest.id)?;
+        let _lock = self.lock()?;
+        self.unkick_locked(owner, &guest.id)?;
         if add_to_list {
             let mut gs = self.guests()?.remove(owner).unwrap_or_default();
             if !gs.iter().any(|g| g.id == guest.id) {
                 gs.push(Guest { id: guest.id, name: clean(&guest.name), kind: guest.kind });
-                self.set_guests(owner, &gs)?;
+                self.set_guests_locked(owner, &gs)?;
             }
         }
         Ok(())
@@ -466,6 +501,7 @@ impl Store {
     /// - Any `kicked` entry for `owner` no longer present in `sent` is removed
     ///   automatically (the owner's client has already dropped it).
     pub fn reconcile_kicked(&self, owner: &EndpointId, sent: &[Guest]) -> Result<(Vec<Guest>, Vec<EndpointId>)> {
+        let _lock = self.lock()?;
         let mut list = self.kicked()?;
         let sent_ids: std::collections::HashSet<EndpointId> = sent.iter().map(|g| g.id).collect();
         let before = list.len();
@@ -512,6 +548,11 @@ impl Store {
 
     /// Replaces `owner`'s invites (the expired ones left out).
     pub fn set_invites(&self, owner: &EndpointId, invites: &[Invite]) -> Result<()> {
+        let _lock = self.lock()?;
+        self.set_invites_locked(owner, invites)
+    }
+
+    fn set_invites_locked(&self, owner: &EndpointId, invites: &[Invite]) -> Result<()> {
         let now = unix_now();
         let mut m = self.invites()?;
         let old = m.remove(owner).unwrap_or_default();
@@ -537,6 +578,7 @@ impl Store {
 
     /// Uses up `owner`'s invite with `token`: true if it was there and not expired.
     pub fn take_invite(&self, owner: &EndpointId, token: &[u8; 8]) -> Result<bool> {
+        let _lock = self.lock()?;
         let mut m = self.invites()?;
         let Some(is) = m.get_mut(owner) else { return Ok(false) };
         let Some(i) = is.iter().position(|i| constant_eq(&i.token, token)) else {
@@ -581,6 +623,7 @@ impl Store {
     }
 
     pub fn set_status(&self, s: &Status) -> Result<()> {
+        let _lock = self.lock()?;
         let mut text = format!("# rc-relay status, written by the running relay\nstarted\t{}\nwritten\t{}\n", s.started, s.written);
         for id in &s.online {
             text += &format!("online\t{id}\n");
@@ -599,14 +642,39 @@ impl Store {
         self.write(&self.status_path(), &text)
     }
 
-    fn write(&self, path: &Path, text: &str) -> Result<()> {
+    fn lock(&self) -> Result<std::fs::File> {
         std::fs::create_dir_all(&self.dir).with_context(|| format!("create {}", self.dir.display()))?;
-        let tmp = path.with_extension("tmp");
-        let mut f = std::fs::File::create(&tmp).with_context(|| format!("write {}", tmp.display()))?;
-        f.write_all(text.as_bytes())?;
-        f.sync_all()?;
-        drop(f);
-        std::fs::rename(&tmp, path).with_context(|| format!("replace {}", path.display()))
+        let path = self.dir.join(".lock");
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .with_context(|| format!("open {}", path.display()))?;
+        f.lock().with_context(|| format!("lock {}", path.display()))?;
+        Ok(f)
+    }
+
+    fn write(&self, path: &Path, text: &str) -> Result<()> {
+        static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+        let dir = path.parent().unwrap_or(&self.dir);
+        std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+        let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("state");
+        let tmp = dir.join(format!(".{name}.tmp.{}.{seq}", std::process::id()));
+        let res = (|| -> Result<()> {
+            let mut f = std::fs::File::create(&tmp).with_context(|| format!("write {}", tmp.display()))?;
+            f.write_all(text.as_bytes())?;
+            f.sync_all()?;
+            drop(f);
+            std::fs::rename(&tmp, path).with_context(|| format!("replace {}", path.display()))?;
+            Ok(())
+        })();
+        if res.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        res
     }
 }
 
@@ -794,5 +862,23 @@ mod tests {
         assert_eq!(s.invites().unwrap()[&id(1)], [a], "the new list replaces the old one");
         s.remove_owner(&id(1)).unwrap();
         assert!(s.invites().unwrap().is_empty());
+    }
+
+    #[test]
+    fn concurrent_updates_do_not_collide_or_lose_entries() {
+        let s = temp("concurrent");
+        let c = s.new_code("shared").unwrap();
+        std::thread::scope(|scope| {
+            for t in 0..4u8 {
+                let s = s.clone();
+                scope.spawn(move || {
+                    for k in 0..5u8 {
+                        let dev = id(t * 10 + k + 1);
+                        s.join(dev, c.n, "dev").unwrap();
+                    }
+                });
+            }
+        });
+        assert_eq!(s.owners().unwrap().len(), 20);
     }
 }

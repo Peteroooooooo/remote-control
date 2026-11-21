@@ -345,9 +345,15 @@ impl ToRgb {
         Ok(&c.views)
     }
 
+    /// Drops cached SRVs of decoder textures (e.g. when the decoder is rebuilt).
+    pub fn clear_cache(&mut self) {
+        self.cache.clear();
+    }
+
     /// Draws the top-left `stream` pixels of `pic` into `dest` of the target;
     /// the rest of the target becomes black.
     pub fn draw(&mut self, gpu: &Gpu, pic: &Picture, stream: (u32, u32), rtv: &ID3D11RenderTargetView, dest: RECT) -> Result<()> {
+        const NONE_SRVS: [Option<ID3D11ShaderResourceView>; 2] = [None, None];
         let mut desc = D3D11_TEXTURE2D_DESC::default();
         unsafe { pic.tex.GetDesc(&mut desc) };
         let (dw, dh) = ((dest.right - dest.left).max(1) as f32, (dest.bottom - dest.top).max(1) as f32);
@@ -364,9 +370,9 @@ impl ToRgb {
             unsafe { gpu.ctx.UpdateSubresource(&self.consts, 0, None, &consts as *const _ as *const _, 0, 0) };
             self.last = Some(consts);
         }
-        let (nv12, srvs) = match self.views_for(gpu, pic, &desc)? {
-            Views::Nv12(y, uv) => (true, vec![Some(y.clone()), Some(uv.clone())]),
-            Views::Ayuv(a) => (false, vec![Some(a.clone())]),
+        let (nv12, srvs, count) = match self.views_for(gpu, pic, &desc)? {
+            Views::Nv12(y, uv) => (true, [Some(y.clone()), Some(uv.clone())], 2),
+            Views::Ayuv(a) => (false, [Some(a.clone()), None], 1),
         };
         let (ps, first) = if nv12 { (&self.ps_nv12, 0) } else { (&self.ps_ayuv, 2) };
         unsafe {
@@ -390,10 +396,10 @@ impl ToRgb {
             c.PSSetShader(ps, None);
             c.PSSetSamplers(0, Some(&[Some(self.sampler.clone())]));
             c.PSSetConstantBuffers(0, Some(&[Some(self.consts.clone())]));
-            c.PSSetShaderResources(first, Some(&srvs));
+            c.PSSetShaderResources(first, Some(&srvs[..count]));
             c.Draw(3, 0);
             // Let go of the picture, so the decoder may write it again.
-            c.PSSetShaderResources(first, Some(&vec![None; srvs.len()]));
+            c.PSSetShaderResources(first, Some(&NONE_SRVS[..count]));
             c.OMSetRenderTargets(Some(&[None]), None);
         }
         Ok(())

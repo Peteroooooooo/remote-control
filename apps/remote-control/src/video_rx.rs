@@ -177,12 +177,67 @@ pub struct RxCounters {
     largest: u16,
 }
 
+/// Wakeable queue between `video_rx::run` and `view::render_loop`: lets window
+/// resize / quit events wake the renderer immediately instead of waiting on a
+/// 30 ms `mpsc::recv_timeout`.
+#[derive(Default)]
+pub struct FrameQueue {
+    inner: Mutex<FrameQueueState>,
+    cv: std::sync::Condvar,
+}
+
+#[derive(Default)]
+struct FrameQueueState {
+    frames: Vec<Delivered>,
+    woken: bool,
+    closed: bool,
+}
+
+impl FrameQueue {
+    pub fn push(&self, f: Delivered) -> bool {
+        let mut s = self.inner.lock().unwrap();
+        if s.closed {
+            return false;
+        }
+        s.frames.push(f);
+        self.cv.notify_one();
+        true
+    }
+
+    pub fn wake(&self) {
+        let mut s = self.inner.lock().unwrap();
+        s.woken = true;
+        self.cv.notify_one();
+    }
+
+    pub fn close(&self) {
+        let mut s = self.inner.lock().unwrap();
+        s.closed = true;
+        self.cv.notify_all();
+    }
+
+    /// Blocks until at least one frame arrives, `wake()` is called, the queue
+    /// closes, or `timeout` elapses. Returns `None` once closed and empty.
+    pub fn take_wait(&self, timeout: Duration) -> Option<Vec<Delivered>> {
+        let mut s = self.inner.lock().unwrap();
+        if s.frames.is_empty() && !s.woken && !s.closed {
+            let (guard, _) = self.cv.wait_timeout(s, timeout).unwrap();
+            s = guard;
+        }
+        s.woken = false;
+        if s.frames.is_empty() && s.closed {
+            return None;
+        }
+        Some(std::mem::take(&mut s.frames))
+    }
+}
+
 /// Runs until the connection closes. Decodable frames go to `frames`; key
 /// frame requests go to the control stream writer through `ctrl`.
 /// `sim` drops some received video datagrams (for tests).
 pub async fn run(
     conn: Connection,
-    frames: std::sync::mpsc::Sender<Delivered>,
+    frames: Arc<FrameQueue>,
     ctrl: mpsc::UnboundedSender<Msg>,
     counters: Arc<Mutex<RxCounters>>,
     mut sim: Option<crate::lossim::LossSim>,
@@ -194,6 +249,9 @@ pub async fn run(
     let mut check = tokio::time::interval(CHECK_EVERY);
     check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut last_first: Option<u32> = None;
+    let mut recent_acked = std::collections::VecDeque::<u32>::with_capacity(64);
+    let mut prev_key_requests = 0u64;
+    let mut prev_lost = 0u64;
     loop {
         tokio::select! {
             d = conn.read_datagram() => {
@@ -228,7 +286,20 @@ pub async fn run(
                 }
                 let Some(c) = asm.push(&d, now) else { continue };
                 crate::trace::mark(c.frame, "complete", None);
-                let _ = conn.send_datagram(Ack { frame: c.frame, recovered: c.recovered }.encode().into());
+                let mut prev_mask = 0u32;
+                for &f in &recent_acked {
+                    let diff = c.frame.wrapping_sub(f);
+                    if (1..=32).contains(&diff) {
+                        prev_mask |= 1u32 << (diff - 1);
+                    }
+                }
+                if recent_acked.len() == 64 {
+                    recent_acked.pop_front();
+                }
+                recent_acked.push_back(c.frame);
+                let _ = conn.send_datagram(bytes::Bytes::copy_from_slice(
+                    &Ack { frame: c.frame, recovered: c.recovered, prev_mask }.encode(),
+                ));
                 let Some((header, body)) = FrameHeader::parse(&c.data) else { continue };
                 if crate::trace::on() {
                     // Capture-to-send time on the host and the frame's size, so
@@ -244,7 +315,7 @@ pub async fn run(
                 }
                 let d = Delivered { header, data: body.to_vec(), complete_at: now, frame: c.frame };
                 for f in ro.push(c.frame, d, now) {
-                    if frames.send(f).is_err() {
+                    if !frames.push(f) {
                         return;
                     }
                 }
@@ -279,8 +350,10 @@ pub async fn run(
                     let _ = conn.send_datagram(r.encode().into());
                 }
                 let mut k = counters.lock().unwrap();
-                k.key_requests = ro.key_requests;
-                k.lost = ro.lost;
+                k.key_requests += ro.key_requests - prev_key_requests;
+                k.lost += ro.lost - prev_lost;
+                prev_key_requests = ro.key_requests;
+                prev_lost = ro.lost;
                 k.failed += r.frames_failed as u64;
             }
         }

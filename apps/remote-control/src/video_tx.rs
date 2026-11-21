@@ -6,7 +6,7 @@ use std::{
     collections::HashMap,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -84,6 +84,11 @@ struct State {
     /// budget (a key frame, the first frame after a still screen): frames
     /// skipped or shrunk meanwhile say nothing about the link.
     own_backlog_until: Option<Instant>,
+    /// Most recent keyframe number sent, used to avoid endlessly re-requesting
+    /// a keyframe on a still screen if reverse ACKs are lost.
+    last_key_frame: Option<u32>,
+    /// Last time a timed-out tail frame triggered an automatic keyframe.
+    last_timeout_rekey: Option<Instant>,
 }
 
 /// A frame queued for the pacer task.
@@ -103,6 +108,10 @@ pub struct VideoTx {
     /// Frames per second the encoder runs at now (see `configure`).
     fps: Arc<AtomicU32>,
     pacer: mpsc::UnboundedSender<PaceFrame>,
+    /// Total datagram bytes currently queued inside `pacer` awaiting send.
+    pacer_bytes: Arc<AtomicUsize>,
+    /// Shared flag telling the capture pipeline to emit a keyframe.
+    want_key: Arc<AtomicBool>,
     /// Set by `host` whenever a control message is written so the datagram
     /// pacer briefly lets `datagrams.outgoing` drain (in `noq-proto`,
     /// DATAGRAM frames strictly preempt STREAM frames).
@@ -116,9 +125,10 @@ const MIN_BPS: f64 = 1.5e6;
 
 impl VideoTx {
     /// Starts the pacing, feedback and rate-control tasks on the current runtime.
-    pub fn start(conn: Connection, fps: u32, max_bps: f64) -> Arc<Self> {
+    pub fn start(conn: Connection, fps: u32, max_bps: f64, want_key: Arc<AtomicBool>) -> Arc<Self> {
         let (ptx, prx) = mpsc::unbounded_channel();
         let fps = Arc::new(AtomicU32::new(fps.max(1)));
+        let pacer_bytes = Arc::new(AtomicUsize::new(0));
         let ctrl_pending = Arc::new(AtomicBool::new(false));
         let tx = Arc::new(VideoTx {
             conn: conn.clone(),
@@ -128,16 +138,25 @@ impl VideoTx {
                 frame: 0,
                 sec: Second::default(),
                 own_backlog_until: None,
+                last_key_frame: None,
+                last_timeout_rekey: None,
             }),
             fps: fps.clone(),
             pacer: ptx,
+            pacer_bytes: pacer_bytes.clone(),
+            want_key,
             ctrl_pending: ctrl_pending.clone(),
             paused: AtomicBool::new(false),
         });
-        tokio::spawn(pace(conn, prx, fps, ctrl_pending));
+        tokio::spawn(pace(conn, prx, fps, pacer_bytes, ctrl_pending));
         tokio::spawn(tx.clone().read_feedback());
         tokio::spawn(tx.clone().control());
         tx
+    }
+
+    /// True while video transmission is paused (e.g. only a public relay is up).
+    pub fn is_paused(&self) -> bool {
+        self.paused.load(Ordering::Relaxed)
     }
 
     /// Signals that a control stream message is queued and should not be
@@ -168,7 +187,8 @@ impl VideoTx {
         let chosen = s.rc.bitrate();
         let bits = encoder_bps as f64;
         let normal = ((bits / 8.0 / self.fps.load(Ordering::Relaxed) as f64) as usize).max(1);
-        let queued = SEND_BUFFER.saturating_sub(self.conn.datagram_send_buffer_space());
+        let queued = SEND_BUFFER.saturating_sub(self.conn.datagram_send_buffer_space())
+            + self.pacer_bytes.load(Ordering::Relaxed);
         s.sec.queued_max = s.sec.queued_max.max(queued);
         let link_signal = s.own_backlog_until.is_none_or(|t| Instant::now() >= t);
         let budget = if shrink { SHRINKING } else { WHOLE_FRAMES };
@@ -212,6 +232,10 @@ impl VideoTx {
                 let until = Instant::now() + Duration::from_secs_f64(extra);
                 s.own_backlog_until = Some(s.own_backlog_until.map_or(until, |t| t.max(until)));
             }
+            let is_key = crate::proto::FrameHeader::parse(payload).is_some_and(|(h, _)| h.key);
+            if is_key {
+                s.last_key_frame = Some(f);
+            }
             let packets = encode_frame(f, payload, max, s.rc.fec_pct(), MIN_PARITY);
             s.in_flight.insert(f, (Instant::now(), payload.len() as u64));
             s.sec.sent += 1;
@@ -220,8 +244,7 @@ impl VideoTx {
             s.sec.encode_us.push(encode_us as f64);
             s.sec.size_ratio.push(payload.len() as f64 / budget.max(1) as f64);
             if payload.len() > 3 * budget {
-                let key = crate::proto::FrameHeader::parse(payload).is_some_and(|(h, _)| h.key);
-                s.sec.big.push((payload.len(), budget, key));
+                s.sec.big.push((payload.len(), budget, is_key));
             }
             (f, packets, s.rc.bitrate())
         };
@@ -232,12 +255,19 @@ impl VideoTx {
             .map_or(rate_bps, |bw| bw as f64);
         let (path_kind, _, path_rtt) = net::selected_path(&self.conn);
         let fast_lan = path_kind == net::PathKind::Direct && path_rtt < 10.0;
-        let _ = self.pacer.send(PaceFrame {
-            packets: packets.into_iter().map(Bytes::from).collect(),
-            bytes,
-            link_bps,
-            fast_lan,
-        });
+        self.pacer_bytes.fetch_add(bytes, Ordering::Relaxed);
+        if self
+            .pacer
+            .send(PaceFrame {
+                packets: packets.into_iter().map(Bytes::from).collect(),
+                bytes,
+                link_bps,
+                fast_lan,
+            })
+            .is_err()
+        {
+            self.pacer_bytes.fetch_sub(bytes, Ordering::Relaxed);
+        }
         f
     }
 
@@ -292,10 +322,23 @@ impl VideoTx {
             match d.first() {
                 Some(&T_ACK) => {
                     let Some(ack) = Ack::parse(&d) else { continue };
-                    let Some((sent_at, bytes)) = s.in_flight.remove(&ack.frame) else { continue };
-                    let ms = sent_at.elapsed().as_secs_f64() * 1000.0;
-                    s.sec.frame_rtt.push(ms);
-                    s.rc.on_frame_acked(ms, bytes);
+                    if let Some((sent_at, bytes)) = s.in_flight.remove(&ack.frame) {
+                        let ms = sent_at.elapsed().as_secs_f64() * 1000.0;
+                        s.sec.frame_rtt.push(ms);
+                        s.rc.on_frame_acked(ms, bytes);
+                    }
+                    // Redundant ACK bitmap for the preceding 32 frames: credit
+                    // delivered bytes and prevent false timeouts without
+                    // polluting RTT samples with later frames' arrival times.
+                    let mut mask = ack.prev_mask;
+                    while mask != 0 {
+                        let bit = mask.trailing_zeros();
+                        mask &= mask - 1;
+                        let prev = ack.frame.wrapping_sub(bit + 1);
+                        if let Some((_, bytes)) = s.in_flight.remove(&prev) {
+                            s.rc.on_frame_acked_late(bytes.min(u32::MAX as u64) as u32);
+                        }
+                    }
                 }
                 Some(&T_REPORT) => {
                     if let Some(r) = Report::parse(&d) {
@@ -319,9 +362,25 @@ impl VideoTx {
             let now = Instant::now();
             let mut s = self.st.lock().unwrap();
             let before = s.in_flight.len();
+            let last_sent = (s.frame > 0).then(|| s.frame.wrapping_sub(1));
+            let last_was_in_flight = last_sent.is_some_and(|f| s.in_flight.contains_key(&f));
             s.in_flight.retain(|_, (at, _)| now.duration_since(*at) < timeout);
-            for _ in 0..before - s.in_flight.len() {
+            let timed_out = before - s.in_flight.len();
+            for _ in 0..timed_out {
                 s.rc.on_frame_failed();
+            }
+            // If the very last frame sent before the screen went still lost all
+            // its shards, the viewer never saw a shard or a later frame number
+            // and cannot ask for a keyframe. Recover automatically once.
+            if last_was_in_flight
+                && let Some(f) = last_sent
+                && !s.in_flight.contains_key(&f)
+                && !self.paused.load(Ordering::Relaxed)
+                && s.last_key_frame != Some(f)
+                && s.last_timeout_rekey.is_none_or(|t| now.duration_since(t) >= timeout)
+            {
+                s.last_timeout_rekey = Some(now);
+                self.want_key.store(true, Ordering::Relaxed);
             }
             if k != last_path {
                 s.rc.reset_base();
@@ -359,31 +418,39 @@ async fn pace(
     conn: Connection,
     mut rx: mpsc::UnboundedReceiver<PaceFrame>,
     fps: Arc<AtomicU32>,
+    pacer_bytes: Arc<AtomicUsize>,
     ctrl_pending: Arc<AtomicBool>,
 ) {
+    let ctrl_backlog_threshold = MAX_DATAGRAM * 4;
     while let Some(frame) = rx.recv().await {
-        let spread = pace_spread(frame.packets.len(), frame.bytes, fps.load(Ordering::Relaxed), frame.link_bps, frame.fast_lan);
+        let frame_bytes = frame.bytes;
+        let spread = pace_spread(frame.packets.len(), frame_bytes, fps.load(Ordering::Relaxed), frame.link_bps, frame.fast_lan);
         let plan = pacer::plan(frame.packets.len(), spread, PACE_GAP);
         let start = tokio::time::Instant::now();
         let mut it = frame.packets.into_iter();
+        let mut yielded_for_ctrl = false;
         for (off, n) in plan {
             if !off.is_zero() {
                 tokio::time::sleep_until(start + off).await;
             }
             for p in it.by_ref().take(n) {
-                if ctrl_pending.swap(false, Ordering::AcqRel) {
+                if !yielded_for_ctrl && ctrl_pending.swap(false, Ordering::AcqRel) {
                     // `noq-proto` packs DATAGRAM frames ahead of STREAM frames;
-                    // let `datagrams.outgoing` drain briefly so control messages
-                    // (Pong, Stats, Cursor) never starve during high-bitrate motion.
-                    let deadline = tokio::time::Instant::now() + Duration::from_millis(2);
-                    while conn.datagram_send_buffer_space() < SEND_BUFFER && tokio::time::Instant::now() < deadline {
-                        tokio::time::sleep(Duration::from_micros(250)).await;
+                    // only yield when outgoing datagrams have actually built up,
+                    // avoiding repeated coarse 1-2 ms Windows timer sleeps on
+                    // every packet.
+                    if SEND_BUFFER.saturating_sub(conn.datagram_send_buffer_space()) > ctrl_backlog_threshold {
+                        yielded_for_ctrl = true;
+                        tokio::task::yield_now().await;
+                        if SEND_BUFFER.saturating_sub(conn.datagram_send_buffer_space()) > ctrl_backlog_threshold {
+                            tokio::time::sleep(Duration::from_millis(1)).await;
+                        }
                     }
-                    tokio::task::yield_now().await;
                 }
                 let _ = conn.send_datagram(p);
             }
         }
+        pacer_bytes.fetch_sub(frame_bytes, Ordering::Relaxed);
         if conn.close_reason().is_some() {
             return;
         }

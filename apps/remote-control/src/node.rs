@@ -2233,7 +2233,7 @@ async fn watch_incoming(sh: Arc<Shared>, conn: Connection) {
         {
             let mut st = sh.st.lock().unwrap();
             let lan_ok = st.peers.get(&from).is_some_and(|p| p.met == Some(Met::Lan)) && is_lan_conn(&conn);
-            if sh.is_stopped() || (!sh.knows(&st, &from) && !(sh.lobby_open(&st) && lan_ok)) {
+            if sh.is_stopped() || !(sh.knows(&st, &from) || sh.lobby_open(&st) && lan_ok) {
                 drop(st);
                 conn.close(0u32.into(), b"forgotten");
                 break;
@@ -2266,7 +2266,7 @@ async fn watch_incoming(sh: Arc<Shared>, conn: Connection) {
         p.lan = None;
         p.met = None;
     }
-    if st.peers.get(&from).is_some_and(|p| mine(p)) {
+    if st.peers.get(&from).is_some_and(mine) {
         if let Some(p) = st.peers.get_mut(&from) {
             p.conn = None;
             p.since = None;

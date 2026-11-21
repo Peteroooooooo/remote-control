@@ -46,7 +46,7 @@ enum Source {
 
 pub struct Capture {
     src: Source,
-    pub image: ID3D11Texture2D,
+    image: Option<ID3D11Texture2D>,
     pub width: u32,
     pub height: u32,
     /// Degrees clockwise the image must be turned to look like the display:
@@ -90,7 +90,7 @@ impl Capture {
             let (w, h) = (dd.ModeDesc.Width, dd.ModeDesc.Height);
             Ok(Capture {
                 src: Source::Dxgi(dupl),
-                image: bgra_texture(gpu, w, h, 0)?,
+                image: None,
                 width: w,
                 height: h,
                 rotation: crate::monitors::rotation_degrees(dd.Rotation),
@@ -103,14 +103,22 @@ impl Capture {
         let monitor = unsafe { output.GetDesc()? }.Monitor;
         let w = Wgc::start(gpu, monitor)?;
         let (width, height) = (w.width, w.height);
-        Ok(Capture { src: Source::Wgc(w), image: bgra_texture(gpu, width, height, 0)?, width, height, rotation: 0 })
+        Ok(Capture { src: Source::Wgc(w), image: None, width, height, rotation: 0 })
     }
 
     /// WGC in an agent running as the console user (for the service's helper).
     pub fn agent(gpu: &Gpu, output: &IDXGIOutput1) -> Result<Capture> {
         let a = Agent::start(gpu, &device_name(output)?)?;
         let (width, height) = (a.width, a.height);
-        Ok(Capture { src: Source::Agent(a), image: bgra_texture(gpu, width, height, 0)?, width, height, rotation: 0 })
+        Ok(Capture { src: Source::Agent(a), image: None, width, height, rotation: 0 })
+    }
+
+    /// Staging BGRA texture holding the last grabbed frame, allocated on first use.
+    pub fn image(&mut self, gpu: &Gpu) -> Result<&ID3D11Texture2D> {
+        if self.image.is_none() {
+            self.image = Some(bgra_texture(gpu, self.width, self.height, 0)?);
+        }
+        Ok(self.image.as_ref().expect("created above"))
     }
 
     /// Whether the image comes from WGC (without the pointer).
@@ -150,31 +158,51 @@ impl Capture {
     }
 
     pub fn grab(&mut self, gpu: &Gpu, timeout_ms: u32) -> Result<Grab> {
+        if self.image.is_none() {
+            self.image = Some(bgra_texture(gpu, self.width, self.height, 0)?);
+        }
+        let image = self.image.as_ref().expect("created above");
         match &self.src {
-            Source::Dxgi(dupl) => grab_dxgi(dupl, &self.image, gpu, timeout_ms),
-            Source::Wgc(w) => w.grab(gpu, &self.image, timeout_ms),
-            Source::Agent(a) => a.grab(gpu, &self.image, timeout_ms),
+            Source::Dxgi(dupl) => grab_dxgi(dupl, image, gpu, timeout_ms),
+            Source::Wgc(w) => w.grab(gpu, image, timeout_ms),
+            Source::Agent(a) => a.grab(gpu, image, timeout_ms),
+        }
+    }
+}
+
+struct FrameGuard<'a>(&'a IDXGIOutputDuplication);
+
+impl Drop for FrameGuard<'_> {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = self.0.ReleaseFrame();
         }
     }
 }
 
 fn grab_dxgi(dupl: &IDXGIOutputDuplication, image: &ID3D11Texture2D, gpu: &Gpu, timeout_ms: u32) -> Result<Grab> {
     unsafe {
-        let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
-        let mut res: Option<IDXGIResource> = None;
-        match dupl.AcquireNextFrame(timeout_ms, &mut info, &mut res) {
-            Ok(()) => {}
-            Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => return Ok(Grab::Timeout),
-            Err(e) if e.code() == DXGI_ERROR_ACCESS_LOST => return Ok(Grab::Lost),
-            Err(e) => return Err(e).context("AcquireNextFrame"),
-        }
+        let acquired = {
+            let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
+            let mut res: Option<IDXGIResource> = None;
+            match dupl.AcquireNextFrame(timeout_ms, &mut info, &mut res) {
+                Ok(()) => {}
+                Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => return Ok(Grab::Timeout),
+                Err(e) if e.code() == DXGI_ERROR_ACCESS_LOST => return Ok(Grab::Lost),
+                Err(e) => return Err(e).context("AcquireNextFrame"),
+            }
+            (info, res)
+        };
+        // `_guard` is declared before `(info, res)`, so `res` and `tex` are always
+        // released before `ReleaseFrame()` runs—including on error return.
+        let _guard = FrameGuard(dupl);
+        let (info, res) = acquired;
         // LastPresentTime 0 means only the mouse pointer moved.
         let fresh = info.LastPresentTime != 0;
         if fresh && let Some(r) = res {
             let tex: ID3D11Texture2D = r.cast()?;
             gpu.ctx.CopyResource(image, &tex);
         }
-        let _ = dupl.ReleaseFrame();
         Ok(if fresh { Grab::New { present_qpc: info.LastPresentTime } } else { Grab::Timeout })
     }
 }

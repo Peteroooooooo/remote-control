@@ -27,10 +27,15 @@ use std::{
 use windows::{
     Win32::{
         Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
-        Graphics::Gdi::{ClientToScreen, HFONT, InvalidateRect, ScreenToClient},
+        Graphics::Gdi::{
+            ClientToScreen, GetMonitorInfoW, HFONT, InvalidateRect, MONITOR_DEFAULTTONEAREST, MONITORINFO,
+            MonitorFromWindow, ScreenToClient,
+        },
         System::LibraryLoader::GetModuleHandleW,
         UI::{
-            Input::KeyboardAndMouse::{TME_LEAVE, TME_NONCLIENT, TRACKMOUSEEVENT, TrackMouseEvent},
+            Input::KeyboardAndMouse::{
+                GetCapture, ReleaseCapture, SetCapture, TME_LEAVE, TME_NONCLIENT, TRACKMOUSEEVENT, TrackMouseEvent,
+            },
             WindowsAndMessaging::*,
         },
     },
@@ -122,7 +127,6 @@ enum Chip {
     Fps(u8),
     Mbps(u16),
     Sharp(bool),
-    AudioOn(bool),
     AudioLossless(bool),
     AudioCh(u8),
     AudioMuteHost(bool),
@@ -135,7 +139,6 @@ impl Chip {
             Chip::Fps(f) => q.fps == f,
             Chip::Mbps(m) => q.mbps == m,
             Chip::Sharp(s) => q.sharp == s,
-            Chip::AudioOn(on) => a.enabled == on,
             Chip::AudioLossless(l) => a.lossless == l,
             Chip::AudioCh(ch) => a.channels == ch,
             Chip::AudioMuteHost(m) => a.mute_host == m,
@@ -148,7 +151,6 @@ impl Chip {
             Chip::Fps(f) => quality::choose(|c| c.fps = f),
             Chip::Mbps(m) => quality::choose(|c| c.mbps = m),
             Chip::Sharp(s) => quality::choose(|c| c.sharp = s),
-            Chip::AudioOn(on) => audio::config::choose(|c| c.enabled = on),
             Chip::AudioLossless(l) => audio::config::choose(|c| c.lossless = l),
             Chip::AudioCh(ch) => audio::config::choose(|c| c.channels = ch),
             Chip::AudioMuteHost(m) => audio::config::choose(|c| c.mute_host = m),
@@ -190,6 +192,7 @@ struct Look {
     full: bool,
     monitors: usize,
     audio_enabled: bool,
+    audio_mute_host: bool,
 }
 
 fn look() -> Look {
@@ -206,7 +209,14 @@ fn look() -> Look {
         full: window::fullscreen(),
         monitors: window::monitors().1,
         audio_enabled: audio::config::viewer_enabled(),
+        audio_mute_host: audio::config::host_muted(),
     }
+}
+
+#[derive(Clone, Copy)]
+struct SliderRects {
+    hit: RECT,
+    track: RECT,
 }
 
 struct State {
@@ -229,6 +239,10 @@ struct State {
     chips: Vec<(Chip, RECT)>,
     chip_hover: Option<Chip>,
     chip_pressed: Option<Chip>,
+    /// The 声音 menu's volume slider in this window's pixels.
+    slider: Option<SliderRects>,
+    slider_hover: bool,
+    slider_drag: bool,
     hover: Option<(Hot, Instant)>,
     pressed: Option<Hot>,
     r_pressed: Option<Hot>,
@@ -276,8 +290,16 @@ pub fn follow() {
 
 /// The picture was clicked: the numbers and the menu close (session window's thread).
 pub fn dismiss() {
-    if with(|s| std::mem::take(&mut s.stats) | std::mem::take(&mut s.menu) | std::mem::take(&mut s.audio_menu))
-        .unwrap_or(false)
+    if with(|s| {
+        let closed = std::mem::take(&mut s.stats) | std::mem::take(&mut s.menu) | std::mem::take(&mut s.audio_menu);
+        if closed {
+            s.slider = None;
+            s.slider_hover = false;
+            s.slider_drag = false;
+        }
+        closed
+    })
+    .unwrap_or(false)
     {
         changed();
     }
@@ -333,6 +355,9 @@ fn open(owner: HWND) -> windows::core::Result<()> {
             chips: Vec::new(),
             chip_hover: None,
             chip_pressed: None,
+            slider: None,
+            slider_hover: false,
+            slider_drag: false,
             hover: None,
             pressed: None,
             r_pressed: None,
@@ -388,9 +413,15 @@ fn tip(part: Part, look: &Look) -> Option<String> {
         }
         Part::Cad => "发送 Ctrl+Alt+Del（Ctrl+Alt+End）".into(),
         Part::Quality => "画面：分辨率、帧率、码率".into(),
-        Part::Audio if look.audio_enabled => "声音：已开启（单击关闭）".into(),
-        Part::Audio => "声音：已关闭（单击开启）".into(),
-        Part::AudioMenu => "声音设置：音质、声道、静音对方扬声器".into(),
+        Part::Audio => {
+            let main = if look.audio_enabled { "传回本机：已开启" } else { "传回本机：已关闭" };
+            if look.audio_mute_host {
+                format!("{main} · 对方扬声器已静音")
+            } else {
+                main.into()
+            }
+        }
+        Part::AudioMenu => "声音设置：传回音量、对方扬声器、音质、声道".into(),
         Part::Terminal => "终端：在对方电脑上开 PowerShell".into(),
         Part::Full if look.full => "退出全屏".into(),
         Part::Full => "全屏".into(),
@@ -555,15 +586,18 @@ pub fn paint_caption(hwnd: HWND) {
     let note_w = c.text_width(RELEASED, f);
     let active = unsafe { GetForegroundWindow() } == hwnd;
     let left = px(12);
-    c.text(&rect(left, 0, left + name_w + 2, h), &name, bold, if active { gdi::TEXT } else { gdi::DIM }, false);
     let w = c.size.right;
     let cw = px(CAP_W);
     let mut lay = layout(&px, &IN_CAPTION, h, 0, badge_w, note_w, &look);
     // Centred like the full-screen bar, the released note hanging off the
     // right; a narrow window moves them left of the caption buttons, never
-    // over the name.
+    // overlapping the caption buttons (name truncates with ellipsis).
     let controls_w = lay.parts.last().map_or(0, |(_, r)| r.right);
-    lay.shift(((w - controls_w) / 2).min(w - cw * 3 - px(8) - lay.right).max(left + name_w + px(14)));
+    let dx = ((w - controls_w) / 2).max(left + name_w + px(14)).min(w - cw * 3 - px(8) - lay.right);
+    lay.shift(dx);
+    let controls_left = lay.parts.first().map_or(w - cw * 3 - px(8), |(_, r)| r.left);
+    let name_max_w = (controls_left - left - px(12)).max(px(32));
+    c.text(&rect(left, 0, left + (name_w + 2).min(name_max_w), h), &name, bold, if active { gdi::TEXT } else { gdi::DIM }, false);
     let (hover, pressed, stats, menu, audio_menu) =
         with(|s| (s.hover.map(|h| h.0), s.pressed, s.stats, s.menu, s.audio_menu)).unwrap_or((None, None, false, false, false));
     let paint = Paint { px: &px, pf: &pf, font: f, hover, pressed, stats, menu, audio_menu, live: true };
@@ -579,7 +613,15 @@ pub fn paint_caption(hwnd: HWND) {
     }
     let mut hits: Vec<(Hot, RECT)> = caps.to_vec();
     hits.extend(lay.parts.iter().filter(|(_, r)| r.right <= w - cw * 3).map(|(p, r)| (Hot::Part(*p), *r)));
-    with(|s| s.caption = hits);
+    let need_follow = with(|s| {
+        let changed = s.caption != hits;
+        s.caption = hits;
+        changed && (s.stats || s.menu || s.audio_menu || s.tip_shown)
+    })
+    .unwrap_or(false);
+    if need_follow {
+        post(WM_APP_FOLLOW);
+    }
 }
 
 /// A caption button with its glyph, drawn like Windows 11's.
@@ -653,6 +695,7 @@ fn set_hover(owner: HWND, k: Option<Hot>) {
         }
         s.hover = k.map(|k| (k, Instant::now()));
         s.pressed = s.pressed.filter(|p| Some(*p) == k);
+        s.r_pressed = s.r_pressed.filter(|p| Some(*p) == k);
         true
     })
     .unwrap_or(false);
@@ -800,10 +843,17 @@ fn paint_panel(c: &Canvas, r: &RECT, px: &dyn Fn(i32) -> i32, f: HFONT, look: &L
     }
 }
 
-/// The 画面 menu, laid out from (0, 0).
+struct Slider {
+    hit: RECT,
+    track: RECT,
+    value: RECT,
+}
+
+/// The 画面 or 声音 menu, laid out from (0, 0).
 struct Menu {
     size: (i32, i32),
     labels: Vec<(&'static str, RECT)>,
+    slider: Option<Slider>,
     chips: Vec<(Chip, String, RECT)>,
     line: i32,
     footer: (String, RECT),
@@ -841,13 +891,17 @@ fn menu_layout(px: &dyn Fn(i32) -> i32) -> Menu {
     if matches!(quality::streaming(), Some((_, Some(s))) if s.can444) {
         rows.push(("文字", vec![(Chip::Sharp(false), "标准".into()), (Chip::Sharp(true), "清晰".into())]));
     }
-    build_menu(px, rows, menu_footer())
+    build_menu(px, None, rows, menu_footer())
 }
 
 fn audio_menu_footer() -> String {
     let c = audio::config::choice();
     if !c.enabled {
-        return "声音已关闭".into();
+        return if c.mute_host {
+            "未传回本机 · 对方已静音".into()
+        } else {
+            "未传回本机".into()
+        };
     }
     let ch = if c.channels == 1 { "单声道" } else { "立体声" };
     let rate_hz = audio::config::active_rate_hz();
@@ -857,31 +911,47 @@ fn audio_menu_footer() -> String {
         format!("{:.1} kHz", rate_hz as f32 / 1000.0)
     };
     let q = if c.lossless { "无损 PCM" } else { "Opus" };
-    let mute = if c.mute_host { " · 已静音对方" } else { "" };
+    let mute = if c.mute_host { " · 对方已静音" } else { "" };
     format!("{q} · {ch} · {rate_str}{mute}")
 }
 
 fn audio_menu_layout(px: &dyn Fn(i32) -> i32) -> Menu {
     let rows = vec![
-        ("声音", vec![(Chip::AudioOn(true), "开启".into()), (Chip::AudioOn(false), "关闭".into())]),
+        ("对方扬声器", vec![(Chip::AudioMuteHost(false), "正常出声".into()), (Chip::AudioMuteHost(true), "静音".into())]),
         ("音质", vec![(Chip::AudioLossless(false), "标准".into()), (Chip::AudioLossless(true), "无损".into())]),
         ("声道", vec![(Chip::AudioCh(2), "立体声".into()), (Chip::AudioCh(1), "单声道".into())]),
-        ("对方扬声器", vec![(Chip::AudioMuteHost(false), "保持".into()), (Chip::AudioMuteHost(true), "静音".into())]),
     ];
-    build_menu(px, rows, audio_menu_footer())
+    build_menu(px, Some("传回音量"), rows, audio_menu_footer())
 }
 
-fn build_menu(px: &dyn Fn(i32) -> i32, rows: Vec<(&'static str, Vec<(Chip, String)>)>, footer_text: String) -> Menu {
+fn build_menu(
+    px: &dyn Fn(i32) -> i32,
+    slider_label: Option<&'static str>,
+    rows: Vec<(&'static str, Vec<(Chip, String)>)>,
+    footer_text: String,
+) -> Menu {
     let mut c = Canvas::offscreen(1, 1, rgb(FILL));
     let f = c.font(px(13), false);
     let pad = px(14);
-    let max_label_w = rows.iter().map(|(l, _)| c.text_width(l, f)).max().unwrap_or(0);
+    let max_label_w = rows
+        .iter()
+        .map(|(l, _)| *l)
+        .chain(slider_label)
+        .map(|l| c.text_width(l, f))
+        .max()
+        .unwrap_or(0);
     let label_w = px(MENU_LABEL_W).max(max_label_w + px(14));
+    let x0 = pad + label_w;
     let (mut labels, mut chips) = (Vec::new(), Vec::new());
     let mut y = px(8);
     let mut right = 0;
+    let slider_y = slider_label.map(|label| {
+        let sy = y;
+        labels.push((label, rect(pad, sy, x0, sy + px(MENU_ROW))));
+        y += px(MENU_ROW);
+        sy
+    });
     for (label, row) in rows {
-        let x0 = pad + label_w;
         labels.push((label, rect(pad, y, x0, y + px(MENU_ROW))));
         let mut x = x0;
         let top = y + (px(MENU_ROW) - px(CHIP_H)) / 2;
@@ -899,18 +969,63 @@ fn build_menu(px: &dyn Fn(i32) -> i32, rows: Vec<(&'static str, Vec<(Chip, Strin
     let fw = c.text_width(&footer_text, f);
     let footer = (footer_text, rect(pad, y, pad + fw + 2, y + px(ROW_H)));
     y += px(ROW_H) + px(8);
-    let w = right.max(pad + fw + 2) + pad;
-    Menu { size: (w, y), labels, chips, line, footer }
+    let val_w = c.text_width("100%", f) + px(4);
+    let min_slider_right = if slider_y.is_some() { x0 + px(120) + px(10) + val_w } else { 0 };
+    let content_right = right.max(pad + fw + 2).max(min_slider_right);
+    let slider = slider_y.map(|sy| {
+        let cy = sy + px(MENU_ROW) / 2;
+        let track_l = x0 + px(6);
+        let track_r = (content_right - val_w - px(10)).max(track_l + px(40));
+        let half_h = px(2).max(1);
+        Slider {
+            hit: rect(track_l - px(6), sy + px(3), track_r + px(6), sy + px(MENU_ROW) - px(3)),
+            track: rect(track_l, cy - half_h, track_r, cy + half_h),
+            value: rect(content_right - val_w, sy, content_right + 2, sy + px(MENU_ROW)),
+        }
+    });
+    let w = content_right + pad;
+    Menu { size: (w, y), labels, slider, chips, line, footer }
 }
 
-/// Paints the menu at `at` (its top left in `c`); returns its chips there.
-fn paint_menu(c: &Canvas, m: &Menu, at: POINT, px: &dyn Fn(i32) -> i32, f: HFONT, st: &State) -> Vec<(Chip, RECT)> {
+/// Paints the menu at `at` (its top left in `c`); returns its chips and optional slider there.
+fn paint_menu(
+    c: &Canvas,
+    m: &Menu,
+    at: POINT,
+    px: &dyn Fn(i32) -> i32,
+    f: HFONT,
+    st: &State,
+) -> (Vec<(Chip, RECT)>, Option<SliderRects>) {
     let (dx, dy) = (at.x, at.y);
     let r = rect(dx, dy, dx + m.size.0, dy + m.size.1);
     c.round(&r, px(10), Some(rgb(FILL)), Some((rgb(EDGE), 1)));
     for (label, lr) in &m.labels {
         c.text(&moved(lr, dx, dy), label, f, gdi::DIM, false);
     }
+    let slider_hit = m.slider.as_ref().map(|s| {
+        let vol = audio::config::display_volume();
+        let hit = moved(&s.hit, dx, dy);
+        let tr = moved(&s.track, dx, dy);
+        let vr = moved(&s.value, dx, dy);
+        let cy = (tr.top + tr.bottom) / 2;
+        let fill_x = tr.left + ((tr.right - tr.left) * vol as i32 + 50) / 100;
+        c.round(&tr, px(2), Some(rgb(theme::BUTTON_EDGE)), None);
+        if fill_x > tr.left {
+            c.round(&rect(tr.left, tr.top, fill_x, tr.bottom), px(2), Some(rgb(theme::ACCENT)), None);
+        }
+        let active = st.slider_drag || st.slider_hover;
+        let knob_r = if active { px(7) } else { px(6) };
+        let knob_fill = if st.slider_drag {
+            rgb(theme::ACCENT_HOVER)
+        } else if vol > 0 || active {
+            rgb(0xffffff)
+        } else {
+            gdi::DIM
+        };
+        c.circle(fill_x, cy, knob_r, Some(knob_fill), Some((rgb(FILL), 1)));
+        c.text(&vr, &format!("{vol}%"), f, if vol > 0 { gdi::TEXT } else { gdi::DIM }, false);
+        SliderRects { hit, track: tr }
+    });
     let q_choice = quality::choice();
     let a_choice = audio::config::choice();
     let mut hits = Vec::new();
@@ -932,7 +1047,7 @@ fn paint_menu(c: &Canvas, m: &Menu, at: POINT, px: &dyn Fn(i32) -> i32, f: HFONT
     }
     c.fill(&rect(dx + px(14), dy + m.line, dx + m.size.0 - px(14), dy + m.line + 1), rgb(EDGE));
     c.text(&moved(&m.footer.1, dx, dy), &m.footer.0, f, gdi::DIM, false);
-    hits
+    (hits, slider_hit)
 }
 
 fn paint_tip(c: &Canvas, r: &RECT, px: &dyn Fn(i32) -> i32, f: HFONT, text: &str) {
@@ -957,10 +1072,14 @@ fn present(c: &Canvas, hwnd: HWND, at: POINT, shapes: &[([f32; 4], f32)]) {
 
 fn draw(hwnd: HWND, st: &mut State) {
     let look = look();
+    if st.stats && look.rows.is_empty() {
+        st.stats = false;
+    }
     if look.full != st.full {
         st.full = look.full;
         st.hover = None;
         st.pressed = None;
+        st.r_pressed = None;
         if look.full {
             let now = Instant::now();
             st.started = now;
@@ -988,12 +1107,38 @@ fn show(hwnd: HWND, on: bool) {
     }
 }
 
+fn work_area(owner: HWND) -> RECT {
+    let mut mi = MONITORINFO { cbSize: size_of::<MONITORINFO>() as u32, ..Default::default() };
+    let ok = unsafe { GetMonitorInfoW(MonitorFromWindow(owner, MONITOR_DEFAULTTONEAREST), &mut mi) }.as_bool();
+    if ok {
+        mi.rcWork
+    } else {
+        let mut r = RECT::default();
+        unsafe {
+            let _ = SystemParametersInfoW(SPI_GETWORKAREA, 0, Some(&mut r as *mut RECT as *mut _), Default::default());
+        }
+        r
+    }
+}
+
+fn clamp_rect(r: RECT, bounds: &RECT, pad: i32) -> RECT {
+    let (w, h) = (r.right - r.left, r.bottom - r.top);
+    let min_x = bounds.left + pad;
+    let max_x = (bounds.right - pad - w).max(min_x);
+    let min_y = bounds.top + pad;
+    let max_y = (bounds.bottom - pad - h).max(min_y);
+    let x = r.left.clamp(min_x, max_x);
+    let y = r.top.clamp(min_y, max_y);
+    rect(x, y, x + w, y + h)
+}
+
 /// In a window: the numbers under the badge, a tip under a title bar button.
 fn draw_popups(hwnd: HWND, st: &mut State, look: &Look) {
-    let px = gdi::scale(hwnd);
+    let px = gdi::scale(st.owner);
     let tip_due = due_tip(st, look);
     let (_, _, tip_w, key_w, value_w) = measure(&px, &IN_CAPTION, look, tip_due.as_ref().map(|t| t.1.as_str()));
     let owner = st.owner;
+    let work = work_area(owner);
     let screen = |r: &RECT| {
         let mut p = POINT { x: r.left, y: r.top };
         unsafe {
@@ -1003,10 +1148,10 @@ fn draw_popups(hwnd: HWND, st: &mut State, look: &Look) {
     };
     let find = |k: Hot| st.caption.iter().find(|(h, _)| *h == k).map(|(_, r)| screen(r));
     let panel = match find(Hot::Part(Part::Badge)) {
-        Some(b) if st.stats => {
+        Some(b) if st.stats && !look.rows.is_empty() => {
             let (w, h) = panel_size(&px, look, key_w, value_w);
             let top = b.bottom + px(6);
-            Some(rect(b.left - px(6), top, b.left - px(6) + w, top + h))
+            Some(clamp_rect(rect(b.left - px(6), top, b.left - px(6) + w, top + h), &work, px(6)))
         }
         _ => None,
     };
@@ -1019,21 +1164,24 @@ fn draw_popups(hwnd: HWND, st: &mut State, look: &Look) {
     };
     let menu = menu.map(|(b, m)| {
         let (w, h) = m.size;
-        // Under the button, kept inside the session window where it can be.
+        // Under the button, kept inside the session window where it can be, then clamped to monitor work area.
         let (origin, client_w) = owner_top(owner);
         let l = (b.left - px(6)).min(origin.x + client_w - w - px(6)).max(origin.x + px(6));
-        (rect(l, b.bottom + px(6), l + w, b.bottom + px(6) + h), m)
+        let r = clamp_rect(rect(l, b.bottom + px(6), l + w, b.bottom + px(6) + h), &work, px(6));
+        (r, m)
     });
     let tip = tip_due.and_then(|(p, text)| {
         let r = find(Hot::Part(p))?;
         let w = tip_w + px(16);
         let l = (r.left + r.right) / 2 - w / 2;
-        Some((rect(l, r.bottom + px(6), l + w, r.bottom + px(6) + px(24)), text))
+        let tr = clamp_rect(rect(l, r.bottom + px(6), l + w, r.bottom + px(6) + px(24)), &work, px(6));
+        Some((tr, text))
     });
     st.tip_shown = tip.is_some();
     st.parts.clear();
     st.panel = None;
     st.chips.clear();
+    st.slider = None;
     let boxes: Vec<RECT> = panel.iter().copied().chain(menu.iter().map(|m| m.0)).chain(tip.iter().map(|t| t.0)).collect();
     if boxes.is_empty() {
         show(hwnd, false);
@@ -1051,7 +1199,9 @@ fn draw_popups(hwnd: HWND, st: &mut State, look: &Look) {
     }
     if let Some((r, m)) = &menu {
         let r = moved(r, -at.x, -at.y);
-        st.chips = paint_menu(&c, m, POINT { x: r.left, y: r.top }, &px, f, st);
+        let (chips, slider) = paint_menu(&c, m, POINT { x: r.left, y: r.top }, &px, f, st);
+        st.chips = chips;
+        st.slider = slider;
         shapes.push(shape(&r, px(10)));
     }
     if let Some((t, text)) = &tip {
@@ -1066,7 +1216,7 @@ fn draw_popups(hwnd: HWND, st: &mut State, look: &Look) {
 
 /// Full screen: the bar at the top edge, with the numbers or a tip under it.
 fn draw_bar(hwnd: HWND, st: &mut State, look: &Look) {
-    let px = gdi::scale(hwnd);
+    let px = gdi::scale(st.owner);
     let pf = |v: f32| v * px(96) as f32 / 96.0;
     let tip_due = due_tip(st, look);
     let (badge_w, note_w, tip_w, key_w, value_w) = measure(&px, &IN_BAR, look, tip_due.as_ref().map(|t| t.1.as_str()));
@@ -1082,11 +1232,13 @@ fn draw_bar(hwnd: HWND, st: &mut State, look: &Look) {
     } else {
         None
     };
+    let show_stats = st.stats && !look.rows.is_empty();
     let (panel_w, panel_h) = match &menu {
         Some(m) => m.size,
-        None => panel_size(&px, look, key_w, value_w),
+        None if show_stats => panel_size(&px, look, key_w, value_w),
+        None => (0, 0),
     };
-    let panel_h = if st.stats || st.menu || st.audio_menu { panel_h } else { 0 };
+    let panel_h = if show_stats || st.menu || st.audio_menu { panel_h } else { 0 };
     let win_w = bar_w.max(panel_w).max(tip_w + px(40)) + 2;
     let win_h = h + px(8) + panel_h.max(px(30)) + 2;
     let left = (win_w - bar_w) / 2;
@@ -1121,12 +1273,17 @@ fn draw_bar(hwnd: HWND, st: &mut State, look: &Look) {
     let mut shapes = vec![shape(&bar, r)];
     let mut panel = None;
     st.chips.clear();
-    if (st.stats || st.menu || st.audio_menu) && st.t > 0.0 {
+    st.slider = None;
+    if (show_stats || st.menu || st.audio_menu) && st.t > 0.0 {
         let pl = (win_w - panel_w) / 2;
         let pt = h - off + px(8);
         let pr = rect(pl, pt, pl + panel_w, pt + panel_h);
         match &menu {
-            Some(m) => st.chips = paint_menu(&c, m, POINT { x: pl, y: pt }, &px, f, st),
+            Some(m) => {
+                let (chips, slider) = paint_menu(&c, m, POINT { x: pl, y: pt }, &px, f, st);
+                st.chips = chips;
+                st.slider = slider;
+            }
             None => paint_panel(&c, &pr, &px, f, look, value_w),
         }
         shapes.push(shape(&pr, px(10)));
@@ -1209,6 +1366,11 @@ fn icon(c: &Canvas, part: Part, r: &RECT, pf: &dyn Fn(f32) -> f32, color: COLORR
                 line(&[(10.2, 6.0), (13.8, 10.0)]);
                 line(&[(13.8, 6.0), (10.2, 10.0)]);
             }
+            if look.audio_mute_host {
+                let (dx, dy) = p(13.8, 2.2);
+                let dr = pf(2.4).round().max(2.0) as i32;
+                c.circle(dx.round() as i32, dy.round() as i32, dr, Some(rgb(AMBER)), Some((rgb(FILL), 1)));
+            }
         }
         Part::AudioMenu => {
             line(&[(5.0, 6.5), (8.0, 9.8), (11.0, 6.5)]);
@@ -1244,7 +1406,7 @@ fn start_animation(hwnd: HWND, st: &mut State) {
 /// Full screen: the pointer at the top edge above the bar, or on the bar
 /// (or the numbers) while it is down.
 fn near(hwnd: HWND, st: &State) -> bool {
-    let px = gdi::scale(hwnd);
+    let px = gdi::scale(st.owner);
     let mut p = POINT::default();
     unsafe {
         if GetCursorPos(&mut p).is_err() {
@@ -1275,12 +1437,15 @@ fn watch(hwnd: HWND, st: &mut State) {
             || st.stats
             || st.menu
             || st.audio_menu
+            || st.slider_drag
             || now - st.started < FIRST_SHOW
             || now - st.last_near < LINGER;
         if open != st.open {
             st.open = open;
             if !open {
                 st.hover = None;
+                st.pressed = None;
+                st.r_pressed = None;
             }
             start_animation(hwnd, st);
         }
@@ -1321,12 +1486,26 @@ fn chip_at(st: &State, lp: LPARAM) -> Option<Chip> {
     st.chips.iter().find(|(_, r)| gdi::inside(r, x, y)).map(|(c, _)| *c)
 }
 
+fn slider_at(st: &State, lp: LPARAM) -> bool {
+    let (x, y) = ((lp.0 & 0xffff) as i16 as i32, ((lp.0 >> 16) & 0xffff) as i16 as i32);
+    st.slider.is_some_and(|sr| gdi::inside(&sr.hit, x, y))
+}
+
+fn slider_vol(track: &RECT, x: i32) -> u8 {
+    let w = (track.right - track.left).max(1);
+    let t = (x - track.left).clamp(0, w);
+    ((t * 100 + w / 2) / w) as u8
+}
+
 fn toggle_audio_menu() {
     with(|s| {
         s.audio_menu = !s.audio_menu;
         s.stats = false;
         s.menu = false;
         s.chip_hover = None;
+        s.slider = None;
+        s.slider_hover = false;
+        s.slider_drag = false;
     });
     changed();
 }
@@ -1334,10 +1513,14 @@ fn toggle_audio_menu() {
 fn act(part: Part) {
     match part {
         Part::Badge => {
+            let has_rows = !look().rows.is_empty();
             with(|s| {
-                s.stats = !s.stats;
+                s.stats = if s.stats { false } else { has_rows };
                 s.menu = false;
                 s.audio_menu = false;
+                s.slider = None;
+                s.slider_hover = false;
+                s.slider_drag = false;
             });
             changed();
         }
@@ -1347,6 +1530,9 @@ fn act(part: Part) {
                 s.stats = false;
                 s.audio_menu = false;
                 s.chip_hover = None;
+                s.slider = None;
+                s.slider_hover = false;
+                s.slider_drag = false;
             });
             changed();
         }
@@ -1381,54 +1567,118 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             WM_MOUSEACTIVATE => LRESULT(MA_NOACTIVATE as isize),
             WM_SETCURSOR => {
-                let hand = with(|s| s.hover.is_some() && s.full || s.chip_hover.is_some()).unwrap_or(false);
+                let hand = with(|s| s.hover.is_some() && s.full || s.chip_hover.is_some() || s.slider_hover || s.slider_drag)
+                    .unwrap_or(false);
                 if let Ok(c) = LoadCursorW(None, if hand { IDC_HAND } else { IDC_ARROW }) {
                     SetCursor(Some(c));
                 }
                 LRESULT(1)
             }
             WM_MOUSEMOVE => {
-                with(|s| {
+                let dragging_vol = with(|s| {
+                    if s.slider_drag
+                        && let Some(sr) = s.slider
+                    {
+                        let x = (lp.0 & 0xffff) as i16 as i32;
+                        return Some(slider_vol(&sr.track, x));
+                    }
                     let on = part_at(s, lp).map(Hot::Part);
                     let chip = chip_at(s, lp);
-                    let mut again = chip != s.chip_hover;
+                    let s_hover = slider_at(s, lp);
+                    let mut again = chip != s.chip_hover || s_hover != s.slider_hover;
                     s.chip_hover = chip;
                     s.chip_pressed = s.chip_pressed.filter(|c| Some(*c) == chip);
-                    if s.full && on != s.hover.map(|h| h.0) {
-                        s.hover = on.map(|p| (p, Instant::now()));
-                        s.pressed = s.pressed.filter(|p| Some(*p) == on);
-                        again = true;
+                    s.slider_hover = s_hover;
+                    if s.full {
+                        s.r_pressed = s.r_pressed.filter(|p| Some(*p) == on);
+                        if on != s.hover.map(|h| h.0) {
+                            s.hover = on.map(|p| (p, Instant::now()));
+                            s.pressed = s.pressed.filter(|p| Some(*p) == on);
+                            again = true;
+                        }
                     }
                     if again {
                         draw(hwnd, s);
                     }
-                });
+                    None
+                })
+                .flatten();
+                if let Some(vol) = dragging_vol {
+                    audio::config::set_volume_live(vol);
+                    redraw(hwnd);
+                }
                 track(hwnd, false);
                 LRESULT(0)
             }
             WM_MOUSELEAVE => {
                 with(|s| {
-                    if s.full && (s.hover.is_some() || s.pressed.is_some()) || s.chip_hover.is_some() {
+                    if s.slider_drag {
+                        return;
+                    }
+                    if s.full && (s.hover.is_some() || s.pressed.is_some() || s.r_pressed.is_some())
+                        || s.chip_hover.is_some()
+                        || s.slider_hover
+                    {
                         if s.full {
                             s.hover = None;
                             s.pressed = None;
+                            s.r_pressed = None;
                         }
                         s.chip_hover = None;
                         s.chip_pressed = None;
+                        s.slider_hover = false;
                         draw(hwnd, s);
                     }
                 });
                 LRESULT(0)
             }
             WM_LBUTTONDOWN | WM_LBUTTONDBLCLK => {
-                with(|s| {
+                let start_vol = with(|s| {
+                    if slider_at(s, lp)
+                        && let Some(sr) = s.slider
+                    {
+                        s.slider_drag = true;
+                        s.slider_hover = true;
+                        s.pressed = None;
+                        s.chip_pressed = None;
+                        let x = (lp.0 & 0xffff) as i16 as i32;
+                        return Some(slider_vol(&sr.track, x));
+                    }
                     s.pressed = part_at(s, lp).map(Hot::Part);
                     s.chip_pressed = chip_at(s, lp);
                     draw(hwnd, s);
-                });
+                    None
+                })
+                .flatten();
+                if let Some(vol) = start_vol {
+                    SetCapture(hwnd);
+                    audio::config::set_volume_live(vol);
+                    redraw(hwnd);
+                }
                 LRESULT(0)
             }
             WM_LBUTTONUP => {
+                let drag_vol = with(|s| {
+                    if !s.slider_drag {
+                        return None;
+                    }
+                    s.slider_drag = false;
+                    s.slider_hover = slider_at(s, lp);
+                    let x = (lp.0 & 0xffff) as i16 as i32;
+                    Some(s.slider.map(|sr| slider_vol(&sr.track, x)))
+                })
+                .flatten();
+                if let Some(vol_opt) = drag_vol {
+                    if GetCapture() == hwnd {
+                        let _ = ReleaseCapture();
+                    }
+                    if let Some(vol) = vol_opt {
+                        audio::config::set_volume_live(vol);
+                    }
+                    audio::config::commit_volume();
+                    changed();
+                    return LRESULT(0);
+                }
                 let hit = with(|s| {
                     let was = s.pressed.take();
                     let hit = was.filter(|p| part_at(s, lp).map(Hot::Part) == Some(*p));
@@ -1444,6 +1694,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     if let Some(Hot::Part(p)) = hit {
                         act(p);
                     }
+                }
+                LRESULT(0)
+            }
+            WM_CAPTURECHANGED => {
+                let was_drag = with(|s| std::mem::take(&mut s.slider_drag)).unwrap_or(false);
+                if was_drag {
+                    audio::config::commit_volume();
+                    changed();
                 }
                 LRESULT(0)
             }

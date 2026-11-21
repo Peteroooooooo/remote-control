@@ -29,7 +29,7 @@ use windows::{
             BLACK_BRUSH, GetMonitorInfoW, GetStockObject, HBRUSH, InvalidateRect, MONITOR_DEFAULTTONEAREST, MONITORINFO,
             MonitorFromWindow, ScreenToClient,
         },
-        System::LibraryLoader::GetModuleHandleW,
+        System::{LibraryLoader::GetModuleHandleW, Threading::GetCurrentThreadId},
         UI::{
             HiDpi::{GetDpiForSystem, GetDpiForWindow, GetSystemMetricsForDpi},
             Input::KeyboardAndMouse::{
@@ -94,7 +94,9 @@ static CURSOR_DUMP: OnceLock<PathBuf> = OnceLock::new();
 const WM_APP_RELEASE: u32 = WM_APP + 1;
 /// The host's cursor changed.
 const WM_APP_CURSOR: u32 = WM_APP + 2;
-/// More cursor images than any desktop uses; beyond this new ones are not kept.
+/// Posted by `toggle_fullscreen()` when called off the UI thread.
+const WM_APP_FULLSCREEN: u32 = WM_APP + 3;
+/// Maximum cached cursor images kept on the viewer (LRU).
 const MAX_CURSORS: usize = 512;
 
 enum Shown {
@@ -104,9 +106,52 @@ enum Shown {
     Remote(u32),
 }
 
+struct CursorStore {
+    images: HashMap<u32, (CursorImage, u64)>,
+    tick: u64,
+    shown: Shown,
+    evicted: Vec<u32>,
+}
+
+impl CursorStore {
+    fn new() -> Self {
+        Self {
+            images: HashMap::new(),
+            tick: 0,
+            shown: Shown::Local,
+            evicted: Vec::new(),
+        }
+    }
+
+    fn set_cursor_shape(&mut self, id: u32, image: CursorImage) {
+        self.tick += 1;
+        let t = self.tick;
+        if self.images.contains_key(&id) {
+            self.evicted.push(id);
+        } else if self.images.len() >= MAX_CURSORS
+            && let Some(old_id) = self.images.iter().min_by_key(|(_, (_, tk))| *tk).map(|(k, _)| *k)
+        {
+            self.images.remove(&old_id);
+            self.evicted.push(old_id);
+        }
+        self.images.insert(id, (image, t));
+        self.shown = Shown::Remote(id);
+    }
+
+    fn set_cursor_use(&mut self, id: u32) {
+        self.tick += 1;
+        let t = self.tick;
+        if let Some((_, tk)) = self.images.get_mut(&id) {
+            *tk = t;
+        }
+        self.shown = Shown::Remote(id);
+    }
+}
+
 /// The host's cursor images by id, filled from the network thread.
-static CURSORS: LazyLock<Mutex<(HashMap<u32, CursorImage>, Shown)>> =
-    LazyLock::new(|| Mutex::new((HashMap::new(), Shown::Local)));
+static CURSORS: LazyLock<Mutex<CursorStore>> = LazyLock::new(|| Mutex::new(CursorStore::new()));
+/// Callback invoked on `WM_SIZE` to wake the render thread immediately.
+static RESIZE_WAKE: Mutex<Option<Arc<dyn Fn() + Send + Sync>>> = Mutex::new(None);
 
 // The hook runs on the window's thread, inside its message loop.
 thread_local! {
@@ -125,6 +170,11 @@ static MONITORS: Mutex<(usize, usize)> = Mutex::new((0, 0));
 
 pub fn set_cursor_dump(dir: PathBuf) {
     let _ = CURSOR_DUMP.set(dir);
+}
+
+/// Registers a callback invoked on `WM_SIZE` to wake the render thread immediately.
+pub fn set_resize_wake(cb: Arc<dyn Fn() + Send + Sync>) {
+    *RESIZE_WAKE.lock().unwrap() = Some(cb);
 }
 
 /// The host sent its display list (any thread, also before the window exists).
@@ -178,17 +228,14 @@ pub fn remote_cursor(m: Msg) {
                     image.hot_x,
                     image.hot_y
                 );
-                if c.0.len() < MAX_CURSORS || c.0.contains_key(&id) {
-                    c.0.insert(id, image);
-                }
-                c.1 = Shown::Remote(id);
+                c.set_cursor_shape(id, image);
             }
-            Msg::CursorUse { id } => c.1 = Shown::Remote(id),
+            Msg::CursorUse { id } => c.set_cursor_use(id),
             Msg::CursorHidden => {
-                if !matches!(c.1, Shown::Hidden) {
+                if !matches!(c.shown, Shown::Hidden) {
                     log!("cursor hidden");
                 }
-                c.1 = Shown::Hidden
+                c.shown = Shown::Hidden;
             }
             _ => return,
         }
@@ -381,6 +428,20 @@ pub fn fullscreen() -> bool {
 /// The window fills its display without a frame, or gets its frame back.
 pub fn toggle_fullscreen() {
     let hwnd = hwnd();
+    if hwnd.is_invalid() {
+        return;
+    }
+    let ui_tid = unsafe { GetWindowThreadProcessId(hwnd, None) };
+    if ui_tid != 0 && unsafe { GetCurrentThreadId() } != ui_tid {
+        unsafe {
+            let _ = PostMessageW(Some(hwnd), WM_APP_FULLSCREEN, WPARAM(0), LPARAM(0));
+        }
+        return;
+    }
+    toggle_fullscreen_on_ui(hwnd);
+}
+
+fn toggle_fullscreen_on_ui(hwnd: HWND) {
     let before = FULL.lock().unwrap().take();
     unsafe {
         match before {
@@ -530,20 +591,45 @@ fn deactivate() {
     refresh_cursor(picture());
 }
 
+fn drain_evicted_built(evicted: &[u32]) -> Vec<HCURSOR> {
+    if evicted.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    BUILT.with_borrow_mut(|built| {
+        for id in evicted {
+            if let Some(h) = built.remove(id) {
+                out.push(h);
+            }
+        }
+    });
+    out
+}
+
+fn destroy_cursors(list: Vec<HCURSOR>) {
+    for h in list {
+        unsafe {
+            let _ = DestroyCursor(h);
+        }
+    }
+}
+
 /// The cursor to show over the picture: None for the local arrow, Some(None) for no cursor.
 /// Shown at the size the host shows it, whatever the picture's scale (as RDP and Parsec do).
-fn remote_hcursor() -> Option<Option<HCURSOR>> {
-    let c = CURSORS.lock().unwrap();
-    let id = match c.1 {
-        Shown::Local => return None,
-        Shown::Hidden => return Some(None),
+fn remote_hcursor() -> (Option<Option<HCURSOR>>, Vec<HCURSOR>) {
+    let mut c = CURSORS.lock().unwrap();
+    let evicted = std::mem::take(&mut c.evicted);
+    let to_destroy = drain_evicted_built(&evicted);
+    let id = match c.shown {
+        Shown::Local => return (None, to_destroy),
+        Shown::Hidden => return (Some(None), to_destroy),
         Shown::Remote(id) => id,
     };
-    BUILT.with_borrow_mut(|built| {
+    let res = BUILT.with_borrow_mut(|built| {
         if let Some(h) = built.get(&id) {
             return Some(Some(*h));
         }
-        let img = c.0.get(&id)?;
+        let (img, _) = c.images.get(&id)?;
         match cursor::build(img) {
             Ok(h) => {
                 if let Some(dir) = CURSOR_DUMP.get() {
@@ -560,7 +646,8 @@ fn remote_hcursor() -> Option<Option<HCURSOR>> {
                 None
             }
         }
-    })
+    });
+    (res, to_destroy)
 }
 
 /// Shows the current cursor now if the pointer is over the window, instead
@@ -581,13 +668,16 @@ fn set_cursor(lparam: LPARAM) -> bool {
     if (lparam.0 & 0xffff) as u32 != HTCLIENT || local {
         return false;
     }
-    match remote_hcursor() {
+    let (res, to_destroy) = remote_hcursor();
+    let handled = match res {
         Some(h) => {
             unsafe { SetCursor(h) };
             true
         }
         None => false,
-    }
+    };
+    destroy_cursors(to_destroy);
+    handled
 }
 
 fn async_down(vk: windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY) -> bool {
@@ -675,7 +765,7 @@ fn mouse_move(hwnd: HWND, lparam: LPARAM) {
     send(Msg::MouseMove { x, y });
 }
 
-fn button(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) {
+fn button(pic: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) {
     let x = ((wparam.0 >> 16) & 0xffff) as u16;
     let (b, pressed) = match msg {
         WM_LBUTTONDOWN => (0, true),
@@ -693,6 +783,9 @@ fn button(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) {
         SKIP_UP.set(SKIP_UP.get() & !bit);
         return;
     }
+    if unsafe { GetForegroundWindow() } != hwnd() {
+        return;
+    }
     if !captured() {
         if pressed && STATE.get().is_some_and(|s| s.input) {
             SKIP_UP.set(SKIP_UP.get() | bit);
@@ -700,10 +793,10 @@ fn button(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) {
         }
         return;
     }
-    mouse_move(hwnd, lparam);
+    mouse_move(pic, lparam);
     unsafe {
         if pressed {
-            SetCapture(hwnd);
+            SetCapture(pic);
         } else if wparam.0 & 0x73 == 0 {
             // No button left down (MK_LBUTTON | MK_RBUTTON | MK_MBUTTON | MK_XBUTTON1 | MK_XBUTTON2).
             release_mouse_capture();
@@ -813,9 +906,15 @@ unsafe extern "system" fn picture_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
         }
         WM_APP_CURSOR => {
             if CURSOR_DUMP.get().is_some() {
-                let _ = remote_hcursor();
+                let (_, to_destroy) = remote_hcursor();
+                destroy_cursors(to_destroy);
             }
             refresh_cursor(hwnd);
+            let leftover = {
+                let mut c = CURSORS.lock().unwrap();
+                std::mem::take(&mut c.evicted)
+            };
+            destroy_cursors(drain_evicted_built(&leftover));
         }
         WM_ERASEBKGND => return LRESULT(1),
         _ => return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
@@ -848,7 +947,23 @@ fn hit_test(hwnd: HWND, lparam: LPARAM) -> LRESULT {
         let _ = ScreenToClient(hwnd, &mut p);
         let dpi = GetDpiForWindow(hwnd);
         let border = GetSystemMetricsForDpi(SM_CYFRAME, dpi) + GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi);
+        let cap_hit = (p.y < caption_px(hwnd)).then(|| crate::toolbar::caption_hit(p.x, p.y));
         if p.y < border && !IsZoomed(hwnd).as_bool() {
+            if let Some(ht) = cap_hit {
+                if ht == HTCLIENT {
+                    return LRESULT(HTCLIENT as isize);
+                }
+                if matches!(ht, HTMINBUTTON | HTMAXBUTTON | HTCLOSE) {
+                    let edge = (border / 3).clamp(2, 3);
+                    if p.y >= edge {
+                        return LRESULT(ht as isize);
+                    }
+                    let mut c = RECT::default();
+                    let _ = GetClientRect(hwnd, &mut c);
+                    let resize = if p.x >= c.right - border { HTTOPRIGHT } else { HTTOP };
+                    return LRESULT(resize as isize);
+                }
+            }
             let mut c = RECT::default();
             let _ = GetClientRect(hwnd, &mut c);
             let ht = if p.x < border * 2 {
@@ -860,8 +975,8 @@ fn hit_test(hwnd: HWND, lparam: LPARAM) -> LRESULT {
             };
             return LRESULT(ht as isize);
         }
-        if p.y < caption_px(hwnd) {
-            return LRESULT(crate::toolbar::caption_hit(p.x, p.y) as isize);
+        if let Some(ht) = cap_hit {
+            return LRESULT(ht as isize);
         }
         def
     }
@@ -906,11 +1021,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let _ = SetFocus(Some(picture()));
         },
         WM_APP_RELEASE => release(),
+        WM_APP_FULLSCREEN => toggle_fullscreen_on_ui(hwnd),
         WM_SIZE => {
             place_picture(hwnd);
             invalidate_caption(hwnd);
             crate::toolbar::follow();
             crate::quality::follow_window(hwnd);
+            let cb = RESIZE_WAKE.lock().unwrap().clone();
+            if let Some(f) = cb {
+                f();
+            }
             return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
         }
         WM_MOVE => {
@@ -922,12 +1042,19 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             crate::quality::follow_window(hwnd);
             return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
         }
-        WM_DPICHANGED => unsafe {
-            let r = &*(lparam.0 as *const RECT);
-            let _ = SetWindowPos(hwnd, None, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOZORDER | SWP_NOACTIVATE);
-        },
+        WM_DPICHANGED => {
+            unsafe {
+                let r = &*(lparam.0 as *const RECT);
+                let _ = SetWindowPos(hwnd, None, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOZORDER | SWP_NOACTIVATE);
+            }
+            place_picture(hwnd);
+            invalidate_caption(hwnd);
+            crate::toolbar::refresh();
+            crate::quality::follow_window(hwnd);
+        }
         WM_DESTROY => {
             remove_hook();
+            *RESIZE_WAKE.lock().unwrap() = None;
             WINDOW.store(0, Ordering::Relaxed);
             PICTURE.store(0, Ordering::Relaxed);
             BUILT.with_borrow_mut(|built| {

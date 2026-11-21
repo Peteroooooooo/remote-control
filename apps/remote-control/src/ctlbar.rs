@@ -154,6 +154,17 @@ fn label(name: &str) -> String {
     format!("「{name}」正在控制")
 }
 
+fn recompute_layout(hwnd: HWND, st: &mut State) {
+    let px = gdi::scale(hwnd);
+    let mut m = Canvas::offscreen(1, 1, rgb(FILL));
+    let f = m.font(px(14), false);
+    st.text_w = m.text_width(&label(&st.name), f);
+    let clock_w = m.text_width("00:00:00", f);
+    st.width = px(30) + st.text_w + px(12) + clock_w + px(12) + px(BUTTON_W) + px(8);
+    st.x = (unsafe { GetSystemMetrics(SM_CXSCREEN) } - st.width) / 2;
+    st.y = 0;
+}
+
 fn run(mut st: State, hwnd_out: &AtomicIsize, gone: &AtomicBool) -> windows::core::Result<()> {
     unsafe {
         let inst = GetModuleHandleW(None)?;
@@ -168,16 +179,7 @@ fn run(mut st: State, hwnd_out: &AtomicIsize, gone: &AtomicBool) -> windows::cor
         RegisterClassW(&wc);
         let ex = WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE;
         let hwnd = CreateWindowExW(ex, class, &HSTRING::from("remote control"), WS_POPUP, 0, 0, 10, 10, None, None, Some(inst.into()), None)?;
-        let px = gdi::scale(hwnd);
-        {
-            let mut m = Canvas::offscreen(1, 1, rgb(FILL));
-            let f = m.font(px(14), false);
-            st.text_w = m.text_width(&label(&st.name), f);
-            let clock_w = m.text_width("00:00:00", f);
-            st.width = px(30) + st.text_w + px(12) + clock_w + px(12) + px(BUTTON_W) + px(8);
-        }
-        st.x = (GetSystemMetrics(SM_CXSCREEN) - st.width) / 2;
-        st.y = 0;
+        recompute_layout(hwnd, &mut st);
         let ptr = Box::into_raw(Box::new(st));
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, ptr as isize);
         draw(hwnd, &mut *ptr);
@@ -295,8 +297,8 @@ fn near(hwnd: HWND, st: &State) -> bool {
         return false;
     }
     let (l, r) = (st.x - px(40), st.x + st.width + px(40));
-    let at_edge = p.y <= st.y + px(TAB_H) && p.x >= l && p.x < r;
-    let down = st.t > 0.5 && p.x >= st.x && p.x < st.x + st.width && p.y < st.y + px(HEIGHT) + px(6);
+    let at_edge = p.y >= st.y && p.y <= st.y + px(TAB_H) && p.x >= l && p.x < r;
+    let down = st.t > 0.5 && p.x >= st.x && p.x < st.x + st.width && p.y >= st.y && p.y < st.y + px(HEIGHT) + px(6);
     at_edge || down
 }
 
@@ -397,6 +399,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     if was && on_button(hwnd, s, lp) {
                         (s.on_click)();
                     }
+                    draw(hwnd, s);
+                }
+                LRESULT(0)
+            }
+            WM_DISPLAYCHANGE | WM_DPICHANGED => {
+                if let Some(s) = state(hwnd) {
+                    recompute_layout(hwnd, s);
                     draw(hwnd, s);
                 }
                 LRESULT(0)

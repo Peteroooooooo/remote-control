@@ -8,9 +8,9 @@
 use std::{
     sync::{
         Arc,
-        atomic::{AtomicIsize, Ordering},
+        atomic::{AtomicBool, AtomicIsize, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use tokio::sync::oneshot;
@@ -20,7 +20,10 @@ use windows::{
         Graphics::Gdi::InvalidateRect,
         System::LibraryLoader::GetModuleHandleW,
         UI::{
-            Input::KeyboardAndMouse::{TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VK_ESCAPE},
+            HiDpi::{AdjustWindowRectExForDpi, GetDpiForWindow},
+            Input::KeyboardAndMouse::{
+                GetCapture, ReleaseCapture, SetCapture, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VK_ESCAPE,
+            },
             WindowsAndMessaging::*,
         },
     },
@@ -42,6 +45,7 @@ pub enum Kind {
 /// Only allow or deny: the popup never changes what the device is to this
 /// computer (`devices-and-relay.md` 3.2).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(clippy::enum_variant_names)]
 pub enum Answer {
     Allow,
     Deny,
@@ -52,11 +56,13 @@ pub enum Answer {
 
 pub struct Asking {
     hwnd: Arc<AtomicIsize>,
+    cancelled: Arc<AtomicBool>,
     pub rx: oneshot::Receiver<Answer>,
 }
 
 impl Asking {
     pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::SeqCst);
         let h = self.hwnd.load(Ordering::SeqCst);
         if h != 0 {
             unsafe {
@@ -77,10 +83,15 @@ struct Popup {
     name: String,
     kind: Kind,
     hover: Option<Hit>,
+    pressed: Option<Hit>,
     left_s: u32,
     wait_s: u32,
+    shown_at: Instant,
     tx: Option<oneshot::Sender<Answer>>,
 }
+
+/// Ignore accidental clicks on "允许" right after the popup appears.
+const COOLDOWN: Duration = Duration::from_millis(300);
 
 /// The client area in window units.
 const WIDTH: i32 = 440;
@@ -90,11 +101,11 @@ const AMBER: windows::Win32::Foundation::COLORREF = gdi::rgb(0xd29922);
 
 impl Popup {
     /// Where the buttons go, in window units: 拒绝, then 允许 on the right.
-    fn layout(&self) -> Vec<(Hit, RECT)> {
+    fn layout(&self) -> [(Hit, RECT); 2] {
         let by = HEIGHT - 20 - 36;
         let allow = rect(WIDTH - 24 - 100, by, WIDTH - 24, by + 36);
         let deny = rect(allow.left - 10 - 92, by, allow.left - 10, by + 36);
-        vec![(Hit::Deny, deny), (Hit::Allow, allow)]
+        [(Hit::Deny, deny), (Hit::Allow, allow)]
     }
 
     fn hit(&self, hwnd: HWND, x: i32, y: i32) -> Option<Hit> {
@@ -106,28 +117,36 @@ impl Popup {
 /// Shows the popup; the answer arrives on `Asking::rx`.
 pub fn ask(name: &str, kind: Kind, wait: Duration) -> Asking {
     let hwnd = Arc::new(AtomicIsize::new(0));
+    let cancelled = Arc::new(AtomicBool::new(false));
     let (tx, rx) = oneshot::channel();
     let wait_s = wait.as_secs().max(1) as u32;
-    let popup = Popup { name: name.to_string(), kind, hover: None, left_s: wait_s, wait_s, tx: Some(tx) };
-    let h = hwnd.clone();
+    let popup = Popup { name: name.to_string(), kind, hover: None, pressed: None, left_s: wait_s, wait_s, shown_at: Instant::now(), tx: Some(tx) };
+    let (h, c) = (hwnd.clone(), cancelled.clone());
     let r = std::thread::Builder::new().name("consent".into()).spawn(move || {
         if let Err(e) = crate::desktop::follow() {
             log!("confirmation popup: {e:#}");
         }
-        if let Err(e) = run(popup, &h) {
+        if let Err(e) = run(popup, &h, &c) {
             log!("confirmation popup could not open: {e:#}");
         }
     });
     if let Err(e) = r {
         log!("confirmation popup thread: {e}");
     }
-    Asking { hwnd, rx }
+    Asking { hwnd, cancelled, rx }
 }
 
 const TIMER: usize = 1;
+const WM_MOUSELEAVE: u32 = 0x02A3;
 
-fn run(popup: Popup, hwnd_out: &AtomicIsize) -> windows::core::Result<()> {
+fn run(mut popup: Popup, hwnd_out: &AtomicIsize, cancelled: &AtomicBool) -> windows::core::Result<()> {
     unsafe {
+        if cancelled.load(Ordering::SeqCst) {
+            if let Some(tx) = popup.tx.take() {
+                let _ = tx.send(Answer::Cancelled);
+            }
+            return Ok(());
+        }
         let inst = GetModuleHandleW(None)?;
         let class = w!("remote-control-consent");
         let wc = WNDCLASSW {
@@ -139,7 +158,6 @@ fn run(popup: Popup, hwnd_out: &AtomicIsize) -> windows::core::Result<()> {
             ..Default::default()
         };
         RegisterClassW(&wc);
-        let height = HEIGHT;
         let ptr = Box::into_raw(Box::new(popup));
         let style = WS_CAPTION | WS_SYSMENU;
         let hwnd = CreateWindowExW(
@@ -167,16 +185,27 @@ fn run(popup: Popup, hwnd_out: &AtomicIsize) -> windows::core::Result<()> {
         };
         theme::frame(hwnd, theme::CHROME);
         let px = gdi::scale(hwnd);
-        let mut r = RECT { left: 0, top: 0, right: px(WIDTH), bottom: px(height) };
-        let _ = AdjustWindowRectEx(&mut r, style, false, WS_EX_TOPMOST);
+        let mut r = RECT { left: 0, top: 0, right: px(WIDTH), bottom: px(HEIGHT) };
+        let dpi = GetDpiForWindow(hwnd).max(96);
+        let _ = AdjustWindowRectExForDpi(&mut r, style, false, WS_EX_TOPMOST, dpi);
         let (w, h) = (r.right - r.left, r.bottom - r.top);
         let (sw, sh) = (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN));
+        if cancelled.load(Ordering::SeqCst) {
+            finish(hwnd, Answer::Cancelled);
+            return Ok(());
+        }
         let _ = SetWindowPos(hwnd, Some(HWND_TOPMOST), (sw - w) / 2, (sh - h) / 2, w, h, SWP_SHOWWINDOW);
+        if let Some(p) = self::popup(hwnd) {
+            p.shown_at = Instant::now();
+        }
         if !SetForegroundWindow(hwnd).as_bool() {
             let _ = FlashWindow(hwnd, true);
         }
         SetTimer(Some(hwnd), TIMER, 1000, None);
         hwnd_out.store(hwnd.0 as isize, Ordering::SeqCst);
+        if cancelled.load(Ordering::SeqCst) {
+            let _ = PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(1), LPARAM(0));
+        }
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
             let _ = TranslateMessage(&msg);
@@ -236,9 +265,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 }
                 LRESULT(0)
             }
-            0x02A3 /* WM_MOUSELEAVE */ => {
+            WM_MOUSELEAVE => {
+                if let Some(p) = popup(hwnd) {
+                    let changed = p.hover.take().is_some() || p.pressed.take().is_some();
+                    if changed {
+                        let _ = InvalidateRect(Some(hwnd), None, false);
+                    }
+                }
+                LRESULT(0)
+            }
+            WM_CAPTURECHANGED => {
                 if let Some(p) = popup(hwnd)
-                    && p.hover.take().is_some()
+                    && p.pressed.take().is_some()
                 {
                     let _ = InvalidateRect(Some(hwnd), None, false);
                 }
@@ -249,13 +287,46 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 let _ = SetCursor(LoadCursorW(None, if hand { IDC_HAND } else { IDC_ARROW }).ok());
                 LRESULT(1)
             }
+            WM_LBUTTONDOWN => {
+                if let Some(p) = popup(hwnd) {
+                    let (x, y) = xy(lp);
+                    let h = p.hit(hwnd, x, y);
+                    if h == Some(Hit::Allow) && p.shown_at.elapsed() < COOLDOWN {
+                        return LRESULT(0);
+                    }
+                    if h != p.pressed {
+                        p.pressed = h;
+                        let _ = InvalidateRect(Some(hwnd), None, false);
+                    }
+                    if h.is_some() {
+                        SetCapture(hwnd);
+                    }
+                }
+                LRESULT(0)
+            }
             WM_LBUTTONUP => {
                 let (x, y) = xy(lp);
                 let Some(p) = popup(hwnd) else { return LRESULT(0) };
-                match p.hit(hwnd, x, y) {
-                    Some(Hit::Allow) => finish(hwnd, Answer::Allow),
-                    Some(Hit::Deny) => finish(hwnd, Answer::Deny),
-                    None => {}
+                let was = p.pressed.take();
+                if GetCapture() == hwnd {
+                    let _ = ReleaseCapture();
+                }
+                let hit_now = p.hit(hwnd, x, y);
+                if hit_now == Some(Hit::Allow) && p.shown_at.elapsed() < COOLDOWN {
+                    if was.is_some() {
+                        let _ = InvalidateRect(Some(hwnd), None, false);
+                    }
+                    return LRESULT(0);
+                }
+                if let (Some(w), Some(now)) = (was, hit_now)
+                    && w == now
+                {
+                    match now {
+                        Hit::Allow => finish(hwnd, Answer::Allow),
+                        Hit::Deny => finish(hwnd, Answer::Deny),
+                    }
+                } else if was.is_some() {
+                    let _ = InvalidateRect(Some(hwnd), None, false);
                 }
                 LRESULT(0)
             }

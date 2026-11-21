@@ -344,7 +344,13 @@ impl Drop for Clipboard {
             let _ = PostMessageW(Some(HWND(self.hwnd as *mut _)), WM_CLOSE, WPARAM(0), LPARAM(0));
         }
         if let Some(t) = self.thread.take() {
-            let _ = t.join();
+            if tokio::runtime::Handle::try_current().is_ok() {
+                let _ = std::thread::Builder::new().name("clipboard-join".into()).spawn(move || {
+                    let _ = t.join();
+                });
+            } else {
+                let _ = t.join();
+            }
         }
     }
 }

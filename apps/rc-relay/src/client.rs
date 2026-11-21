@@ -14,7 +14,7 @@ use iroh_base::{PublicKey, RelayUrl, SecretKey};
 use iroh_relay::tls::CaTlsConfig;
 use rc_ident::{proof::unix_now, relay_code::RelayCode};
 
-use crate::api::{self, ClaimRequest, Guest, GuestsRequest, Invite, InvitesRequest, MeetRequest, Refusal};
+use crate::api::{self, ClaimRequest, Guest, GuestsRequest, Invite, InvitesRequest, Kind, MeetRequest, Refusal};
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 /// The head start of each address over the next one (Happy Eyeballs).
@@ -138,7 +138,7 @@ pub async fn set_guests(relay: &[RelayUrl], device: &SecretKey, ca: &CaTlsConfig
         async move { race(relay, |u| call(client.clone(), u, api::GUESTS_PATH, req.clone())).await }
     };
     let body = match send(guests).await?.1 {
-        Err(Refusal::BadRequest) if guests.iter().any(|g| !g.name.is_empty()) => {
+        Err(Refusal::BadRequest) if guests.iter().any(|g| !g.name.is_empty() || g.kind != Kind::Unknown) => {
             let plain: Vec<Guest> = guests.iter().map(|g| Guest::from(g.id)).collect();
             send(&plain).await?.1?
         }
@@ -229,10 +229,14 @@ pub async fn watch(relay: &[RelayUrl], device: &SecretKey, ca: &CaTlsConfig, syn
     };
     let (url, r) = race(relay, open).await?;
     let Some(mut res) = r? else { return Err(anyhow::Error::new(NoWatch)) };
+    const MAX_WATCH_LINE: usize = 8192;
     let mut line = Vec::new();
     while let Some(chunk) = res.chunk().await.with_context(|| format!("{url}"))? {
         for &b in chunk.iter() {
             if b != b'\n' {
+                if line.len() >= MAX_WATCH_LINE {
+                    bail!("{url}: watch line exceeded {MAX_WATCH_LINE} bytes");
+                }
                 line.push(b);
                 continue;
             }

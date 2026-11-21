@@ -6,7 +6,7 @@
 //! comes from `ephemeral` (iroh and the relay handshake prove that).
 //!
 //! Payload: version 1, device key, ephemeral key, expiry (Unix seconds, big
-//! endian), Ed25519 signature over [`DOMAIN`] and the fields before it.
+//! endian), Ed25519 signature over `DOMAIN` and the fields before it.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 

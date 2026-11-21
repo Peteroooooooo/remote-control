@@ -16,7 +16,7 @@
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
-    sync::{Mutex, RwLock},
+    sync::RwLock,
 };
 
 use iroh_base::EndpointId;
@@ -33,6 +33,8 @@ struct Roster {
     /// Guests kicked on the relay (`kicked.txt`), waiting for the owner's
     /// client to sync the drop notice.
     kicked: HashSet<(EndpointId, EndpointId)>,
+    /// (owner, device that brought its invite) and (until Unix seconds, name).
+    met: HashMap<(EndpointId, EndpointId), (u64, String)>,
 }
 
 #[derive(Debug, Default)]
@@ -40,24 +42,26 @@ struct Peer {
     conns: Vec<(ConnectionId, Option<EndpointId>)>,
 }
 
-
 #[derive(Debug)]
 pub struct Policy {
     roster: RwLock<Roster>,
-    peers: Mutex<HashMap<EndpointId, Peer>>,
-    /// (owner, device that brought its invite) and (until Unix seconds, name).
-    met: Mutex<HashMap<(EndpointId, EndpointId), (u64, String)>>,
+    peers: RwLock<HashMap<EndpointId, Peer>>,
 }
 
-/// The devices an endpoint counts as: itself and what its proofs speak for.
-fn devices(peers: &HashMap<EndpointId, Peer>, id: &EndpointId) -> Vec<EndpointId> {
-    let mut v = vec![*id];
-    if let Some(p) = peers.get(id) {
-        v.extend(p.conns.iter().filter_map(|(_, s)| *s));
-    }
-    v
+/// Checks `f(x, y)` across `src` / `dst` and any devices their proofs speak for,
+/// without heap allocation.
+fn any_device_pair(
+    src: &EndpointId,
+    src_conns: &[(ConnectionId, Option<EndpointId>)],
+    dst: &EndpointId,
+    dst_conns: &[(ConnectionId, Option<EndpointId>)],
+    mut f: impl FnMut(&EndpointId, &EndpointId) -> bool,
+) -> bool {
+    let mut check_x = |y: &EndpointId| {
+        f(src, y) || src_conns.iter().filter_map(|(_, s)| s.as_ref()).any(|x| f(x, y))
+    };
+    check_x(dst) || dst_conns.iter().filter_map(|(_, s)| s.as_ref()).any(check_x)
 }
-
 
 impl Policy {
     pub fn new(
@@ -69,8 +73,9 @@ impl Policy {
             owners: owners.into_iter().collect(),
             guests: guests.into_iter().map(|(o, gs)| (o, gs.into_iter().collect())).collect(),
             kicked: kicked.into_iter().collect(),
+            met: HashMap::new(),
         };
-        Policy { roster: RwLock::new(r), peers: Mutex::default(), met: Mutex::default() }
+        Policy { roster: RwLock::new(r), peers: RwLock::default() }
     }
 
     pub fn set_roster(
@@ -80,8 +85,8 @@ impl Policy {
         kicked: impl IntoIterator<Item = (EndpointId, EndpointId)>,
     ) {
         let kicked_set: HashSet<(EndpointId, EndpointId)> = kicked.into_iter().collect();
-        self.met.lock().unwrap().retain(|k, _| !kicked_set.contains(k));
         let mut r = self.roster.write().unwrap();
+        r.met.retain(|k, _| !kicked_set.contains(k));
         r.owners = owners.into_iter().collect();
         r.guests = guests.into_iter().map(|(o, gs)| (o, gs.into_iter().collect())).collect();
         r.kicked = kicked_set;
@@ -92,8 +97,8 @@ impl Policy {
     /// (the owner's lobby closed) stops the forwarding.
     pub fn set_guests(&self, owner: EndpointId, guests: Vec<EndpointId>) {
         let set: HashSet<EndpointId> = guests.into_iter().collect();
-        self.met.lock().unwrap().retain(|(o, d), _| *o != owner || !set.contains(d));
         let mut r = self.roster.write().unwrap();
+        r.met.retain(|(o, d), _| *o != owner || !set.contains(d));
         if set.is_empty() {
             r.guests.remove(&owner);
         } else {
@@ -105,23 +110,23 @@ impl Policy {
     /// other until `until` (Unix seconds).
     pub fn admit(&self, owner: EndpointId, device: EndpointId, name: &str, until: u64) {
         let now = unix_now();
-        let mut m = self.met.lock().unwrap();
-        m.retain(|_, (t, _)| *t > now);
-        m.insert((owner, device), (until, name.to_string()));
+        let mut r = self.roster.write().unwrap();
+        r.met.retain(|_, (t, _)| *t > now);
+        r.met.insert((owner, device), (until, name.to_string()));
     }
 
     /// Whether `device` was admitted to `owner` and still is.
     pub fn admitted(&self, owner: &EndpointId, device: &EndpointId) -> bool {
-        self.met.lock().unwrap().get(&(*owner, *device)).is_some_and(|(t, _)| *t > unix_now())
+        self.roster.read().unwrap().met.get(&(*owner, *device)).is_some_and(|(t, _)| *t > unix_now())
     }
 
     /// Active temporary guests (`(owner, guest, name)`) for `status.txt`.
     pub fn admitted_list(&self) -> Vec<(EndpointId, EndpointId, String)> {
         let now = unix_now();
-        let r = self.roster.read().unwrap();
-        let mut m = self.met.lock().unwrap();
-        m.retain(|_, (t, _)| *t > now);
-        let mut v: Vec<_> = m
+        let mut r = self.roster.write().unwrap();
+        r.met.retain(|_, (t, _)| *t > now);
+        let mut v: Vec<_> = r
+            .met
             .iter()
             .filter(|((o, d), _)| r.owners.contains_key(o) && !r.kicked.contains(&(*o, *d)))
             .map(|((o, d), (_, n))| (*o, *d, n.clone()))
@@ -140,8 +145,11 @@ impl Policy {
 
     /// The devices connected now (by key, and by what their proofs speak for).
     pub fn online(&self) -> HashSet<EndpointId> {
-        let peers = self.peers.lock().unwrap();
-        peers.keys().flat_map(|id| devices(&peers, id)).collect()
+        let peers = self.peers.read().unwrap();
+        peers
+            .iter()
+            .flat_map(|(id, p)| std::iter::once(*id).chain(p.conns.iter().filter_map(|(_, s)| *s)))
+            .collect()
     }
 }
 
@@ -178,12 +186,12 @@ impl AccessControl for Policy {
             }
         };
         info!("{} connected ({}): {what}", id.fmt_short(), req.connection_id());
-        self.peers.lock().unwrap().entry(id).or_default().conns.push((req.connection_id(), speaks));
+        self.peers.write().unwrap().entry(id).or_default().conns.push((req.connection_id(), speaks));
         Access::Allow
     }
 
     fn on_disconnect(&self, id: EndpointId, conn: ConnectionId) {
-        let mut peers = self.peers.lock().unwrap();
+        let mut peers = self.peers.write().unwrap();
         if let Some(p) = peers.get_mut(&id) {
             p.conns.retain(|(c, _)| *c != conn);
             if p.conns.is_empty() {
@@ -195,21 +203,32 @@ impl AccessControl for Policy {
 
     fn allow_forward(&self, src: EndpointId, dst: EndpointId, _len: usize) -> bool {
         let r = self.roster.read().unwrap();
-        let peers = self.peers.lock().unwrap();
-        let (a, b) = (devices(&peers, &src), devices(&peers, &dst));
-        let same_code = |x: &EndpointId, y: &EndpointId| r.owners.get(x).is_some_and(|c| r.owners.get(y) == Some(c));
-        if a.iter().any(|x| b.iter().any(|y| same_code(x, y))) {
+        let peers = self.peers.read().unwrap();
+        let src_conns = peers.get(&src).map(|p| p.conns.as_slice()).unwrap_or(&[]);
+        let dst_conns = peers.get(&dst).map(|p| p.conns.as_slice()).unwrap_or(&[]);
+        if any_device_pair(&src, src_conns, &dst, dst_conns, |x, y| {
+            r.owners.get(x).is_some_and(|c| r.owners.get(y) == Some(c))
+        }) {
             return true;
         }
-        let met = self.met.lock().unwrap();
-        let now = unix_now();
-        let pair = |o: &EndpointId, g: &EndpointId| {
+        let guest_pair = |o: &EndpointId, g: &EndpointId| {
             r.owners.contains_key(o)
                 && !r.kicked.contains(&(*o, *g))
-                && (r.guests.get(o).is_some_and(|gs| gs.contains(g))
-                    || met.get(&(*o, *g)).is_some_and(|(t, _)| *t > now))
+                && r.guests.get(o).is_some_and(|gs| gs.contains(g))
         };
-        a.iter().any(|x| b.iter().any(|y| pair(x, y) || pair(y, x)))
+        if any_device_pair(&src, src_conns, &dst, dst_conns, |x, y| guest_pair(x, y) || guest_pair(y, x)) {
+            return true;
+        }
+        if r.met.is_empty() {
+            return false;
+        }
+        let now = unix_now();
+        let met_pair = |o: &EndpointId, g: &EndpointId| {
+            r.owners.contains_key(o)
+                && !r.kicked.contains(&(*o, *g))
+                && r.met.get(&(*o, *g)).is_some_and(|(t, _)| *t > now)
+        };
+        any_device_pair(&src, src_conns, &dst, dst_conns, |x, y| met_pair(x, y) || met_pair(y, x))
     }
 }
 

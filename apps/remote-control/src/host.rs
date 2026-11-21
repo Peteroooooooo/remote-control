@@ -117,6 +117,7 @@ impl HostArgs {
                 scenario_hint: !self.no_hints,
                 qp_control: false,
                 yuv444: false,
+                allow_untrusted_hevc: false,
             },
             shrink: self.shrink,
             hevc: self.codec == "auto",
@@ -184,8 +185,10 @@ pub async fn session(conn: Connection, send: SendStream, mut recv: RecvStream, h
 async fn stream(conn: &Connection, mut send: SendStream, recv: &mut RecvStream, hello: Hello, cfg: PipeConfig, service: bool) -> Result<()> {
     let hevc = cfg.hevc && hello.caps & CAN_HEVC != 0;
     let cfg = PipeConfig { hevc, viewer444: hevc && hello.caps & CAN_HEVC444 != 0, ..cfg };
+    let sh = Arc::new(PipeShared::default());
+    *sh.quality.lock().unwrap() = hello.quality();
     // The capture loop sets the real rate and highest bitrate before the first frame.
-    let tx = VideoTx::start(conn.clone(), 60, 20e6);
+    let tx = VideoTx::start(conn.clone(), 60, 20e6, sh.want_key.clone());
     let _ = send.set_priority(100);
     let (wtx, mut wrx) = mpsc::unbounded_channel::<Msg>();
     {
@@ -199,8 +202,6 @@ async fn stream(conn: &Connection, mut send: SendStream, recv: &mut RecvStream, 
             }
         });
     }
-    let sh = Arc::new(PipeShared::default());
-    *sh.quality.lock().unwrap() = hello.quality();
     let pipe = {
         let (tx, sh, info) = (tx.clone(), sh.clone(), wtx.clone());
         std::thread::Builder::new().name("capture".into()).spawn(move || pipeline::run(cfg, tx, sh, info))?
@@ -209,13 +210,14 @@ async fn stream(conn: &Connection, mut send: SendStream, recv: &mut RecvStream, 
         let (out, sh) = (wtx.clone(), sh.clone());
         std::thread::Builder::new().name("cursor".into()).spawn(move || cursor::watch(out, sh))?;
     }
-    let clip = match ClipSync::start(conn, wtx.clone(), true, service, None) {
+    let clip = match ClipSync::start_clip(conn, wtx.clone(), true, service) {
         Ok(c) => Some(c),
         Err(e) => {
             log!("clipboard sharing off: {e:#}");
             None
         }
     };
+    tokio::spawn(crate::clipsync::accept_uni_loop(conn.clone(), clip.as_ref().map(Arc::downgrade), None));
     {
         let (tx, wtx, conn) = (tx.clone(), wtx.clone(), conn.clone());
         tokio::spawn(async move {
@@ -234,7 +236,7 @@ async fn stream(conn: &Connection, mut send: SendStream, recv: &mut RecvStream, 
     tokio::spawn(watch_path(conn.clone(), tx.clone(), audio_paused, sh.clone(), wtx.clone()));
     tokio::spawn(watch_hint(conn.clone(), sh.clone(), wtx.clone()));
     let result = control_loop(recv, &sh, &wtx, clip.as_deref(), &audio_host).await;
-    drop(audio_host);
+    let _ = tokio::task::spawn_blocking(move || drop(audio_host)).await;
     sh.stop.store(true, Ordering::Relaxed);
     let _ = tokio::task::spawn_blocking(move || pipe.join()).await;
     conn.close(0u32.into(), b"bye");
@@ -312,7 +314,19 @@ async fn watch_hint(conn: Connection, sh: Arc<PipeShared>, wtx: mpsc::UnboundedS
     }
 }
 
+enum InjectCmd {
+    Move { display: windows::Win32::Foundation::RECT, x: u16, y: u16 },
+    Button { display: windows::Win32::Foundation::RECT, button: u8, down: bool },
+    Wheel { display: windows::Win32::Foundation::RECT, delta: i16, horizontal: bool },
+    Key { display: windows::Win32::Foundation::RECT, scan: u16, down: bool },
+    ReleaseAll { display: windows::Win32::Foundation::RECT },
+    Cursor { display: windows::Win32::Foundation::RECT, reply: tokio::sync::oneshot::Sender<(u16, u16)> },
+}
+
 /// Applies the viewer's input until the control stream ends.
+/// All `SetThreadDesktop` / `SendInput` / `GetCursorPos` calls are isolated to
+/// a dedicated OS thread so Tokio worker threads never have their desktop
+/// binding mutated or blocked by input injection.
 async fn control_loop(
     recv: &mut RecvStream,
     sh: &PipeShared,
@@ -320,26 +334,69 @@ async fn control_loop(
     clip: Option<&ClipSync>,
     audio_host: &AudioHost,
 ) -> Result<()> {
-    let mut inj = Injector::new(*sh.display.lock().unwrap());
+    let init_display = *sh.display.lock().unwrap();
+    let (inj_tx, inj_rx) = std::sync::mpsc::channel::<InjectCmd>();
+    let inj_thread = std::thread::Builder::new().name("inject".into()).spawn(move || {
+        let mut inj = Injector::new(init_display);
+        while let Ok(cmd) = inj_rx.recv() {
+            match cmd {
+                InjectCmd::Move { display, x, y } => {
+                    inj.set_display(display);
+                    inj.move_to(x, y);
+                }
+                InjectCmd::Button { display, button, down } => {
+                    inj.set_display(display);
+                    inj.button(button, down);
+                }
+                InjectCmd::Wheel { display, delta, horizontal } => {
+                    inj.set_display(display);
+                    inj.wheel(delta, horizontal);
+                }
+                InjectCmd::Key { display, scan, down } => {
+                    inj.set_display(display);
+                    inj.key(scan, down);
+                }
+                InjectCmd::ReleaseAll { display } => {
+                    inj.set_display(display);
+                    inj.release_all();
+                }
+                InjectCmd::Cursor { display, reply } => {
+                    inj.set_display(display);
+                    let _ = reply.send(inj.cursor());
+                }
+            }
+        }
+        inj.release_all();
+    })?;
     let result = loop {
         let msg = match read_msg(recv).await {
             Ok(m) => m,
             Err(e) => break Err(e),
         };
-        inj.set_display(*sh.display.lock().unwrap());
+        let display = *sh.display.lock().unwrap();
         match msg {
-            Msg::MouseMove { x, y } => inj.move_to(x, y),
-            Msg::MouseButton { button, down } => inj.button(button, down),
-            Msg::Wheel { delta, horizontal } => inj.wheel(delta, horizontal),
-            Msg::Key { scan, down } => inj.key(scan, down),
-            Msg::ReleaseAll => inj.release_all(),
+            Msg::MouseMove { x, y } => {
+                let _ = inj_tx.send(InjectCmd::Move { display, x, y });
+            }
+            Msg::MouseButton { button, down } => {
+                let _ = inj_tx.send(InjectCmd::Button { display, button, down });
+            }
+            Msg::Wheel { delta, horizontal } => {
+                let _ = inj_tx.send(InjectCmd::Wheel { display, delta, horizontal });
+            }
+            Msg::Key { scan, down } => {
+                let _ = inj_tx.send(InjectCmd::Key { display, scan, down });
+            }
+            Msg::ReleaseAll => {
+                let _ = inj_tx.send(InjectCmd::ReleaseAll { display });
+            }
             Msg::RequestKeyframe => sh.want_key.store(true, Ordering::Relaxed),
             Msg::Quality(q) => {
                 let mut cur = sh.quality.lock().unwrap();
                 if *cur != q {
                     log!("viewer wants the picture {q:?}");
                     *cur = q;
-                    sh.quality_changed.store(true, Ordering::Relaxed);
+                    sh.quality_changed.store(true, Ordering::Release);
                 }
             }
             Msg::SelectMonitor { index } => match crate::monitors::select(&sh.monitors, index) {
@@ -368,10 +425,15 @@ async fn control_loop(
                 let _ = wtx.send(Msg::Pong { t_us });
             }
             Msg::Probe { x, y } => {
-                inj.move_to(x, y);
+                let _ = inj_tx.send(InjectCmd::Move { display, x, y });
                 tokio::time::sleep(Duration::from_millis(50)).await;
-                let (cx, cy) = inj.cursor();
-                let _ = wtx.send(Msg::ProbeReply { x: cx, y: cy });
+                let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                let cur_display = *sh.display.lock().unwrap();
+                if inj_tx.send(InjectCmd::Cursor { display: cur_display, reply: reply_tx }).is_ok()
+                    && let Ok((cx, cy)) = reply_rx.await
+                {
+                    let _ = wtx.send(Msg::ProbeReply { x: cx, y: cy });
+                }
             }
             Msg::ClipOffer { seq, .. } => {
                 if let Some(c) = clip {
@@ -382,7 +444,8 @@ async fn control_loop(
             _ => {}
         }
     };
-    inj.release_all();
+    drop(inj_tx);
+    let _ = tokio::task::spawn_blocking(move || inj_thread.join()).await;
     // The viewer closing its window ends the stream; that is a normal exit.
     match result {
         Err(e) if format!("{e:#}").contains("closed") => Ok(()),

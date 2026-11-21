@@ -200,8 +200,9 @@ impl Injector {
     pub fn cursor(&self) -> (u16, u16) {
         follow_desktop(false);
         let mut p = POINT::default();
-        unsafe {
-            let _ = GetCursorPos(&mut p);
+        if unsafe { GetCursorPos(&mut p) }.is_err() {
+            follow_desktop(true);
+            let _ = unsafe { GetCursorPos(&mut p) };
         }
         desktop_to_stream(&self.display, p.x, p.y)
     }

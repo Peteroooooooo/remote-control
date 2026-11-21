@@ -69,8 +69,7 @@ pub fn requested() -> bool {
 /// Resolves with the close code once someone asks the host to go away.
 pub async fn wait() -> u32 {
     let mut rx = code().subscribe();
-    let c = *rx.wait_for(|c| *c != 0).await.expect("the sender is static");
-    c
+    *rx.wait_for(|c| *c != 0).await.expect("the sender is static")
 }
 
 /// The sessions are closed: an asker waiting in `request_and_wait` may return.

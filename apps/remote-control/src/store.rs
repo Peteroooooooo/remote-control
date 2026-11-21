@@ -55,6 +55,32 @@ pub fn clean(name: &str) -> String {
     name.chars().map(|c| if c.is_control() { ' ' } else { c }).collect::<String>().trim().chars().take(64).collect()
 }
 
+fn write_atomic(path: &Path, content: &[u8]) -> Result<()> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    if let Some(dir) = path.parent()
+        && !dir.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+    }
+    let n = SEQ.fetch_add(1, Ordering::Relaxed);
+    let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("data");
+    let tmp = path.with_file_name(format!(".{name}.{}.{n}.tmp", std::process::id()));
+    let res = (|| -> Result<()> {
+        let mut f = std::fs::File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
+        f.write_all(content).with_context(|| format!("write {}", tmp.display()))?;
+        f.sync_all().with_context(|| format!("sync {}", tmp.display()))?;
+        drop(f);
+        std::fs::rename(&tmp, path).with_context(|| format!("write {}", path.display()))?;
+        Ok(())
+    })();
+    if res.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    res
+}
+
 fn addrs(field: Option<&str>) -> Vec<SocketAddr> {
     field.map_or(Vec::new(), |a| a.split(',').filter_map(|s| s.trim().parse().ok()).collect())
 }
@@ -133,12 +159,7 @@ impl Store {
             let relay = url_list(&d.relays);
             text += &format!("{}\t{flags}\t{}\t{relay}\t{}\n", d.id, clean(&d.name), addrs.join(","));
         }
-        if let Some(dir) = self.path.parent() {
-            std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
-        }
-        let tmp = self.path.with_extension("tmp");
-        std::fs::write(&tmp, text).with_context(|| format!("write {}", tmp.display()))?;
-        std::fs::rename(&tmp, &self.path).with_context(|| format!("write {}", self.path.display()))
+        write_atomic(&self.path, text.as_bytes())
     }
 
     /// A device in the list (deleted ones are not).
@@ -262,9 +283,6 @@ impl Settings {
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
         let mut text = format!("name={}\n", clean(&self.name));
         for r in &self.relays {
             text += &format!("relay={}\n", url_list(r));
@@ -277,7 +295,7 @@ impl Settings {
             self.lock_control as u8,
             self.stay_awake as u8,
         );
-        std::fs::write(path, text).with_context(|| format!("write {}", path.display()))
+        write_atomic(path, text.as_bytes())
     }
 
     /// The name other devices see: the one set here, else the computer name.

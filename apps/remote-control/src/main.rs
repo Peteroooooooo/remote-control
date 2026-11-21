@@ -220,15 +220,10 @@ fn attach_parent_console() {
 }
 
 fn setup_process() {
-    use windows::Win32::{
-        Media::timeBeginPeriod,
-        UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext},
-    };
+    use windows::Win32::UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext};
     unsafe {
         // Real pixels everywhere: capture sizes, window sizes, pointer positions.
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-        // Windows timers tick every 15.6 ms by default, too coarse for pacing.
-        timeBeginPeriod(1);
     }
 }
 

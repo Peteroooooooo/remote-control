@@ -137,7 +137,7 @@ fn effective_lossless_rate(host_rate: u32, viewer_max_rate: u32) -> u32 {
 }
 
 fn parse_mix_format(wfx_ptr: *const WAVEFORMATEX) -> Result<(PcmFormat, usize)> {
-    let wfx = unsafe { *wfx_ptr };
+    let wfx = unsafe { ptr::read_unaligned(wfx_ptr) };
     let tag = wfx.wFormatTag as u32;
     let channels = wfx.nChannels;
     let rate = wfx.nSamplesPerSec;
@@ -148,13 +148,21 @@ fn parse_mix_format(wfx_ptr: *const WAVEFORMATEX) -> Result<(PcmFormat, usize)> 
         SampleFmt::F32
     } else if tag == WAVE_FORMAT_PCM && bits == 16 {
         SampleFmt::I16
+    } else if tag == WAVE_FORMAT_PCM && bits == 24 {
+        SampleFmt::I24
+    } else if tag == WAVE_FORMAT_PCM && bits == 32 {
+        SampleFmt::I32
     } else if tag == WAVE_FORMAT_EXTENSIBLE && wfx.cbSize >= 22 {
-        let wfxe = unsafe { *(wfx_ptr as *const WAVEFORMATEXTENSIBLE) };
+        let wfxe = unsafe { ptr::read_unaligned(wfx_ptr as *const WAVEFORMATEXTENSIBLE) };
         let sub = wfxe.SubFormat;
         if sub == KSDATAFORMAT_SUBTYPE_IEEE_FLOAT && bits == 32 {
             SampleFmt::F32
         } else if sub == KSDATAFORMAT_SUBTYPE_PCM && bits == 16 {
             SampleFmt::I16
+        } else if sub == KSDATAFORMAT_SUBTYPE_PCM && bits == 24 {
+            SampleFmt::I24
+        } else if sub == KSDATAFORMAT_SUBTYPE_PCM && bits == 32 {
+            SampleFmt::I32
         } else {
             bail!("unsupported extensible WASAPI format: bits={bits}");
         }
@@ -365,6 +373,20 @@ impl Drop for HostMuteGuard {
     }
 }
 
+/// Best-effort unmute of the default render endpoint when an `audio-agent`
+/// child exits abnormally or is killed before `HostMuteGuard::drop` runs.
+pub fn force_unmute_default_render() {
+    let Ok(_com) = ComGuard::init() else { return };
+    let Ok(enumerator) = (unsafe { CoCreateInstance::<_, IMMDeviceEnumerator>(&MMDeviceEnumerator, None, CLSCTX_ALL) }) else {
+        return;
+    };
+    if let Ok((dev, _)) = default_render_device(&enumerator)
+        && let Ok(vol) = (unsafe { dev.Activate::<IAudioEndpointVolume>(CLSCTX_ALL, None) })
+    {
+        let _ = unsafe { vol.SetMute(false, ptr::null()) };
+    }
+}
+
 pub struct CaptureState {
     pub stop: AtomicBool,
     pub enabled: AtomicBool,
@@ -411,6 +433,8 @@ impl CaptureLoop {
                 mute_guard.poll();
                 continue;
             }
+
+            let _timer = super::TimerPeriodGuard::enter(1);
 
             let cur_lossless = shared.lossless.load(Ordering::Relaxed);
             let cur_max_rate = shared.max_rate_hz.load(Ordering::Relaxed);
@@ -647,16 +671,171 @@ fn parse_incoming_pkt(d: Bytes) -> Option<ParsedPkt> {
     }
 }
 
+fn drain_rx(rx: &mut UnboundedReceiver<Bytes>) -> bool {
+    loop {
+        match rx.try_recv() {
+            Ok(_) => {}
+            Err(TryRecvError::Empty) => return true,
+            Err(TryRecvError::Disconnected) => return false,
+        }
+    }
+}
+
+/// Keeps at most ~2 ms of buffered audio and fades it linearly to 0.0 so codec
+/// switches do not click or pop.
+fn fade_out_tail(pcm_queue: &mut VecDeque<f32>, rate: u32, ch: usize) {
+    if ch == 0 {
+        pcm_queue.clear();
+        return;
+    }
+    let fade_frames = (rate as usize / 500).max(1);
+    let keep_floats = fade_frames * ch;
+    if pcm_queue.len() > keep_floats {
+        pcm_queue.truncate(keep_floats);
+    }
+    let actual_frames = pcm_queue.len() / ch;
+    if actual_frames == 0 {
+        pcm_queue.clear();
+        return;
+    }
+    for f in 0..actual_frames {
+        let gain = 1.0 - (f + 1) as f32 / actual_frames as f32;
+        for c in 0..ch {
+            if let Some(s) = pcm_queue.get_mut(f * ch + c) {
+                *s *= gain;
+            }
+        }
+    }
+}
+
+/// Lightweight adaptive jitter buffer controller for viewer audio playback.
+struct JitterCtrl {
+    target_ms: u32,
+    last_bump: Option<Instant>,
+    last_decay: Option<Instant>,
+    gap_since: Option<Instant>,
+}
+
+impl JitterCtrl {
+    const BASE_MS: u32 = 10;
+    const MAX_MS: u32 = 45;
+    const STEP_UP_MS: u32 = 10;
+    const DECAY_STEP_MS: u32 = 5;
+    const LOW_BUFFER_MS: u32 = 12;
+    const WASAPI_HEADROOM_MS: u32 = 25;
+    const STABLE_HOLD: Duration = Duration::from_secs(15);
+    const DECAY_INTERVAL: Duration = Duration::from_secs(5);
+
+    fn new() -> Self {
+        Self {
+            target_ms: Self::BASE_MS,
+            last_bump: None,
+            last_decay: None,
+            gap_since: None,
+        }
+    }
+
+    fn target_ms(&self) -> u32 {
+        self.target_ms
+    }
+
+    fn wasapi_ceiling_ms(&self) -> u32 {
+        self.target_ms() + Self::WASAPI_HEADROOM_MS
+    }
+
+    fn prime_params(&self, frame_ms: u32) -> (usize, Duration) {
+        let frame_ms = frame_ms.max(1);
+        let packets = (self.target_ms / frame_ms).max(1) as usize;
+        let timeout = Duration::from_millis(self.target_ms.max(20) as u64);
+        (packets, timeout)
+    }
+
+    fn max_pending(&self, codec: u8) -> usize {
+        let (base_max, frame_ms) = if codec == CODEC_PCM24 {
+            (10usize, 10u32)
+        } else {
+            (5usize, 20u32)
+        };
+        let extra = self.target_ms.saturating_sub(Self::BASE_MS).div_ceil(frame_ms) as usize;
+        base_max + extra
+    }
+
+    fn on_jitter_event(&mut self, now: Instant) {
+        self.target_ms = (self.target_ms + Self::STEP_UP_MS).min(Self::MAX_MS);
+        self.last_bump = Some(now);
+        self.last_decay = None;
+    }
+
+    fn tick(&mut self, now: Instant) {
+        if self.target_ms <= Self::BASE_MS {
+            return;
+        }
+        let Some(bumped) = self.last_bump else {
+            return;
+        };
+        if now.saturating_duration_since(bumped) < Self::STABLE_HOLD {
+            return;
+        }
+        let due = self
+            .last_decay
+            .is_none_or(|prev| now.saturating_duration_since(prev) >= Self::DECAY_INTERVAL);
+        if due {
+            self.target_ms = self
+                .target_ms
+                .saturating_sub(Self::DECAY_STEP_MS)
+                .max(Self::BASE_MS);
+            self.last_decay = Some(now);
+        }
+    }
+
+    fn should_wait_gap(&mut self, now: Instant, buffered_ms: u32) -> bool {
+        if buffered_ms <= Self::LOW_BUFFER_MS {
+            self.gap_since = None;
+            return false;
+        }
+        let since = *self.gap_since.get_or_insert(now);
+        if now.saturating_duration_since(since) < Duration::from_millis(self.target_ms as u64) {
+            true
+        } else {
+            self.gap_since = None;
+            false
+        }
+    }
+
+    fn clear_gap(&mut self) {
+        self.gap_since = None;
+    }
+
+    fn reset_stream(&mut self) {
+        self.gap_since = None;
+    }
+}
+
+/// Maps UI volume percentage `0..=100` to linear amplitude using a quadratic
+/// perceptual curve (`(v/100)^2`), giving fine control at low background levels.
+fn volume_gain(pct: u8) -> f32 {
+    if pct == 0 {
+        0.0
+    } else if pct >= 100 {
+        1.0
+    } else {
+        let x = pct as f32 / 100.0;
+        x * x
+    }
+}
+
 pub struct Player;
 
 impl Player {
-    pub fn run(mut rx: UnboundedReceiver<Bytes>, stop: Arc<AtomicBool>) {
-        if let Err(e) = Self::run_inner(&mut rx, &stop) {
+    /// Runs the audio player with an explicit `reset` signal (set on reconnect or
+    /// host handoff so sequence numbers restarting from 0 are accepted immediately).
+    pub fn run_with_reset(mut rx: UnboundedReceiver<Bytes>, stop: Arc<AtomicBool>, reset: Arc<AtomicBool>) {
+        if let Err(e) = Self::run_inner(&mut rx, &stop, &reset) {
             log!("audio playback ended: {e:#}");
         }
     }
 
-    fn run_inner(rx: &mut UnboundedReceiver<Bytes>, stop: &AtomicBool) -> Result<()> {
+    fn run_inner(rx: &mut UnboundedReceiver<Bytes>, stop: &AtomicBool, reset: &AtomicBool) -> Result<()> {
         let _com = ComGuard::init().context("COM init for audio playback")?;
         let enumerator: IMMDeviceEnumerator =
             unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) }.context("MMDeviceEnumerator")?;
@@ -673,21 +852,31 @@ impl Player {
         let mut last_rx_at: Option<Instant> = None;
         let mut desired_rate: u32 = SAMPLE_RATE;
         let mut cur_codec: u8 = CODEC_OPUS;
+        let mut jitter = JitterCtrl::new();
 
         while !stop.load(Ordering::Relaxed) {
+            if reset.swap(false, Ordering::AcqRel) {
+                pending.clear();
+                pcm_queue.clear();
+                expected_seq = None;
+                last_rx = None;
+                last_rx_at = None;
+                jitter.reset_stream();
+                resampler.reset();
+            }
+
             let Ok((dev, cur_id)) = default_render_device(&enumerator) else {
-                loop {
-                    match rx.try_recv() {
-                        Ok(_) => {}
-                        Err(TryRecvError::Empty) => break,
-                        Err(TryRecvError::Disconnected) => return Ok(()),
-                    }
+                if !drain_rx(rx) {
+                    return Ok(());
                 }
                 std::thread::sleep(Duration::from_millis(500));
                 continue;
             };
 
             let Ok(audio_client) = (unsafe { dev.Activate::<IAudioClient>(CLSCTX_ALL, None) }) else {
+                if !drain_rx(rx) {
+                    return Ok(());
+                }
                 std::thread::sleep(Duration::from_millis(500));
                 continue;
             };
@@ -710,6 +899,9 @@ impl Player {
                 PcmFormat { rate: active_rate, channels: 2, sample: SampleFmt::F32 }
             } else {
                 let Ok(mix_ptr) = (unsafe { audio_client.GetMixFormat() }) else {
+                    if !drain_rx(rx) {
+                        return Ok(());
+                    }
                     std::thread::sleep(Duration::from_millis(500));
                     continue;
                 };
@@ -720,6 +912,9 @@ impl Player {
                 });
                 unsafe { CoTaskMemFree(Some(mix_ptr as *const _)) };
                 let Ok(fmt) = init_res else {
+                    if !drain_rx(rx) {
+                        return Ok(());
+                    }
                     std::thread::sleep(Duration::from_millis(500));
                     continue;
                 };
@@ -734,14 +929,31 @@ impl Player {
 
             resampler.reset();
             pcm_queue.clear();
+            jitter.reset_stream();
             let mut primed = false;
             let mut first_pending_at: Option<Instant> = None;
+            let mut underrun_armed = false;
             let mut last_dev_check = Instant::now();
+            let mut timer_guard: Option<super::TimerPeriodGuard> = None;
+            let mut cur_gain = volume_gain(super::config::viewer_volume());
             let dev_ch = fmt.channels as usize;
             let dev_10ms_floats = (fmt.rate as usize / 100).max(1) * dev_ch;
-            let max_queue_floats = dev_10ms_floats * 10; // ~100 ms cap
+            let max_queue_floats = dev_10ms_floats * 12; // ~120 ms cap
 
             'reopen: while !stop.load(Ordering::Relaxed) {
+                if reset.swap(false, Ordering::AcqRel) {
+                    pending.clear();
+                    pcm_queue.clear();
+                    expected_seq = None;
+                    last_rx = None;
+                    last_rx_at = None;
+                    primed = false;
+                    first_pending_at = None;
+                    underrun_armed = false;
+                    jitter.reset_stream();
+                    resampler.reset();
+                }
+
                 loop {
                     match rx.try_recv() {
                         Ok(d) => {
@@ -751,12 +963,33 @@ impl Player {
                             if !super::config::viewer_enabled() {
                                 continue;
                             }
+                            if pcm_queue.is_empty()
+                                && pending.is_empty()
+                                && last_rx_at.is_some_and(|t| t.elapsed() >= Duration::from_millis(250))
+                            {
+                                expected_seq = None;
+                                last_rx = None;
+                                primed = false;
+                                first_pending_at = None;
+                                underrun_armed = false;
+                                jitter.reset_stream();
+                            }
                             last_rx_at = Some(Instant::now());
+                            // Drop stale in-flight packets from the previous codec so Opus <-> PCM24
+                            // transitions never ping-pong and flush the playback queue.
+                            if pkt.codec != cur_codec
+                                && let Some((prev_u16, _)) = last_rx
+                                && (pkt.seq.wrapping_sub(prev_u16) as i16) <= 0
+                            {
+                                continue;
+                            }
                             if pkt.rate != active_rate {
                                 desired_rate = pkt.rate;
                                 cur_codec = pkt.codec;
                                 pending.clear();
                                 pcm_queue.clear();
+                                resampler.reset();
+                                jitter.reset_stream();
                                 last_rx = Some((pkt.seq, pkt.seq as i64));
                                 expected_seq = Some(pkt.seq as i64);
                                 pending.insert(pkt.seq as i64, (pkt.codec, pkt.ch, pkt.payload));
@@ -765,11 +998,14 @@ impl Player {
                             if pkt.codec != cur_codec {
                                 cur_codec = pkt.codec;
                                 pending.clear();
-                                pcm_queue.clear();
+                                fade_out_tail(&mut pcm_queue, fmt.rate, dev_ch);
+                                resampler.reset();
                                 last_rx = None;
                                 expected_seq = None;
                                 primed = false;
                                 first_pending_at = Some(Instant::now());
+                                underrun_armed = false;
+                                jitter.reset_stream();
                             }
                             let u_seq = match last_rx {
                                 None => {
@@ -785,17 +1021,37 @@ impl Player {
                                     val
                                 }
                             };
-                            if expected_seq.is_none_or(|e| (u_seq - e).abs() > 100) {
-                                pending.clear();
-                                pcm_queue.clear();
-                                expected_seq = Some(u_seq);
-                                primed = false;
-                                first_pending_at = Some(Instant::now());
-                            }
-                            if expected_seq.is_some_and(|e| u_seq >= e) {
-                                pending.entry(u_seq).or_insert((pkt.codec, pkt.ch, pkt.payload));
-                                if !primed && first_pending_at.is_none() {
+                            match expected_seq {
+                                None => {
+                                    expected_seq = Some(u_seq);
+                                    primed = false;
                                     first_pending_at = Some(Instant::now());
+                                    jitter.reset_stream();
+                                }
+                                Some(e) if (u_seq - e).abs() > 100 => {
+                                    pending.clear();
+                                    pcm_queue.clear();
+                                    resampler.reset();
+                                    expected_seq = Some(u_seq);
+                                    primed = false;
+                                    first_pending_at = Some(Instant::now());
+                                    underrun_armed = false;
+                                    jitter.reset_stream();
+                                }
+                                _ => {}
+                            }
+                            if underrun_armed {
+                                jitter.on_jitter_event(Instant::now());
+                                underrun_armed = false;
+                            }
+                            if let Some(e) = expected_seq {
+                                if u_seq >= e {
+                                    pending.entry(u_seq).or_insert((pkt.codec, pkt.ch, pkt.payload));
+                                    if !primed && first_pending_at.is_none() {
+                                        first_pending_at = Some(Instant::now());
+                                    }
+                                } else {
+                                    jitter.on_jitter_event(Instant::now());
                                 }
                             }
                         }
@@ -816,8 +1072,12 @@ impl Player {
                     }
                 };
 
+                let now = Instant::now();
                 let enabled = super::config::viewer_enabled();
+                let mut target_wasapi_frames = 0usize;
                 if !enabled {
+                    timer_guard = None;
+                    cur_gain = 0.0;
                     pending.clear();
                     pcm_queue.clear();
                     expected_seq = None;
@@ -825,12 +1085,22 @@ impl Player {
                     last_rx_at = None;
                     primed = false;
                     first_pending_at = None;
+                    underrun_armed = false;
+                    jitter.reset_stream();
                 } else {
-                    let prime_packets = if cur_codec == CODEC_PCM24 { 3 } else { 2 };
-                    let max_pending = if cur_codec == CODEC_PCM24 { 10 } else { 5 };
+                    if timer_guard.is_none() {
+                        timer_guard = Some(super::TimerPeriodGuard::enter(1));
+                    }
+                    jitter.tick(now);
+                    let frame_ms = if cur_codec == CODEC_PCM24 { 10 } else { 20 };
+                    let (prime_packets, prime_timeout) = jitter.prime_params(frame_ms);
+                    let max_pending = jitter.max_pending(cur_codec);
+                    target_wasapi_frames = ((fmt.rate as usize * jitter.wasapi_ceiling_ms() as usize) / 1000)
+                        .min(buffer_frames as usize);
+
                     if !primed
                         && (pending.len() >= prime_packets
-                            || first_pending_at.is_some_and(|t| t.elapsed() >= Duration::from_millis(35)))
+                            || first_pending_at.is_some_and(|t| t.elapsed() >= prime_timeout))
                     {
                         primed = true;
                     }
@@ -839,11 +1109,15 @@ impl Player {
                             if let Some((&k, _)) = pending.first_key_value() {
                                 pending.remove(&k);
                                 expected_seq = Some(k + 1);
+                                jitter.clear_gap();
                             }
                         }
-                        while pcm_queue.len() < dev_10ms_floats * 6 {
+                        while (padding as usize + (pcm_queue.len() / dev_ch)) < target_wasapi_frames
+                            && pcm_queue.len() < max_queue_floats
+                        {
                             let Some(exp) = expected_seq else { break };
                             if let Some((codec, ch, payload)) = pending.remove(&exp) {
+                                jitter.clear_gap();
                                 if codec == CODEC_PCM24 {
                                     decode_pcm24(&payload, &mut pcm24_f32);
                                     if ch as usize == dev_ch && active_rate == fmt.rate {
@@ -875,6 +1149,17 @@ impl Player {
                                 expected_seq = Some(exp + 1);
                             } else if let Some(&next_k) = pending.keys().next() {
                                 let gap = next_k - exp;
+                                if gap <= 0 {
+                                    pending.remove(&next_k);
+                                    continue;
+                                }
+                                let sw_frames = pcm_queue.len() / dev_ch;
+                                let buffered_ms =
+                                    (((padding as usize + sw_frames) as u64 * 1000) / fmt.rate as u64) as u32;
+                                if jitter.should_wait_gap(now, buffered_ms) {
+                                    break;
+                                }
+                                jitter.on_jitter_event(now);
                                 if cur_codec == CODEC_OPUS && (1..=3).contains(&gap) {
                                     if decoder.decode_plc(&mut decode_buf).is_ok() {
                                         let ch = decoder.channels();
@@ -890,10 +1175,8 @@ impl Player {
                                         pcm_queue.extend(resampled_buf.iter().copied());
                                     }
                                     expected_seq = Some(exp + 1);
-                                } else if gap > 0 {
-                                    expected_seq = Some(next_k);
                                 } else {
-                                    pending.remove(&next_k);
+                                    expected_seq = Some(next_k);
                                 }
                             } else {
                                 break;
@@ -903,18 +1186,27 @@ impl Player {
                             let drop_n = ((pcm_queue.len() - max_queue_floats) / dev_ch) * dev_ch;
                             pcm_queue.drain(..drop_n);
                         }
-                        if pcm_queue.is_empty()
-                            && pending.is_empty()
-                            && padding == 0
-                            && last_rx_at.is_none_or(|t| t.elapsed() >= Duration::from_millis(120))
-                        {
-                            primed = false;
-                            first_pending_at = None;
+                        if pcm_queue.is_empty() && pending.is_empty() {
+                            if last_rx_at.is_some_and(|t| t.elapsed() >= Duration::from_millis(250)) {
+                                expected_seq = None;
+                                last_rx = None;
+                                primed = false;
+                                first_pending_at = None;
+                                underrun_armed = false;
+                                jitter.reset_stream();
+                            } else if padding == 0
+                                && last_rx_at.is_none_or(|t| t.elapsed() >= Duration::from_millis(120))
+                            {
+                                primed = false;
+                                first_pending_at = None;
+                                underrun_armed = false;
+                                jitter.reset_stream();
+                            }
                         }
                     }
                 }
 
-                let avail = buffer_frames.saturating_sub(padding) as usize;
+                let avail = target_wasapi_frames.saturating_sub(padding as usize);
                 let queued_frames = pcm_queue.len() / dev_ch;
                 let frames_to_write = avail.min(queued_frames);
 
@@ -928,18 +1220,58 @@ impl Player {
                         }
                     };
                     let n_floats = frames_to_write * dev_ch;
+                    let target_gain = volume_gain(super::config::viewer_volume());
+                    let gain_step = 1.0 / (fmt.rate as f32 * 0.015).max(1.0);
+                    let mut next_frame_gain = || {
+                        if (cur_gain - target_gain).abs() <= gain_step {
+                            cur_gain = target_gain;
+                        } else if cur_gain < target_gain {
+                            cur_gain += gain_step;
+                        } else {
+                            cur_gain -= gain_step;
+                        }
+                        cur_gain
+                    };
                     match fmt.sample {
                         SampleFmt::F32 => {
                             let dst = unsafe { std::slice::from_raw_parts_mut(buf_ptr as *mut f32, n_floats) };
-                            for slot in dst.iter_mut() {
-                                *slot = pcm_queue.pop_front().unwrap_or(0.0);
+                            for frame in dst.chunks_exact_mut(dev_ch) {
+                                let g = next_frame_gain();
+                                for slot in frame {
+                                    *slot = pcm_queue.pop_front().unwrap_or(0.0) * g;
+                                }
                             }
                         }
                         SampleFmt::I16 => {
                             let dst = unsafe { std::slice::from_raw_parts_mut(buf_ptr as *mut i16, n_floats) };
-                            for slot in dst.iter_mut() {
-                                let s = pcm_queue.pop_front().unwrap_or(0.0).clamp(-1.0, 1.0);
-                                *slot = (s * 32767.0) as i16;
+                            for frame in dst.chunks_exact_mut(dev_ch) {
+                                let g = next_frame_gain();
+                                for slot in frame {
+                                    let s = (pcm_queue.pop_front().unwrap_or(0.0) * g).clamp(-1.0, 1.0);
+                                    *slot = (s * 32767.0) as i16;
+                                }
+                            }
+                        }
+                        SampleFmt::I24 => {
+                            let dst = unsafe { std::slice::from_raw_parts_mut(buf_ptr, n_floats * 3) };
+                            for frame in dst.chunks_exact_mut(dev_ch * 3) {
+                                let g = next_frame_gain();
+                                for tri in frame.chunks_exact_mut(3) {
+                                    let s = (pcm_queue.pop_front().unwrap_or(0.0) * g).clamp(-1.0, 1.0);
+                                    let q = (s * 8_388_607.0).round() as i32;
+                                    let b = q.to_le_bytes();
+                                    tri.copy_from_slice(&b[..3]);
+                                }
+                            }
+                        }
+                        SampleFmt::I32 => {
+                            let dst = unsafe { std::slice::from_raw_parts_mut(buf_ptr as *mut i32, n_floats) };
+                            for frame in dst.chunks_exact_mut(dev_ch) {
+                                let g = next_frame_gain();
+                                for slot in frame {
+                                    let s = (pcm_queue.pop_front().unwrap_or(0.0) * g).clamp(-1.0, 1.0);
+                                    *slot = (s as f64 * 2_147_483_647.0).round() as i32;
+                                }
                             }
                         }
                     }
@@ -950,6 +1282,8 @@ impl Player {
                         let _ = unsafe { audio_client.Stop() };
                         return Err(e.into());
                     }
+                } else if enabled && primed && padding == 0 && pcm_queue.is_empty() {
+                    underrun_armed = true;
                 }
 
                 if last_dev_check.elapsed() >= Duration::from_secs(1) {
@@ -980,6 +1314,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn volume_gain_is_monotonic_and_bounded() {
+        assert_eq!(volume_gain(0), 0.0);
+        assert_eq!(volume_gain(100), 1.0);
+        assert_eq!(volume_gain(255), 1.0);
+        assert!((volume_gain(50) - 0.25).abs() < 1e-6);
+        assert!(volume_gain(20) > 0.0 && volume_gain(20) < volume_gain(50));
+    }
+
+    #[test]
     fn effective_lossless_rate_picks_min_of_endpoints() {
         assert_eq!(effective_lossless_rate(48_000, 192_000), 48_000);
         assert_eq!(effective_lossless_rate(192_000, 48_000), 48_000);
@@ -988,6 +1331,96 @@ mod tests {
         assert_eq!(effective_lossless_rate(44_100, 48_000), 44_100);
         assert_eq!(effective_lossless_rate(88_200, 48_000), 48_000);
         assert_eq!(effective_lossless_rate(96_000, 0), 96_000);
+    }
+
+    #[test]
+    fn jitter_ctrl_starts_at_base_and_caps_at_max() {
+        let t0 = Instant::now();
+        let mut jc = JitterCtrl::new();
+        assert_eq!(jc.target_ms(), JitterCtrl::BASE_MS);
+        assert_eq!(jc.wasapi_ceiling_ms(), JitterCtrl::BASE_MS + JitterCtrl::WASAPI_HEADROOM_MS);
+        assert_eq!(jc.prime_params(20), (1, Duration::from_millis(20)));
+        assert_eq!(jc.prime_params(10), (1, Duration::from_millis(20)));
+        assert_eq!(jc.max_pending(CODEC_OPUS), 5);
+        assert_eq!(jc.max_pending(CODEC_PCM24), 10);
+
+        jc.on_jitter_event(t0);
+        assert_eq!(jc.target_ms(), 20);
+        jc.on_jitter_event(t0 + Duration::from_millis(10));
+        assert_eq!(jc.target_ms(), 30);
+        jc.on_jitter_event(t0 + Duration::from_millis(20));
+        assert_eq!(jc.target_ms(), 40);
+        jc.on_jitter_event(t0 + Duration::from_millis(30));
+        assert_eq!(jc.target_ms(), JitterCtrl::MAX_MS);
+        jc.on_jitter_event(t0 + Duration::from_millis(40));
+        assert_eq!(jc.target_ms(), JitterCtrl::MAX_MS);
+        assert_eq!(jc.prime_params(20), (2, Duration::from_millis(45)));
+        assert_eq!(jc.max_pending(CODEC_OPUS), 7);
+        assert_eq!(jc.max_pending(CODEC_PCM24), 14);
+    }
+
+    #[test]
+    fn jitter_ctrl_decays_slowly_after_stable_period() {
+        let t0 = Instant::now();
+        let mut jc = JitterCtrl::new();
+        jc.on_jitter_event(t0);
+        jc.on_jitter_event(t0);
+        assert_eq!(jc.target_ms(), 30);
+
+        jc.tick(t0 + Duration::from_secs(14));
+        assert_eq!(jc.target_ms(), 30);
+
+        jc.tick(t0 + Duration::from_secs(15));
+        assert_eq!(jc.target_ms(), 25);
+
+        jc.tick(t0 + Duration::from_secs(19));
+        assert_eq!(jc.target_ms(), 25);
+
+        jc.tick(t0 + Duration::from_secs(20));
+        assert_eq!(jc.target_ms(), 20);
+
+        // New event resets stability hold.
+        let t1 = t0 + Duration::from_secs(21);
+        jc.on_jitter_event(t1);
+        assert_eq!(jc.target_ms(), 30);
+        jc.tick(t1 + Duration::from_secs(10));
+        assert_eq!(jc.target_ms(), 30);
+
+        jc.tick(t1 + Duration::from_secs(15));
+        assert_eq!(jc.target_ms(), 25);
+        jc.tick(t1 + Duration::from_secs(20));
+        assert_eq!(jc.target_ms(), 20);
+        jc.tick(t1 + Duration::from_secs(25));
+        assert_eq!(jc.target_ms(), 15);
+        jc.tick(t1 + Duration::from_secs(30));
+        assert_eq!(jc.target_ms(), JitterCtrl::BASE_MS);
+        jc.tick(t1 + Duration::from_secs(40));
+        assert_eq!(jc.target_ms(), JitterCtrl::BASE_MS);
+    }
+
+    #[test]
+    fn jitter_ctrl_gap_wait_respects_buffer_and_deadline() {
+        let t0 = Instant::now();
+        let mut jc = JitterCtrl::new();
+        jc.on_jitter_event(t0);
+        assert_eq!(jc.target_ms(), 20);
+
+        // Buffered audio sufficient (> 12 ms): wait until target_ms expires.
+        assert!(jc.should_wait_gap(t0, 25));
+        assert!(jc.should_wait_gap(t0 + Duration::from_millis(12), 20));
+        assert!(!jc.should_wait_gap(t0 + Duration::from_millis(20), 20));
+
+        // Low buffer (<= 12 ms): release immediately to prevent underrun.
+        let t1 = t0 + Duration::from_millis(30);
+        assert!(jc.should_wait_gap(t1, 25));
+        assert!(!jc.should_wait_gap(t1 + Duration::from_millis(4), 12));
+
+        // Late packet arrival clears gap timer cleanly.
+        let t2 = t0 + Duration::from_millis(50);
+        assert!(jc.should_wait_gap(t2, 25));
+        jc.clear_gap();
+        let t3 = t2 + Duration::from_millis(100);
+        assert!(jc.should_wait_gap(t3, 25));
     }
 
     #[test]

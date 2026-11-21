@@ -283,6 +283,7 @@ impl Relay {
             (Method::POST, api::MEET_PATH, route(&shared, Shared::meet)),
             (Method::POST, api::WATCH_PATH, watch_route(&shared)),
         ];
+        #[allow(clippy::field_reassign_with_default)]
         let mut sc = ServerConfig::default();
         sc.relay = Some(rc);
         sc.quic = cfg.enable_quic_addr_discovery.then(|| QuicConfig::new(cfg.quic_bind_addr()));
@@ -326,20 +327,22 @@ fn guest_ids(m: BTreeMap<EndpointId, Vec<crate::api::Guest>>) -> BTreeMap<Endpoi
     m.into_iter().map(|(o, gs)| (o, gs.into_iter().map(|g| g.id).collect())).collect()
 }
 
-/// Picks up changes other processes make to `owners.txt` and `kicked.txt`
-/// within a quarter second (a kick on the management screen reaches the
-/// owner's watch at once), and writes `status.txt` (connected devices and
+/// Picks up changes other processes make to `owners.txt`, `kicked.txt` and
+/// `guests.txt` within a quarter second (a kick on the management screen reaches
+/// the owner's watch at once), and writes `status.txt` (connected devices and
 /// temporary guests) when they change, looked at every 2 s.
 async fn watch_owners(sh: Arc<Shared>, started: u64) {
     let op = sh.store.owners_path();
     let kp = sh.store.kicked_path();
+    let gp = sh.store.guests_path();
     let stamps = || {
         (
             std::fs::metadata(&op).and_then(|m| m.modified()).ok(),
             std::fs::metadata(&kp).and_then(|m| m.modified()).ok(),
+            std::fs::metadata(&gp).and_then(|m| m.modified()).ok(),
         )
     };
-    let mut last: (Option<SystemTime>, Option<SystemTime>) = stamps();
+    let mut last: (Option<SystemTime>, Option<SystemTime>, Option<SystemTime>) = stamps();
     let mut shown: Option<(Vec<EndpointId>, Vec<ActiveMeet>)> = None;
     let mut written = 0;
     let mut tick = 0u32;

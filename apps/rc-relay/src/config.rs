@@ -323,7 +323,7 @@ mod tests {
             .skip_while(|l| !l.starts_with("//! ```toml"))
             .skip(1)
             .take_while(|l| !l.starts_with("//! ```"))
-            .map(|l| l.strip_prefix("//! ").or(l.strip_prefix("//!")).unwrap_or(l).to_string() + "\n")
+            .map(|l| l.strip_prefix("//! ").or_else(|| l.strip_prefix("//!")).unwrap_or(l).to_string() + "\n")
             .collect();
         let c: Config = toml::from_str(&toml).unwrap();
         c.check().unwrap();

@@ -19,7 +19,7 @@
 use std::{
     collections::VecDeque,
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, Weak},
     time::Instant,
 };
 
@@ -95,14 +95,14 @@ pub struct ClipSync {
 }
 
 impl ClipSync {
-    /// Starts watching the local clipboard and accepting the other side's.
-    /// Runs until the connection closes. `host` decides ties.
-    pub fn start(
+    /// Starts watching the local clipboard and serving pasted files without
+    /// claiming `conn.accept_uni()`. Pair with [`accept_uni_loop`] so audio
+    /// uni-streams still run even if the clipboard fails to start.
+    pub fn start_clip(
         conn: &Connection,
         ctrl: mpsc::UnboundedSender<Msg>,
         host: bool,
         service: bool,
-        audio_tx: Option<mpsc::UnboundedSender<Bytes>>,
     ) -> Result<Arc<ClipSync>> {
         let (changed_tx, changed_rx) = mpsc::unbounded_channel();
         let sync = Arc::new(ClipSync {
@@ -111,9 +111,8 @@ impl ClipSync {
             served: Mutex::default(),
             service,
         });
-        tokio::spawn(send_loop(conn.clone(), ctrl, changed_rx, sync.clone()));
-        tokio::spawn(accept_loop(conn.clone(), sync.clone(), audio_tx));
-        tokio::spawn(serve_loop(conn.clone(), sync.clone()));
+        tokio::spawn(send_loop(conn.clone(), ctrl, changed_rx, Arc::downgrade(&sync)));
+        tokio::spawn(serve_loop(conn.clone(), Arc::downgrade(&sync)));
         Ok(sync)
     }
 
@@ -127,28 +126,49 @@ impl ClipSync {
     }
 }
 
+struct AbortOnDrop(Option<AbortHandle>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        if let Some(h) = self.0.take() {
+            h.abort();
+        }
+    }
+}
+
 async fn send_loop(
     conn: Connection,
     ctrl: mpsc::UnboundedSender<Msg>,
     mut changed: mpsc::UnboundedReceiver<Content>,
-    sync: Arc<ClipSync>,
+    sync: Weak<ClipSync>,
 ) {
-    let mut current: Option<AbortHandle> = None;
-    while let Some(content) = changed.recv().await {
+    let mut current = AbortOnDrop(None);
+    loop {
+        let content = tokio::select! {
+            _ = conn.closed() => break,
+            c = changed.recv() => match c {
+                Some(c) => c,
+                None => break,
+            },
+        };
         let mut what = content.describe();
-        let (seq, seen) = sync.order.lock().unwrap().local_copy();
+        let (seq, seen, service) = {
+            let Some(s) = sync.upgrade() else { break };
+            let (seq, seen) = s.order.lock().unwrap().local_copy();
+            (seq, seen, s.service)
+        };
         let t0 = Instant::now();
         let encoded = match content {
             Content::Files(roots) => {
-                let service = sync.service;
                 let listed = tokio::task::spawn_blocking(move || crate::term_proc::as_user(service, || clipfiles::scan(&roots))?).await;
                 match listed {
                     Ok(Ok((entries, paths))) => {
                         what = clipfiles::describe(&entries);
-                        let mut s = sync.served.lock().unwrap();
-                        s.push_back((seq, Arc::new(paths)));
-                        if s.len() > SERVED {
-                            s.pop_front();
+                        let Some(s) = sync.upgrade() else { break };
+                        let mut served = s.served.lock().unwrap();
+                        served.push_back((seq, Arc::new(paths)));
+                        if served.len() > SERVED {
+                            served.pop_front();
                         }
                         Ok(Ok((FORMAT_FILES, clipfiles::encode_list(&entries))))
                     }
@@ -174,12 +194,12 @@ async fn send_loop(
             break;
         }
         // A newer copy replaces one still being sent.
-        if let Some(h) = current.take() {
+        if let Some(h) = current.0.take() {
             h.abort();
         }
         let conn = conn.clone();
         let encode_ms = t0.elapsed().as_millis();
-        current = Some(
+        current.0 = Some(
             tokio::spawn(async move {
                 let t1 = Instant::now();
                 match send_one(&conn, seq, seen, format, &data).await {
@@ -211,9 +231,22 @@ async fn send_one(conn: &Connection, seq: u32, seen: u32, format: u8, data: &[u8
     Ok(())
 }
 
-async fn accept_loop(conn: Connection, sync: Arc<ClipSync>, audio_tx: Option<mpsc::UnboundedSender<Bytes>>) {
-    while let Ok(mut recv) = conn.accept_uni().await {
-        let (sync, conn, audio_tx) = (sync.clone(), conn.clone(), audio_tx.clone());
+/// Accepts incoming unidirectional streams on `conn`, dispatching clipboard
+/// transfers to `clip` (when alive) and lossless audio frames to `audio_tx`.
+pub async fn accept_uni_loop(
+    conn: Connection,
+    clip: Option<Weak<ClipSync>>,
+    audio_tx: Option<mpsc::UnboundedSender<Bytes>>,
+) {
+    loop {
+        let mut recv = tokio::select! {
+            _ = conn.closed() => break,
+            r = conn.accept_uni() => match r {
+                Ok(r) => r,
+                Err(_) => break,
+            },
+        };
+        let (clip, conn, audio_tx) = (clip.clone(), conn.clone(), audio_tx.clone());
         tokio::spawn(async move {
             let mut kind = [0u8; 1];
             if recv.read_exact(&mut kind).await.is_err() {
@@ -221,6 +254,10 @@ async fn accept_loop(conn: Connection, sync: Arc<ClipSync>, audio_tx: Option<mps
             }
             match kind[0] {
                 STREAM_CLIPBOARD => {
+                    let Some(sync) = clip.as_ref().and_then(Weak::upgrade) else {
+                        let _ = recv.stop(0u32.into());
+                        return;
+                    };
                     if let Err(e) = receive_clipboard(recv, &sync, &conn).await {
                         log!("clipboard: receive failed: {e:#}");
                     }
@@ -242,8 +279,15 @@ async fn accept_loop(conn: Connection, sync: Arc<ClipSync>, audio_tx: Option<mps
 }
 
 /// The other side pasting files copied here asks for them one by one.
-async fn serve_loop(conn: Connection, sync: Arc<ClipSync>) {
-    while let Ok((send, mut recv)) = conn.accept_bi().await {
+async fn serve_loop(conn: Connection, sync: Weak<ClipSync>) {
+    loop {
+        let (send, mut recv) = tokio::select! {
+            _ = conn.closed() => break,
+            r = conn.accept_bi() => match r {
+                Ok(s) => s,
+                Err(_) => break,
+            },
+        };
         let sync = sync.clone();
         tokio::spawn(async move {
             let mut kind = [0u8; 1];
@@ -251,6 +295,10 @@ async fn serve_loop(conn: Connection, sync: Arc<ClipSync>) {
                 let _ = recv.stop(0u32.into());
                 return;
             }
+            let Some(sync) = sync.upgrade() else {
+                let _ = recv.stop(0u32.into());
+                return;
+            };
             let t0 = Instant::now();
             let lookup = |seq, index| sync.served_path(seq, index);
             match clipfiles::serve(send, recv, lookup, sync.service).await {

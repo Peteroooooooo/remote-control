@@ -2,7 +2,7 @@
 //!
 //! It is iroh-relay with an access policy: it only forwards between devices
 //! on its roster (its owners and the guests each owner lists), and only if
-//! one end is an owner ([`policy`]); a device that brings one of an owner's
+//! one end is an owner (`policy`); a device that brings one of an owner's
 //! unused connection codes may meet that owner too. Owners are added by
 //! claiming the relay with a relay code (`rcr1…`, [`api`]); the first code
 //! is printed when the relay starts with no owners.

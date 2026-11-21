@@ -373,7 +373,7 @@ pub fn run(a: EncTestArgs) -> Result<()> {
         if dims != (cw, ch) || b.len() != 8 + (cw * ch * 4) as usize {
             bail!("{} is {}x{}, the screen {cw}x{ch}", p.display(), dims.0, dims.1);
         }
-        unsafe { gpu.ctx.UpdateSubresource(&cap.image, 0, None, b[8..].as_ptr() as _, cw * 4, 0) };
+        unsafe { gpu.ctx.UpdateSubresource(cap.image(&gpu)?, 0, None, b[8..].as_ptr() as _, cw * 4, 0) };
     }
     if let Some(p) = &a.save_image {
         let mut staging = None;
@@ -381,13 +381,13 @@ pub fn run(a: EncTestArgs) -> Result<()> {
         v.extend_from_slice(&cw.to_le_bytes());
         v.extend_from_slice(&ch.to_le_bytes());
         // Four bytes per pixel: read it as a "luma" plane four times as wide.
-        v.extend(luma(&gpu, &cap.image, 0, cw * 4, ch, &mut staging)?);
+        v.extend(luma(&gpu, cap.image(&gpu)?, 0, cw * 4, ch, &mut staging)?);
         std::fs::write(p, v)?;
         log!("screen saved to {}", p.display());
     }
     let moving: ID3D11Texture2D = unsafe {
         let mut desc = Default::default();
-        cap.image.GetDesc(&mut desc);
+        cap.image(&gpu)?.GetDesc(&mut desc);
         let mut t = None;
         gpu.device.CreateTexture2D(&desc, None, Some(&mut t))?;
         t.context("CreateTexture2D")?
@@ -401,6 +401,7 @@ pub fn run(a: EncTestArgs) -> Result<()> {
         scenario_hint: !a.no_scenario_hint,
         qp_control: a.qp,
         yuv444: false,
+        allow_untrusted_hevc: true,
     };
     let mut enc = Encoder::new_with(&gpu.device, gpu.luid, w, h, a.fps, max, opts, &a.settings)?;
     log!(
@@ -433,7 +434,7 @@ pub fn run(a: EncTestArgs) -> Result<()> {
     }
     if a.yuv444 {
         drop(enc);
-        return run_yuv444(&a, &gpu, &cap, (w, h));
+        return run_yuv444(&a, &gpu, &mut cap, (w, h));
     }
     if a.refine {
         let src = Source { live: false, scroll: a.scroll, cw, ch, moving: &moving };
@@ -466,10 +467,10 @@ pub fn run(a: EncTestArgs) -> Result<()> {
                     Grab::Timeout => continue,
                     Grab::Lost => bail!("capture lost (desktop switch?)"),
                 }
-                &cap.image
+                cap.image(&gpu)?
             } else {
                 n += 1;
-                scrolled(&gpu, &cap.image, &moving, cw, ch, (n * a.scroll) % ch);
+                scrolled(&gpu, cap.image(&gpu)?, &moving, cw, ch, (n * a.scroll) % ch);
                 &moving
             };
             let dip = dips && i % 10 == 5;
@@ -535,13 +536,13 @@ impl Source<'_> {
     fn next(&self, gpu: &Gpu, cap: &mut Capture, n: &mut u32) -> Result<Option<ID3D11Texture2D>> {
         if self.live {
             return match cap.grab(gpu, 50)? {
-                Grab::New { .. } => Ok(Some(cap.image.clone())),
+                Grab::New { .. } => Ok(Some(cap.image(gpu)?.clone())),
                 Grab::Timeout => Ok(None),
                 Grab::Lost => bail!("capture lost (desktop switch?)"),
             };
         }
         *n += 1;
-        scrolled(gpu, &cap.image, self.moving, self.cw, self.ch, (*n * self.scroll) % self.ch);
+        scrolled(gpu, cap.image(gpu)?, self.moving, self.cw, self.ch, (*n * self.scroll) % self.ch);
         Ok(Some(self.moving.clone()))
     }
 }
@@ -601,12 +602,12 @@ fn run_keys(
         pending.push_back((i, y));
         i += 1;
         let out = enc.encode(nv12, Duration::from_millis(200), None)?;
-        if forced {
-            if let Some(c) = enc.codec_api() {
-                for (k, v) in &restore {
-                    if let Some(v) = v {
-                        set_failed += mf::set_u32(c, k, *v as u32).is_err() as u32;
-                    }
+        if forced
+            && let Some(c) = enc.codec_api()
+        {
+            for (k, v) in &restore {
+                if let Some(v) = v {
+                    set_failed += mf::set_u32(c, k, *v as u32).is_err() as u32;
                 }
             }
         }
@@ -695,12 +696,13 @@ fn run_keys(
 }
 
 /// See `EncTestArgs::yuv444`.
-fn run_yuv444(a: &EncTestArgs, gpu: &Gpu, cap: &Capture, (w, h): (u32, u32)) -> Result<()> {
+fn run_yuv444(a: &EncTestArgs, gpu: &Gpu, cap: &mut Capture, (w, h): (u32, u32)) -> Result<()> {
     let [x, y, cw, ch] = a.crop[..] else { bail!("--crop x,y,w,h") };
     std::fs::create_dir_all(&a.out)?;
     // The source: BGRA, read as a plane four bytes per pixel.
     let mut st = None;
-    let bgra = luma(gpu, &cap.image, 0, cap.width * 4, cap.height, &mut st)?;
+    let img = cap.image(gpu)?.clone();
+    let bgra = luma(gpu, &img, 0, cap.width * 4, cap.height, &mut st)?;
     let (cw, ch) = (cw.min(w - x.min(w)), ch.min(h - y.min(h)));
     let row = (cw as usize * 3).div_ceil(4) * 4;
     let mut px = vec![0u8; row * ch as usize];
@@ -715,14 +717,14 @@ fn run_yuv444(a: &EncTestArgs, gpu: &Gpu, cap: &Capture, (w, h): (u32, u32)) -> 
     let frames = (a.seconds * a.fps as f64).max(1.0) as u32;
     for yuv444 in [false, true] {
         let name = if yuv444 { "444" } else { "420" };
-        let opts = EncOptions { codec: Codec::Hevc, yuv444, ..Default::default() };
+        let opts = EncOptions { codec: Codec::Hevc, yuv444, allow_untrusted_hevc: true, ..Default::default() };
         let mut enc = Encoder::new_with(&gpu.device, gpu.luid, w, h, a.fps, (a.mbps * 1e6) as u32, opts, &a.settings)?;
         let tex = crate::pipeline::yuv_texture(gpu, w, h, yuv444)?;
         if yuv444 {
-            crate::yuv444::ToAyuv::new(gpu, &cap.image, &tex, (w, h))?.run(gpu);
+            crate::yuv444::ToAyuv::new(gpu, &img, &tex, (w, h))?.run(gpu);
         } else {
             let conv = Vp::new(gpu, (cap.width, cap.height), (w, h), vp::RGB_FULL, vp::YUV_709)?;
-            conv.blt(&cap.image, 0, &tex, RECT { left: 0, top: 0, right: w as i32, bottom: h as i32 })
+            conv.blt(&img, 0, &tex, RECT { left: 0, top: 0, right: w as i32, bottom: h as i32 })
                 .with_context(|| format!("{name}: video processor into the encoder's picture"))?;
         }
         let mut dec = Decoder::new(&gpu.device, w, h, Codec::Hevc)?;
@@ -936,8 +938,9 @@ fn run_qp_sweep(
     let mut dec = Decoder::new(&gpu.device, w, h, enc.format)?;
     let (mut st_src, mut st_dec) = (None, None);
     let mut pending: VecDeque<(u32, u32, Option<Vec<u8>>)> = VecDeque::new();
+    type QpSample = (usize, Option<u32>, Option<f64>);
     // Per QP asked for: (bytes, reported QP, PSNR) of frames not right after a change.
-    let mut by_qp: std::collections::BTreeMap<u32, Vec<(usize, Option<u32>, Option<f64>)>> = Default::default();
+    let mut by_qp: std::collections::BTreeMap<u32, Vec<QpSample>> = Default::default();
     let mut first_after: std::collections::BTreeMap<u32, Vec<usize>> = Default::default();
     let (mut i, mut n) = (0u32, 0u32);
     let t0 = Instant::now();
@@ -1014,7 +1017,7 @@ fn run_churn(
         let mut i = 0u32;
         while t0.elapsed().as_secs_f64() < a.seconds {
             let Some(tex) = src.next(gpu, cap, &mut n)? else { continue };
-            if i > 0 && i % every == 0 {
+            if i > 0 && i.is_multiple_of(every) {
                 let r = if enc.bitrate == max { (max as f64 * a.churn_step) as u32 } else { max };
                 if let Some(c) = enc.codec_api().cloned() {
                     let mean = || mf::set_u32(&c, &CODECAPI_AVEncCommonMeanBitRate, r).is_ok();

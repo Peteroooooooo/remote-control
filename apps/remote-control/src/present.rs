@@ -19,16 +19,17 @@
 use anyhow::{Context, Result};
 use windows::{
     Win32::{
-        Foundation::{HWND, RECT},
+        Foundation::{CloseHandle, HANDLE, HWND, RECT},
         Graphics::{
             Direct3D11::{ID3D11RenderTargetView, ID3D11Texture2D},
             Dxgi::{
                 Common::{DXGI_ALPHA_MODE_IGNORE, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC},
-                DXGI_MWA_NO_ALT_ENTER, DXGI_PRESENT, DXGI_SCALING_NONE, DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_CHAIN_FLAG,
-                DXGI_SWAP_EFFECT_FLIP_DISCARD, DXGI_USAGE_RENDER_TARGET_OUTPUT, IDXGIDevice1, IDXGIFactory2,
-                IDXGISwapChain1,
+                DXGI_MWA_NO_ALT_ENTER, DXGI_PRESENT, DXGI_SCALING_NONE, DXGI_SWAP_CHAIN_DESC1,
+                DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT, DXGI_SWAP_EFFECT_FLIP_DISCARD,
+                DXGI_USAGE_RENDER_TARGET_OUTPUT, IDXGIDevice1, IDXGIFactory2, IDXGISwapChain1, IDXGISwapChain2,
             },
         },
+        System::Threading::WaitForSingleObjectEx,
         UI::WindowsAndMessaging::GetClientRect,
     },
     core::Interface,
@@ -44,6 +45,7 @@ use crate::{
 pub struct Presenter {
     hwnd: HWND,
     swap: IDXGISwapChain1,
+    waitable: Option<HANDLE>,
     size: (u32, u32),
     /// None once it failed: the video processor draws from then on.
     shader: Option<ToRgb>,
@@ -74,17 +76,31 @@ impl Presenter {
                 Scaling: DXGI_SCALING_NONE,
                 SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
                 AlphaMode: DXGI_ALPHA_MODE_IGNORE,
+                Flags: DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT.0 as u32,
                 ..Default::default()
             };
             let swap = factory
                 .CreateSwapChainForHwnd(&gpu.device, hwnd, &desc, None, None)
                 .context("CreateSwapChainForHwnd")?;
             let _ = factory.MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER);
-            if let Ok(d) = gpu.device.cast::<IDXGIDevice1>() {
-                let _ = d.SetMaximumFrameLatency(1);
-            }
+            let waitable = if let Ok(sc2) = swap.cast::<IDXGISwapChain2>() {
+                let _ = sc2.SetMaximumFrameLatency(1);
+                let h = sc2.GetFrameLatencyWaitableObject();
+                (!h.is_invalid()).then_some(h)
+            } else {
+                if let Ok(d) = gpu.device.cast::<IDXGIDevice1>() {
+                    let _ = d.SetMaximumFrameLatency(1);
+                }
+                None
+            };
             let shader = ToRgb::new(gpu).inspect_err(|e| crate::log!("picture shader: {e:#}; the video processor draws")).ok();
-            Ok(Presenter { hwnd, swap, size, shader, rtv: None, vp: None })
+            Ok(Presenter { hwnd, swap, waitable, size, shader, rtv: None, vp: None })
+        }
+    }
+
+    pub fn clear_cache(&mut self) {
+        if let Some(shader) = &mut self.shader {
+            shader.clear_cache();
         }
     }
 
@@ -95,8 +111,19 @@ impl Presenter {
             if now != self.size {
                 self.vp = None;
                 self.rtv = None;
-                self.swap.ResizeBuffers(0, now.0, now.1, DXGI_FORMAT_UNKNOWN, DXGI_SWAP_CHAIN_FLAG(0)).context("ResizeBuffers")?;
+                self.swap
+                    .ResizeBuffers(
+                        0,
+                        now.0,
+                        now.1,
+                        DXGI_FORMAT_UNKNOWN,
+                        DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT,
+                    )
+                    .context("ResizeBuffers")?;
                 self.size = now;
+            }
+            if let Some(h) = self.waitable {
+                WaitForSingleObjectEx(h, 100, false);
             }
             let dest = vp::letterbox(stream, self.size);
             let back: ID3D11Texture2D = self.swap.GetBuffer(0)?;
@@ -135,5 +162,15 @@ impl Presenter {
     /// The window's client area no longer matches the back buffers.
     pub fn resized(&self) -> bool {
         client_size(self.hwnd) != self.size
+    }
+}
+
+impl Drop for Presenter {
+    fn drop(&mut self) {
+        if let Some(h) = self.waitable {
+            unsafe {
+                let _ = CloseHandle(h);
+            }
+        }
     }
 }

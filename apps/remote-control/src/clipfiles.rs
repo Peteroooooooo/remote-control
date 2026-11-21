@@ -82,15 +82,27 @@ fn name_ok(rel: &str) -> bool {
 /// The copied files and folders, with everything in the folders: the list
 /// sent, and where each entry is here. Blocking (the host's runs as its user).
 pub fn scan(roots: &[PathBuf]) -> Result<(Vec<Entry>, Vec<PathBuf>)> {
+    const MAX_DEPTH: usize = 64;
     let (mut entries, mut paths) = (Vec::new(), Vec::new());
-    fn walk(path: &Path, rel: String, entries: &mut Vec<Entry>, paths: &mut Vec<PathBuf>) -> Result<()> {
+    fn walk(path: &Path, rel: String, depth: usize, entries: &mut Vec<Entry>, paths: &mut Vec<PathBuf>) -> Result<()> {
+        if depth > MAX_DEPTH {
+            bail!("{} has a path nested more than {MAX_DEPTH} folders deep", path.display());
+        }
         if entries.len() >= MAX_ENTRIES {
             bail!("more than {MAX_ENTRIES} files and folders");
         }
         if !name_ok(&rel) {
             bail!("{} has a path longer than {MAX_NAME} characters", path.display());
         }
-        let meta = std::fs::metadata(path).with_context(|| path.display().to_string())?;
+        let meta = if depth == 0 {
+            std::fs::metadata(path)
+        } else {
+            std::fs::symlink_metadata(path)
+        }
+        .with_context(|| path.display().to_string())?;
+        if depth > 0 && meta.file_type().is_symlink() {
+            return Ok(());
+        }
         let mtime = meta.modified().map_or(0, filetime);
         let dir = meta.is_dir();
         entries.push(Entry { rel: rel.clone(), dir, size: if dir { 0 } else { meta.len() }, mtime });
@@ -102,14 +114,14 @@ pub fn scan(roots: &[PathBuf]) -> Result<(Vec<Entry>, Vec<PathBuf>)> {
                 .collect();
             list.sort_by_key(|e| e.file_name());
             for e in list {
-                walk(&e.path(), format!("{rel}/{}", e.file_name().to_string_lossy()), entries, paths)?;
+                walk(&e.path(), format!("{rel}/{}", e.file_name().to_string_lossy()), depth + 1, entries, paths)?;
             }
         }
         Ok(())
     }
     for r in roots {
         let name = r.file_name().ok_or_else(|| anyhow!("{} is a whole drive", r.display()))?;
-        walk(r, name.to_string_lossy().into_owned(), &mut entries, &mut paths)?;
+        walk(r, name.to_string_lossy().into_owned(), 0, &mut entries, &mut paths)?;
     }
     Ok((entries, paths))
 }

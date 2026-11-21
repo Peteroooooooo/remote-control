@@ -99,7 +99,7 @@ mod tests {
         let code = encode("rcx1", b"payload");
         let msg = format!("连这个：{code}，谢谢");
         assert_eq!(find("rcx1", &msg), Some(code.as_str()));
-        assert_eq!(find("rcx1", &format!("{code}")), Some(code.as_str()));
+        assert_eq!(find("rcx1", &code), Some(code.as_str()));
         // Glued to a word, or cut short: not a code.
         assert_eq!(find("rcx1", &format!("abc{code}")), None);
         assert_eq!(find("rcx1", &code[..code.len() - 2]), None);

@@ -134,12 +134,14 @@ pub fn run(a: LobbyArgs) -> Result<()> {
         std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
             let code = rt.block_on(crate::goaway::wait());
+            b.flush_undoables();
             b.goodbye(code);
             crate::goaway::done();
             std::process::exit(0);
         });
     }
     let r = ui::run(b.clone(), a.hidden);
+    b.flush_undoables();
     b.goodbye(net::CLOSE_STOPPED);
     r
 }

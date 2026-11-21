@@ -189,19 +189,21 @@ impl App {
         let mut last_read = Instant::now();
         loop {
             term.draw(|f| self.draw(f))?;
-            if event::poll(Duration::from_millis(500))? {
-                if let Event::Key(k) = event::read()? {
-                    if k.kind == KeyEventKind::Press && !self.key(term, k.code, k.modifiers)? {
-                        return Ok(());
-                    }
-                }
+            if event::poll(Duration::from_millis(500))?
+                && let Event::Key(k) = event::read()?
+                && k.kind == KeyEventKind::Press
+                && !self.key(term, k.code, k.modifiers)?
+            {
+                return Ok(());
             }
             if self.toast.as_ref().is_some_and(|t| t.1.elapsed() > Duration::from_secs(3)) {
                 self.toast = None;
             }
             // Devices joining and going on- and offline, without a key press.
             if last_read.elapsed() > Duration::from_secs(2) && self.modal.is_none() {
-                self.reload()?;
+                if let Err(e) = self.reload() {
+                    self.toast(format!("刷新失败：{e:#}"), false);
+                }
                 last_read = Instant::now();
             }
         }
@@ -736,12 +738,11 @@ fn show_copy_line(term: &mut ratatui::DefaultTerminal, text: &str, label: &str) 
     let _ = out.flush();
     let _ = enable_raw_mode();
     loop {
-        if let Event::Key(k) = event::read()? {
-            if k.kind == KeyEventKind::Press
-                && matches!(k.code, KeyCode::Char(' ') | KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q'))
-            {
-                break;
-            }
+        if let Event::Key(k) = event::read()?
+            && k.kind == KeyEventKind::Press
+            && matches!(k.code, KeyCode::Char(' ') | KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q'))
+        {
+            break;
         }
     }
     let _ = execute!(out, Hide);

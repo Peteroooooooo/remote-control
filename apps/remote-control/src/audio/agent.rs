@@ -166,11 +166,13 @@ struct AudioSender {
     paused: Arc<AtomicBool>,
     stream: Option<SendStream>,
     wire_buf: Vec<u8>,
+    /// Monotonic connection-wide sequence number, surviving `audio-agent` restarts.
+    tx_seq: u16,
 }
 
 impl AudioSender {
     fn new(conn: Connection, rt: tokio::runtime::Handle, paused: Arc<AtomicBool>) -> Self {
-        Self { conn, rt, paused, stream: None, wire_buf: Vec::with_capacity(16_384) }
+        Self { conn, rt, paused, stream: None, wire_buf: Vec::with_capacity(16_384), tx_seq: 0 }
     }
 
     fn close_stream(&mut self) {
@@ -179,11 +181,13 @@ impl AudioSender {
         }
     }
 
-    fn send(&mut self, codec: u8, seq: u16, ch: u8, rate: u32, payload: &[u8]) {
+    fn send(&mut self, codec: u8, _seq: u16, ch: u8, rate: u32, payload: &[u8]) {
         if self.paused.load(Ordering::Relaxed) {
             self.close_stream();
             return;
         }
+        let seq = self.tx_seq;
+        self.tx_seq = self.tx_seq.wrapping_add(1);
         if codec == CODEC_OPUS {
             self.close_stream();
             let mut pkt = Vec::with_capacity(4 + payload.len());
@@ -333,6 +337,8 @@ fn run_service_agent(
         }
 
         sender.close_stream();
+        // Close stdout first so an agent blocked in stdout write wakes immediately on BrokenPipe.
+        drop(stdout);
         if let Some(mut s) = agent_stdin.lock().unwrap().take() {
             let _ = s.write_all(&encode_cmd(CMD_STOP, AudioCfg::default()));
             let _ = s.flush();
@@ -343,13 +349,24 @@ fn run_service_agent(
         let waiter = {
             let proc = proc.clone();
             std::thread::spawn(move || {
-                let _ = proc.wait();
-                let _ = done_tx.send(());
+                let code = proc.wait();
+                let _ = done_tx.send(code);
             })
         };
-        if done_rx.recv_timeout(Duration::from_millis(500)).is_err() {
-            proc.kill();
-            let _ = waiter.join();
+        let needs_unmute = match done_rx.recv_timeout(Duration::from_millis(1000)) {
+            Ok(0) => false,
+            Ok(_) => true,
+            Err(_) => {
+                proc.kill();
+                let _ = waiter.join();
+                true
+            }
+        };
+        if needs_unmute
+            && cfg.lock().unwrap().mute_host
+            && term_proc::as_user(true, super::wasapi::force_unmute_default_render).is_err()
+        {
+            super::wasapi::force_unmute_default_render();
         }
 
         if !stop.load(Ordering::Relaxed) && conn.close_reason().is_none() {

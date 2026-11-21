@@ -172,7 +172,11 @@ impl Decoder {
 impl Drop for Decoder {
     fn drop(&mut self) {
         unsafe {
+            let _ = self.mft.ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
             let _ = self.mft.ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
+            if let Ok(s) = self.mft.cast::<IMFShutdown>() {
+                let _ = s.Shutdown();
+            }
         }
     }
 }

@@ -112,18 +112,25 @@ pub fn read(cursor: HCURSOR) -> Option<CursorImage> {
         let color = !ii.0.hbmColor.is_invalid();
         let (w, mask_h) = (bm.bmWidth, bm.bmHeight);
         let h = if color { mask_h } else { mask_h / 2 };
-        if w < 1 || h < 1 || w > MAX_SIDE as i32 || h > MAX_SIDE as i32 {
+        if w < 1 || h < 1 || mask_h < 1 || bm.bmWidthBytes <= 0 || w > MAX_SIDE as i32 || h > MAX_SIDE as i32 {
             return None;
         }
         let (w, h) = (w as u16, h as u16);
         let stride = CursorImage::stride(w);
-        let mut raw = vec![0u8; bm.bmWidthBytes as usize * mask_h as usize];
-        if GetBitmapBits(ii.0.hbmMask, raw.len() as i32, raw.as_mut_ptr() as *mut _) as usize != raw.len() {
+        let width_bytes = bm.bmWidthBytes as usize;
+        let mask_rows = mask_h as usize;
+        let raw_len = width_bytes.checked_mul(mask_rows)?;
+        if raw_len > i32::MAX as usize {
             return None;
         }
-        let mut mask = vec![0u8; stride * mask_h as usize];
-        for (dst, src) in mask.chunks_exact_mut(stride).zip(raw.chunks_exact(bm.bmWidthBytes as usize)) {
-            dst.copy_from_slice(&src[..stride]);
+        let mut raw = vec![0u8; raw_len];
+        if GetBitmapBits(ii.0.hbmMask, raw_len as i32, raw.as_mut_ptr() as *mut _) as usize != raw_len {
+            return None;
+        }
+        let mut mask = vec![0u8; stride * mask_rows];
+        let row_bytes = width_bytes.min(stride);
+        for (dst, src) in mask.chunks_exact_mut(stride).zip(raw.chunks_exact(width_bytes)) {
+            dst[..row_bytes].copy_from_slice(&src[..row_bytes]);
         }
         let mut bgra = Vec::new();
         if color {
@@ -139,8 +146,8 @@ pub fn read(cursor: HCURSOR) -> Option<CursorImage> {
         let img = CursorImage {
             width: w,
             height: h,
-            hot_x: (ii.0.xHotspot as u16).min(w - 1),
-            hot_y: (ii.0.yHotspot as u16).min(h - 1),
+            hot_x: ii.0.xHotspot.min((w - 1) as u32) as u16,
+            hot_y: ii.0.yHotspot.min((h - 1) as u32) as u16,
             color: bgra,
             mask,
         };
@@ -219,11 +226,16 @@ pub fn dump(cursor: HCURSOR, img: &CursorImage, path: &Path) -> Result<()> {
     Ok(())
 }
 
+const HOST_CURSOR_CACHE: usize = 256;
+
 /// Host side, on its own thread until `sh.stop`: watches the cursor and
 /// sends its shape when it changes, at the size the host shows it.
 pub fn watch(out: UnboundedSender<Msg>, sh: Arc<PipeShared>) {
-    let mut ids: HashMap<u64, u32> = HashMap::new();
+    let mut ids: HashMap<u64, (u32, u64)> = HashMap::new();
+    let mut next_id = 1u32;
+    let mut tick = 0u64;
     let mut last: Option<(bool, isize)> = None;
+    let mut shapes_sent = 0u64;
     let mut repeats = 0u32;
     let mut follow_failed = 0u64;
     while !sh.stop.load(Ordering::Relaxed) {
@@ -252,23 +264,33 @@ pub fn watch(out: UnboundedSender<Msg>, sh: Arc<PipeShared>) {
             let Some(img) = read(ci.hCursor) else { continue };
             let mut hasher = DefaultHasher::new();
             img.hash(&mut hasher);
-            let next = ids.len() as u32 + 1;
-            match ids.entry(hasher.finish()) {
-                std::collections::hash_map::Entry::Occupied(e) => {
-                    repeats += 1;
-                    Msg::CursorUse { id: *e.get() }
+            let hash = hasher.finish();
+            tick += 1;
+            if let Some((id, last_tick)) = ids.get_mut(&hash) {
+                *last_tick = tick;
+                repeats += 1;
+                Msg::CursorUse { id: *id }
+            } else {
+                if ids.len() >= HOST_CURSOR_CACHE
+                    && let Some(evict) = ids.iter().min_by_key(|(_, (_, t))| *t).map(|(k, _)| *k)
+                {
+                    ids.remove(&evict);
                 }
-                std::collections::hash_map::Entry::Vacant(e) => {
-                    e.insert(next);
-                    Msg::CursorShape { id: next, image: img }
+                let id = next_id;
+                next_id = next_id.wrapping_add(1);
+                if next_id == 0 {
+                    next_id = 1;
                 }
+                ids.insert(hash, (id, tick));
+                shapes_sent += 1;
+                Msg::CursorShape { id, image: img }
             }
         };
         if out.send(msg).is_err() {
             break;
         }
     }
-    log!("cursor watch stopped: {} shapes sent, {repeats} repeats sent as ids", ids.len());
+    log!("cursor watch stopped: {shapes_sent} shapes sent, {repeats} repeats sent as ids");
 }
 
 #[cfg(test)]

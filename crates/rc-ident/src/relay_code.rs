@@ -60,10 +60,10 @@ impl RelayCode {
     /// The first relay code in `text`, also accepting line-wrapped or
     /// box-border-wrapped copies from a terminal.
     pub fn find(text: &str) -> Option<RelayCode> {
-        if let Some(s) = text::find(PREFIX, text) {
-            if let Ok(c) = RelayCode::decode(s) {
-                return Some(c);
-            }
+        if let Some(s) = text::find(PREFIX, text)
+            && let Ok(c) = RelayCode::decode(s)
+        {
+            return Some(c);
         }
         let cleaned: String = text.chars().filter(|c| !c.is_whitespace() && !matches!(c, '│' | '┃' | '|')).collect();
         RelayCode::decode(text::find(PREFIX, &cleaned)?).ok()

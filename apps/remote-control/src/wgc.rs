@@ -19,6 +19,7 @@ use std::{
     io::{BufRead, BufReader, Read, Write},
     sync::{
         Arc,
+        atomic::{AtomicBool, Ordering},
         mpsc::{self, RecvTimeoutError},
     },
     time::{Duration, Instant},
@@ -83,10 +84,13 @@ impl Drop for Event {
 }
 
 pub struct Wgc {
+    item: GraphicsCaptureItem,
     pool: Direct3D11CaptureFramePool,
     session: GraphicsCaptureSession,
-    /// Set by WGC when a frame arrives.
+    /// Set by WGC when a frame arrives or the captured item closes.
     arrived: Arc<Event>,
+    closed: Arc<AtomicBool>,
+    closed_token: i64,
     pub width: u32,
     pub height: u32,
 }
@@ -116,8 +120,30 @@ impl Wgc {
             }
             Ok(())
         }))?;
-        session.StartCapture()?;
-        Ok(Wgc { pool, session, arrived, width: size.Width as u32, height: size.Height as u32 })
+        let closed = Arc::new(AtomicBool::new(false));
+        let c = closed.clone();
+        let a_closed = arrived.clone();
+        let closed_token = item.Closed(&TypedEventHandler::new(move |_, _| {
+            c.store(true, Ordering::SeqCst);
+            unsafe {
+                let _ = SetEvent(a_closed.0);
+            }
+            Ok(())
+        }))?;
+        if let Err(e) = session.StartCapture() {
+            let _ = item.RemoveClosed(closed_token);
+            return Err(e.into());
+        }
+        Ok(Wgc {
+            item,
+            pool,
+            session,
+            arrived,
+            closed,
+            closed_token,
+            width: size.Width as u32,
+            height: size.Height as u32,
+        })
     }
 
     /// The newest waiting frame; older ones go back.
@@ -133,10 +159,16 @@ impl Wgc {
 
     /// Waits up to `timeout_ms` for a new frame and passes its texture to `on_frame`.
     fn grab_with(&self, timeout_ms: u32, on_frame: impl FnOnce(&ID3D11Texture2D) -> Result<()>) -> Result<Grab> {
+        if self.closed.load(Ordering::SeqCst) {
+            return Ok(Grab::Lost);
+        }
         let mut f = self.newest();
         if f.is_none() {
             if unsafe { WaitForSingleObject(self.arrived.0, timeout_ms) } != WAIT_OBJECT_0 {
-                return Ok(Grab::Timeout);
+                return Ok(if self.closed.load(Ordering::SeqCst) { Grab::Lost } else { Grab::Timeout });
+            }
+            if self.closed.load(Ordering::SeqCst) {
+                return Ok(Grab::Lost);
             }
             f = self.newest();
         }
@@ -168,6 +200,7 @@ impl Wgc {
 
 impl Drop for Wgc {
     fn drop(&mut self) {
+        let _ = self.item.RemoveClosed(self.closed_token);
         let _ = self.session.Close();
         let _ = self.pool.Close();
     }

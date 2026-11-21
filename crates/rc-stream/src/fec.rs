@@ -36,7 +36,7 @@ pub fn encode_frame(frame: u32, data: &[u8], max_datagram: usize, parity_pct: u3
     let k = data.len().div_ceil(max_shard).max(1);
     assert!(k <= MAX_DATA_SHARDS, "frame too large");
     let shard_len = (data.len().div_ceil(k).max(2) + 1) & !1;
-    let m = parity_count(k, parity_pct, min_parity);
+    let m = parity_count(k, parity_pct, min_parity).min(u16::MAX as usize - k);
 
     let mut shards: Vec<Vec<u8>> = (0..k)
         .map(|i| {
@@ -57,8 +57,14 @@ pub fn encode_frame(frame: u32, data: &[u8], max_datagram: usize, parity_pct: u3
         .enumerate()
         .map(|(i, s)| {
             let mut d = Vec::with_capacity(SHARD_HDR + s.len());
-            ShardHeader { frame, index: i as u16, data: k as u16, parity: m as u16, frame_len: data.len() as u32 }
-                .write(&mut d);
+            ShardHeader {
+                frame,
+                index: u16::try_from(i).expect("total shards fit in u16"),
+                data: k as u16,
+                parity: m as u16,
+                frame_len: data.len() as u32,
+            }
+            .write(&mut d);
             d.extend_from_slice(&s);
             d
         })
@@ -136,7 +142,7 @@ impl Assembler {
         if self.retired.contains(&h.frame) {
             return None;
         }
-        let total = (h.data + h.parity) as usize;
+        let total = h.data as usize + h.parity as usize;
         let p = self.frames.entry(h.frame).or_insert_with(|| Partial {
             data: h.data,
             parity: h.parity,
@@ -182,7 +188,7 @@ impl Assembler {
         for f in old {
             let p = self.frames.remove(&f).expect("listed above");
             let r = &mut self.pending;
-            r.shards_expected += (p.data + p.parity) as u32;
+            r.shards_expected += p.data as u32 + p.parity as u32;
             r.shards_received += p.received as u32;
             match p.done {
                 Some(false) => r.frames_ok += 1,
@@ -309,5 +315,26 @@ mod tests {
         let mut a = Assembler::new(Duration::from_millis(100));
         let c = a.push(&pkts[2], Instant::now()).expect("one parity shard is enough for one data shard");
         assert_eq!(c.data, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn rejects_u16_overflow_shard_header() {
+        let mut pkt = Vec::new();
+        ShardHeader { frame: 1, index: 0, data: 32_768, parity: 32_768, frame_len: 100 }.write(&mut pkt);
+        pkt.extend_from_slice(&[0u8; 4]);
+        let mut a = Assembler::new(Duration::from_millis(100));
+        assert!(a.push(&pkt, Instant::now()).is_none());
+    }
+
+    #[test]
+    fn encode_frame_clamps_total_shards_to_u16_max() {
+        let data = vec![0x5a; 65_536];
+        let pkts = encode_frame(1, &data, SHARD_HDR + 2, 100, 2);
+        assert_eq!(pkts.len(), u16::MAX as usize);
+        let (first, _) = ShardHeader::parse(&pkts[0]).expect("first shard parses");
+        assert_eq!(first.data, 32_768);
+        assert_eq!(first.parity, 32_767);
+        let (last, _) = ShardHeader::parse(pkts.last().unwrap()).expect("last shard parses");
+        assert_eq!(last.index, u16::MAX - 1);
     }
 }

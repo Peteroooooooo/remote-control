@@ -16,7 +16,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use windows::{
     Win32::{
         Foundation::{HMODULE, LUID},
@@ -103,6 +103,7 @@ const MFX_CODEC_HEVC: u32 = fourcc(b'H', b'E', b'V', b'C');
 const MFX_FOURCC_NV12: u32 = fourcc(b'N', b'V', b'1', b'2');
 const MFX_FOURCC_P8: u32 = fourcc(b'P', b'8', b' ', b' ');
 const MFX_EXTBUFF_CODING_OPTION: u32 = fourcc(b'C', b'D', b'O', b'P');
+const MFX_EXTBUFF_VIDEO_SIGNAL_INFO: u32 = fourcc(b'V', b'S', b'I', b'N');
 const MFX_EXTBUFF_CODING_OPTION3: u32 = fourcc(b'C', b'D', b'O', b'3');
 const MFX_SCENARIO_DISPLAY_REMOTING: u16 = 7;
 
@@ -334,6 +335,18 @@ struct MfxExtCodingOption {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct MfxExtVideoSignalInfo {
+    header: MfxExtBuffer,
+    video_format: u16,
+    video_full_range: u16,
+    colour_description_present: u16,
+    colour_primaries: u16,
+    transfer_characteristics: u16,
+    matrix_coefficients: u16,
+}
+
+#[repr(C)]
 #[derive(Clone, Copy)]
 struct MfxExtCodingOption3 {
     header: MfxExtBuffer,
@@ -441,6 +454,7 @@ const _: () = {
     assert!(size_of::<MfxBitstream>() == 72);
     assert!(size_of::<MfxEncodeCtrl>() == 56);
     assert!(size_of::<MfxExtCodingOption>() == 64);
+    assert!(size_of::<MfxExtVideoSignalInfo>() == 20);
     assert!(size_of::<MfxExtCodingOption3>() == 512);
     assert!(size_of::<MfxFrameAllocRequest>() == 92);
     assert!(size_of::<MfxFrameAllocResponse>() == 32);
@@ -499,28 +513,49 @@ fn try_load_vpl(path: &std::path::Path) -> Option<VplApi> {
     unsafe {
         let h = LoadLibraryW(&HSTRING::from(path.as_os_str())).ok()?;
         macro_rules! sym {
-            ($name:literal) => {{
+            ($name:literal, $ty:ty) => {{
                 let c = CStr::from_bytes_with_nul_unchecked(concat!($name, "\0").as_bytes());
                 let p = GetProcAddress(h, PCSTR(c.as_ptr() as *const u8))?;
-                std::mem::transmute(p)
+                std::mem::transmute::<unsafe extern "system" fn() -> isize, $ty>(p)
             }};
         }
         Some(VplApi {
             _module: h,
-            mfx_load: sym!("MFXLoad"),
-            mfx_unload: sym!("MFXUnload"),
-            mfx_create_config: sym!("MFXCreateConfig"),
-            mfx_set_config_filter_property: sym!("MFXSetConfigFilterProperty"),
-            mfx_create_session: sym!("MFXCreateSession"),
-            mfx_close: sym!("MFXClose"),
-            set_handle: sym!("MFXVideoCORE_SetHandle"),
-            set_frame_allocator: sym!("MFXVideoCORE_SetFrameAllocator"),
-            sync_operation: sym!("MFXVideoCORE_SyncOperation"),
-            encode_init: sym!("MFXVideoENCODE_Init"),
-            encode_reset: sym!("MFXVideoENCODE_Reset"),
-            encode_close: sym!("MFXVideoENCODE_Close"),
-            encode_get_video_param: sym!("MFXVideoENCODE_GetVideoParam"),
-            encode_frame_async: sym!("MFXVideoENCODE_EncodeFrameAsync"),
+            mfx_load: sym!("MFXLoad", unsafe extern "C" fn() -> MfxLoader),
+            mfx_unload: sym!("MFXUnload", unsafe extern "C" fn(MfxLoader)),
+            mfx_create_config: sym!("MFXCreateConfig", unsafe extern "C" fn(MfxLoader) -> MfxConfig),
+            mfx_set_config_filter_property: sym!(
+                "MFXSetConfigFilterProperty",
+                unsafe extern "C" fn(MfxConfig, *const u8, MfxVariant) -> MfxStatus
+            ),
+            mfx_create_session: sym!("MFXCreateSession", unsafe extern "C" fn(MfxLoader, u32, *mut MfxSession) -> MfxStatus),
+            mfx_close: sym!("MFXClose", unsafe extern "C" fn(MfxSession) -> MfxStatus),
+            set_handle: sym!("MFXVideoCORE_SetHandle", unsafe extern "C" fn(MfxSession, i32, MfxHdl) -> MfxStatus),
+            set_frame_allocator: sym!(
+                "MFXVideoCORE_SetFrameAllocator",
+                unsafe extern "C" fn(MfxSession, *mut MfxFrameAllocator) -> MfxStatus
+            ),
+            sync_operation: sym!(
+                "MFXVideoCORE_SyncOperation",
+                unsafe extern "C" fn(MfxSession, MfxSyncPoint, u32) -> MfxStatus
+            ),
+            encode_init: sym!("MFXVideoENCODE_Init", unsafe extern "C" fn(MfxSession, *mut MfxVideoParam) -> MfxStatus),
+            encode_reset: sym!("MFXVideoENCODE_Reset", unsafe extern "C" fn(MfxSession, *mut MfxVideoParam) -> MfxStatus),
+            encode_close: sym!("MFXVideoENCODE_Close", unsafe extern "C" fn(MfxSession) -> MfxStatus),
+            encode_get_video_param: sym!(
+                "MFXVideoENCODE_GetVideoParam",
+                unsafe extern "C" fn(MfxSession, *mut MfxVideoParam) -> MfxStatus
+            ),
+            encode_frame_async: sym!(
+                "MFXVideoENCODE_EncodeFrameAsync",
+                unsafe extern "C" fn(
+                    MfxSession,
+                    *mut MfxEncodeCtrl,
+                    *mut MfxFrameSurface1,
+                    *mut MfxBitstream,
+                    *mut MfxSyncPoint,
+                ) -> MfxStatus
+            ),
         })
     }
 }
@@ -571,22 +606,26 @@ fn intel_vpl_driver_dirs() -> Vec<PathBuf> {
     dirs
 }
 
-/// True when `luid` belongs to an Intel graphics adapter (`VendorId == 0x8086`).
-pub fn is_intel_adapter(luid: LUID) -> bool {
+fn intel_adapter_index(luid: LUID) -> Option<u32> {
     unsafe {
-        let Ok(factory) = CreateDXGIFactory1::<IDXGIFactory1>() else { return false };
+        let factory = CreateDXGIFactory1::<IDXGIFactory1>().ok()?;
         let mut i = 0;
         while let Ok(adapter) = factory.EnumAdapters1(i) {
-            i += 1;
             if let Ok(d) = adapter.GetDesc1()
                 && d.AdapterLuid.LowPart == luid.LowPart
                 && d.AdapterLuid.HighPart == luid.HighPart
             {
-                return d.VendorId == 0x8086;
+                return (d.VendorId == 0x8086).then_some(i);
             }
+            i += 1;
         }
-        false
+        None
     }
+}
+
+/// True when `luid` belongs to an Intel graphics adapter (`VendorId == 0x8086`).
+pub fn is_intel_adapter(luid: LUID) -> bool {
+    intel_adapter_index(luid).is_some()
 }
 
 /// True when `luid` is an Intel GPU and the driver's oneVPL runtime is loadable.
@@ -620,6 +659,8 @@ impl MidEntry {
 
 struct AllocBatch {
     mids: Vec<MfxMemId>,
+    // FFI holds raw pointers to each MidEntry across batch allocations.
+    #[allow(clippy::vec_box)]
     _entries: Vec<Box<MidEntry>>,
 }
 
@@ -722,6 +763,7 @@ unsafe extern "C" fn lock_frame(pthis: MfxHdl, mid: MfxMemId, ptr: *mut MfxFrame
             }
             (*ptr).y = mapped.pData as *mut u8;
             (*ptr).pitch_low = mapped.RowPitch as u16;
+            (*ptr).pitch_high = (mapped.RowPitch >> 16) as u16;
             return MFX_ERR_NONE;
         }
         MFX_ERR_UNSUPPORTED
@@ -742,6 +784,7 @@ unsafe extern "C" fn unlock_frame(pthis: MfxHdl, mid: MfxMemId, ptr: *mut MfxFra
             if !ptr.is_null() {
                 (*ptr).y = std::ptr::null_mut();
                 (*ptr).pitch_low = 0;
+                (*ptr).pitch_high = 0;
             }
             return MFX_ERR_NONE;
         }
@@ -790,15 +833,17 @@ pub struct QsvEncoder {
     session: MfxSession,
     _alloc_state: Box<D3D11Allocator>,
     _alloc_table: Box<MfxFrameAllocator>,
+    device: ID3D11Device,
     ctx: ID3D11DeviceContext,
-    /// Dedicated 16-aligned NV12 GPU surface when caller texture is unaligned
-    /// (e.g. 1920x1080 -> 1920x1088) or lacks compatible dimensions.
+    /// Lazily allocated 16-aligned NV12 GPU surface when caller passes an
+    /// unaligned texture (e.g. 1920x1080 -> 1920x1088).
     aligned_tex: Option<ID3D11Texture2D>,
     input_mid: Box<MidEntry>,
     params: MfxVideoParam,
     _ext_co: Box<MfxExtCodingOption>,
+    _ext_vsi: Box<MfxExtVideoSignalInfo>,
     _ext_co3: Box<MfxExtCodingOption3>,
-    ext_ptrs: Box<[*mut MfxExtBuffer; 2]>,
+    ext_ptrs: Box<[*mut MfxExtBuffer; 3]>,
     bs_buf: Vec<u8>,
     pub name: String,
     pub format: Codec,
@@ -806,10 +851,37 @@ pub struct QsvEncoder {
     init_max_kbps: u16,
     width: u32,
     height: u32,
+    aligned_w: u32,
+    aligned_h: u32,
     fps: u32,
     index: u64,
     key_next: bool,
+    rate_changed: bool,
     qp_control: bool,
+}
+
+fn create_aligned_tex(device: &ID3D11Device, aligned_w: u32, aligned_h: u32) -> Result<ID3D11Texture2D> {
+    let desc = D3D11_TEXTURE2D_DESC {
+        Width: aligned_w,
+        Height: aligned_h,
+        MipLevels: 1,
+        ArraySize: 1,
+        Format: DXGI_FORMAT_NV12,
+        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Usage: D3D11_USAGE_DEFAULT,
+        BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_DECODER.0) as u32,
+        CPUAccessFlags: 0,
+        MiscFlags: 0,
+    };
+    let mut t: Option<ID3D11Texture2D> = None;
+    let mut r = unsafe { device.CreateTexture2D(&desc, None, Some(&mut t)) };
+    if r.is_err() {
+        let mut d2 = desc;
+        d2.BindFlags = D3D11_BIND_RENDER_TARGET.0 as u32;
+        r = unsafe { device.CreateTexture2D(&d2, None, Some(&mut t)) };
+    }
+    r.context("CreateTexture2D(qsv aligned)")?;
+    t.context("CreateTexture2D(qsv aligned)")
 }
 
 impl QsvEncoder {
@@ -825,9 +897,9 @@ impl QsvEncoder {
         if opts.yuv444 {
             bail!("QSV 4:4:4 not enabled");
         }
-        if !is_intel_adapter(luid) {
+        let Some(adapter_idx) = intel_adapter_index(luid) else {
             bail!("not an Intel adapter");
-        }
+        };
         let Some(api) = vpl_api() else {
             bail!("oneVPL dispatcher (libvpl.dll) not found");
         };
@@ -836,38 +908,52 @@ impl QsvEncoder {
             Codec::Hevc => MFX_CODEC_HEVC,
         };
         unsafe {
-            let loader = (api.mfx_load)();
-            if loader.is_null() {
-                bail!("MFXLoad returned null");
-            }
-            let set_u32_filter = |prop: &[u8], val: u32| -> Result<()> {
-                let cfg = (api.mfx_create_config)(loader);
-                if cfg.is_null() {
-                    bail!("MFXCreateConfig failed");
+            let init_session = |with_adapter_idx: bool| -> Result<(MfxLoader, MfxSession)> {
+                let loader = (api.mfx_load)();
+                if loader.is_null() {
+                    bail!("MFXLoad returned null");
                 }
-                let v = MfxVariant { version: 0, _pad: 0, ty: MFX_VARIANT_TYPE_U32, data: val as u64 };
-                let sts = (api.mfx_set_config_filter_property)(cfg, prop.as_ptr(), v);
-                if sts < MFX_ERR_NONE {
-                    bail!("MFXSetConfigFilterProperty failed: {sts}");
+                let setup = || -> Result<MfxSession> {
+                    let set_u32_filter = |prop: &[u8], val: u32| -> Result<()> {
+                        let cfg = (api.mfx_create_config)(loader);
+                        if cfg.is_null() {
+                            bail!("MFXCreateConfig failed");
+                        }
+                        let v = MfxVariant { version: 0, _pad: 0, ty: MFX_VARIANT_TYPE_U32, data: val as u64 };
+                        let sts = (api.mfx_set_config_filter_property)(cfg, prop.as_ptr(), v);
+                        if sts < MFX_ERR_NONE {
+                            bail!("MFXSetConfigFilterProperty failed: {sts}");
+                        }
+                        Ok(())
+                    };
+                    set_u32_filter(b"mfxImplDescription.Impl\0", MFX_IMPL_TYPE_HARDWARE)?;
+                    set_u32_filter(b"mfxImplDescription.AccelerationMode\0", MFX_ACCEL_MODE_VIA_D3D11)?;
+                    set_u32_filter(b"mfxImplDescription.mfxEncoderDescription.encoder.CodecID\0", codec_id)?;
+                    if with_adapter_idx {
+                        set_u32_filter(b"DXGIAdapterIndex\0", adapter_idx)?;
+                    }
+                    let mut session: MfxSession = std::ptr::null_mut();
+                    let sts = (api.mfx_create_session)(loader, 0, &mut session);
+                    if sts < MFX_ERR_NONE || session.is_null() {
+                        bail!("MFXCreateSession failed: {sts}");
+                    }
+                    Ok(session)
+                };
+                match setup() {
+                    Ok(session) => Ok((loader, session)),
+                    Err(e) => {
+                        (api.mfx_unload)(loader);
+                        Err(e)
+                    }
                 }
-                Ok(())
             };
-            let init_session = || -> Result<MfxSession> {
-                set_u32_filter(b"mfxImplDescription.Impl\0", MFX_IMPL_TYPE_HARDWARE)?;
-                set_u32_filter(b"mfxImplDescription.AccelerationMode\0", MFX_ACCEL_MODE_VIA_D3D11)?;
-                set_u32_filter(b"mfxImplDescription.mfxEncoderDescription.encoder.CodecID\0", codec_id)?;
-                let mut session: MfxSession = std::ptr::null_mut();
-                let sts = (api.mfx_create_session)(loader, 0, &mut session);
-                if sts < MFX_ERR_NONE || session.is_null() {
-                    bail!("MFXCreateSession failed: {sts}");
-                }
-                Ok(session)
-            };
-            let session = match init_session() {
-                Ok(s) => s,
+            let (loader, session) = match init_session(true) {
+                Ok(pair) => pair,
                 Err(e) => {
-                    (api.mfx_unload)(loader);
-                    return Err(e);
+                    crate::log!(
+                        "oneVPL DXGIAdapterIndex={adapter_idx} filter unavailable ({e:#}); falling back to default adapter"
+                    );
+                    init_session(false)?
                 }
             };
 
@@ -908,81 +994,101 @@ impl QsvEncoder {
                 Some(s) => (7 - (s.min(100) * 6 / 100) as u16).clamp(MFX_TARGETUSAGE_BEST_QUALITY, MFX_TARGETUSAGE_BEST_SPEED),
             };
 
-            let mut ext_co = Box::new(MfxExtCodingOption::default());
-            ext_co.header = MfxExtBuffer {
-                buffer_id: MFX_EXTBUFF_CODING_OPTION,
-                buffer_sz: size_of::<MfxExtCodingOption>() as u32,
-            };
-            ext_co.max_dec_frame_buffering = 1;
-            ext_co.nal_hrd_conformance = MFX_CODINGOPTION_OFF;
-            ext_co.vui_nal_hrd_parameters = MFX_CODINGOPTION_OFF;
-            ext_co.pic_timing_sei = MFX_CODINGOPTION_OFF;
-            ext_co.au_delimiter = MFX_CODINGOPTION_OFF;
+            let mut ext_co = Box::new(MfxExtCodingOption {
+                header: MfxExtBuffer {
+                    buffer_id: MFX_EXTBUFF_CODING_OPTION,
+                    buffer_sz: size_of::<MfxExtCodingOption>() as u32,
+                },
+                max_dec_frame_buffering: 1,
+                nal_hrd_conformance: MFX_CODINGOPTION_OFF,
+                vui_nal_hrd_parameters: MFX_CODINGOPTION_OFF,
+                pic_timing_sei: MFX_CODINGOPTION_OFF,
+                au_delimiter: MFX_CODINGOPTION_OFF,
+                ..Default::default()
+            });
 
-            let mut ext_co3 = Box::new(MfxExtCodingOption3::default());
-            ext_co3.header = MfxExtBuffer {
-                buffer_id: MFX_EXTBUFF_CODING_OPTION3,
-                buffer_sz: size_of::<MfxExtCodingOption3>() as u32,
-            };
-            ext_co3.low_delay_brc = MFX_CODINGOPTION_ON;
-            ext_co3.scenario_info = MFX_SCENARIO_DISPLAY_REMOTING;
+            let mut ext_vsi = Box::new(MfxExtVideoSignalInfo {
+                header: MfxExtBuffer {
+                    buffer_id: MFX_EXTBUFF_VIDEO_SIGNAL_INFO,
+                    buffer_sz: size_of::<MfxExtVideoSignalInfo>() as u32,
+                },
+                video_format: 5,
+                video_full_range: 0,
+                colour_description_present: 1,
+                colour_primaries: 1,
+                transfer_characteristics: 1,
+                matrix_coefficients: 1,
+            });
+
+            let mut ext_co3 = Box::new(MfxExtCodingOption3 {
+                header: MfxExtBuffer {
+                    buffer_id: MFX_EXTBUFF_CODING_OPTION3,
+                    buffer_sz: size_of::<MfxExtCodingOption3>() as u32,
+                },
+                low_delay_brc: MFX_CODINGOPTION_ON,
+                scenario_info: MFX_SCENARIO_DISPLAY_REMOTING,
+                ..Default::default()
+            });
 
             let mut ext_ptrs = Box::new([
                 (&mut *ext_co as *mut MfxExtCodingOption) as *mut MfxExtBuffer,
+                (&mut *ext_vsi as *mut MfxExtVideoSignalInfo) as *mut MfxExtBuffer,
                 (&mut *ext_co3 as *mut MfxExtCodingOption3) as *mut MfxExtBuffer,
             ]);
 
-            let mut params = MfxVideoParam::default();
-            params.async_depth = 1;
-            params.io_pattern = MFX_IOPATTERN_IN_VIDEO_MEMORY;
-            params.mfx.codec_id = codec_id;
-            params.mfx.codec_profile = match opts.codec {
-                Codec::H264 => MFX_PROFILE_AVC_HIGH,
-                Codec::Hevc => MFX_PROFILE_HEVC_MAIN,
-            };
-            params.mfx.low_power = MFX_CODINGOPTION_ON;
-            params.mfx.target_usage = target_usage;
-            params.mfx.gop_pic_size = (fps * 60).min(u16::MAX as u32) as u16;
-            params.mfx.gop_ref_dist = 1; // no B-frames
-            params.mfx.idr_interval = 0;
-            params.mfx.num_ref_frame = 1;
-            params.mfx.frame_info = MfxFrameInfo {
-                fourcc: MFX_FOURCC_NV12,
-                chroma_format: MFX_CHROMAFORMAT_YUV420,
-                pic_struct: MFX_PICSTRUCT_PROGRESSIVE,
-                width: aligned_w as u16,
-                height: aligned_h as u16,
-                crop_x: 0,
-                crop_y: 0,
-                crop_w: width as u16,
-                crop_h: height as u16,
-                frame_rate_ext_n: fps.max(1),
-                frame_rate_ext_d: 1,
-                aspect_ratio_w: 1,
-                aspect_ratio_h: 1,
-                bit_depth_luma: 8,
-                bit_depth_chroma: 8,
+            let mut params = MfxVideoParam {
+                async_depth: 1,
+                io_pattern: MFX_IOPATTERN_IN_VIDEO_MEMORY,
+                mfx: MfxInfoMfx {
+                    codec_id,
+                    codec_profile: match opts.codec {
+                        Codec::H264 => MFX_PROFILE_AVC_HIGH,
+                        Codec::Hevc => MFX_PROFILE_HEVC_MAIN,
+                    },
+                    low_power: MFX_CODINGOPTION_ON,
+                    target_usage,
+                    gop_pic_size: (fps * 60).min(u16::MAX as u32) as u16,
+                    gop_ref_dist: 1, // no B-frames
+                    idr_interval: 0,
+                    num_ref_frame: 1,
+                    frame_info: MfxFrameInfo {
+                        fourcc: MFX_FOURCC_NV12,
+                        chroma_format: MFX_CHROMAFORMAT_YUV420,
+                        pic_struct: MFX_PICSTRUCT_PROGRESSIVE,
+                        width: aligned_w as u16,
+                        height: aligned_h as u16,
+                        crop_x: 0,
+                        crop_y: 0,
+                        crop_w: width as u16,
+                        crop_h: height as u16,
+                        frame_rate_ext_n: fps.max(1),
+                        frame_rate_ext_d: 1,
+                        aspect_ratio_w: 1,
+                        aspect_ratio_h: 1,
+                        bit_depth_luma: 8,
+                        bit_depth_chroma: 8,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                ext_param: ext_ptrs.as_mut_ptr(),
+                num_ext_param: 3,
                 ..Default::default()
             };
             apply_rate_params(&mut params, bitrate, fps, vbv_frames, opts.qp_control);
-            params.ext_param = ext_ptrs.as_mut_ptr();
-            params.num_ext_param = 2;
 
             // Try LowPower=ON (dedicated VDENC fixed-function hardware) first;
-            // fall back to LowPower=OFF on older Gen iGPUs without VDENC.
-            let mut sts = (api.encode_init)(session, &mut params);
-            if sts < MFX_ERR_NONE {
-                params.mfx.low_power = MFX_CODINGOPTION_OFF;
-                sts = (api.encode_init)(session, &mut params);
-            }
-            if sts < MFX_ERR_NONE {
-                // Retry without ExtCodingOption3 in case older driver rejects it.
-                params.num_ext_param = 1;
-                params.mfx.low_power = MFX_CODINGOPTION_ON;
-                sts = (api.encode_init)(session, &mut params);
-                if sts < MFX_ERR_NONE {
-                    params.mfx.low_power = MFX_CODINGOPTION_OFF;
+            // fall back to LowPower=OFF on older Gen iGPUs without VDENC, and
+            // drop optional extension buffers if an older driver rejects them.
+            let mut sts = MFX_ERR_UNSUPPORTED;
+            'init: for num_ext in [3u16, 2, 1] {
+                params.num_ext_param = num_ext;
+                for lp in [MFX_CODINGOPTION_ON, MFX_CODINGOPTION_OFF] {
+                    params.mfx.low_power = lp;
                     sts = (api.encode_init)(session, &mut params);
+                    if sts >= MFX_ERR_NONE {
+                        break 'init;
+                    }
                 }
             }
             if sts < MFX_ERR_NONE {
@@ -995,63 +1101,51 @@ impl QsvEncoder {
             // calls don't fail with MFX_ERR_INCOMPATIBLE_VIDEO_PARAM (-14).
             let _ = (api.encode_get_video_param)(session, &mut params);
 
-            let aligned_tex = if aligned_w != width || aligned_h != height {
-                let desc = D3D11_TEXTURE2D_DESC {
-                    Width: aligned_w,
-                    Height: aligned_h,
-                    MipLevels: 1,
-                    ArraySize: 1,
-                    Format: DXGI_FORMAT_NV12,
-                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
-                    Usage: D3D11_USAGE_DEFAULT,
-                    BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_DECODER.0) as u32,
-                    CPUAccessFlags: 0,
-                    MiscFlags: 0,
-                };
-                let mut t: Option<ID3D11Texture2D> = None;
-                let mut r = device.CreateTexture2D(&desc, None, Some(&mut t));
-                if r.is_err() {
-                    let mut d2 = desc;
-                    d2.BindFlags = D3D11_BIND_RENDER_TARGET.0 as u32;
-                    r = device.CreateTexture2D(&d2, None, Some(&mut t));
-                }
-                r.context("CreateTexture2D(qsv aligned)")?;
-                t
-            } else {
-                None
-            };
-
             let lp = if params.mfx.low_power == MFX_CODINGOPTION_ON { "VDENC" } else { "VME" };
             let name = format!("Intel QSV {} ({lp}, oneVPL)", opts.codec.name());
             crate::log!("encoder {name}: {width}x{height} (aligned {aligned_w}x{aligned_h}) @ {fps} fps, TU={target_usage}, init status={sts}");
 
             let init_max_kbps = params.mfx.max_kbps.max(params.mfx.target_kbps).max(1);
+            let actual_bitrate = if !opts.qp_control && params.mfx.target_kbps > 0 {
+                (params.mfx.target_kbps as u32) * (params.mfx.brc_param_multiplier.max(1) as u32) * 1000
+            } else {
+                bitrate
+            };
             Ok(QsvEncoder {
                 api,
                 loader,
                 session,
                 _alloc_state: alloc_state,
                 _alloc_table: alloc_table,
+                device: device.clone(),
                 ctx,
-                aligned_tex,
+                aligned_tex: None,
                 input_mid: Box::new(MidEntry { res: AllocResource::External(std::ptr::null_mut()), is_p8: false }),
                 params,
                 _ext_co: ext_co,
+                _ext_vsi: ext_vsi,
                 _ext_co3: ext_co3,
                 ext_ptrs,
                 bs_buf: vec![0u8; (width as usize * height as usize).max(1024 * 1024)],
                 name,
                 format: opts.codec,
-                bitrate,
+                bitrate: actual_bitrate,
                 init_max_kbps,
                 width,
                 height,
+                aligned_w,
+                aligned_h,
                 fps,
                 index: 0,
                 key_next: true,
+                rate_changed: false,
                 qp_control: opts.qp_control,
             })
         }
+    }
+
+    pub fn aligned_size(&self) -> (u32, u32) {
+        (self.aligned_w, self.aligned_h)
     }
 
     pub fn set_bitrate(&mut self, bps: u32) {
@@ -1070,7 +1164,9 @@ impl QsvEncoder {
         self.params.ext_param = self.ext_ptrs.as_mut_ptr();
         let sts = unsafe { (self.api.encode_reset)(self.session, &mut self.params) };
         if sts >= MFX_ERR_NONE {
-            self.bitrate = bps;
+            let actual_mult = self.params.mfx.brc_param_multiplier.max(1) as u32;
+            self.bitrate = (scaled as u32) * actual_mult * 1000;
+            self.rate_changed = true;
         } else {
             crate::log!(
                 "QSV set_bitrate({bps}) reset failed: {sts} (mult={mult}, buf={}, init_delay={})",
@@ -1085,34 +1181,53 @@ impl QsvEncoder {
         self.key_next = true;
     }
 
-    pub fn encode(&mut self, nv12: &ID3D11Texture2D, timeout: Duration, qp: Option<u32>) -> Result<Option<Encoded>> {
-        let src_ptr = if let Some(ref aligned) = self.aligned_tex {
+    pub fn encode(
+        &mut self,
+        nv12: &ID3D11Texture2D,
+        timeout: Duration,
+        qp: Option<u32>,
+        rekeys_on_rate_change: &mut bool,
+    ) -> Result<Option<Encoded>> {
+        let mut tex_desc = D3D11_TEXTURE2D_DESC::default();
+        unsafe { nv12.GetDesc(&mut tex_desc) };
+        let src_ptr = if tex_desc.Width == self.aligned_w && tex_desc.Height == self.aligned_h {
+            nv12.as_raw()
+        } else {
+            if self.aligned_tex.is_none() {
+                self.aligned_tex = Some(create_aligned_tex(&self.device, self.aligned_w, self.aligned_h)?);
+            }
+            let aligned = self.aligned_tex.as_ref().expect("created above");
+            let copy_w = tex_desc.Width.min(self.width);
+            let copy_h = tex_desc.Height.min(self.height);
             unsafe {
-                let bx = D3D11_BOX { left: 0, top: 0, front: 0, right: self.width, bottom: self.height, back: 1 };
+                let bx = D3D11_BOX { left: 0, top: 0, front: 0, right: copy_w, bottom: copy_h, back: 1 };
                 self.ctx.CopySubresourceRegion(aligned, 0, 0, 0, 0, nv12, 0, Some(&bx));
             }
             aligned.as_raw()
-        } else {
-            nv12.as_raw()
         };
         self.input_mid.res = AllocResource::External(src_ptr);
 
-        let mut surf = MfxFrameSurface1::default();
-        surf.info = self.params.mfx.frame_info;
-        surf.data.mem_id = (&mut *self.input_mid as *mut MidEntry) as MfxMemId;
-        surf.data.mem_type = MFX_MEMTYPE_VIDEO_MEMORY_DECODER_TARGET | MFX_MEMTYPE_EXTERNAL_FRAME;
-        surf.data.time_stamp = self.index * (90_000 / self.fps.max(1) as u64);
-        self.index += 1;
+        let mut surf = MfxFrameSurface1 {
+            info: self.params.mfx.frame_info,
+            data: MfxFrameData {
+                mem_id: (&mut *self.input_mid as *mut MidEntry) as MfxMemId,
+                mem_type: MFX_MEMTYPE_VIDEO_MEMORY_DECODER_TARGET | MFX_MEMTYPE_EXTERNAL_FRAME,
+                time_stamp: self.index * (90_000 / self.fps.max(1) as u64),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
 
-        let mut ctrl = MfxEncodeCtrl::default();
         let asked_key = std::mem::take(&mut self.key_next);
-        if asked_key {
-            ctrl.frame_type = MFX_FRAMETYPE_I | MFX_FRAMETYPE_REF | MFX_FRAMETYPE_IDR;
-        }
-        if let Some(q) = qp {
-            ctrl.qp = q.min(51) as u16;
-        }
+        let mut ctrl = MfxEncodeCtrl {
+            frame_type: if asked_key { MFX_FRAMETYPE_I | MFX_FRAMETYPE_REF | MFX_FRAMETYPE_IDR } else { 0 },
+            qp: qp.map_or(0, |q| q.min(51) as u16),
+            ..Default::default()
+        };
         let ctrl_ptr = if asked_key || qp.is_some() { &mut ctrl as *mut MfxEncodeCtrl } else { std::ptr::null_mut() };
+
+        let deadline = Instant::now() + timeout;
+        let mut buf_retries = 0u32;
 
         loop {
             let mut bs = MfxBitstream {
@@ -1124,28 +1239,46 @@ impl QsvEncoder {
             let sts = unsafe { (self.api.encode_frame_async)(self.session, ctrl_ptr, &mut surf, &mut bs, &mut syncp) };
             match sts {
                 s if s == MFX_ERR_NOT_ENOUGH_BUFFER => {
-                    let new_len = self.bs_buf.len().saturating_mul(2).max(4 * 1024 * 1024);
+                    buf_retries += 1;
+                    const MAX_BS_BUF: usize = 64 * 1024 * 1024;
+                    if buf_retries > 6 || self.bs_buf.len() >= MAX_BS_BUF {
+                        if asked_key {
+                            self.key_next = true;
+                        }
+                        bail!("QSV bitstream buffer limit exceeded ({} bytes, retries={buf_retries})", self.bs_buf.len());
+                    }
+                    let new_len = self.bs_buf.len().saturating_mul(2).clamp(4 * 1024 * 1024, MAX_BS_BUF);
                     self.bs_buf.resize(new_len, 0);
                     continue;
                 }
                 s if s == MFX_WRN_DEVICE_BUSY => {
+                    if Instant::now() >= deadline {
+                        if asked_key {
+                            self.key_next = true;
+                        }
+                        return Ok(None);
+                    }
                     std::thread::sleep(Duration::from_micros(200));
                     continue;
                 }
-                s if s == MFX_ERR_MORE_DATA => return Ok(None),
+                s if s == MFX_ERR_MORE_DATA => {
+                    self.index += 1;
+                    return Ok(None);
+                }
                 s if s < MFX_ERR_NONE => bail!("MFXVideoENCODE_EncodeFrameAsync failed: {s}"),
                 _ => {}
             }
+            self.index += 1;
             if syncp.is_null() {
                 return Ok(None);
             }
-            let deadline = Instant::now() + timeout;
+            let sync_deadline = Instant::now() + timeout;
             loop {
-                let rem_ms = deadline.saturating_duration_since(Instant::now()).as_millis().clamp(1, 60_000) as u32;
+                let rem_ms = sync_deadline.saturating_duration_since(Instant::now()).as_millis().clamp(1, 60_000) as u32;
                 let ssts = unsafe { (self.api.sync_operation)(self.session, syncp, rem_ms) };
                 if ssts == MFX_WRN_IN_EXECUTION {
-                    if Instant::now() >= deadline {
-                        return Ok(None);
+                    if Instant::now() >= sync_deadline {
+                        return Err(anyhow!("qsv sync timeout"));
                     }
                     continue;
                 }
@@ -1161,6 +1294,11 @@ impl QsvEncoder {
             let padding = data.iter().rev().take_while(|&&b| b == 0).count();
             data.truncate(data.len() - padding);
             let key = (bs.frame_type & (MFX_FRAMETYPE_IDR | MFX_FRAMETYPE_I)) != 0;
+            let after_change = std::mem::take(&mut self.rate_changed);
+            if key && !asked_key && after_change && !*rekeys_on_rate_change {
+                *rekeys_on_rate_change = true;
+                crate::log!("encoder starts a key frame on every bitrate change; changing the bitrate rarely from now on");
+            }
             return Ok(Some(Encoded { data, key, qp, padding }));
         }
     }

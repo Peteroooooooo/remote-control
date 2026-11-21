@@ -5,8 +5,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-        mpsc::{Receiver, RecvTimeoutError},
+        atomic::{AtomicBool, AtomicI32, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -31,7 +30,7 @@ use crate::{
     proto::{CAN_HEVC, CAN_HEVC444, HostStats, Msg, read_msg},
     stats::{now_us, percentile},
     toolbar,
-    video_rx::{self, Delivered, RxCounters},
+    video_rx::{self, FrameQueue, RxCounters},
     window::{self, WindowState},
 };
 
@@ -151,6 +150,10 @@ struct Shared {
     hint: std::sync::atomic::AtomicU8,
     /// When the host said Ctrl+Alt+Del did not go through.
     no_sas: Mutex<Option<Instant>>,
+    /// Currently streamed host monitor index (-1 if unknown).
+    current_monitor: AtomicI32,
+    /// Monitor index to restore after a handoff reconnect (-1 if none pending).
+    restore_monitor: AtomicI32,
 }
 
 /// How long "Ctrl+Alt+Del did not go through" stays up.
@@ -350,7 +353,12 @@ fn spawn_ctrl_read(
                         .map(|m| format!("{} {}x{} at ({}, {})", m.name, m.width, m.height, m.x, m.y))
                         .collect();
                     log!("host displays: {} (streaming {})", names.join("; "), current as u32 + 1);
+                    sh.current_monitor.store(current as i32, Ordering::SeqCst);
                     window::set_monitors(current as usize, list.len());
+                    let want = sh.restore_monitor.swap(-1, Ordering::SeqCst);
+                    if want >= 0 && want as usize != current as usize && (want as usize) < list.len() {
+                        let _ = sh.ctrl.send(Msg::SelectMonitor { index: want as u8 });
+                    }
                 }
                 m @ (Msg::CursorShape { .. } | Msg::CursorUse { .. } | Msg::CursorHidden) => window::remote_cursor(m),
                 Msg::ClipOffer { seq, .. } => {
@@ -392,6 +400,7 @@ fn run_connected(
     caps: u8,
     proof: String,
 ) -> Result<()> {
+    let _timer = crate::audio::TimerPeriodGuard::enter(1);
     let mut conn = initial_conn.clone();
     if let Some(dir) = &a.cursor_dump {
         std::fs::create_dir_all(dir)?;
@@ -501,6 +510,8 @@ fn run_connected(
         paused: AtomicBool::new(false),
         hint: Default::default(),
         no_sas: Mutex::default(),
+        current_monitor: AtomicI32::new(-1),
+        restore_monitor: AtomicI32::new(-1),
     });
     let (_, init_quality) = crate::quality::start(&a.id.to_string(), a.fps, a.mbps);
     let init_screen = crate::quality::screen();
@@ -509,14 +520,15 @@ fn run_connected(
     crate::audio::config::connect(ctrl_tx.clone());
     let (audio_tx, audio_rx) = mpsc::unbounded_channel::<bytes::Bytes>();
     let audio_stop = Arc::new(AtomicBool::new(false));
+    let audio_reset = Arc::new(AtomicBool::new(false));
     let audio_player = {
-        let stop = audio_stop.clone();
+        let (stop, reset) = (audio_stop.clone(), audio_reset.clone());
         std::thread::Builder::new().name("audio-play".into()).spawn(move || {
-            crate::audio::wasapi::Player::run(audio_rx, stop);
+            crate::audio::wasapi::Player::run_with_reset(audio_rx, stop, reset);
         })?
     };
 
-    let (frames_tx, frames_rx) = std::sync::mpsc::channel::<Delivered>();
+    let frames = Arc::new(FrameQueue::default());
     let counters = Arc::new(Mutex::new(RxCounters::default()));
     let sim = make_sim(a);
     if let Some(s) = &sim {
@@ -528,7 +540,7 @@ fn run_connected(
     // says why no picture can come (locked, no display) gets the window at
     // once, at a size of its own until the picture comes.
     let mut handoff_deadline: Option<Instant> = None;
-    let (sw, sh_, encoder, mut read_handle, mut video_handle) = loop {
+    let (sw, sh_, encoder, mut read_handle, mut video_handle, mut uni_handle) = loop {
         let mut open_err: Option<String> = None;
         let streams = match rt.block_on(conn.open_bi()) {
             Ok((mut send, recv)) => {
@@ -559,7 +571,7 @@ fn run_connected(
             }
         };
 
-        let mut got: Option<(u32, u32, String, AbortHandle, AbortHandle)> = None;
+        let mut got: Option<(u32, u32, String, AbortHandle, AbortHandle, AbortHandle)> = None;
         if let Some((send, recv)) = streams {
             sh.hint.store(crate::proto::HINT_NONE, Ordering::SeqCst);
             sh.waiting.store(false, Ordering::SeqCst);
@@ -567,7 +579,7 @@ fn run_connected(
             let (info_tx, mut info_rx) = mpsc::unbounded_channel::<(u32, u32, String)>();
             let clip = {
                 let _rt = rt.enter();
-                match ClipSync::start(&conn, ctrl_tx.clone(), false, false, Some(audio_tx.clone())) {
+                match ClipSync::start_clip(&conn, ctrl_tx.clone(), false, false) {
                     Ok(c) => Some(c),
                     Err(e) => {
                         log!("clipboard sharing off: {e:#}");
@@ -575,8 +587,17 @@ fn run_connected(
                     }
                 }
             };
+            let u_handle = rt
+                .spawn(crate::clipsync::accept_uni_loop(
+                    conn.clone(),
+                    clip.as_ref().map(Arc::downgrade),
+                    Some(audio_tx.clone()),
+                ))
+                .abort_handle();
             let r_handle = spawn_ctrl_read(rt.handle(), sh.clone(), recv, clip, info_tx);
-            let v_handle = rt.spawn(video_rx::run(conn.clone(), frames_tx.clone(), ctrl_tx.clone(), counters.clone(), make_sim(a), Some(audio_tx.clone()))).abort_handle();
+            let v_handle = rt
+                .spawn(video_rx::run(conn.clone(), frames.clone(), ctrl_tx.clone(), counters.clone(), make_sim(a), Some(audio_tx.clone())))
+                .abort_handle();
             let asked = Instant::now();
             let res = rt.block_on(async {
                 loop {
@@ -604,11 +625,15 @@ fn run_connected(
                     *sh.active_conn.lock().unwrap() = conn.clone();
                     *sh.last_heard.lock().unwrap() = Instant::now();
                     let _ = writer_tx.send(Some(send));
-                    got = Some((w, h, enc, r_handle, v_handle));
+                    got = Some((w, h, enc, r_handle, v_handle, u_handle));
                 }
                 Err(fallback_why) => {
                     r_handle.abort();
                     v_handle.abort();
+                    u_handle.abort();
+                    if conn.close_reason().is_none() {
+                        conn.close(0u32.into(), b"timeout");
+                    }
                     open_err = Some(fallback_why);
                 }
             }
@@ -620,8 +645,8 @@ fn run_connected(
             });
         }
 
-        if let Some((w, h, enc, r_h, v_h)) = got {
-            break (w, h, enc, r_h, v_h);
+        if let Some((w, h, enc, r_h, v_h, u_h)) = got {
+            break (w, h, enc, r_h, v_h, u_h);
         }
 
         if is_handoff_close(&conn) {
@@ -652,11 +677,15 @@ fn run_connected(
     let title = a.name.clone().unwrap_or_else(|| a.id.fmt_short().to_string());
     let hwnd = window::create(wstate.clone(), &title, window::initial_client_size((sw, sh_)))?;
     let hwnd_raw = hwnd.0 as isize;
+    {
+        let frames_wake = frames.clone();
+        window::set_resize_wake(Arc::new(move || frames_wake.wake()));
+    }
 
     let render = {
-        let sh = sh.clone();
+        let (sh, frames) = (sh.clone(), frames.clone());
         std::thread::Builder::new().name("render".into()).spawn(move || {
-            if let Err(e) = render_loop(&sh, frames_rx, HWND(hwnd_raw as *mut _)) {
+            if let Err(e) = render_loop(&sh, frames, HWND(hwnd_raw as *mut _)) {
                 log!("render: {e:#}");
             }
         })?
@@ -681,7 +710,7 @@ fn run_connected(
         });
     }
     {
-        let (sh, wstate, ep, target, proof, ctrl_tx, writer_tx, frames_tx, counters, audio_tx) = (
+        let (sh, wstate, ep, target, proof, ctrl_tx, writer_tx, frames, counters, audio_tx, audio_reset) = (
             sh.clone(),
             wstate.clone(),
             ep.clone(),
@@ -689,9 +718,10 @@ fn run_connected(
             proof.clone(),
             ctrl_tx.clone(),
             writer_tx.clone(),
-            frames_tx.clone(),
+            frames.clone(),
             counters.clone(),
             audio_tx.clone(),
+            audio_reset.clone(),
         );
         let sim_loss = a.sim_loss;
         let sim_burst = a.sim_burst;
@@ -721,17 +751,19 @@ fn run_connected(
                 }
 
                 log!("host is handing off (CLOSE_HANDOFF); reconnecting...");
+                let prev_monitor = sh.current_monitor.load(Ordering::SeqCst);
                 sh.reconnecting.store(true, Ordering::SeqCst);
                 status("connecting");
                 crate::toolbar::update(crate::toolbar::Tone::Fair, "对方正在切换后台服务，正在重连…".into(), vec![], true);
                 let _ = writer_tx.send(None);
                 read_handle.abort();
                 video_handle.abort();
+                uni_handle.abort();
                 watchdog_handle.abort();
 
                 let deadline = Instant::now() + Duration::from_secs(45);
                 let mut terminal_code: Option<u32> = None;
-                let mut reconnected: Option<(Connection, SendStream, AbortHandle)> = None;
+                let mut reconnected: Option<(Connection, SendStream, AbortHandle, AbortHandle, AbortHandle)> = None;
                 loop {
                     if sh.quit.load(Ordering::Relaxed) || wstate.closed.load(Ordering::Relaxed) {
                         return;
@@ -806,19 +838,39 @@ fn run_connected(
                     sh.hint.store(crate::proto::HINT_NONE, Ordering::SeqCst);
                     sh.waiting.store(false, Ordering::SeqCst);
                     sh.paused.store(false, Ordering::SeqCst);
+                    sh.restore_monitor.store(prev_monitor, Ordering::SeqCst);
                     let (info_tx, mut info_rx) = mpsc::unbounded_channel::<(u32, u32, String)>();
-                    let new_clip = match ClipSync::start(&new_conn, ctrl_tx.clone(), false, false, Some(audio_tx.clone())) {
+                    let new_clip = match ClipSync::start_clip(&new_conn, ctrl_tx.clone(), false, false) {
                         Ok(c) => Some(c),
                         Err(e) => {
                             log!("clipboard sharing off: {e:#}");
                             None
                         }
                     };
+                    let new_uni = tokio::spawn(crate::clipsync::accept_uni_loop(
+                        new_conn.clone(),
+                        new_clip.as_ref().map(Arc::downgrade),
+                        Some(audio_tx.clone()),
+                    ))
+                    .abort_handle();
                     let new_read = spawn_ctrl_read(&rt_handle, sh.clone(), new_recv, new_clip, info_tx);
+                    let sim = (sim_loss > 0.0)
+                        .then(|| crate::lossim::LossSim::new(sim_loss, sim_burst, now_us() ^ 0x9E37_79B9_7F4A_7C15));
+                    let new_video = tokio::spawn(video_rx::run(
+                        new_conn.clone(),
+                        frames.clone(),
+                        ctrl_tx.clone(),
+                        counters.clone(),
+                        sim,
+                        Some(audio_tx.clone()),
+                    ))
+                    .abort_handle();
                     let info_deadline = Instant::now() + Duration::from_secs(10);
                     let ready = loop {
                         if sh.quit.load(Ordering::Relaxed) || wstate.closed.load(Ordering::Relaxed) {
                             new_read.abort();
+                            new_video.abort();
+                            new_uni.abort();
                             new_conn.close(0u32.into(), b"bye");
                             return;
                         }
@@ -840,10 +892,12 @@ fn run_connected(
                         }
                     };
                     if ready {
-                        reconnected = Some((new_conn, new_send, new_read));
+                        reconnected = Some((new_conn, new_send, new_read, new_video, new_uni));
                         break;
                     }
                     new_read.abort();
+                    new_video.abort();
+                    new_uni.abort();
                     if let Some(code) = check_terminal_refusal(&new_conn).await {
                         terminal_code = Some(code);
                         break;
@@ -860,7 +914,7 @@ fn run_connected(
                     window::close();
                     return;
                 }
-                let Some((new_conn, new_send, new_read)) = reconnected else {
+                let Some((new_conn, new_send, new_read, new_video, new_uni)) = reconnected else {
                     if !sh.quit.load(Ordering::Relaxed) && !wstate.closed.load(Ordering::Relaxed) {
                         log!("reconnect timed out after 45 s");
                         status("closed\t重连超时");
@@ -873,6 +927,7 @@ fn run_connected(
 
                 let (k, addr, rtt) = net::selected_path(&new_conn);
                 log!("reconnected via {} {addr} (rtt {rtt:.0} ms)", k.label());
+                audio_reset.store(true, Ordering::Release);
                 *sh.active_conn.lock().unwrap() = new_conn.clone();
                 let _ = writer_tx.send(Some(new_send));
                 *sh.last_heard.lock().unwrap() = Instant::now();
@@ -880,13 +935,12 @@ fn run_connected(
                 sh.reconnecting.store(false, Ordering::SeqCst);
                 status("connected");
                 crate::toolbar::update(crate::toolbar::Tone::Good, "已重连".into(), vec![], false);
-                let sim = (sim_loss > 0.0).then(|| crate::lossim::LossSim::new(sim_loss, sim_burst, now_us() ^ 0x9E37_79B9_7F4A_7C15));
-                let new_video = tokio::spawn(video_rx::run(new_conn.clone(), frames_tx.clone(), ctrl_tx.clone(), counters.clone(), sim, Some(audio_tx.clone()))).abort_handle();
                 let new_watchdog = spawn_watchdog(&rt_handle, sh.clone(), new_conn.clone());
 
                 conn = new_conn;
                 read_handle = new_read;
                 video_handle = new_video;
+                uni_handle = new_uni;
                 watchdog_handle = new_watchdog;
             }
         });
@@ -897,6 +951,7 @@ fn run_connected(
     }
     window::run_loop();
     sh.quit.store(true, Ordering::SeqCst);
+    frames.close();
     audio_stop.store(true, Ordering::SeqCst);
     let _ = ctrl_tx.send(Msg::ReleaseAll);
     let _ = render.join();
@@ -969,15 +1024,23 @@ fn show(pres: &mut Presenter, gpu: &Gpu, p: &Picture, size: (u32, u32), hwnd: HW
 }
 
 /// Decodes every frame (delta frames depend on each other) and presents the newest.
-fn render_loop(sh: &Shared, frames: Receiver<Delivered>, hwnd: HWND) -> Result<()> {
+fn render_loop(sh: &Shared, frames: Arc<FrameQueue>, hwnd: HWND) -> Result<()> {
     mf::init_thread()?;
     let _wlan = crate::wlan::LowLatency::enter();
-    let gpu = Gpu::default_adapter()?;
+    let mut gpu = Gpu::default_adapter()?;
     let mut pres = Presenter::new(&gpu, hwnd)?;
     log!("decoding on {}", gpu.name);
     let mut dec: Option<(Decoder, (u32, u32), Codec, bool)> = None;
     let mut last: Option<(Picture, (u32, u32))> = None;
     let mut last_shown: Option<Instant> = None;
+    let mut last_key_req: Option<Instant> = None;
+    let mut dec_switched = false;
+    let mut req_key = |now: Instant| {
+        if last_key_req.is_none_or(|t| now.duration_since(t) >= Duration::from_millis(300)) {
+            last_key_req = Some(now);
+            let _ = sh.ctrl.send(Msg::RequestKeyframe);
+        }
+    };
     while !sh.quit.load(Ordering::Relaxed) {
         if let Some((p, s)) = &last
             && let Some(path) = sh.shot.lock().unwrap().take()
@@ -985,19 +1048,33 @@ fn render_loop(sh: &Shared, frames: Receiver<Delivered>, hwnd: HWND) -> Result<(
             let r = crate::snapshot::save_bmp(&gpu, p, *s, &path);
             log!("shot {}: {r:?}", path.display());
         }
-        let mut batch = Vec::new();
-        match frames.recv_timeout(Duration::from_millis(30)) {
-            Ok(f) => batch.push(f),
-            Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => break,
-        }
-        batch.extend(frames.try_iter());
+        let Some(batch) = frames.take_wait(Duration::from_millis(50)) else {
+            break;
+        };
         if batch.is_empty() {
             // The window was resized while the picture is still: draw the last frame again.
             if let Some((p, s)) = &last
                 && pres.resized()
             {
-                show(&mut pres, &gpu, p, *s, hwnd)?;
+                match show(&mut pres, &gpu, p, *s, hwnd) {
+                    Ok(true) => {}
+                    Ok(false) => break,
+                    Err(e) => {
+                        log!("present on resize failed ({e:#}); rebuilding renderer");
+                        dec = None;
+                        last = None;
+                        pres.clear_cache();
+                        if let Ok(g) = Gpu::default_adapter()
+                            && let Ok(np) = Presenter::new(&g, hwnd)
+                        {
+                            gpu = g;
+                            pres = np;
+                            req_key(Instant::now());
+                        } else {
+                            std::thread::sleep(Duration::from_millis(100));
+                        }
+                    }
+                }
             }
             continue;
         }
@@ -1007,13 +1084,28 @@ fn render_loop(sh: &Shared, frames: Receiver<Delivered>, hwnd: HWND) -> Result<(
             let codec = if f.header.hevc { Codec::Hevc } else { Codec::H264 };
             if dec.as_ref().is_none_or(|d| d.1 != size || d.2 != codec || d.3 != f.header.yuv444) {
                 if !f.header.key {
+                    req_key(Instant::now());
                     continue;
                 }
-                dec = Some((Decoder::new(&gpu.device, size.0, size.1, codec)?, size, codec, f.header.yuv444));
-                if last.as_ref().is_some_and(|l| l.1 != size) {
-                    log!("stream now {}x{}", size.0, size.1);
+                dec = None;
+                pres.clear_cache();
+                match Decoder::new(&gpu.device, size.0, size.1, codec) {
+                    Ok(d) => {
+                        dec = Some((d, size, codec, f.header.yuv444));
+                        dec_switched = true;
+                        if last.as_ref().is_some_and(|l| l.1 != size) {
+                            log!("stream now {}x{}", size.0, size.1);
+                        }
+                        window::set_stream(size);
+                    }
+                    Err(e) => {
+                        log!("decoder init ({}x{} {codec:?}): {e:#}", size.0, size.1);
+                        sh.render.lock().unwrap().errors += 1;
+                        req_key(Instant::now());
+                        std::thread::sleep(Duration::from_millis(50));
+                        continue;
+                    }
                 }
-                window::set_stream(size);
             }
             let t0 = Instant::now();
             let r = dec.as_mut().expect("created above").0.decode(&f.data);
@@ -1030,13 +1122,32 @@ fn render_loop(sh: &Shared, frames: Receiver<Delivered>, hwnd: HWND) -> Result<(
                     log!("decode: {e:#}");
                     sh.render.lock().unwrap().errors += 1;
                     dec = None;
-                    let _ = sh.ctrl.send(Msg::RequestKeyframe);
+                    pres.clear_cache();
+                    req_key(Instant::now());
                 }
             }
         }
         if let Some((p, size, complete_at, host_us, frame)) = newest {
-            if !show(&mut pres, &gpu, &p, size, hwnd)? {
-                break;
+            match show(&mut pres, &gpu, &p, size, hwnd) {
+                Ok(true) => {}
+                Ok(false) => break,
+                Err(e) => {
+                    log!("present failed ({e:#}); rebuilding renderer");
+                    sh.render.lock().unwrap().errors += 1;
+                    dec = None;
+                    last = None;
+                    pres.clear_cache();
+                    if let Ok(g) = Gpu::default_adapter()
+                        && let Ok(np) = Presenter::new(&g, hwnd)
+                    {
+                        gpu = g;
+                        pres = np;
+                    } else {
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                    req_key(Instant::now());
+                    continue;
+                }
             }
             crate::trace::mark(frame, "shown", None);
             let mut rs = sh.render.lock().unwrap();
@@ -1056,6 +1167,11 @@ fn render_loop(sh: &Shared, frames: Receiver<Delivered>, hwnd: HWND) -> Result<(
             }
             drop(first);
             last = Some((p, size));
+            if dec_switched {
+                // Drop SRVs cached for the previous decoder's `last` picture.
+                pres.clear_cache();
+                dec_switched = false;
+            }
         }
     }
     Ok(())

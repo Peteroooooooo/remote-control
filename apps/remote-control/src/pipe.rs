@@ -72,10 +72,10 @@ fn read_message(h: HANDLE) -> Option<Vec<u8>> {
 /// Serves requests forever, each connection on a thread of its own.
 pub fn serve(name: &str, access: Access, handler: impl Fn(&str) -> String + Send + Sync + 'static) -> Result<()> {
     let sddl = match access {
-        Access::Admins => "D:P(A;;GA;;;SY)(A;;GA;;;BA)",
+        Access::Admins => "D:P(A;;GA;;;SY)(A;;GA;;;BA)S:(ML;;NWNX;;;HI)",
         // IU: interactive users; the session check below narrows it to this session's.
-        Access::SessionUser => "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;IU)",
-        Access::Owner => "D:P(A;;GA;;;SY)(A;;GA;;;OW)",
+        Access::SessionUser => "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;IU)S:(ML;;NWNX;;;ME)",
+        Access::Owner => "D:P(A;;GA;;;SY)(A;;GA;;;OW)S:(ML;;NWNX;;;ME)",
     };
     let mut sd = PSECURITY_DESCRIPTOR::default();
     unsafe {

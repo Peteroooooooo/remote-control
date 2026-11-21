@@ -112,6 +112,12 @@ impl RateController {
         self.acked_bytes += bytes;
     }
 
+    /// A frame of `bytes` was confirmed late (for example via an ACK bitmap);
+    /// counts toward delivery without adding stale latency to `rtts`.
+    pub fn on_frame_acked_late(&mut self, bytes: u32) {
+        self.acked_bytes += bytes as u64;
+    }
+
     /// A frame of `bytes` was due: its encoded size if sent as is, or the size the
     /// bitrate allows if it was shrunk or skipped because of a backlog.
     pub fn on_frame_offered(&mut self, bytes: u64) {
@@ -434,5 +440,18 @@ mod tests {
             c.update(t);
         }
         assert_eq!(c.bitrate(), 20.0 * MBPS);
+    }
+
+    #[test]
+    fn late_ack_counts_delivery_without_polluting_rtt() {
+        let mut t = Instant::now();
+        let mut c = RateController::new(RateConfig::new(2.0 * MBPS, 20.0 * MBPS), t);
+        t += Duration::from_millis(100);
+        c.on_frame_offered(10_000);
+        c.on_frame_acked(5.0, 5_000);
+        c.on_frame_acked_late(5_000);
+        c.update(t);
+        assert_eq!(c.queue_ms(), 0.0);
+        assert!((c.delivery() - 10_000.0 * 8.0 / 0.1).abs() < 1e-6);
     }
 }

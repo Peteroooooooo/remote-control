@@ -112,6 +112,8 @@ impl Decoder {
 pub enum SampleFmt {
     F32,
     I16,
+    I24,
+    I32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -155,6 +157,19 @@ impl DownmixResampler {
             SampleFmt::I16 => {
                 for ch in bytes.chunks_exact(2) {
                     self.scratch.push(i16::from_le_bytes([ch[0], ch[1]]) as f32 / 32768.0);
+                }
+            }
+            SampleFmt::I24 => {
+                for ch in bytes.chunks_exact(3) {
+                    let sign = if ch[2] & 0x80 != 0 { 0xFF } else { 0x00 };
+                    let q = i32::from_le_bytes([ch[0], ch[1], ch[2], sign]);
+                    self.scratch.push(q as f32 / 8_388_608.0);
+                }
+            }
+            SampleFmt::I32 => {
+                for ch in bytes.chunks_exact(4) {
+                    let q = i32::from_le_bytes([ch[0], ch[1], ch[2], ch[3]]);
+                    self.scratch.push((q as f64 / 2_147_483_648.0) as f32);
                 }
             }
         }
@@ -450,7 +465,7 @@ mod tests {
                 if i < 40 && f % 2 == 0 {
                     l += 0.4 * ((i as f32) * 0.3).sin();
                 }
-                if i >= 480 && i < 520 && f % 2 == 1 {
+                if (480..520).contains(&i) && f % 2 == 1 {
                     r += 0.4 * ((i as f32) * 0.5).sin();
                 }
                 pcm.push(l);
@@ -559,6 +574,66 @@ mod tests {
         assert_eq!(decoded.len(), src.len());
         for (&a, &b) in src.iter().zip(decoded.iter()) {
             assert!((a - b).abs() < 3e-7, "pcm24 mismatch: {a} vs {b}");
+        }
+    }
+
+    #[test]
+    fn i24_and_i32_process_raw_round_trip() {
+        let src = [-1.0f32, -0.5, -0.0001, 0.0, 0.0001, 0.25, 0.75, 0.999999];
+        let mut resampler = DownmixResampler::new();
+
+        // 24-bit packed LE integer PCM
+        let mut raw_i24 = Vec::new();
+        encode_pcm24(&src, &mut raw_i24);
+        let mut out_i24 = Vec::new();
+        resampler.process_raw(
+            &raw_i24,
+            PcmFormat { rate: 48_000, channels: 2, sample: SampleFmt::I24 },
+            48_000,
+            2,
+            &mut out_i24,
+        );
+        assert_eq!(out_i24.len(), src.len());
+        for (&a, &b) in src.iter().zip(out_i24.iter()) {
+            assert!((a - b).abs() < 3e-7, "i24 mismatch: {a} vs {b}");
+        }
+
+        // 32-bit LE integer PCM
+        let mut raw_i32 = Vec::with_capacity(src.len() * 4);
+        for &s in &src {
+            let q = (s as f64 * 2_147_483_647.0).round() as i32;
+            raw_i32.extend_from_slice(&q.to_le_bytes());
+        }
+        let mut out_i32 = Vec::new();
+        resampler.process_raw(
+            &raw_i32,
+            PcmFormat { rate: 48_000, channels: 2, sample: SampleFmt::I32 },
+            48_000,
+            2,
+            &mut out_i32,
+        );
+        assert_eq!(out_i32.len(), src.len());
+        for (&a, &b) in src.iter().zip(out_i32.iter()) {
+            assert!((a - b).abs() < 1e-6, "i32 mismatch: {a} vs {b}");
+        }
+
+        // 24-in-32 MSB-aligned LE integer PCM (lower 8 bits zero)
+        let mut raw_24in32 = Vec::with_capacity(src.len() * 4);
+        for &s in &src {
+            let q24 = (s.clamp(-1.0, 1.0) * 8_388_607.0).round() as i32;
+            raw_24in32.extend_from_slice(&(q24 << 8).to_le_bytes());
+        }
+        let mut out_24in32 = Vec::new();
+        resampler.process_raw(
+            &raw_24in32,
+            PcmFormat { rate: 48_000, channels: 2, sample: SampleFmt::I32 },
+            48_000,
+            2,
+            &mut out_24in32,
+        );
+        assert_eq!(out_24in32.len(), src.len());
+        for (&a, &b) in src.iter().zip(out_24in32.iter()) {
+            assert!((a - b).abs() < 3e-7, "24-in-32 mismatch: {a} vs {b}");
         }
     }
 
