@@ -2422,7 +2422,7 @@ mod tests {
 
     #[test]
     fn short_hosts() {
-        assert_eq!(short_host("https://sg-relay.example.com:7843/,https://203.0.113.7:7843/"), "sg-relay");
+        assert_eq!(short_host("https://relay-a.example.com:7843/,https://203.0.113.7:7843/"), "relay-a");
         assert_eq!(short_host("https://203.0.113.7:7843/"), "203.0.113.7");
         assert_eq!(short_host("https://[2001:db8::7]:7843/"), "2001:db8::7");
     }

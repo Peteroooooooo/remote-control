@@ -1,7 +1,7 @@
 //! Windows.Graphics.Capture (WGC) of one display, with the pointer left out
 //! of the image. DXGI duplication draws the pointer into the image while a
 //! window is dragged, and the viewer, which shows a pointer of its own, then
-//! shows two (PeterBook, 2026-11-19); WGC with cursor capture off never does.
+//! shows two (observed on a 120 Hz laptop, 2026-11-19); WGC with cursor capture off never does.
 //!
 //! WGC does not start as SYSTEM (0x80070424) and cannot see the Winlogon
 //! desktop (lock, login and UAC screens). So the service's helper (SYSTEM)
@@ -10,7 +10,7 @@
 //! guarded by a keyed mutex (key 0: the agent's turn, 1: the helper's). On
 //! Winlogon the helper duplicates with DXGI as before (`capture`).
 //!
-//! Measured on PeterBook (2880x1920, 120 Hz, 2026-11-19) with an animated
+//! Measured on a laptop (2880x1920, 120 Hz, 2026-11-19) with an animated
 //! square, from drawn to in the helper's hands: DXGI 114.6 fps, median 8.5 ms,
 //! p99 16.8; WGC through the agent 119.4 fps, median 12.1 ms, p99 18.2, and
 //! about 34 ms of CPU per second more for both processes together.

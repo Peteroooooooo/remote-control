@@ -510,7 +510,7 @@ const STEPS = [
   { id: 'relay', title: '4. 快捷跳转与控制', tip: '点击左下角自建中转或左上角本机卡片可直达对应设置；双击在线设备行发起远程控制。', page: 'devices', target: 'relay-box' },
 ];
 
-const DEFAULT_HOST = 'PETER-PC';
+const DEFAULT_HOST = 'DESKTOP-DEMO';
 const SAMPLE_PEER_CODE = 'rc1-peer-8Q4nLm9x2KvR';
 
 let S, menu = null, modal = null, copied = 0, why = null, renaming = null, ui, codeSeq = 0;
@@ -552,11 +552,11 @@ function reset() {
   mountShell();
   const initPage = new URLSearchParams(location.search).get('page') === 'settings' ? 'settings' : 'devices';
   S = {
-    name: 'PETER',
+    name: '主力机',
     icon: 'desktop',
     relays: [
-      { host: 'sg-relay.example.com:7843', state: 'home', rtt: 42 },
-      { host: 'sgnew-relay.example.com:7843', state: 'idle', rtt: 58 },
+      { host: 'relay-a.example.com:7843', state: 'home', rtt: 42 },
+      { host: 'relay-b.example.com:7843', state: 'idle', rtt: 58 },
     ],
     set: { public: true, lan: true, svc: 'none', boot: true, lock: true, awake: false, skills: 'none' },
     codes: [],
@@ -566,7 +566,7 @@ function reset() {
     incoming: null,
     page: initPage,
     devs: [
-      { id: 'pb', name: 'PETERBOOK', icon: 'laptop', kind: 'mine', online: true, info: '在线 · 9 ms · 直连' },
+      { id: 'laptop', name: '笔记本', icon: 'laptop', kind: 'mine', online: true, info: '在线 · 9 ms · 直连' },
       { id: 'desk', name: '台式机', icon: 'desktop', kind: 'trusted', online: true, info: '在线 · 3 ms · 直连' },
       { id: 'office', name: '公司电脑', icon: 'desktop', kind: 'trusted', online: false, unreach: true, info: '无法连接' },
       { id: 'study', name: '书房笔记本', icon: 'laptop', kind: 'temp', via: '局域网', online: true, info: '在线 · 1 ms · 直连' },
@@ -969,7 +969,7 @@ function openRemote(d, note) {
   S.controlling = d.id;
   remote = {
     id: d.id, name: d.name, mon: 1, fps: 60, released: false,
-    ms: d.id === 'pb' ? 9 : d.id === 'desk' ? 3 : d.id === 'study' ? 1 : 26,
+    ms: d.id === 'laptop' ? 9 : d.id === 'desk' ? 3 : d.id === 'study' ? 1 : 26,
     path: d.info.includes('自建中转') ? '经自建中转' : '直连',
     toast: note,
     notepad: 'README.md — 记事本\n\n- 画面优先走两端直连\n- 剪贴板在会话内自动同步\n- 装上后台服务后，锁屏、登录界面与 UAC 弹窗下照常控制',
@@ -993,7 +993,7 @@ function openTerm(id) {
   term = {
     id: d.id,
     name: d.name,
-    cwd: 'C:\\Users\\Peter',
+    cwd: 'C:\\Users\\Demo',
     lines: [
       `正在连接「${d.name}」……`,
       'Windows PowerShell',
@@ -1212,9 +1212,9 @@ function addRelay() {
   setTimeout(() => {
     ui.adding = false;
     const isFirst = S.relays.filter(r => !r.hidden).length === 0;
-    S.relays.push({ host: 'jp-relay.example.com:7843', state: isFirst ? 'home' : 'idle', rtt: 35 });
+    S.relays.push({ host: 'relay-c.example.com:7843', state: isFirst ? 'home' : 'idle', rtt: 35 });
     render();
-    toast('已添加中转 jp-relay.example.com:7843', 'ok');
+    toast('已添加中转 relay-c.example.com:7843', 'ok');
   }, 900);
 }
 
