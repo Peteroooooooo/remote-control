@@ -91,7 +91,7 @@ fn first_lobby(key: &std::path::Path, log: &std::path::Path) -> bool {
                 return false;
             }
             if Instant::now() >= deadline {
-                if let Ok(win) = FindWindowW(None, w!("remote control")) {
+                if let Ok(win) = FindWindowW(None, w!("Remote Control")) {
                     if IsIconic(win).as_bool() {
                         let _ = ShowWindow(win, SW_RESTORE);
                     }

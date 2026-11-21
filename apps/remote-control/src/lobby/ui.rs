@@ -29,7 +29,7 @@ use windows::Win32::{
     },
 };
 
-use super::backend::{Ask, Backend, Dev, SessionState, Snap, Status, Tone, Undoable};
+use super::backend::{Ask, Backend, Dev, SessionInfo, SessionState, Snap, Status, Tone, Undoable};
 use crate::{meet, net::PathKind, theme};
 
 const fn hex(c: u32) -> Color32 {
@@ -123,6 +123,12 @@ mod ic {
 enum Page {
     Devices,
     Settings,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SettingsTarget {
+    SelfName,
+    Relays,
 }
 
 struct Toast {
@@ -326,13 +332,20 @@ pub struct App {
     adding_relay: bool,
     relay_paste: String,
     relay_probe: RelayProbe,
+    page_anim: Option<Instant>,
+    scroll_to_dev: Option<EndpointId>,
+    highlight_dev: Option<(EndpointId, Instant)>,
+    scroll_to_settings: Option<SettingsTarget>,
+    highlight_settings: Option<(SettingsTarget, Instant)>,
+    focus_name: bool,
+    skill_state: crate::term::SkillState,
 }
 
 /// `hidden`: started at sign-in, with only the icon in the tray.
 pub fn run(b: Backend, hidden: bool) -> anyhow::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("remote control")
+            .with_title("Remote Control")
             .with_inner_size([920.0, 600.0])
             .with_min_inner_size([720.0, 460.0])
             // An empty icon: eframe would otherwise put its own (or one picture
@@ -385,6 +398,13 @@ pub fn run(b: Backend, hidden: bool) -> anyhow::Result<()> {
                 relay_paste: String::new(),
                 update_later: false,
                 relay_probe: RelayProbe::default(),
+                page_anim: None,
+                scroll_to_dev: None,
+                highlight_dev: None,
+                scroll_to_settings: None,
+                highlight_settings: None,
+                focus_name: false,
+                skill_state: crate::term::skill_state(),
             }))
         }),
     )
@@ -457,6 +477,17 @@ fn setup(ctx: &egui::Context) {
         s.spacing.item_spacing = Vec2::new(10.0, 8.0);
         s.spacing.button_padding = Vec2::new(12.0, 6.0);
         s.spacing.menu_margin = Margin::same(4);
+        // Win11-style floating scrollbar: thin at rest, widens smoothly on hover/drag.
+        s.spacing.scroll = egui::style::ScrollStyle {
+            floating: true,
+            bar_width: 8.0,
+            floating_width: 3.0,
+            floating_allocated_width: 0.0,
+            bar_inner_margin: 2.0,
+            bar_outer_margin: 3.0,
+            handle_min_length: 28.0,
+            ..egui::style::ScrollStyle::floating()
+        };
         s.text_styles.insert(egui::TextStyle::Body, FontId::proportional(14.0));
         s.text_styles.insert(egui::TextStyle::Button, FontId::proportional(14.0));
     });
@@ -593,36 +624,45 @@ impl<'a> Btn<'a> {
         r.widget_info(|| WidgetInfo::labeled(WidgetType::Button, on, &name));
         let hot = on && (r.hovered() || r.has_focus());
         let down = on && r.is_pointer_button_down_on();
+        let ht = ui.ctx().animate_bool_with_time(r.id.with("hot"), hot, 0.12);
         let none = Color32::TRANSPARENT;
         let (fill, edge, text) = match self.look {
-            Look::Normal => (veil(if down { 10 } else if hot { 26 } else { 16 }), veil(13), TEXT),
+            Look::Normal if self.color == Some(GREEN) => (GREEN.gamma_multiply(0.11), GREEN.gamma_multiply(0.28), GREEN),
+            Look::Normal => (
+                if down { veil(10) } else { veil(16).lerp_to_gamma(veil(26), ht) },
+                veil(13).lerp_to_gamma(veil(24), ht),
+                TEXT,
+            ),
             Look::Primary => (
                 if down {
                     hex(theme::ACCENT_PRESSED)
-                } else if hot {
-                    hex(theme::ACCENT_HOVER)
                 } else {
-                    ACCENT
+                    ACCENT.lerp_to_gamma(hex(theme::ACCENT_HOVER), ht)
                 },
                 none,
                 Color32::WHITE,
             ),
             Look::Soft if !on => (veil(10), none, DIM),
-            Look::Soft => (ACCENT.gamma_multiply(if hot { 0.26 } else { 0.16 }), none, if hot { hex(0xb5d0f7) } else { LINK }),
-            Look::Ghost => (if hot { veil(16) } else { none }, none, if hot { TEXT } else { DIM }),
-            Look::Danger => (RED.gamma_multiply(if hot { 0.26 } else { 0.16 }), none, DANGER),
-            Look::Link => (if hot { ACCENT.gamma_multiply(0.14) } else { none }, none, LINK),
+            Look::Soft => (
+                ACCENT.gamma_multiply(if down { 0.14 } else { 0.16 + 0.10 * ht }),
+                none,
+                LINK.lerp_to_gamma(hex(0xb5d0f7), ht),
+            ),
+            Look::Ghost => (veil(if down { 10 } else { 16 }).gamma_multiply(ht), none, DIM.lerp_to_gamma(TEXT, ht)),
+            Look::Danger => (RED.gamma_multiply(if down { 0.14 } else { 0.16 + 0.10 * ht }), none, DANGER),
+            Look::Link => (ACCENT.gamma_multiply(0.14 * ht), none, LINK),
         };
         let text = self.color.unwrap_or(text);
         let fade = if on || self.look == Look::Soft { 1.0 } else { 0.4 };
+        let draw_rect = if down { rect.shrink(0.5) } else { rect };
         let p = ui.painter();
-        p.rect(rect, radius, fill.gamma_multiply(fade), Stroke::new(1.0, edge.gamma_multiply(fade)), StrokeKind::Inside);
-        let mut x = rect.center().x - (icon_w + g.size().x) / 2.0;
+        p.rect(draw_rect, radius, fill.gamma_multiply(fade), Stroke::new(1.0, edge.gamma_multiply(fade)), StrokeKind::Inside);
+        let mut x = draw_rect.center().x - (icon_w + g.size().x) / 2.0;
         if let Some(c) = self.icon {
-            glyph(p, pos2(x + size / 2.0, rect.center().y), c, size, text.gamma_multiply(fade));
+            glyph(p, pos2(x + size / 2.0, draw_rect.center().y), c, size, text.gamma_multiply(fade));
             x += icon_w;
         }
-        p.galley(pos2(x, rect.center().y - g.size().y / 2.0), g, text.gamma_multiply(fade));
+        p.galley(pos2(x, draw_rect.center().y - g.size().y / 2.0), g, text.gamma_multiply(fade));
         if on { r.on_hover_cursor(egui::CursorIcon::PointingHand) } else { r }
     }
 }
@@ -658,13 +698,18 @@ fn switch(ui: &mut egui::Ui, on: &mut bool, enabled: bool, name: &str) -> egui::
     let t = ui.ctx().animate_bool_with_time_and_easing(r.id, *on, 0.18, easing::cubic_out);
     let fade = if enabled { 1.0 } else { 0.35 };
     let hot = enabled && r.hovered();
-    let ring = veil(if hot { 179 } else { 115 }).lerp_to_gamma(ACCENT, t);
+    let down = enabled && r.is_pointer_button_down_on();
+    let ht = ui.ctx().animate_bool_with_time(r.id.with("hot"), hot, 0.12);
+    let ring = veil(115).lerp_to_gamma(veil(179), ht).lerp_to_gamma(ACCENT, t);
     let fill = Color32::TRANSPARENT.lerp_to_gamma(ACCENT, t);
     ui.painter().rect(rect, 10.0, fill.gamma_multiply(fade), Stroke::new(1.0, ring.gamma_multiply(fade)), StrokeKind::Inside);
-    let x = egui::lerp(rect.left() + 10.0..=rect.right() - 11.0, t);
+    let radius = 6.0 + 0.8 * ht;
+    let stretch = if down { 3.0 } else { 0.0 };
+    let x = egui::lerp(rect.left() + 10.0 + stretch * 0.5..=rect.right() - 11.0 - stretch * 0.5, t);
     let knob = hex(0xc9cbd0).lerp_to_gamma(Color32::WHITE, t).gamma_multiply(fade);
-    ui.painter().circle_filled(pos2(x, rect.center().y), if hot { 7.0 } else { 6.0 }, knob);
-    r
+    let knob_rect = Rect::from_center_size(pos2(x, rect.center().y), vec2(radius * 2.0 + stretch, radius * 2.0));
+    ui.painter().rect_filled(knob_rect, radius, knob);
+    if enabled { r.on_hover_cursor(egui::CursorIcon::PointingHand) } else { r }
 }
 
 /// Shows `add` folding open while `open`, and folding away after: its
@@ -770,12 +815,23 @@ fn section_head_with(ui: &mut egui::Ui, title: &str, note: Option<&str>, right: 
 }
 
 /// The card that holds a section's rows or lines.
-fn group(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
-    Frame::new().fill(CARD).corner_radius(GROUP_RADIUS).stroke(Stroke::new(1.0, veil(8))).show(ui, |ui| {
-        ui.set_width(ui.available_width());
-        ui.spacing_mut().item_spacing.y = 0.0;
-        add(ui);
-    });
+fn group(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) -> egui::Response {
+    group_highlighted(ui, 0.0, add)
+}
+
+fn group_highlighted(ui: &mut egui::Ui, hi: f32, add: impl FnOnce(&mut egui::Ui)) -> egui::Response {
+    let fill = if hi > 0.0 { CARD.lerp_to_gamma(ACCENT, 0.10 * hi) } else { CARD };
+    let stroke = if hi > 0.0 { Stroke::new(1.0 + 0.5 * hi, veil(8).lerp_to_gamma(ACCENT, hi)) } else { Stroke::new(1.0, veil(8)) };
+    Frame::new()
+        .fill(fill)
+        .corner_radius(GROUP_RADIUS)
+        .stroke(stroke)
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.spacing_mut().item_spacing.y = 0.0;
+            add(ui);
+        })
+        .response
 }
 
 /// One line of a settings card: an icon (or a dot), a title, a line under
@@ -874,20 +930,21 @@ impl<'a> Item<'a> {
 fn nav(ui: &mut egui::Ui, c: char, text: &str, on: bool, count: Option<usize>) -> egui::Response {
     let (rect, r) = ui.allocate_exact_size(vec2(ui.available_width(), 36.0), Sense::click());
     r.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, text));
+    let on_t = ui.ctx().animate_bool_with_time_and_easing(r.id.with("on"), on, 0.20, easing::cubic_out);
+    let hot_t = ui.ctx().animate_bool_with_time(r.id.with("hot"), r.hovered(), 0.12);
     let p = ui.painter();
-    let fill = if on {
-        veil(16)
-    } else if r.hovered() {
-        veil(10)
-    } else {
-        Color32::TRANSPARENT
-    };
-    p.rect_filled(rect, CONTROL_RADIUS, fill);
-    if on {
-        let bar = Rect::from_min_size(pos2(rect.left(), rect.top() + 10.0), vec2(3.0, 16.0));
-        p.rect_filled(bar, 2.0, ACCENT);
+    let alpha = (16.0 * on_t).max(10.0 * hot_t).round() as u8;
+    if alpha > 0 {
+        p.rect_filled(rect, CONTROL_RADIUS, veil(alpha));
     }
-    glyph(p, pos2(rect.left() + 20.0, rect.center().y), c, 16.0, if on { TEXT } else { DIM });
+    if on_t > 0.02 {
+        let half = 8.0 * on_t;
+        let cy = rect.center().y;
+        let bar = Rect::from_min_max(pos2(rect.left(), cy - half), pos2(rect.left() + 3.0, cy + half));
+        p.rect_filled(bar, 2.0, ACCENT.gamma_multiply(on_t));
+    }
+    let ic_color = DIM.lerp_to_gamma(TEXT, on_t.max(hot_t * 0.7));
+    glyph(p, pos2(rect.left() + 20.0, rect.center().y), c, 16.0, ic_color);
     p.text(pos2(rect.left() + 40.0, rect.center().y), Align2::LEFT_CENTER, text, font(14.0), TEXT);
     if let Some(n) = count {
         p.text(pos2(rect.right() - 12.0, rect.center().y), Align2::RIGHT_CENTER, n.to_string(), font(12.0), DIM);
@@ -898,30 +955,43 @@ fn nav(ui: &mut egui::Ui, c: char, text: &str, on: bool, count: Option<usize>) -
 /// One line of a popup menu: clickable across its width, lit while the
 /// pointer is on it (red for `danger`). `sub`: dim text after the title;
 /// `tick`: the choice in force.
-fn menu_item(ui: &mut egui::Ui, icon: Option<char>, text: &str, sub: Option<&str>, tick: bool, danger: bool) -> egui::Response {
-    let (rect, r) = ui.allocate_exact_size(vec2(ui.available_width(), 34.0), Sense::click());
-    r.widget_info(|| WidgetInfo::selected(WidgetType::Button, true, tick, text));
-    let t = ui.ctx().animate_bool_with_time(r.id, ui.rect_contains_pointer(rect), 0.1);
+fn menu_item_enabled(
+    ui: &mut egui::Ui,
+    icon: Option<char>,
+    text: &str,
+    sub: Option<&str>,
+    tick: bool,
+    danger: bool,
+    enabled: bool,
+) -> egui::Response {
+    let (rect, r) = ui.allocate_exact_size(vec2(ui.available_width(), 34.0), if enabled { Sense::click() } else { Sense::hover() });
+    r.widget_info(|| WidgetInfo::selected(WidgetType::Button, enabled, tick, text));
+    let t = if enabled { ui.ctx().animate_bool_with_time(r.id, ui.rect_contains_pointer(rect), 0.1) } else { 0.0 };
     let p = ui.painter();
     if t > 0.0 {
         let fill = if danger { RED.gamma_multiply(0.16 * t) } else { veil(16).gamma_multiply(t) };
         p.rect_filled(rect, CONTROL_RADIUS, fill);
     }
-    let color = if danger { DANGER } else { TEXT };
+    let color = if !enabled { FAINT } else if danger { DANGER } else { TEXT };
     if let Some(c) = icon {
-        glyph(p, pos2(rect.left() + 18.0, rect.center().y), c, 14.0, if danger { DANGER } else { DIM });
+        let ic_color = if !enabled { FAINT } else if danger { DANGER } else { DIM };
+        glyph(p, pos2(rect.left() + 18.0, rect.center().y), c, 14.0, ic_color);
     }
     let g = p.layout_no_wrap(text.to_string(), font(14.0), color);
     let x = rect.left() + 36.0;
     let w = g.size().x;
     p.galley(pos2(x, rect.center().y - g.size().y / 2.0), g, color);
     if let Some(s) = sub {
-        p.text(pos2(x + w + 8.0, rect.center().y), Align2::LEFT_CENTER, s, font(12.0), DIM);
+        p.text(pos2(x + w + 8.0, rect.center().y), Align2::LEFT_CENTER, s, font(12.0), if enabled { DIM } else { FAINT });
     }
     if tick {
-        glyph(p, pos2(rect.right() - 16.0, rect.center().y), ic::CHECK, 12.0, LINK);
+        glyph(p, pos2(rect.right() - 16.0, rect.center().y), ic::CHECK, 12.0, if enabled { LINK } else { FAINT });
     }
-    r.on_hover_cursor(egui::CursorIcon::PointingHand)
+    if enabled { r.on_hover_cursor(egui::CursorIcon::PointingHand) } else { r }
+}
+
+fn menu_item(ui: &mut egui::Ui, icon: Option<char>, text: &str, sub: Option<&str>, tick: bool, danger: bool) -> egui::Response {
+    menu_item_enabled(ui, icon, text, sub, tick, danger, true)
 }
 
 fn menu_sep(ui: &mut egui::Ui) {
@@ -944,15 +1014,19 @@ fn ago(s: u64) -> String {
 
 /// The line under a device's name: its colour, and whether something is
 /// going on (a spinner before it).
-fn sub_line(d: &Dev, session: Option<SessionState>) -> (String, Color32, bool) {
+fn sub_line(d: &Dev, session: Option<SessionInfo>) -> (String, Color32, bool) {
     if d.ask == Ask::In {
         return ("想记住你。同意后互相记住，以后随时能连".into(), AMBER_TEXT, false);
     }
     match session {
-        Some(SessionState::Connecting) => return ("正在连接…".into(), DIM, true),
-        Some(SessionState::Waiting) => return ("等对方允许".into(), DIM, true),
-        Some(SessionState::Connected) => return ("控制中".into(), LINK, false),
-        Some(SessionState::Paused) => return ("控制中 · 画面暂停".into(), AMBER_TEXT, false),
+        Some(SessionInfo { state: SessionState::Connecting, .. }) => return ("正在连接…".into(), DIM, true),
+        Some(SessionInfo { state: SessionState::Waiting, since }) => {
+            let left = 30u64.saturating_sub(since.elapsed().as_secs());
+            let s = if left > 0 { format!("等对方允许 · {left} 秒") } else { "等对方允许".into() };
+            return (s, DIM, true);
+        }
+        Some(SessionInfo { state: SessionState::Connected, .. }) => return ("控制中".into(), LINK, false),
+        Some(SessionInfo { state: SessionState::Paused, .. }) => return ("控制中 · 画面暂停".into(), AMBER_TEXT, false),
         None => {}
     }
     if d.ask == Ask::Out {
@@ -960,8 +1034,8 @@ fn sub_line(d: &Dev, session: Option<SessionState>) -> (String, Color32, bool) {
     }
     let via = match d.met.as_str() {
         _ if d.listed => "",
-        "code" => "连接码 · ",
-        "lan" => "局域网 · ",
+        "code" => " · 连接码",
+        "lan" => " · 局域网",
         _ => "",
     };
     let (s, color, busy) = match d.status {
@@ -974,12 +1048,12 @@ fn sub_line(d: &Dev, session: Option<SessionState>) -> (String, Color32, bool) {
             };
             (format!("在线 · {:.0} ms{way}", rtt_ms.max(1.0)), DIM, false)
         }
-        Status::Checking => ("正在找…".into(), DIM, true),
+        Status::Checking => ("正在连接…".into(), DIM, true),
         Status::Offline => ("离线".into(), DIM, false),
-        Status::Unreachable => ("打不通".into(), AMBER_TEXT, false),
+        Status::Unreachable => ("无法连接".into(), AMBER_TEXT, false),
         Status::Refused(r) => (meet::refusal_text(r).into(), AMBER_TEXT, false),
     };
-    (format!("{via}{s}"), color, busy)
+    (format!("{s}{via}"), color, busy)
 }
 
 fn tone_look(t: Tone) -> (char, Color32) {
@@ -1048,7 +1122,7 @@ impl eframe::App for App {
         if esc && self.confirm.is_some() {
             self.confirm = None;
         } else if esc && self.page == Page::Settings {
-            self.page = Page::Devices;
+            self.set_page(Page::Devices);
         }
         if self.page != Page::Devices {
             self.renaming = None;
@@ -1069,6 +1143,19 @@ impl eframe::App for App {
             .stroke(Stroke::new(1.0, veil(12)))
             .outer_margin(Margin { left: 0, right: -2, top: 0, bottom: -2 })
             .inner_margin(Margin { left: 27, right: 9, top: 1, bottom: 0 });
+        let page_t = match self.page_anim {
+            Some(t0) => {
+                let p = (t0.elapsed().as_secs_f32() / 0.18).clamp(0.0, 1.0);
+                if p >= 1.0 {
+                    self.page_anim = None;
+                    1.0
+                } else {
+                    ctx.request_repaint();
+                    easing::cubic_out(p)
+                }
+            }
+            None => 1.0,
+        };
         let content = egui::CentralPanel::default()
             .frame(layer)
             .show(ui, |ui| {
@@ -1076,7 +1163,10 @@ impl eframe::App for App {
                     // Room for the scroll bar on the right, and above and below the rows
                     // (inside the scrolled part, so rows scroll up to the edge).
                     ui.set_width(ui.available_width() - 18.0);
-                    ui.add_space(21.0);
+                    if page_t < 1.0 {
+                        ui.multiply_opacity(0.45 + 0.55 * page_t);
+                    }
+                    ui.add_space(21.0 + 6.0 * (1.0 - page_t));
                     match self.page {
                         Page::Devices => self.devices(ui, &snap),
                         Page::Settings => self.settings(ui, &snap),
@@ -1153,12 +1243,61 @@ impl App {
         self.toast(Tone::Ok, format!("已删除「{}」，{there}", c.name));
     }
 
-    fn hidden_code(&self, token: &str) -> bool {
-        self.b.has_pending_code(token)
-    }
-
     fn hidden_relay(&self, url: &str) -> bool {
         self.b.has_pending_relay(url)
+    }
+
+    fn set_page(&mut self, page: Page) {
+        if self.page != page {
+            if page != Page::Devices {
+                self.renaming = None;
+            }
+            if page == Page::Settings {
+                self.skill_state = crate::term::skill_state();
+            }
+            self.page = page;
+            self.page_anim = Some(Instant::now());
+        }
+    }
+
+    fn jump_settings(&mut self, target: SettingsTarget) {
+        self.why = None;
+        self.set_page(Page::Settings);
+        self.scroll_to_settings = Some(target);
+        self.highlight_settings = Some((target, Instant::now()));
+        if target == SettingsTarget::SelfName {
+            self.focus_name = true;
+        }
+    }
+
+    fn settings_highlight(&mut self, ctx: &egui::Context, target: SettingsTarget) -> f32 {
+        let Some((t, at)) = self.highlight_settings else { return 0.0 };
+        if t != target {
+            return 0.0;
+        }
+        let p = at.elapsed().as_secs_f32() / 1.1;
+        if p >= 1.0 {
+            self.highlight_settings = None;
+            0.0
+        } else {
+            ctx.request_repaint();
+            1.0 - easing::cubic_out(p)
+        }
+    }
+
+    fn dev_highlight(&mut self, ctx: &egui::Context, id: EndpointId) -> f32 {
+        let Some((hid, at)) = self.highlight_dev else { return 0.0 };
+        if hid != id {
+            return 0.0;
+        }
+        let p = at.elapsed().as_secs_f32() / 1.1;
+        if p >= 1.0 {
+            self.highlight_dev = None;
+            0.0
+        } else {
+            ctx.request_repaint();
+            1.0 - easing::cubic_out(p)
+        }
     }
 
     /// Messages of the node and of the backend become toasts.
@@ -1169,7 +1308,12 @@ impl App {
             self.seen_notice = Some(n.clone());
             self.b.act(&format!("dismiss\t{n}"));
             let tone = if text.contains("互相记住") { Tone::Ok } else { Tone::Warn };
-            self.toast(tone, text.clone());
+            let msg = if text.contains("互相记住") && !text.contains("我的电脑") {
+                format!("{text}；若为自己的电脑，可在 ··· 设为「我的电脑」")
+            } else {
+                text.clone()
+            };
+            self.toast(tone, msg);
         }
         for n in self.b.take_notices() {
             self.toast(n.tone, n.text);
@@ -1200,16 +1344,23 @@ impl App {
         match self.b.request(&format!("paste\t{line}")) {
             Ok(id) => {
                 self.paste.clear();
-                self.page = Page::Devices;
+                self.set_page(Page::Devices);
+                let trimmed = id.trim();
+                if let Ok(eid) = trimmed.parse::<EndpointId>() {
+                    self.scroll_to_dev = Some(eid);
+                    self.highlight_dev = Some((eid, Instant::now()));
+                }
                 // The card may have been there already (found on the LAN): say it went in.
                 let snap = self.b.snap();
-                let dev = snap.devs.iter().find(|d| d.id.to_string() == id.trim());
+                let dev = snap.devs.iter().find(|d| d.id.to_string() == trimmed);
                 let text = match dev {
-                    Some(d) if matches!(d.status, Status::Online { .. }) => format!("已和「{}」连上", d.name),
-                    Some(d) => format!("正在连接「{}」…", d.name),
-                    None => "正在连接对方…".to_string(),
+                    Some(d) if matches!(d.status, Status::Online { .. }) => {
+                        format!("已添加「{}」，点「控制」开始或点「记住」保存", d.name)
+                    }
+                    Some(d) => format!("已添加「{}」，正在查找连接…", d.name),
+                    None => "已提交连接码，正在查找对方…".to_string(),
                 };
-                self.toast(Tone::Info, text);
+                self.toast(Tone::Ok, text);
             }
             Err(e) => self.toast(Tone::Err, format!("{e:#}")),
         }
@@ -1217,15 +1368,20 @@ impl App {
 
     fn left(&mut self, ui: &mut egui::Ui, snap: &Snap) {
         ui.spacing_mut().item_spacing.y = 2.0;
-        // This computer.
-        let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 64.0), Sense::hover());
-        let av = Rect::from_min_size(rect.min + vec2(8.0, 6.0), Vec2::splat(40.0));
+        // This computer (clickable to jump to device name in Settings).
+        let (rect, me_resp) = ui.allocate_exact_size(vec2(ui.available_width(), 58.0), Sense::click());
+        me_resp.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, "修改本机设备名称"));
+        let me_ht = ui.ctx().animate_bool_with_time(me_resp.id.with("hot"), me_resp.hovered(), 0.14);
         let p = ui.painter();
+        if me_ht > 0.0 {
+            p.rect_filled(rect, 8.0, veil((12.0 * me_ht).round() as u8));
+        }
+        let av = Rect::from_min_size(pos2(rect.left() + 8.0, rect.center().y - 20.0), Vec2::splat(40.0));
         p.rect_filled(av, 10.0, ACCENT.gamma_multiply(0.16));
         glyph(p, av.center(), ic::DESKTOP, 20.0, LINK);
         let x = av.right() + 12.0;
         let name = if snap.name.is_empty() { "…" } else { &snap.name };
-        let g = one_line(ui, name, bold(16.0), TEXT, rect.right() - x);
+        let g = one_line(ui, name, bold(16.0), TEXT, rect.right() - x - 8.0);
         let top = av.center().y - (g.size().y + 17.0) / 2.0;
         let gh = g.size().y;
         ui.painter().galley(pos2(x, top), g, TEXT);
@@ -1233,13 +1389,20 @@ impl App {
         let y = top + gh + 9.0;
         ui.painter().circle_filled(pos2(x + 3.5, y), 3.5, dot);
         ui.painter().text(pos2(x + 13.0, y), Align2::LEFT_CENTER, state, font(12.0), DIM);
+        if me_resp
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .on_hover_text("点击前往设置修改设备名称")
+            .clicked()
+        {
+            self.jump_settings(SettingsTarget::SelfName);
+        }
+        ui.add_space(10.0);
 
         if nav(ui, ic::DEVICES, "设备", self.page == Page::Devices, Some(snap.devs.len())).clicked() {
-            self.page = Page::Devices;
+            self.set_page(Page::Devices);
         }
         if nav(ui, ic::GEAR, "设置", self.page == Page::Settings, None).clicked() {
-            self.renaming = None;
-            self.page = Page::Settings;
+            self.set_page(Page::Settings);
         }
 
         let relays: Vec<_> = snap.relays.iter().filter(|r| !self.hidden_relay(&r.url)).collect();
@@ -1247,28 +1410,51 @@ impl App {
             return;
         }
         ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
-            ui.spacing_mut().item_spacing.y = 0.0;
-            for r in relays.iter().rev() {
-                let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 22.0), Sense::hover());
-                let (color, state) = match r.state.as_str() {
-                    "home" => (GREEN, "在用"),
-                    "temp" => (GREEN, "临时在用"),
+            let h = 16.0 + 18.0 + 4.0 + (relays.len() as f32) * 22.0;
+            let (card, r) = ui.allocate_exact_size(vec2(ui.available_width(), h), Sense::click());
+            r.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, "管理自建中转"));
+            let ht = ui.ctx().animate_bool_with_time(r.id.with("hot"), r.hovered(), 0.14);
+            let p = ui.painter();
+            if ht > 0.0 {
+                p.rect_filled(card, 8.0, veil((12.0 * ht).round() as u8));
+            }
+            let head_y = card.top() + 8.0 + 9.0;
+            p.text(pos2(card.left() + 8.0, head_y), Align2::LEFT_CENTER, "自建中转", font(12.0), DIM);
+            if ht > 0.02 {
+                p.text(
+                    pos2(card.right() - 8.0, head_y),
+                    Align2::RIGHT_CENTER,
+                    "管理",
+                    font(11.0),
+                    LINK.gamma_multiply(ht),
+                );
+            }
+            let mut ry = card.top() + 8.0 + 18.0 + 4.0;
+            for relay in &relays {
+                let row_rect = Rect::from_min_size(pos2(card.left(), ry), vec2(card.width(), 22.0));
+                let (color, state) = match relay.state.as_str() {
+                    "home" => (GREEN, "已连"),
+                    "temp" => (GREEN, "临时接管"),
                     "fail" => (AMBER, "连不上"),
                     "idle" => (GONE, "备用"),
                     _ => (GONE, "…"),
                 };
                 let p = ui.painter();
-                p.circle_filled(pos2(rect.left() + 11.5, rect.center().y), 3.5, color);
+                p.circle_filled(pos2(row_rect.left() + 11.5, row_rect.center().y), 3.5, color);
                 let right = p.layout_no_wrap(state.to_string(), font(12.0), DIM);
                 let rw = right.size().x;
-                p.galley(pos2(rect.right() - 8.0 - rw, rect.center().y - right.size().y / 2.0), right, DIM);
-                let host = one_line(ui, &short_host(&r.url), font(12.0), TEXT, rect.width() - 23.0 - rw - 16.0);
-                let hy = rect.center().y - host.size().y / 2.0;
-                ui.painter().galley(pos2(rect.left() + 23.0, hy), host, TEXT);
+                p.galley(pos2(row_rect.right() - 8.0 - rw, row_rect.center().y - right.size().y / 2.0), right, DIM);
+                let host = one_line(ui, &short_host(&relay.url), font(12.0), TEXT, row_rect.width() - 23.0 - rw - 16.0);
+                let hy = row_rect.center().y - host.size().y / 2.0;
+                ui.painter().galley(pos2(row_rect.left() + 23.0, hy), host, TEXT);
+                ry += 22.0;
             }
-            ui.add_space(4.0);
-            let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 18.0), Sense::hover());
-            ui.painter().text(pos2(rect.left() + 8.0, rect.center().y), Align2::LEFT_CENTER, "自建中转", font(12.0), DIM);
+            if r.on_hover_cursor(egui::CursorIcon::PointingHand)
+                .on_hover_text("前往设置管理自建中转")
+                .clicked()
+            {
+                self.jump_settings(SettingsTarget::Relays);
+            }
         });
     }
 
@@ -1315,7 +1501,7 @@ impl App {
         let idle = self.b.busy().is_none();
         reveal(ui, Id::new("card-suggest"), suggest, GAP, |ui| {
             banner(ui, Tint::Blue, Lead::Icon(ic::SERVICE), "装上后台服务，锁屏时也能被控制", |ui| {
-                if Btn::new("安装").look(Look::Primary).enabled(idle).show(ui).clicked() {
+                if Btn::new("安装").icon(ic::SHIELD).look(Look::Primary).enabled(idle).show(ui).clicked() {
                     b.act("unsuggest");
                     b.service(true);
                 }
@@ -1329,7 +1515,7 @@ impl App {
         let mut later = false;
         reveal(ui, Id::new("card-update"), other, GAP, |ui| {
             banner(ui, Tint::Blue, Lead::Icon(ic::SERVICE), "后台服务用的是另一个位置的程序，改用这个", |ui| {
-                if Btn::new("改用这个").look(Look::Primary).enabled(idle).show(ui).clicked() {
+                if Btn::new("改用这个").icon(ic::SHIELD).look(Look::Primary).enabled(idle).show(ui).clicked() {
                     b.service(true);
                 }
                 later = Btn::new("以后").look(Look::Ghost).show(ui).clicked();
@@ -1346,8 +1532,18 @@ impl App {
                 let done = self.copied.is_some_and(|t| t.elapsed() < Duration::from_secs(2));
                 if done {
                     ui.ctx().request_repaint_after(Duration::from_millis(200));
-                    Btn::new("已复制，1 小时内有效").icon(ic::CHECK).color(GREEN).show(ui);
-                } else if Btn::new("复制本机连接码").icon(ic::COPY).enabled(!snap.me.is_empty()).show(ui).clicked() {
+                    Btn::new("已复制，1 小时内有效")
+                        .icon(ic::CHECK)
+                        .color(GREEN)
+                        .show(ui)
+                        .on_hover_text("一次性有效（1 小时），对方连入时会弹窗等你允许");
+                } else if Btn::new("复制本机连接码")
+                    .icon(ic::COPY)
+                    .enabled(!snap.me.is_empty())
+                    .show(ui)
+                    .on_hover_text("一次性有效（1 小时），对方连入时会弹窗等你允许")
+                    .clicked()
+                {
                     match self.b.request("code") {
                         Ok(code) => {
                             ui.ctx().copy_text(code);
@@ -1360,12 +1556,12 @@ impl App {
         });
         ui.add_space(6.0);
         self.connect_field(ui);
-        let codes: Vec<_> = snap.codes.iter().filter(|c| !self.hidden_code(&c.token)).cloned().collect();
+        let codes = &snap.codes;
         if !codes.is_empty() {
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
                 ui.spacing_mut().interact_size.y = 26.0;
-                ui.label(RichText::new("还没用掉的连接码").size(12.0).color(DIM));
+                ui.label(RichText::new("还没用掉的连接码（连入时会先问你）").size(12.0).color(DIM));
                 for c in codes {
                     Frame::new().fill(veil(13)).corner_radius(13).inner_margin(Margin { left: 10, right: 2, top: 2, bottom: 2 }).show(ui, |ui| {
                         ui.spacing_mut().item_spacing.x = 4.0;
@@ -1374,7 +1570,8 @@ impl App {
                             ui.label(RichText::new(format!("{}复制", ago(c.age_s))).size(12.0));
                             let r = Btn::new("撤销").look(Look::Ghost).small().name(format!("撤销 {}复制的连接码", ago(c.age_s))).show(ui);
                             if r.clicked() {
-                                self.undoable(Undoable::Revoke(c.token.clone()), "已撤销连接码".into());
+                                self.b.act(&format!("revoke\t{}", c.token));
+                                self.toast(Tone::Info, "已撤销，这个连接码不能再用了");
                             }
                         });
                     });
@@ -1388,9 +1585,9 @@ impl App {
         let at_own_relay = snap.relays.iter().any(|r| r.state == "home");
         type Kind = (&'static str, &'static str, fn(&Dev) -> bool);
         let kinds: [Kind; 3] = [
-            ("我的电脑", "控制本机不用问", |d| d.listed && d.auto),
-            ("信任设备", "控制本机要先问", |d| d.listed && !d.auto),
-            ("临时设备", "控制本机要先问，关窗口就断开", |d| !d.listed),
+            ("我的电脑", "连入本机免确认", |d| d.listed && d.auto),
+            ("信任设备", "连入本机需确认", |d| d.listed && !d.auto),
+            ("临时设备", "关窗口后移除", |d| !d.listed),
         ];
         let mut any = false;
         for (title, note, is) in kinds {
@@ -1403,7 +1600,7 @@ impl App {
             let last = ds.len() - 1;
             group(ui, |ui| {
                 for (i, d) in ds.into_iter().enumerate() {
-                    self.row(ui, d, sessions.get(&d.id).map(|s| s.1), i == 0, i == last, at_own_relay);
+                    self.row(ui, d, sessions.get(&d.id).map(|(_, info)| *info), i == 0, i == last, at_own_relay);
                 }
             });
             ui.add_space(12.0);
@@ -1414,7 +1611,7 @@ impl App {
                 ui.label(RichText::new(ic::DEVICES.to_string()).font(FontId::new(40.0, FontFamily::Name(ICONS.into()))).color(FAINT));
                 ui.add_space(4.0);
                 ui.label("还没有设备");
-                ui.label(RichText::new("复制连接码发给对方，或把对方的连接码粘贴到上面").size(12.0).color(DIM));
+                ui.label(RichText::new("同一局域网会自动出现；跨网请复制连接码发给对方，或贴到上方").size(12.0).color(DIM));
             });
         }
     }
@@ -1424,10 +1621,13 @@ impl App {
     fn connect_field(&mut self, ui: &mut egui::Ui) {
         let id = Id::new("connect");
         let focused = ui.memory(|m| m.has_focus(id));
+        let focus_t = ui.ctx().animate_bool_with_time(id.with("focus"), focused, 0.14);
         let mut submit = None;
+        let border = veil(16).lerp_to_gamma(ACCENT, focus_t);
+        let bg = veil(10).lerp_to_gamma(veil(14), focus_t);
         let frame = Frame::new()
-            .fill(veil(10))
-            .stroke(Stroke::new(1.0, if focused { ACCENT } else { veil(16) }))
+            .fill(bg)
+            .stroke(Stroke::new(1.0, border))
             .corner_radius(8)
             .inner_margin(Margin { left: 14, right: 6, top: 0, bottom: 0 })
             .show(ui, |ui| {
@@ -1435,32 +1635,39 @@ impl App {
                 ui.spacing_mut().interact_size.y = 40.0;
                 ui.horizontal(|ui| {
                     let (r, _) = ui.allocate_exact_size(Vec2::splat(16.0), Sense::hover());
-                    glyph(ui.painter(), r.center(), ic::LINK, 16.0, DIM);
-                    let kbd = if self.paste.is_empty() { 64.0 } else { 0.0 };
-                    let e = ui.add(
-                        TextEdit::singleline(&mut self.paste)
-                            .id(id)
-                            .frame(Frame::NONE)
-                            .hint_text(RichText::new("粘贴对方的连接码").color(FAINT))
-                            .font(font(14.0))
-                            .margin(Margin::symmetric(0, 4))
-                            .desired_width(ui.available_width() - kbd),
-                    );
+                    glyph(ui.painter(), r.center(), ic::LINK, 16.0, DIM.lerp_to_gamma(LINK, focus_t));
+                    let empty = self.paste.trim().is_empty();
+                    let btn_w = if empty { 0.0 } else { 58.0 };
+                    let mut edit = TextEdit::singleline(&mut self.paste)
+                        .id(id)
+                        .frame(Frame::NONE)
+                        .font(font(14.0))
+                        .margin(Margin::symmetric(0, 4))
+                        .desired_width((ui.available_width() - btn_w).max(60.0));
+                    if !focused {
+                        edit = edit.hint_text(RichText::new("粘贴对方连接码，加入设备列表").color(FAINT));
+                    }
+                    let e = ui.add(edit);
                     if e.changed() && ConnCode::find(&self.paste).is_some() {
                         submit = Some(self.paste.clone());
                     }
                     if e.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) && !self.paste.trim().is_empty() {
                         submit = Some(self.paste.clone());
                     }
-                    if self.paste.is_empty() {
-                        let g = ui.painter().layout_no_wrap("Ctrl V".into(), font(11.0), DIM);
-                        let (r, _) = ui.allocate_exact_size(g.size() + vec2(12.0, 4.0), Sense::hover());
-                        ui.painter().rect_stroke(r, 4.0, Stroke::new(1.0, veil(23)), StrokeKind::Inside);
-                        ui.painter().galley(r.center() - g.size() / 2.0, g, DIM);
+                    if !empty && Btn::new("添加").look(Look::Soft).small().show(ui).clicked() {
+                        submit = Some(self.paste.clone());
                     }
                 });
             });
-        if frame.response.interact(Sense::click()).clicked() {
+        if focus_t > 0.01 {
+            ui.painter().rect_stroke(
+                frame.response.rect.expand(1.5),
+                9.5,
+                Stroke::new(2.5, ACCENT.gamma_multiply(0.18 * focus_t)),
+                StrokeKind::Outside,
+            );
+        }
+        if submit.is_none() && frame.response.interact(Sense::click()).clicked() {
             ui.memory_mut(|m| m.request_focus(id));
         }
         if let Some(t) = submit {
@@ -1470,18 +1677,24 @@ impl App {
 
     /// One device: its picture (what it is to this computer, a dot for its
     /// status), its name and what is going on, its buttons. Double-click:
-    /// control it; double-click the name of a remembered one: rename it.
+    /// control it (rename lives in the `···` menu).
     /// `at_own_relay`: this computer is at its own relay, so a device it
     /// cannot get through to is not at that relay.
-    fn row(&mut self, ui: &mut egui::Ui, d: &Dev, session: Option<SessionState>, first: bool, last: bool, at_own_relay: bool) {
+    fn row(&mut self, ui: &mut egui::Ui, d: &Dev, session: Option<SessionInfo>, first: bool, last: bool, at_own_relay: bool) {
+        if session.is_some_and(|s| s.state == SessionState::Waiting) {
+            ui.ctx().request_repaint_after(Duration::from_millis(500));
+        }
         let online = matches!(d.status, Status::Online { .. });
         let unreachable = d.status == Status::Unreachable;
         let asked = d.ask == Ask::In;
         let why_open = unreachable && self.why == Some(d.id);
         let (rect, row) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_HEIGHT), Sense::click());
-        if online && session.is_none() && !asked && row.double_clicked() {
-            self.b.control(d.id, &d.name);
+        if self.scroll_to_dev == Some(d.id) {
+            self.scroll_to_dev = None;
+            ui.scroll_to_rect(rect, Some(Align::Center));
         }
+        let hi = self.dev_highlight(ui.ctx(), d.id);
+        let row_ht = ui.ctx().animate_bool_with_time(row.id.with("hot"), row.hovered(), 0.12);
         let p = ui.painter().clone();
         let top = if first { GROUP_RADIUS } else { 0 };
         let bottom = if last && !why_open { GROUP_RADIUS } else { 0 };
@@ -1490,8 +1703,10 @@ impl App {
             p.rect_filled(rect, corners, AMBER.gamma_multiply(0.07));
             let bar = Rect::from_min_max(pos2(rect.left(), rect.top() + 10.0), pos2(rect.left() + 3.0, rect.bottom() - 10.0));
             p.rect_filled(bar, 2.0, AMBER);
-        } else if row.hovered() {
-            p.rect_filled(rect, corners, veil(6));
+        } else if hi > 0.0 {
+            p.rect_filled(rect, corners, ACCENT.gamma_multiply(0.22 * hi));
+        } else if row_ht > 0.0 {
+            p.rect_filled(rect, corners, veil((8.0 * row_ht).round() as u8));
         }
         if !first {
             p.hline(rect.left() + ROW_TEXT..=rect.right(), rect.top(), Stroke::new(1.0, veil(13)));
@@ -1503,13 +1718,14 @@ impl App {
         } else if d.auto {
             (ACCENT.gamma_multiply(0.16), LINK)
         } else {
-            (GREEN.gamma_multiply(0.13), hex(0x7fd38b))
+            (hex(0x8b7cf6).gamma_multiply(0.16), hex(0xb6a8ff))
         };
         p.rect_filled(av, 9.0, fill);
         glyph(&p, av.center(), ic::DESKTOP, 18.0, fg);
         let dot = av.right_bottom() - vec2(3.0, 3.0);
         p.circle_filled(dot, 6.0, CARD);
-        p.circle_filled(dot, 4.0, if online { GREEN } else if unreachable { AMBER } else { GONE });
+        let dot_color = if session.is_some() { ACCENT } else if online { GREEN } else if unreachable { AMBER } else { GONE };
+        p.circle_filled(dot, 4.0, dot_color);
 
         // The buttons, from the right.
         let acts_rect = Rect::from_min_max(pos2(rect.left() + ROW_TEXT, rect.top()), pos2(rect.right() - 10.0, rect.bottom()));
@@ -1519,7 +1735,11 @@ impl App {
         if asked {
             if Btn::new("同意").look(Look::Primary).name(format!("同意 {}", d.name)).show(&mut acts).clicked() {
                 match self.b.request(&format!("agree\t{}", d.id)) {
-                    Ok(_) => self.toast(Tone::Ok, format!("已和「{}」互相记住", d.name)),
+                    Ok(_) => {
+                        self.scroll_to_dev = Some(d.id);
+                        self.highlight_dev = Some((d.id, Instant::now()));
+                        self.toast(Tone::Ok, format!("已和「{}」互相记住；若为自己的电脑，可在 ··· 设为「我的电脑」", d.name));
+                    }
                     Err(e) => self.toast(Tone::Err, format!("{e:#}")),
                 }
             }
@@ -1528,9 +1748,14 @@ impl App {
             }
         } else {
             match session {
+                Some(SessionInfo { state: SessionState::Connecting | SessionState::Waiting, .. }) => {
+                    if Btn::new("取消").look(Look::Ghost).name(format!("取消控制 {}", d.name)).show(&mut acts).clicked() {
+                        self.b.cancel_control(d.id);
+                    }
+                }
                 Some(_) => {}
                 None if unreachable => {
-                    if Btn::new("为什么").look(Look::Ghost).name(format!("为什么 {}", d.name)).show(&mut acts).clicked() {
+                    if Btn::new("查看原因").look(Look::Ghost).name(format!("查看原因 {}", d.name)).show(&mut acts).clicked() {
                         self.why = if self.why == Some(d.id) { None } else { Some(d.id) };
                     }
                 }
@@ -1545,14 +1770,27 @@ impl App {
                 let r = Btn::new("记住").look(Look::Ghost).icon(ic::ADD).name(format!("记住 {}", d.name)).show(&mut acts);
                 if r.clicked() {
                     match self.b.request(&format!("remember\t{}", d.id)) {
-                        Ok(both) if both.trim() == "both" => self.toast(Tone::Ok, format!("已和「{}」互相记住", d.name)),
+                        Ok(both) if both.trim() == "both" => {
+                            self.scroll_to_dev = Some(d.id);
+                            self.highlight_dev = Some((d.id, Instant::now()));
+                            self.toast(Tone::Ok, format!("已和「{}」互相记住；若为自己的电脑，可在 ··· 设为「我的电脑」", d.name));
+                        }
                         Ok(_) => {}
                         Err(e) => self.toast(Tone::Err, format!("{e:#}")),
                     }
                 }
+            } else if !d.listed && d.ask == Ask::Out && session.is_none() {
+                if Btn::new("取消").look(Look::Ghost).name(format!("取消记住 {}", d.name)).show(&mut acts).clicked() {
+                    self.b.act(&format!("cancel-remember\t{}", d.id));
+                }
             }
         }
-        let text_right = acts.min_rect().left() - 12.0;
+        let acts_used = acts.min_rect();
+        let on_acts = ui.input(|i| i.pointer.latest_pos().is_some_and(|pos| acts_used.contains(pos)));
+        if online && session.is_none() && !asked && self.renaming.is_none() && !on_acts && row.double_clicked() {
+            self.b.control(d.id, &d.name);
+        }
+        let text_right = acts_used.left() - 12.0;
 
         // The name and the line under it.
         let x = rect.left() + ROW_TEXT;
@@ -1582,14 +1820,7 @@ impl App {
                 }
             }
         } else {
-            let at = Rect::from_min_size(pos2(x, y), name.size());
-            p.galley(at.min, name, TEXT);
-            if d.listed {
-                let r = ui.interact(at, Id::new(("name", d.id)), Sense::click()).on_hover_text("双击改名");
-                if r.double_clicked() {
-                    self.renaming = Some((d.id, d.name.clone()));
-                }
-            }
+            p.galley(pos2(x, y), name, TEXT);
         }
         let mut sx = x;
         if busy {
@@ -1605,9 +1836,9 @@ impl App {
                 ui.set_width(ui.available_width());
                 ui.spacing_mut().item_spacing.y = 8.0;
                 let why = if at_own_relay {
-                    "对方连不上你的自建中转，也找不到直连。可能是它那边的网络连不到中转服务器。"
+                    "对方连不上你的自建中转，也无法建立直连。可能是它那边的网络连不到中转服务器。"
                 } else {
-                    "找不到直连。打开路由器的 IPv6，或者加一台自建中转。"
+                    "两台电脑之间无法直连，通常是网络限制。可开启路由器 IPv6，或在设置中添加自建中转。"
                 };
                 ui.label(RichText::new(why).size(13.0).color(DIM));
                 ui.horizontal(|ui| {
@@ -1620,18 +1851,17 @@ impl App {
             });
         });
         if to_settings {
-            self.why = None;
-            self.renaming = None;
-            self.page = Page::Settings;
+            self.jump_settings(SettingsTarget::Relays);
         }
     }
 
     fn row_menu(&mut self, ui: &mut egui::Ui, d: &Dev) {
+        let online = matches!(d.status, Status::Online { .. });
         let more = icon_button(ui, ic::MORE, 32.0, 16.0, &format!("更多 {}", d.name), false);
         egui::Popup::menu(&more).align(RectAlign::BOTTOM_END).gap(4.0).show(|ui| {
             ui.set_width(MENU_WIDTH);
             ui.spacing_mut().item_spacing.y = 0.0;
-            if menu_item(ui, Some(ic::TERM), "终端", None, false, false).clicked() {
+            if menu_item_enabled(ui, Some(ic::TERM), "终端", None, false, false, online).clicked() {
                 ui.close();
                 if let Err(e) = crate::term::open_window(d.id, &d.name) {
                     self.toast(Tone::Err, format!("打不开终端：{e:#}"));
@@ -1644,13 +1874,19 @@ impl App {
                 }
                 menu_sep(ui);
                 menu_head(ui, "它控制本机时");
-                for (auto, title, sub) in [(true, "我的电脑", "不用问"), (false, "信任设备", "先问")] {
+                for (auto, title, sub) in [(true, "我的电脑", "免确认"), (false, "信任设备", "需确认")] {
                     if menu_item(ui, None, title, Some(sub), d.auto == auto, false).clicked() {
                         ui.close();
                         if d.auto != auto {
                             self.b.act(&format!("auto\t{}\t{}", d.id, auto as u8));
-                            let how = if auto { "不用问" } else { "要先问" };
-                            self.toast(Tone::Ok, format!("「{}」以后控制本机{how}", d.name));
+                            self.scroll_to_dev = Some(d.id);
+                            self.highlight_dev = Some((d.id, Instant::now()));
+                            let msg = if auto {
+                                format!("「{}」以后连入本机免确认（如需双向免确认，请在对方电脑同样设置）", d.name)
+                            } else {
+                                format!("「{}」以后连入本机需确认", d.name)
+                            };
+                            self.toast(Tone::Ok, msg);
                         }
                     }
                 }
@@ -1726,50 +1962,68 @@ impl App {
         let b = self.b.clone();
 
         section_head(ui, "本机", None);
-        group(ui, |ui| {
+        let self_hi = self.settings_highlight(ui.ctx(), SettingsTarget::SelfName);
+        let focus_name = std::mem::take(&mut self.focus_name);
+        let self_resp = group_highlighted(ui, self_hi, |ui| {
             let name = &mut self.name;
             let saved = &mut self.saved;
-            Item::new(Lead::Icon(ic::RENAME), "名字").desc("对方看到的名字").first(true).right_width(276.0).show(ui, |ui| {
-                let e = ui.add(TextEdit::singleline(name).hint_text(&snap.name).desired_width(170.0).margin(FIELD_MARGIN));
-                if !e.has_focus() && !e.lost_focus() {
-                    name.clone_from(&snap.set_name);
-                }
-                if e.lost_focus() {
-                    let cleaned = name.replace(['\t', '\r', '\n'], " ");
-                    let trimmed = cleaned.trim().to_string();
-                    if trimmed != *name {
-                        *name = trimmed.clone();
+            Item::new(Lead::Icon(ic::RENAME), "设备名称")
+                .desc("其他设备看到的本机名称")
+                .first(true)
+                .right_width(276.0)
+                .show(ui, |ui| {
+                    let e = ui.add(TextEdit::singleline(name).hint_text(&snap.name).desired_width(170.0).margin(FIELD_MARGIN));
+                    if !e.has_focus() && !e.lost_focus() {
+                        name.clone_from(&snap.set_name);
                     }
-                    if trimmed != snap.set_name {
-                        b.act(&format!("set-name\t{trimmed}"));
-                        *saved = Some(Instant::now());
+                    if focus_name {
+                        e.request_focus();
                     }
-                }
-                if let Some(t) = *saved {
-                    let a = 1.0 - ((t.elapsed().as_secs_f32() - 1.4) / 0.3).clamp(0.0, 1.0);
-                    if a > 0.0 {
-                        ui.ctx().request_repaint();
-                        ui.label(RichText::new("✓ 已保存").size(12.0).color(GREEN.gamma_multiply(a)));
+                    if e.lost_focus() {
+                        let cleaned = name.replace(['\t', '\r', '\n'], " ");
+                        let trimmed = cleaned.trim().to_string();
+                        if trimmed != *name {
+                            *name = trimmed.clone();
+                        }
+                        if trimmed != snap.set_name {
+                            b.act(&format!("set-name\t{trimmed}"));
+                            *saved = Some(Instant::now());
+                        }
                     }
-                }
-            });
+                    if let Some(t) = *saved {
+                        let a = 1.0 - ((t.elapsed().as_secs_f32() - 1.4) / 0.3).clamp(0.0, 1.0);
+                        if a > 0.0 {
+                            ui.ctx().request_repaint();
+                            ui.label(RichText::new("✓ 已保存").size(12.0).color(GREEN.gamma_multiply(a)));
+                        }
+                    }
+                });
         });
+        if self.scroll_to_settings == Some(SettingsTarget::SelfName) {
+            self.scroll_to_settings = None;
+            ui.scroll_to_rect(self_resp.rect, Some(Align::TOP));
+        }
 
         ui.add_space(12.0);
-        section_head(ui, "连接", None);
+        section_head(ui, "网络与发现", None);
         group(ui, |ui| {
             let mut public = snap.public;
-            Item::new(Lead::Icon(ic::GLOBE), "公共节点牵线").desc("只交换地址，不传画面").first(true).show(ui, |ui| {
-                if switch(ui, &mut public, true, "公共节点牵线").changed() {
-                    b.act(&format!("set\tpublic\t{}", public as u8));
-                }
-            });
+            Item::new(Lead::Icon(ic::GLOBE), "公网辅助连接")
+                .desc("跨网直连时用于交换地址，不转发画面和数据")
+                .first(true)
+                .show(ui, |ui| {
+                    if switch(ui, &mut public, true, "公网辅助连接").changed() {
+                        b.act(&format!("set\tpublic\t{}", public as u8));
+                    }
+                });
             let mut lan = snap.lan;
-            Item::new(Lead::Icon(ic::WIFI), "局域网可见").desc("同一个局域网里的电脑能看到本机").show(ui, |ui| {
-                if switch(ui, &mut lan, true, "局域网可见").changed() {
-                    b.act(&format!("set\tlan\t{}", lan as u8));
-                }
-            });
+            Item::new(Lead::Icon(ic::WIFI), "局域网发现")
+                .desc("允许同一局域网内的设备自动发现本机")
+                .show(ui, |ui| {
+                    if switch(ui, &mut lan, true, "局域网发现").changed() {
+                        b.act(&format!("set\tlan\t{}", lan as u8));
+                    }
+                });
         });
 
         ui.add_space(12.0);
@@ -1782,65 +2036,101 @@ impl App {
             let installed = b.service_installed();
             let busy = b.busy();
             let (title, desc) = match (installed, snap.service) {
-                (true, true) if other => ("运行中，用的是另一个位置的程序", "改用这个才用上这一版"),
-                (true, true) => ("运行中", "关掉窗口也在线"),
-                (true, false) => ("已安装，没在运行", "装上后锁屏时也能被控制"),
-                _ => ("没装", "装上后锁屏时也能被控制"),
+                (true, true) if other => ("运行中（程序路径不一致）", "点击「改用这个」以使用当前版本"),
+                (true, true) => ("运行中", "关闭窗口后仍保持在线"),
+                (true, false) => ("已安装（未运行）", "安装后支持开机在线与锁屏控制（需要管理员权限）"),
+                _ => ("未安装", "安装后支持开机在线与锁屏控制（需要管理员权限）"),
             };
             Item::new(Lead::Icon(ic::SERVICE), title).desc(desc).first(true).show(ui, |ui| {
                 if let Some(what) = &busy {
                     let label = if what.contains("卸载") { "卸载中…" } else { "安装中…" };
                     Btn::new(label).enabled(false).show(ui);
                 } else if !installed {
-                    if Btn::new("安装").look(Look::Primary).show(ui).clicked() {
+                    if Btn::new("安装").icon(ic::SHIELD).look(Look::Primary).show(ui).clicked() {
                         b.service(true);
                     }
                 } else {
-                    if installed && other && Btn::new("改用这个").look(Look::Primary).show(ui).clicked() {
+                    if installed && other && Btn::new("改用这个").icon(ic::SHIELD).look(Look::Primary).show(ui).clicked() {
                         b.service(true);
                     }
-                    if Btn::new("卸载").show(ui).clicked() {
+                    if Btn::new("卸载").icon(ic::SHIELD).show(ui).clicked() {
                         b.service(false);
                     }
                 }
             });
             let on = snap.service;
             for (key, icon, title, desc, value) in [
-                ("boot", ic::POWER, "开机自动在线", None, snap.boot),
-                ("lock", ic::LOCK, "锁屏时可被控制", Some("仅限我的电脑"), snap.lock),
-                ("awake", ic::BOLT, "插电时不睡眠", Some("屏幕照常熄灭"), snap.awake),
+                ("boot", ic::POWER, "开机自启", "系统启动后自动在后台保持在线", snap.boot),
+                ("lock", ic::LOCK, "允许锁屏控制", "仅限「我的电脑」免确认连入", snap.lock),
+                ("awake", ic::BOLT, "接通电源时阻止睡眠", "保持在线，显示器仍按系统设置熄屏", snap.awake),
             ] {
-                let mut v = value;
-                let line = Item::new(Lead::Icon(icon), title).enabled(on);
-                let line = match desc {
-                    Some(d) => line.desc(d),
-                    None => line,
-                };
-                line.show(ui, |ui| {
-                    if switch(ui, &mut v, on, title).changed() {
-                        b.act(&format!("set\t{key}\t{}", v as u8));
-                    }
-                });
+                let mut v = if on { value } else { false };
+                let shown_desc = if on { desc } else { "安装后台服务后可用" };
+                Item::new(Lead::Icon(icon), title)
+                    .desc(shown_desc)
+                    .enabled(on)
+                    .show(ui, |ui| {
+                        if switch(ui, &mut v, on, title).changed() {
+                            b.act(&format!("set\t{key}\t{}", v as u8));
+                        }
+                    });
             }
         });
 
         ui.add_space(12.0);
-        let mut taught = None;
-        section_head(ui, "AI", None);
+        enum SkillAct {
+            Install,
+            Update,
+            Uninstall,
+        }
+        let mut skill_act = None;
+        let skill_desc = match self.skill_state {
+            crate::term::SkillState::NotInstalled => "为 Claude Code、Codex 安装远程控制 Skill，支持通过终端操作设备",
+            crate::term::SkillState::Installed => "已安装 · 支持 Claude Code、Codex",
+            crate::term::SkillState::Outdated => "已安装（当前程序路径或版本有变化）",
+        };
+        section_head(ui, "AI 集成", None);
         group(ui, |ui| {
-            Item::new(Lead::Icon(ic::BOT), "让本机的 AI 会用")
-                .desc("Claude Code、Codex 学会用终端操作设备列表里的电脑")
+            Item::new(Lead::Icon(ic::BOT), "配置 AI Skills")
+                .desc(skill_desc)
                 .first(true)
-                .show(ui, |ui| {
-                    if Btn::new("写入").show(ui).clicked() {
-                        taught = Some(crate::term::install_skill());
+                .show(ui, |ui| match self.skill_state {
+                    crate::term::SkillState::NotInstalled => {
+                        if Btn::new("安装").show(ui).clicked() {
+                            skill_act = Some(SkillAct::Install);
+                        }
+                    }
+                    crate::term::SkillState::Installed => {
+                        if Btn::new("卸载").show(ui).clicked() {
+                            skill_act = Some(SkillAct::Uninstall);
+                        }
+                    }
+                    crate::term::SkillState::Outdated => {
+                        if Btn::new("卸载").show(ui).clicked() {
+                            skill_act = Some(SkillAct::Uninstall);
+                        }
+                        if Btn::new("更新").look(Look::Primary).show(ui).clicked() {
+                            skill_act = Some(SkillAct::Update);
+                        }
                     }
                 });
         });
-        match taught {
-            Some(Ok(where_)) => self.toast(Tone::Ok, format!("已写入 {where_}，新开的 AI 对话就会用")),
-            Some(Err(e)) => self.toast(Tone::Err, format!("没写进去：{e:#}")),
-            None => {}
+        if let Some(act) = skill_act {
+            match act {
+                SkillAct::Install => match crate::term::install_skill() {
+                    Ok(where_) => self.toast(Tone::Ok, format!("已写入 {where_}，新开的 AI 对话即生效")),
+                    Err(e) => self.toast(Tone::Err, format!("安装失败：{e:#}")),
+                },
+                SkillAct::Update => match crate::term::install_skill() {
+                    Ok(_) => self.toast(Tone::Ok, "已更新 AI Skills"),
+                    Err(e) => self.toast(Tone::Err, format!("更新失败：{e:#}")),
+                },
+                SkillAct::Uninstall => match crate::term::uninstall_skill() {
+                    Ok(()) => self.toast(Tone::Ok, "已卸载 AI Skills"),
+                    Err(e) => self.toast(Tone::Err, format!("卸载失败：{e:#}")),
+                },
+            }
+            self.skill_state = crate::term::skill_state();
         }
     }
 
@@ -1855,7 +2145,7 @@ impl App {
             match (j.what.as_str(), answer) {
                 ("relay-claim", Ok(url)) => {
                     let host = host_of(url);
-                    self.toast(Tone::Ok, format!("已加上中转 {host}"));
+                    self.toast(Tone::Ok, format!("已添加中转 {host}"));
                     self.adding_relay = false;
                     self.relay_paste.clear();
                 }
@@ -1886,7 +2176,7 @@ impl App {
         }
 
         let mut manual_refresh = false;
-        section_head_with(ui, "自建中转", Some("从上往下用，第一台连不上时下一台临时顶替"), |ui| {
+        section_head_with(ui, "自建中转", Some("按顺序优先使用，直连受阻时自动接管"), |ui| {
             if urls.is_empty() {
                 return;
             }
@@ -1906,13 +2196,14 @@ impl App {
             self.relay_probe.start_wave(ui.ctx(), &urls);
         }
         let (_, probe_results) = self.relay_probe.snapshot();
-        group(ui, |ui| {
+        let relay_hi = self.settings_highlight(ui.ctx(), SettingsTarget::Relays);
+        let relay_resp = group_highlighted(ui, relay_hi, |ui| {
             for (i, r) in relays.iter().enumerate() {
                 let (state, color) = match r.state.as_str() {
-                    "home" => ("在用", GREEN),
-                    "temp" => ("临时在用（首选连不上）", GREEN),
-                    "fail" => ("连不上", AMBER),
-                    "idle" => ("未使用，名单照常同步", GONE),
+                    "home" => ("已连接（首选）", GREEN),
+                    "temp" => ("临时接管（首选不可用）", GREEN),
+                    "fail" => ("连接失败", AMBER),
+                    "idle" => ("备用 · 首选不可用时接管", GONE),
                     _ => ("正在连接…", GONE),
                 };
                 let desc_suffix = match probe_results.get(&r.url).copied() {
@@ -1923,7 +2214,7 @@ impl App {
                         Some((format!(" · {ms} ms"), sc))
                     }
                     Some(ProbeState::Fail) => {
-                        if state == "连不上" {
+                        if state == "连接失败" {
                             None
                         } else {
                             Some((" · 超时".to_string(), AMBER_TEXT))
@@ -1941,13 +2232,18 @@ impl App {
                 line.show(ui, |ui| {
                     remove = icon_button(ui, ic::DEL, 32.0, 16.0, &format!("移除 {host}"), true).clicked();
                     if i != 0 {
-                        pick = Btn::new("使用").look(Look::Ghost).name(format!("使用 {host}")).show(ui).on_hover_text("以后优先用这台中转").clicked();
+                        pick = Btn::new("设为首选")
+                            .look(Look::Ghost)
+                            .name(format!("设为首选 {host}"))
+                            .show(ui)
+                            .on_hover_text("以后优先使用这台中转")
+                            .clicked();
                     }
                 });
                 if pick {
                     self.b.act(&format!("relay-use\t{}", r.url));
                     let note = if snap.codes.is_empty() || r.state == "temp" { "" } else { "，没用掉的连接码已作废" };
-                    self.toast(Tone::Ok, format!("已改用中转 {host}{note}"));
+                    self.toast(Tone::Ok, format!("已将 {host} 设为首选{note}"));
                 }
                 if remove {
                     self.undoable(Undoable::Relay(r.url.clone()), format!("已移除中转 {host}"));
@@ -1955,17 +2251,18 @@ impl App {
             }
             let first = relays.is_empty();
             if self.adding_relay {
-                let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 62.0), Sense::hover());
+                let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 76.0), Sense::hover());
                 if !first {
                     ui.painter().hline(rect.x_range(), rect.top(), Stroke::new(1.0, veil(13)));
                 }
-                glyph(ui.painter(), pos2(rect.left() + 24.0, rect.center().y), ic::SERVER, 18.0, DIM);
-                let inner = Rect::from_min_max(pos2(rect.left() + 48.0, rect.top()), pos2(rect.right() - 14.0, rect.bottom()));
+                let row_top = rect.top() + 12.0;
+                glyph(ui.painter(), pos2(rect.left() + 24.0, row_top + 16.0), ic::SERVER, 18.0, DIM);
+                let inner = Rect::from_min_size(pos2(rect.left() + 48.0, row_top), vec2(rect.width() - 48.0 - 14.0, 32.0));
                 ui.scope_builder(UiBuilder::new().max_rect(inner).layout(Layout::right_to_left(Align::Center)), |ui| {
                     ui.spacing_mut().item_spacing.x = 8.0;
                     let ready = !running && !self.relay_paste.trim().is_empty();
                     let add = if running {
-                        Btn::new("正在添加…").enabled(false).show(ui)
+                        Btn::new("添加中…").enabled(false).show(ui)
                     } else {
                         Btn::new("添加").look(Look::Primary).enabled(ready).show(ui)
                     };
@@ -1987,10 +2284,17 @@ impl App {
                         self.b.start_job(format!("relay-claim\t{}", self.relay_paste.replace(['\t', '\r', '\n'], " ")));
                     }
                 });
+                ui.painter().text(
+                    pos2(rect.left() + 48.0, rect.top() + 50.0),
+                    Align2::LEFT_TOP,
+                    "在自建服务器运行 rc-relay ui 获取中转码",
+                    font(11.5),
+                    DIM,
+                );
                 ui.advance_cursor_after_rect(rect);
             } else {
                 let (rect, r) = ui.allocate_exact_size(vec2(ui.available_width(), 48.0), Sense::click());
-                r.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, "添加中转"));
+                r.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, "添加中转服务器"));
                 if !first {
                     ui.painter().hline(rect.x_range(), rect.top(), Stroke::new(1.0, veil(13)));
                 }
@@ -2000,12 +2304,16 @@ impl App {
                     ui.painter().rect_filled(rect, corners, veil(6));
                 }
                 glyph(ui.painter(), pos2(rect.left() + 24.0, rect.center().y), ic::PLUS, 16.0, LINK);
-                ui.painter().text(pos2(rect.left() + 48.0, rect.center().y), Align2::LEFT_CENTER, "添加中转", font(14.0), LINK);
+                ui.painter().text(pos2(rect.left() + 48.0, rect.center().y), Align2::LEFT_CENTER, "添加中转服务器", font(14.0), LINK);
                 if r.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                     self.adding_relay = true;
                 }
             }
         });
+        if self.scroll_to_settings == Some(SettingsTarget::Relays) {
+            self.scroll_to_settings = None;
+            ui.scroll_to_rect(relay_resp.rect, Some(Align::Center));
+        }
     }
 
     /// The toasts, centred at the top of the page: they slide in, stay a

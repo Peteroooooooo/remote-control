@@ -1,12 +1,12 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
 <!-- The design as drawn spans x 18-238, y 30-224; scaled by 12/11 about its centre it spans x 8-248, near the edges like Windows' own app icons, so it looks as big as they do. Rendered at 32, 40, 48, 64 and 256 px into icon.ico. -->
-<defs><linearGradient id="dwg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#13704F"/><stop offset="1" stop-color="#0A3F2D"/></linearGradient></defs>
+<defs><linearGradient id="dwg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#2563C9"/><stop offset="1" stop-color="#153B80"/></linearGradient></defs>
 <g transform="translate(-11.636 -10.545) scale(1.0909)">
-<rect x="92" y="30" width="146" height="114" rx="20" fill="#7EE2B8"/>
+<rect x="92" y="30" width="146" height="114" rx="20" fill="#7DB8FF"/>
 <rect x="104" y="60" width="122" height="72" rx="8" fill="#FFFFFF" fill-opacity="0.45"/>
 <rect x="18" y="92" width="164" height="132" rx="22" fill="url(#dwg)"/>
-<rect x="30" y="124" width="140" height="88" rx="10" fill="#06180F"/>
-<rect x="32" y="103" width="18" height="11" rx="3" fill="#7EE2B8"/>
-<path transform="translate(150 70) scale(0.76)" d="M0 0 L0 92 L24 70 L40 106 L58 98 L42 63 L74 63 Z" fill="#FFFFFF" stroke="#06180F" stroke-width="12" stroke-linejoin="round"/>
+<rect x="30" y="124" width="140" height="88" rx="10" fill="#0B1A36"/>
+<rect x="32" y="103" width="18" height="11" rx="3" fill="#7DB8FF"/>
+<path transform="translate(150 70) scale(0.76)" d="M0 0 L0 92 L24 70 L40 106 L58 98 L42 63 L74 63 Z" fill="#FFFFFF" stroke="#0B1A36" stroke-width="12" stroke-linejoin="round"/>
 </g>
 </svg>

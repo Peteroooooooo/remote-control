@@ -170,10 +170,23 @@ pub enum SessionState {
     Paused,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SessionInfo {
+    pub state: SessionState,
+    pub since: Instant,
+}
+
+struct SessionEntry {
+    name: String,
+    state: SessionState,
+    since: Instant,
+    child_pid: Option<u32>,
+    cancelled: bool,
+}
+
 /// A deletion that waits for its toast to go (or for the window/app to close).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Undoable {
-    Revoke(String),
     Relay(String),
 }
 
@@ -198,7 +211,7 @@ struct Sh {
     /// Why there is no snapshot now.
     trouble: Mutex<Option<String>>,
     repaint: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
-    sessions: Mutex<BTreeMap<EndpointId, (String, SessionState)>>,
+    sessions: Mutex<BTreeMap<EndpointId, SessionEntry>>,
     /// Installing or removing the service.
     busy: Mutex<Option<String>>,
     /// The lobby's own messages (sessions, install), not yet shown.
@@ -486,8 +499,14 @@ impl Backend {
         std::mem::take(&mut *self.sh.notes.lock().unwrap())
     }
 
-    pub fn sessions(&self) -> BTreeMap<EndpointId, (String, SessionState)> {
-        self.sh.sessions.lock().unwrap().clone()
+    pub fn sessions(&self) -> BTreeMap<EndpointId, (String, SessionInfo)> {
+        self.sh
+            .sessions
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(id, e)| (*id, (e.name.clone(), SessionInfo { state: e.state, since: e.since })))
+            .collect()
     }
 
     /// A request whose answer only matters if it failed (shown as a notice).
@@ -562,17 +581,12 @@ impl Backend {
         }
     }
 
-    pub fn has_pending_code(&self, token: &str) -> bool {
-        self.sh.undoables.lock().unwrap().iter().any(|(_, w)| matches!(w, Undoable::Revoke(t) if t == token))
-    }
-
     pub fn has_pending_relay(&self, url: &str) -> bool {
         self.sh.undoables.lock().unwrap().iter().any(|(_, w)| matches!(w, Undoable::Relay(u) if u == url))
     }
 
     fn carry_out_undoable(&self, what: Undoable) {
         match what {
-            Undoable::Revoke(token) => self.act(&format!("revoke\t{token}")),
             Undoable::Relay(url) => self.act(&format!("relay-remove\t{url}")),
         }
     }
@@ -598,7 +612,16 @@ impl Backend {
             if s.contains_key(&id) {
                 return;
             }
-            s.insert(id, (name.to_string(), SessionState::Connecting));
+            s.insert(
+                id,
+                SessionEntry {
+                    name: name.to_string(),
+                    state: SessionState::Connecting,
+                    since: Instant::now(),
+                    child_pid: None,
+                    cancelled: false,
+                },
+            );
         }
         self.sh.changed();
         let sh = self.sh.clone();
@@ -615,6 +638,28 @@ impl Backend {
             self.sh.changed();
             self.sh.note(Tone::Err, format!("{e}"));
         }
+    }
+
+    pub fn cancel_control(&self, id: EndpointId) {
+        let pid = {
+            let mut s = self.sh.sessions.lock().unwrap();
+            let Some(e) = s.get_mut(&id) else { return };
+            e.cancelled = true;
+            e.child_pid.take()
+        };
+        if let Some(pid) = pid {
+            use windows::Win32::{
+                Foundation::CloseHandle,
+                System::Threading::{OpenProcess, PROCESS_TERMINATE, TerminateProcess},
+            };
+            unsafe {
+                if let Ok(h) = OpenProcess(PROCESS_TERMINATE, false, pid) {
+                    let _ = TerminateProcess(h, 0);
+                    let _ = CloseHandle(h);
+                }
+            }
+        }
+        self.sh.changed();
     }
 
     /// Installs (`true`) or removes the service: one UAC prompt.
@@ -775,6 +820,9 @@ fn session(sh: &Arc<Sh>, id: EndpointId, name: &str) -> Result<()> {
     args.extend(sh.view_args.iter().cloned());
     let log_path = sh.key.with_file_name(format!("session-{}.log", id.fmt_short()));
     log!("lobby: session to {name}: {}", args.join(" "));
+    if sh.sessions.lock().unwrap().get(&id).is_some_and(|e| e.cancelled) {
+        return Ok(());
+    }
     let mut log_file = std::fs::File::create(&log_path)?;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let mut child = std::process::Command::new(std::env::current_exe()?)
@@ -784,6 +832,18 @@ fn session(sh: &Arc<Sh>, id: EndpointId, name: &str) -> Result<()> {
         .stderr(log_file.try_clone()?)
         .creation_flags(CREATE_NO_WINDOW)
         .spawn()?;
+    {
+        let mut s = sh.sessions.lock().unwrap();
+        if let Some(e) = s.get_mut(&id) {
+            if e.cancelled {
+                drop(s);
+                let _ = child.kill();
+                let _ = child.wait();
+                return Ok(());
+            }
+            e.child_pid = Some(child.id());
+        }
+    }
     {
         let mut stdin = child.stdin.take().expect("piped");
         writeln!(stdin, "{}\n{proof}", hex(&session_key.to_bytes()))?;
@@ -816,13 +876,17 @@ fn session(sh: &Arc<Sh>, id: EndpointId, name: &str) -> Result<()> {
         };
         if let Some(s) = state {
             if let Some(e) = sh.sessions.lock().unwrap().get_mut(&id) {
-                e.1 = s;
+                e.state = s;
+                e.since = Instant::now();
             }
             sh.changed();
         }
     }
     let status = child.wait()?;
     log!("lobby: session to {name} ended after {:.1} s ({status})", t.elapsed().as_secs_f64());
+    if sh.sessions.lock().unwrap().get(&id).is_some_and(|e| e.cancelled) {
+        return Ok(());
+    }
     match ending {
         Some(Err(e)) => Err(anyhow!("{e}")),
         None if !status.success() => Err(anyhow!("会话窗口异常退出（{status}），详情见 {}", log_path.display())),

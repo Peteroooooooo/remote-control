@@ -610,18 +610,24 @@ impl Shared {
         Ok(dropped)
     }
 
-    /// The connection codes on every own relay now, not at `guests_loop`'s
-    /// next round: a new code works at once.
-    async fn send_invites_now(&self) {
+    /// Pushes the current connection codes to every own relay in parallel on
+    /// the background runtime, without blocking `issue_code` or letting one
+    /// unreachable relay stall the others. `guests_loop` still retries if any
+    /// push fails.
+    fn send_invites_now(self: &Arc<Self>) {
         let (groups, list) = {
             let st = self.st.lock().unwrap();
             (st.settings.relays.clone(), self.invites(&st))
         };
         for g in groups {
-            let r = tokio::time::timeout(Duration::from_secs(3), self.send_invites(&g, &list)).await;
-            if let Err(e) = r.unwrap_or_else(|_| Err(anyhow!("no answer within 3 s"))) {
-                log!("connection codes on {}: {e:#}", g[0]);
-            }
+            let sh = self.clone();
+            let list = list.clone();
+            self.rt.spawn(async move {
+                let r = tokio::time::timeout(Duration::from_secs(3), sh.send_invites(&g, &list)).await;
+                if let Err(e) = r.unwrap_or_else(|_| Err(anyhow!("no answer within 3 s"))) {
+                    log!("connection codes on {}: {e:#}", g[0]);
+                }
+            });
         }
     }
 
@@ -1457,6 +1463,7 @@ impl Node {
             "remember" => id(1).ok_or_else(|| anyhow!("bad id")).and_then(|i| self.remember(i)),
             "agree" => id(1).ok_or_else(|| anyhow!("bad id")).and_then(|i| self.agree(i)),
             "refuse" => id(1).ok_or_else(|| anyhow!("bad id")).map(|i| self.refuse(i)),
+            "cancel-remember" => id(1).ok_or_else(|| anyhow!("bad id")).map(|i| self.cancel_remember(i)),
             "retry" => id(1).ok_or_else(|| anyhow!("bad id")).map(|i| self.retry(i)),
             "proof" => id(1).ok_or_else(|| anyhow!("bad id")).map(|i| ident::issue(&self.sh.secret, i)),
             "dial" => id(1).ok_or_else(|| anyhow!("bad id")).map(|i| self.dial(i)),
@@ -1638,14 +1645,22 @@ impl Node {
             (text, !st.settings.relays.is_empty())
         };
         if own {
-            self.sh.rt.block_on(self.sh.send_invites_now());
+            self.sh.send_invites_now();
         }
         Ok(text)
     }
 
     fn revoke(&self, token: &str) -> Result<String> {
         let t = unhex8(token).ok_or_else(|| anyhow!("bad token"))?;
-        self.sh.st.lock().unwrap().codes.retain(|c| c.token != t);
+        let own = {
+            let mut st = self.sh.st.lock().unwrap();
+            st.codes.retain(|c| c.token != t);
+            !st.settings.relays.is_empty()
+        };
+        self.sh.guests_wake.notify_one();
+        if own {
+            self.sh.send_invites_now();
+        }
         Ok(String::new())
     }
 
@@ -1812,6 +1827,17 @@ impl Node {
             p.ask = Ask::None;
             p.say_no = true;
             log!("did not agree to remember {}", id.fmt_short());
+            self.sh.ensure(&mut st, id);
+        }
+        String::new()
+    }
+
+    fn cancel_remember(&self, id: EndpointId) -> String {
+        let mut st = self.sh.st.lock().unwrap();
+        if let Some(p) = st.peers.get_mut(&id).filter(|p| p.ask == Ask::Out) {
+            p.ask = Ask::None;
+            p.say_no = true;
+            log!("cancelled remember request to {}", id.fmt_short());
             self.sh.ensure(&mut st, id);
         }
         String::new()

@@ -46,6 +46,8 @@ pub const ACCENT_PRESSED: u32 = 0x3471c9;
 pub const BUTTON: u32 = 0x292a2e;
 pub const BUTTON_HOVER: u32 = 0x343539;
 pub const BUTTON_EDGE: u32 = 0x36373b;
+pub const DANGER_BTN: u32 = 0xc93b36;
+pub const DANGER_BTN_HOVER: u32 = 0xdc4a45;
 
 /// Colours the native frame of a top-level window: dark caption buttons,
 /// the caption in `caption` (the surface right below it), a quiet border,

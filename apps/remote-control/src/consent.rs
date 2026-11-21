@@ -163,7 +163,7 @@ fn run(mut popup: Popup, hwnd_out: &AtomicIsize, cancelled: &AtomicBool) -> wind
         let hwnd = CreateWindowExW(
             WS_EX_TOPMOST,
             class,
-            &HSTRING::from("remote control"),
+            &HSTRING::from("Remote Control"),
             style,
             0,
             0,
@@ -395,7 +395,7 @@ fn paint(hwnd: HWND, p: &Popup) {
                 c.text(&b, "允许", bold, gdi::TEXT, true);
             }
             Hit::Deny => {
-                c.round(&b, px(6), Some(if hovered { gdi::BUTTON_HOVER } else { gdi::BUTTON }), Some((gdi::BUTTON_EDGE, 1)));
+                c.round(&b, px(6), Some(if hovered { gdi::DANGER_BTN_HOVER } else { gdi::DANGER_BTN }), None);
                 c.text(&b, "拒绝", bold, gdi::TEXT, true);
             }
         }

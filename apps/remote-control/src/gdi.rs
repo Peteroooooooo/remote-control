@@ -37,9 +37,9 @@ pub const TEXT: COLORREF = rgb(theme::TEXT);
 pub const DIM: COLORREF = rgb(theme::DIM);
 pub const ACCENT: COLORREF = rgb(theme::ACCENT);
 pub const ACCENT_HOVER: COLORREF = rgb(theme::ACCENT_HOVER);
-pub const BUTTON: COLORREF = rgb(theme::BUTTON);
-pub const BUTTON_HOVER: COLORREF = rgb(theme::BUTTON_HOVER);
 pub const BUTTON_EDGE: COLORREF = rgb(theme::BUTTON_EDGE);
+pub const DANGER_BTN: COLORREF = rgb(theme::DANGER_BTN);
+pub const DANGER_BTN_HOVER: COLORREF = rgb(theme::DANGER_BTN_HOVER);
 
 /// Window units (96 DPI) to pixels.
 pub fn scale(hwnd: HWND) -> impl Fn(i32) -> i32 {

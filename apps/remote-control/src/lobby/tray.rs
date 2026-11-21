@@ -142,7 +142,7 @@ pub fn hide() {
             let v: Vec<u16> = s.encode_utf16().take(dst.len() - 1).collect();
             dst[..v.len()].copy_from_slice(&v);
         };
-        copy(&mut nid.szInfoTitle, "remote control 还在运行");
+        copy(&mut nid.szInfoTitle, "Remote Control 还在运行");
         copy(&mut nid.szInfo, "点这里的图标打开窗口，右键可以退出");
         unsafe {
             let _ = Shell_NotifyIconW(NIM_MODIFY, &nid);
@@ -200,7 +200,7 @@ fn icon_data(hwnd: HWND) -> NOTIFYICONDATAW {
             nid.hIcon = HICON(icon.0);
         }
     }
-    let tip: Vec<u16> = "remote control".encode_utf16().collect();
+    let tip: Vec<u16> = "Remote Control".encode_utf16().collect();
     nid.szTip[..tip.len()].copy_from_slice(&tip);
     nid
 }

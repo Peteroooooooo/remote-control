@@ -931,19 +931,100 @@ remote-control cp '<设备>:D:\logs' .\logs
 - 用户想自己操作时，告诉用户在大厅设备的 ⋯ 菜单或控制窗口标题栏点【终端】。
 "#;
 
-/// Writes the skill for Claude Code (`~/.claude/skills`) and Codex (`~/.agents/skills`); where it went.
-pub fn install_skill() -> Result<String> {
-    let home = std::env::var_os("USERPROFILE").map(PathBuf::from).ok_or_else(|| anyhow!("找不到用户文件夹"))?;
-    let exe = std::env::current_exe()?;
-    let text = SKILL.replace("{exe}", &exe.display().to_string());
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SkillState {
+    NotInstalled,
+    Installed,
+    Outdated,
+}
+
+fn skill_home() -> Result<PathBuf> {
+    std::env::var_os("USERPROFILE").map(PathBuf::from).ok_or_else(|| anyhow!("找不到用户文件夹"))
+}
+
+fn skill_dirs(home: &Path) -> [(&'static str, PathBuf); 2] {
+    [".claude", ".agents"].map(|dir| (dir, home.join(dir).join("skills").join("remote-control")))
+}
+
+fn rendered_skill(exe: &Path) -> String {
+    SKILL.replace("{exe}", &exe.display().to_string())
+}
+
+fn install_skill_in(home: &Path, exe: &Path) -> Result<String> {
+    let text = rendered_skill(exe);
     let mut done = Vec::new();
-    for dir in [".claude", ".agents"] {
-        let d = home.join(dir).join("skills").join("remote-control");
+    for (dir, d) in skill_dirs(home) {
         std::fs::create_dir_all(&d).map_err(|e| anyhow!("{}：{e}", d.display()))?;
         std::fs::write(d.join("SKILL.md"), &text).map_err(|e| anyhow!("{}：{e}", d.display()))?;
         done.push(format!("~\\{dir}\\skills"));
     }
     Ok(done.join(" 和 "))
+}
+
+/// Writes the skill for Claude Code (`~/.claude/skills`) and Codex (`~/.agents/skills`); where it went.
+pub fn install_skill() -> Result<String> {
+    let home = skill_home()?;
+    let exe = std::env::current_exe()?;
+    install_skill_in(&home, &exe)
+}
+
+fn skill_state_in(home: &Path, exe: &Path) -> SkillState {
+    let expected = rendered_skill(exe);
+    let mut any_exists = false;
+    let mut all_match = true;
+    for (_, d) in skill_dirs(home) {
+        let file = d.join("SKILL.md");
+        match std::fs::read_to_string(&file) {
+            Ok(content) => {
+                any_exists = true;
+                if content != expected {
+                    all_match = false;
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                all_match = false;
+            }
+            Err(_) => {
+                if file.exists() {
+                    any_exists = true;
+                }
+                all_match = false;
+            }
+        }
+    }
+    if !any_exists {
+        SkillState::NotInstalled
+    } else if all_match {
+        SkillState::Installed
+    } else {
+        SkillState::Outdated
+    }
+}
+
+/// Checks whether the remote-control skill is installed for both Claude Code
+/// and Codex and matches this executable's path and current template.
+pub fn skill_state() -> SkillState {
+    let Ok(home) = skill_home() else { return SkillState::NotInstalled };
+    let Ok(exe) = std::env::current_exe() else { return SkillState::NotInstalled };
+    skill_state_in(&home, &exe)
+}
+
+fn uninstall_skill_in(home: &Path) -> Result<()> {
+    for (_, d) in skill_dirs(home) {
+        match std::fs::remove_file(d.join("SKILL.md")) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(anyhow!("{}：{e}", d.display())),
+        }
+        let _ = std::fs::remove_dir(&d);
+    }
+    Ok(())
+}
+
+/// Removes the installed remote-control skill from Claude Code and Codex.
+pub fn uninstall_skill() -> Result<()> {
+    let home = skill_home()?;
+    uninstall_skill_in(&home)
 }
 
 /// The device of this session window, for its 【终端】 button.
@@ -1089,6 +1170,32 @@ mod tests {
         assert_eq!(dest(Path::new("T"), true, "a/b").unwrap(), Path::new("T").join("a").join("b"));
         assert_eq!(dest(Path::new("T"), false, "a/b").unwrap(), Path::new("T").join("b"));
         assert!(dest(Path::new("T"), true, "a/../x").is_err());
+    }
+
+    #[test]
+    fn skill_state_transitions() {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let home = std::env::temp_dir().join(format!("rc-skill-test-{}-{nanos}", std::process::id()));
+        let exe_a = Path::new(r"C:\a\remote-control.exe");
+        let exe_b = Path::new(r"C:\b\remote-control.exe");
+
+        let _ = std::fs::remove_dir_all(&home);
+        assert_eq!(skill_state_in(&home, exe_a), SkillState::NotInstalled);
+
+        let where_msg = install_skill_in(&home, exe_a).unwrap();
+        assert_eq!(where_msg, r"~\.claude\skills 和 ~\.agents\skills");
+        assert_eq!(skill_state_in(&home, exe_a), SkillState::Installed);
+        assert_eq!(skill_state_in(&home, exe_b), SkillState::Outdated);
+
+        // Removing one target leaves it Outdated; uninstalling cleans up the rest.
+        std::fs::remove_file(home.join(".claude").join("skills").join("remote-control").join("SKILL.md")).unwrap();
+        assert_eq!(skill_state_in(&home, exe_a), SkillState::Outdated);
+
+        uninstall_skill_in(&home).unwrap();
+        assert_eq!(skill_state_in(&home, exe_a), SkillState::NotInstalled);
+        uninstall_skill_in(&home).unwrap();
+
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     /// A real shell over the network: `RC_EXE` (this program), `RC_SHELL_ID` (a host that lets this computer in).

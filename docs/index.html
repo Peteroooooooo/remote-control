@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>remote-control · 交互演示</title>
+<title>Remote Control · 交互演示</title>
 <style>
   :root {
     --chrome: #1b1c20; --layer: #222428; --card: #2a2c31; --raised: #2d2f34; --border: #313338;
@@ -11,6 +11,8 @@
     --accent: #3b7fe0; --accent-hover: #4b8be6; --accent-pressed: #3471c9; --link: #8db6f0;
     --green: #3fb950; --amber: #d29922; --amber-text: #e3b34a; --red: #e5534b; --danger: #ff8a83;
     --gone: #5a5e66;
+    --ease: cubic-bezier(.2, .8, .2, 1);
+    --spring: cubic-bezier(.22, 1.2, .36, 1);
   }
   * { box-sizing: border-box; }
   html, body { margin: 0; min-height: 100%; background: #0f1013; color: var(--text);
@@ -23,16 +25,16 @@
     fill: none; stroke: currentColor; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; }
   button svg.ic { width: 14px; height: 14px; }
 
-  /* Guide bar */
+  /* Demo guide bar (outside the app window) */
   .guide-wrap { width: 920px; max-width: 100%; display: flex; flex-direction: column; gap: 8px; }
-  .guide-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .guide-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
   .brand { font-size: 14px; font-weight: 700; color: var(--text); letter-spacing: .2px; }
   .badge-pill { font-size: 11px; padding: 2px 8px; border-radius: 99px; background: rgba(59,127,224,.15); color: var(--link); }
   .guide-head .grow { flex: 1; }
   .steps { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
   .step-btn { height: 30px; padding: 0 11px; border-radius: 99px; font-size: 12px;
     background: rgba(255,255,255,.04); border: 1px solid rgba(255,255,255,.08); color: var(--dim);
-    display: inline-flex; align-items: center; gap: 6px; cursor: pointer; transition: all .15s; }
+    display: inline-flex; align-items: center; gap: 6px; cursor: pointer; transition: all .16s var(--ease); }
   .step-btn:hover { background: rgba(255,255,255,.08); color: var(--text); }
   .step-btn.active { background: rgba(59,127,224,.18); border-color: rgba(59,127,224,.45); color: #d6e6ff; }
   .step-btn.done { border-color: rgba(63,185,80,.4); color: #8fe39c; }
@@ -42,58 +44,67 @@
   .guide-tip b { color: var(--text); }
   .guide-tip .grow { flex: 1; }
 
-  @keyframes pulse-ring {
+  @keyframes pulse-once {
     0% { box-shadow: 0 0 0 0 rgba(59,127,224,.65); }
-    70% { box-shadow: 0 0 0 7px rgba(59,127,224,0); }
+    60% { box-shadow: 0 0 0 7px rgba(59,127,224,0); }
     100% { box-shadow: 0 0 0 0 rgba(59,127,224,0); }
   }
-  .pulse { animation: pulse-ring 1.5s infinite; border-color: var(--accent) !important; }
+  .pulse { animation: pulse-once 1.1s var(--ease) 2; }
 
-  /* Buttons & Inputs */
+  /* Buttons & Inputs with tactile press feedback */
   button { font: inherit; color: var(--text); background: rgba(255,255,255,.063); border: 1px solid rgba(255,255,255,.05);
     border-radius: 6px; height: 32px; padding: 0 12px; cursor: pointer; white-space: nowrap;
-    display: inline-flex; align-items: center; gap: 6px; transition: background .12s, color .12s, border-color .12s; }
-  button:hover { background: rgba(255,255,255,.1); }
-  button:active { background: rgba(255,255,255,.04); }
+    display: inline-flex; align-items: center; gap: 6px;
+    transition: background .14s var(--ease), color .14s var(--ease), border-color .14s var(--ease), transform .12s var(--ease), box-shadow .14s var(--ease); }
+  button:hover { background: rgba(255,255,255,.105); }
+  button:active:not(:disabled) { transform: scale(.97); background: rgba(255,255,255,.05); }
   button:disabled { opacity: .4; cursor: default; background: rgba(255,255,255,.063); }
   button.primary { background: var(--accent); border-color: transparent; color: #fff; }
-  button.primary:hover { background: var(--accent-hover); }
-  button.primary:active { background: var(--accent-pressed); }
-  button.primary:disabled { background: var(--accent); }
+  button.primary:hover { background: var(--accent-hover); box-shadow: 0 2px 10px rgba(59,127,224,.28); }
+  button.primary:active:not(:disabled) { background: var(--accent-pressed); box-shadow: none; }
+  button.primary:disabled { background: var(--accent); box-shadow: none; }
   button.soft { background: rgba(59,127,224,.16); border-color: transparent; color: var(--link); }
-  button.soft:hover { background: rgba(59,127,224,.26); color: #b5d0f7; }
+  button.soft:hover { background: rgba(59,127,224,.26); color: #b8d3f9; }
   button.soft:disabled { background: rgba(255,255,255,.04); color: var(--dim); }
   button.ghost { background: none; border-color: transparent; color: var(--dim); }
-  button.ghost:hover { background: rgba(255,255,255,.063); color: var(--text); }
+  button.ghost:hover { background: rgba(255,255,255,.068); color: var(--text); }
   button.link { background: none; border-color: transparent; color: var(--link); padding: 0 8px; }
   button.link:hover { background: rgba(59,127,224,.14); }
   button.icon { width: 32px; padding: 0; justify-content: center; background: none; border-color: transparent; color: var(--dim); }
-  button.icon:hover { background: rgba(255,255,255,.063); color: var(--text); }
+  button.icon:hover { background: rgba(255,255,255,.068); color: var(--text); }
   button.icon.red:hover { background: rgba(229,83,75,.16); color: var(--danger); }
   button.danger { background: rgba(229,83,75,.16); border-color: transparent; color: var(--danger); }
   button.danger:hover { background: rgba(229,83,75,.26); }
+  button.danger-solid { background: #c93b36; border-color: transparent; color: #fff; }
+  button.danger-solid:hover { background: #dc4a45; }
 
   input.field { font: inherit; color: var(--text); background: rgba(255,255,255,.04); border: 1px solid rgba(255,255,255,.063);
-    border-radius: 6px; height: 32px; padding: 0 10px; outline: none; transition: border-color .12s; }
-  input.field:focus { border-color: var(--accent); }
+    border-radius: 6px; height: 32px; padding: 0 10px; outline: none;
+    transition: border-color .15s var(--ease), box-shadow .15s var(--ease), background .15s var(--ease); }
+  input.field:focus { border-color: var(--accent); background: rgba(255,255,255,.055); box-shadow: 0 0 0 3px rgba(59,127,224,.16); }
   input.field::placeholder { color: var(--faint); }
 
-  /* Switch */
-  .sw { width: 40px; height: 20px; border-radius: 10px; border: 1px solid rgba(255,255,255,.45); position: relative; cursor: pointer;
-    flex: none; transition: background .18s, border-color .18s; }
-  .sw::after { content: ""; position: absolute; top: 3px; left: 4px; width: 12px; height: 12px; border-radius: 50%; background: #c9cbd0;
-    transition: left .18s cubic-bezier(.2,.8,.2,1), background .18s; }
-  .sw:hover { border-color: rgba(255,255,255,.7); }
+  /* Fluent ToggleSwitch with tactile stretch */
+  .sw { width: 40px; height: 20px; border-radius: 10px; border: 1px solid rgba(255,255,255,.42); position: relative; cursor: pointer;
+    flex: none; transition: background .2s var(--ease), border-color .2s var(--ease); }
+  .sw::after { content: ""; position: absolute; top: 3px; left: 4px; width: 12px; height: 12px; border-radius: 6px; background: #c9cbd0;
+    transition: left .22s var(--spring), width .16s var(--ease), background .18s var(--ease), transform .16s var(--ease); }
+  .sw:hover { border-color: rgba(255,255,255,.72); }
+  .sw:hover::after { transform: scale(1.08); }
+  .sw:active::after { width: 15px; }
   .sw.on { background: var(--accent); border-color: var(--accent); }
   .sw.on::after { left: 23px; background: #fff; }
+  .sw.on:active::after { left: 20px; width: 15px; }
   .sw.off-dis { opacity: .35; pointer-events: none; }
 
   /* Main App Window */
   .win { width: 920px; max-width: 100%; height: 610px; border-radius: 8px; border: 1px solid var(--border); overflow: hidden;
     position: relative; background: var(--chrome); display: flex; flex-direction: column; box-shadow: 0 24px 70px rgba(0,0,0,.6); }
-  .titlebar { height: 32px; flex: none; display: flex; align-items: center; padding-left: 12px; font-size: 12px; color: var(--dim); user-select: none; }
+  .titlebar { height: 32px; flex: none; display: flex; align-items: center; gap: 8px; padding-left: 12px; font-size: 12px; color: var(--dim); user-select: none; }
+  .app-icon { width: 16px; height: 16px; flex: none; display: block; }
   .caps { margin-left: auto; display: flex; }
-  .caps span { width: 46px; height: 32px; display: grid; place-items: center; color: var(--dim); }
+  .caps span { width: 46px; height: 32px; display: grid; place-items: center; color: var(--dim); transition: background .12s, color .12s; }
+  .caps span:hover { background: rgba(255,255,255,.06); color: var(--text); }
   .caps span svg.ic { width: 12px; height: 12px; }
   .caps span.x { cursor: pointer; }
   .caps span.x:hover { background: #c42b1c; color: #fff; }
@@ -101,51 +112,123 @@
 
   /* Side pane */
   .pane { width: 236px; flex: none; padding: 8px 12px 14px; display: flex; flex-direction: column; }
-  .me { display: flex; align-items: center; gap: 12px; padding: 6px 8px 18px; }
+  .me { display: flex; align-items: center; gap: 12px; padding: 8px; margin-bottom: 12px; border-radius: 8px;
+    cursor: pointer; transition: background .15s var(--ease), transform .12s var(--ease); }
+  .me:hover { background: rgba(255,255,255,.048); }
+  .me:active { transform: scale(.985); background: rgba(255,255,255,.03); }
   .me .nm { font-size: 16px; font-weight: 700; }
   .me .st { font-size: 12px; color: var(--dim); display: flex; align-items: center; gap: 6px; }
+
   .nav { display: flex; align-items: center; gap: 12px; height: 36px; padding: 0 12px; border-radius: 6px; cursor: pointer;
-    color: var(--text); position: relative; margin-bottom: 2px; }
-  .nav:hover { background: rgba(255,255,255,.04); }
-  .nav.on { background: rgba(255,255,255,.063); }
+    color: var(--text); position: relative; margin-bottom: 2px;
+    transition: background .15s var(--ease), color .15s var(--ease); }
+  .nav:hover { background: rgba(255,255,255,.045); }
+  .nav:active { background: rgba(255,255,255,.03); }
+  .nav.on { background: rgba(255,255,255,.068); }
   .nav.on::before { content: ""; position: absolute; left: 0; top: 10px; width: 3px; height: 16px; border-radius: 2px; background: var(--accent); }
-  .nav svg.ic { color: var(--dim); }
+  .nav.on.anim::before { animation: nav-pill .24s var(--spring); }
+  @keyframes nav-pill { from { transform: scaleY(.25); opacity: .4; } to { transform: scaleY(1); opacity: 1; } }
+  .nav svg.ic { color: var(--dim); transition: color .15s var(--ease), transform .18s var(--ease); }
+  .nav:hover svg.ic { color: var(--text); }
   .nav.on svg.ic { color: var(--text); }
-  .nav .count { margin-left: auto; font-size: 12px; color: var(--dim); }
-  .relays { margin-top: auto; padding: 0 8px; font-size: 12px; color: var(--dim); }
-  .relays .h { margin-bottom: 4px; }
+  .nav .count { margin-left: auto; font-size: 12px; color: var(--dim); transition: color .15s; }
+
+  /* Clickable relay summary at bottom-left */
+  .relays { margin-top: auto; padding: 8px; border-radius: 8px; font-size: 12px; color: var(--dim);
+    cursor: pointer; transition: background .15s var(--ease), transform .12s var(--ease); }
+  .relays:hover { background: rgba(255,255,255,.048); }
+  .relays:active { transform: scale(.985); background: rgba(255,255,255,.03); }
+  .relays .h { margin-bottom: 4px; display: flex; align-items: center; justify-content: space-between; }
+  .relays .h .go { opacity: 0; transform: translateX(-3px); transition: opacity .15s var(--ease), transform .15s var(--ease); color: var(--link); font-size: 11px; }
+  .relays:hover .h .go { opacity: 1; transform: translateX(0); }
   .relays div.r { display: flex; align-items: center; gap: 8px; height: 22px; color: var(--text); }
   .relays div.r span:nth-child(2) { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .relays div.r span:last-child { margin-left: auto; color: var(--dim); flex: none; }
-  .pdot { width: 7px; height: 7px; border-radius: 50%; background: var(--green); flex: none; }
-  .pdot.amber { background: var(--amber); } .pdot.grey { background: var(--gone); }
+
+  .pdot { width: 7px; height: 7px; border-radius: 50%; background: var(--green); flex: none; position: relative; }
+  .pdot.live { box-shadow: 0 0 0 0 rgba(63,185,80,.45); animation: breathe 3s ease-in-out infinite; }
+  @keyframes breathe {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(63,185,80,.35); }
+    50% { box-shadow: 0 0 0 4px rgba(63,185,80,0); }
+  }
+  .pdot.amber { background: var(--amber); animation: none; }
+  .pdot.grey { background: var(--gone); animation: none; }
 
   .content { flex: 1; position: relative; background: var(--layer); border-top-left-radius: 8px;
     border: 1px solid rgba(255,255,255,.047); border-right: 0; border-bottom: 0; min-width: 0; overflow: hidden; }
-  .scroll { position: absolute; inset: 0; overflow-y: auto; padding: 22px 28px 24px; }
-  .scroll::-webkit-scrollbar { width: 10px; }
-  .scroll::-webkit-scrollbar-thumb { background: rgba(255,255,255,.07); border-radius: 5px; border: 3px solid var(--layer); }
+  .scroll { position: absolute; inset: 0; overflow-y: auto; padding: 22px 28px 24px; scroll-behavior: smooth;
+    scrollbar-width: none; -ms-overflow-style: none; }
+  .scroll::-webkit-scrollbar { display: none; }
+  .scroll.page-enter { animation: page-in .2s var(--ease); }
+  @keyframes page-in { from { opacity: 0; transform: translateY(7px); } to { opacity: 1; transform: translateY(0); } }
+
+  /* Win11-style hover-expanding overlay scrollbar */
+  .sbar-track {
+    position: absolute; top: 6px; right: 2px; bottom: 6px; width: 14px; z-index: 15;
+    border-radius: 7px; transition: background .16s var(--ease), opacity .2s var(--ease); opacity: 0; pointer-events: none;
+  }
+  .sbar-track.visible { opacity: 1; pointer-events: auto; }
+  .sbar-track:hover, .sbar-track.drag { background: rgba(255,255,255,.035); }
+  .sbar-thumb {
+    position: absolute; right: 3px; width: 3px; min-height: 28px; border-radius: 99px;
+    background: rgba(255,255,255,.22); cursor: grab;
+    transition: width .16s var(--ease), background .16s var(--ease);
+  }
+  .sbar-track:hover .sbar-thumb, .sbar-track.drag .sbar-thumb {
+    width: 8px; background: rgba(255,255,255,.38);
+  }
+  .sbar-track.drag .sbar-thumb { background: rgba(255,255,255,.52); cursor: grabbing; }
+
   .head { display: flex; align-items: center; gap: 10px; margin-bottom: 14px; }
   .head h1 { margin: 0; font-size: 22px; font-weight: 700; }
   .head .grow { flex: 1; }
-  .copied { color: var(--green) !important; }
+  .copied { color: var(--green) !important; border-color: rgba(63,185,80,.28) !important; background: rgba(63,185,80,.1) !important; }
+  .copied svg.ic { animation: check-pop .26s var(--spring); }
+  @keyframes check-pop { from { transform: scale(.4); opacity: 0; } to { transform: scale(1); opacity: 1; } }
 
+  /* Subtle hover tooltip */
+  .tip-wrap { position: relative; display: inline-flex; }
+  .tip-wrap .tip-box {
+    position: absolute; right: 0; top: calc(100% + 7px); z-index: 25;
+    padding: 6px 10px; border-radius: 6px; font-size: 12px; line-height: 1.4; white-space: nowrap;
+    background: var(--raised); color: var(--text); border: 1px solid rgba(255,255,255,.1);
+    box-shadow: 0 8px 24px rgba(0,0,0,.5); pointer-events: none;
+    opacity: 0; transform: translateY(-4px) scale(.98);
+    transition: opacity .15s var(--ease), transform .15s var(--ease);
+  }
+  .tip-wrap:hover .tip-box { opacity: 1; transform: translateY(0) scale(1); }
+
+  /* Modern connect input: clear placeholder on focus + smooth focus ring + Paste/Add swap */
   .connect { display: flex; align-items: center; gap: 10px; height: 42px; padding: 0 5px 0 14px; border-radius: 8px;
-    background: rgba(255,255,255,.04); border: 1px solid rgba(255,255,255,.063); transition: border-color .12s; }
-  .connect:focus-within { border-color: var(--accent); }
-  .connect svg.ic { color: var(--dim); }
-  .connect input { flex: 1; font: inherit; color: var(--text); background: none; border: 0; outline: none; min-width: 0; }
-  .connect input::placeholder { color: var(--faint); }
-  .connect kbd { font: 11px "Microsoft YaHei", sans-serif; color: var(--dim); border: 1px solid rgba(255,255,255,.09);
-    border-radius: 4px; padding: 1px 6px; margin-right: 6px; flex: none; }
-  .codes { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-top: 8px; font-size: 12px; color: var(--dim); }
+    background: rgba(255,255,255,.04); border: 1px solid rgba(255,255,255,.068);
+    transition: border-color .16s var(--ease), background .16s var(--ease), box-shadow .18s var(--ease); }
+  .connect:hover { border-color: rgba(255,255,255,.12); background: rgba(255,255,255,.05); }
+  .connect:focus-within { border-color: var(--accent); background: rgba(255,255,255,.055); box-shadow: 0 0 0 3px rgba(59,127,224,.16); }
+  .connect > svg.ic { color: var(--dim); transition: color .16s var(--ease), transform .18s var(--ease); }
+  .connect:focus-within > svg.ic { color: var(--link); transform: scale(1.06); }
+  .connect input { flex: 1; font: inherit; color: var(--text); background: none; border: 0; outline: none; min-width: 0; height: 100%; }
+  .connect input::placeholder { color: var(--faint); transition: opacity .14s var(--ease); }
+  .connect input:focus::placeholder { opacity: 0; }
+  .connect .act-paste {
+    height: 28px; padding: 0 10px; font-size: 12px; border-radius: 6px;
+    background: rgba(255,255,255,.05); border: 1px solid rgba(255,255,255,.08); color: var(--dim);
+    animation: btn-swap .16s var(--ease);
+  }
+  .connect .act-paste:hover { background: rgba(255,255,255,.11); color: var(--text); }
+  .connect .act-go { height: 28px; padding: 0 12px; font-size: 12px; border-radius: 6px; animation: btn-swap .16s var(--ease); }
+  @keyframes btn-swap { from { opacity: 0; transform: scale(.92); } to { opacity: 1; transform: scale(1); } }
+
+  .codes { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-top: 8px; font-size: 12px; color: var(--dim);
+    animation: slide-down .2s var(--ease); }
   .codes .chip { display: inline-flex; align-items: center; gap: 4px; height: 26px; padding: 0 2px 0 10px; border-radius: 13px;
-    background: rgba(255,255,255,.05); color: var(--text); }
+    background: rgba(255,255,255,.055); color: var(--text); animation: pop .18s var(--spring); }
   .codes .chip button { height: 22px; border-radius: 11px; padding: 0 8px; font-size: 12px; }
+  @keyframes slide-down { from { opacity: 0; transform: translateY(-5px); } to { opacity: 1; transform: translateY(0); } }
   .gap18 { height: 18px; }
 
   /* Banners */
-  .banner { display: flex; align-items: center; gap: 12px; padding: 9px 9px 9px 14px; border-radius: 8px; margin-bottom: 18px; min-height: 50px; }
+  .banner { display: flex; align-items: center; gap: 12px; padding: 9px 9px 9px 14px; border-radius: 8px; margin-bottom: 18px; min-height: 50px;
+    animation: slide-down .22s var(--ease); }
   .banner.red { background: rgba(229,83,75,.12); border: 1px solid rgba(229,83,75,.25); }
   .banner.blue { background: rgba(59,127,224,.1); border: 1px solid rgba(59,127,224,.22); }
   .banner .grow { flex: 1; }
@@ -154,31 +237,49 @@
   .banner.blue > svg.ic { color: var(--link); }
 
   /* Sections & Rows */
-  .sec { margin-bottom: 20px; }
+  .sec { margin-bottom: 20px; scroll-margin-top: 14px; }
+  .sec.hi .group { animation: flash-border 1.25s var(--ease); }
+  @keyframes flash-border {
+    0% { box-shadow: 0 0 0 1.5px var(--accent); background: rgba(59,127,224,.1); }
+    100% { box-shadow: 0 0 0 0 transparent; background: var(--card); }
+  }
   .sh { display: flex; align-items: baseline; gap: 8px; padding: 0 4px 8px; font-size: 13px; }
   .sh b { font-size: 13px; }
   .sh span { color: var(--dim); font-size: 12px; }
-  .group { background: var(--card); border-radius: 10px; border: 1px solid rgba(255,255,255,.03); overflow: hidden; }
+  .group { background: var(--card); border-radius: 10px; border: 1px solid rgba(255,255,255,.035); overflow: hidden; }
   .group > * { position: relative; }
   .group > * + *::before { content: ""; position: absolute; top: 0; right: 0; height: 1px; background: rgba(255,255,255,.05); left: 0; }
   .group > .row + *::before { left: 62px; }
-  .row { display: flex; align-items: center; gap: 12px; height: 62px; padding: 0 10px 0 14px; transition: background .12s; }
-  .row:hover { background: rgba(255,255,255,.025); }
-  .row.flash { animation: flash 1.1s; }
-  @keyframes flash { from { background: rgba(59,127,224,.2); } }
+  .row { display: flex; align-items: center; gap: 12px; height: 62px; padding: 0 10px 0 14px;
+    transition: background .15s var(--ease); cursor: default; }
+  .row:hover { background: rgba(255,255,255,.032); }
+  .row:hover .av { transform: scale(1.03); }
+  .row.flash { animation: flash-row 1.2s var(--ease); }
+  @keyframes flash-row {
+    0% { background: rgba(59,127,224,.24); transform: translateY(-2px); }
+    30% { transform: translateY(0); }
+    100% { background: transparent; }
+  }
   .row.asking { background: rgba(210,153,34,.07); }
   .row.asking::after { content: ""; position: absolute; left: 0; top: 10px; bottom: 10px; width: 3px; border-radius: 2px; background: var(--amber); }
-  .why { padding: 2px 14px 14px 62px; font-size: 13px; color: var(--dim); animation: fade .2s; }
+
+  .why { padding: 2px 14px 14px 62px; font-size: 13px; color: var(--dim); animation: slide-down .2s var(--ease); }
   .why .btns { display: flex; gap: 8px; margin-top: 8px; }
 
   .av { width: 36px; height: 36px; border-radius: 8px; display: grid; place-items: center; position: relative; flex: none;
-    background: rgba(255,255,255,.06); color: var(--dim); }
+    background: rgba(255,255,255,.06); color: var(--dim); transition: transform .16s var(--ease); }
   .av svg.ic { width: 17px; height: 17px; }
   .av.mine { background: rgba(59,127,224,.15); color: var(--link); }
-  .av.trusted { background: rgba(63,185,80,.13); color: #6bd37a; }
+  .av.trusted { background: rgba(139,124,246,.16); color: #b6a8ff; }
   .dot { position: absolute; right: -2px; bottom: -2px; width: 10px; height: 10px; border-radius: 50%; background: var(--gone);
-    border: 2px solid var(--card); }
-  .dot.on { background: var(--green); } .dot.amber { background: var(--amber); }
+    border: 2px solid var(--card); transition: background .2s var(--ease); }
+  .dot.on { background: var(--green); }
+  .dot.ctl { background: var(--accent); animation: breathe-blue 1.8s ease-in-out infinite; }
+  @keyframes breathe-blue {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(59,127,224,.55); }
+    50% { box-shadow: 0 0 0 4px rgba(59,127,224,0); }
+  }
+  .dot.amber { background: var(--amber); }
 
   .txt { flex: 1; min-width: 0; }
   .nm { font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -194,46 +295,57 @@
   @keyframes fade { from { opacity: 0; } }
 
   /* Settings items */
-  .item { display: flex; align-items: center; gap: 14px; min-height: 58px; padding: 10px 14px; }
+  .item { display: flex; align-items: center; gap: 14px; min-height: 58px; padding: 10px 14px; transition: background .14s var(--ease); }
+  .item:hover { background: rgba(255,255,255,.018); }
   .item > svg.ic { width: 17px; height: 17px; color: var(--dim); }
   .item .txt2 { flex: 1; min-width: 0; }
   .item .t { font-size: 14px; }
   .item .d { font-size: 12px; color: var(--dim); }
   .item .r { display: flex; align-items: center; gap: 8px; }
   .item.dis { opacity: .45; }
+  .item.dis:hover { background: none; }
   .item.add { cursor: pointer; min-height: 46px; color: var(--link); }
-  .item.add svg.ic { color: var(--link); }
-  .item.add:hover { background: rgba(255,255,255,.03); }
-  .saved { font-size: 12px; color: var(--green); }
+  .item.add svg.ic { color: var(--link); transition: transform .16s var(--ease); }
+  .item.add:hover { background: rgba(255,255,255,.035); }
+  .item.add:hover svg.ic { transform: rotate(90deg); }
+  .item.add-form { animation: slide-down .18s var(--ease); }
+  .saved { font-size: 12px; color: var(--green); animation: pop .18s var(--spring); }
 
   /* Menu */
   .menu { position: absolute; z-index: 20; width: 210px; padding: 5px; border-radius: 8px; background: var(--raised);
-    border: 1px solid rgba(255,255,255,.09); box-shadow: 0 12px 32px rgba(0,0,0,.55); animation: pop .12s cubic-bezier(.2,.8,.2,1); }
-  @keyframes pop { from { opacity: 0; transform: translateY(-4px) scale(.97); } }
-  .menu .it { display: flex; align-items: center; gap: 10px; height: 34px; padding: 0 10px; border-radius: 5px; cursor: pointer; font-size: 13.5px; }
-  .menu .it:hover { background: rgba(255,255,255,.07); }
+    border: 1px solid rgba(255,255,255,.09); box-shadow: 0 12px 32px rgba(0,0,0,.55);
+    transform-origin: top right; animation: pop .14s var(--spring); }
+  .menu.up { transform-origin: bottom right; animation: pop-up .14s var(--spring); }
+  @keyframes pop { from { opacity: 0; transform: translateY(-4px) scale(.96); } to { opacity: 1; transform: translateY(0) scale(1); } }
+  @keyframes pop-up { from { opacity: 0; transform: translateY(4px) scale(.96); } to { opacity: 1; transform: translateY(0) scale(1); } }
+  .menu .it { display: flex; align-items: center; gap: 10px; height: 34px; padding: 0 10px; border-radius: 5px; cursor: pointer; font-size: 13.5px;
+    transition: background .12s var(--ease); }
+  .menu .it:hover { background: rgba(255,255,255,.075); }
   .menu .it svg.ic { width: 15px; height: 15px; color: var(--dim); }
   .menu .it .sub { font-size: 12px; color: var(--dim); margin-left: 2px; }
   .menu .it .tick { margin-left: auto; color: var(--link); }
   .menu .it.danger { color: var(--danger); } .menu .it.danger svg.ic { color: var(--danger); }
   .menu .it.danger:hover { background: rgba(229,83,75,.14); }
+  .menu .it.dis { opacity: .4; pointer-events: none; cursor: default; }
   .menu .sep { height: 1px; background: rgba(255,255,255,.06); margin: 4px 6px; }
   .menu .mhead { padding: 4px 10px 2px; font-size: 11.5px; color: var(--faint); }
 
-  /* Toasts */
-  .toasts { position: absolute; right: 16px; bottom: 16px; display: flex; flex-direction: column; gap: 8px; z-index: 30; pointer-events: none; }
-  .toast { pointer-events: auto; display: flex; align-items: center; gap: 10px; max-width: 390px; padding: 8px 8px 8px 12px;
+  /* Toasts with smooth enter & exit */
+  .toasts { position: absolute; top: 46px; left: 50%; transform: translateX(-50%); display: flex; flex-direction: column; align-items: center; gap: 8px; z-index: 30; pointer-events: none; }
+  .toast { pointer-events: auto; display: flex; align-items: center; gap: 10px; max-width: 440px; padding: 8px 8px 8px 12px;
     border-radius: 8px; background: var(--raised); border: 1px solid rgba(255,255,255,.09); box-shadow: 0 8px 24px rgba(0,0,0,.5);
-    animation: slidein .18s cubic-bezier(.2,.8,.2,1); font-size: 13px; }
-  @keyframes slidein { from { opacity: 0; transform: translateY(8px); } }
+    animation: slidein .22s var(--spring); font-size: 13px;
+    transition: opacity .18s var(--ease), transform .18s var(--ease); }
+  .toast.out { opacity: 0; transform: translateY(-8px) scale(.97); }
+  @keyframes slidein { from { opacity: 0; transform: translateY(-8px) scale(.97); } to { opacity: 1; transform: translateY(0) scale(1); } }
   .toast.ok > svg.ic { color: var(--green); } .toast.warn > svg.ic { color: var(--amber); }
   .toast.err > svg.ic { color: var(--danger); } .toast.info > svg.ic { color: var(--link); }
   .toast span { flex: 1; }
 
   /* Modal */
-  .veil { position: absolute; inset: 0; background: rgba(0,0,0,.55); display: grid; place-items: center; z-index: 35; animation: fade .15s; }
+  .veil { position: absolute; inset: 0; background: rgba(0,0,0,.55); display: grid; place-items: center; z-index: 35; animation: fade .16s var(--ease); }
   .dialog { width: 390px; max-width: 92%; background: var(--raised); border: 1px solid rgba(255,255,255,.09); border-radius: 10px;
-    padding: 20px; box-shadow: 0 20px 50px rgba(0,0,0,.6); animation: pop .14s cubic-bezier(.2,.8,.2,1); }
+    padding: 20px; box-shadow: 0 20px 50px rgba(0,0,0,.6); animation: pop .16s var(--spring); }
   .dialog .top2 { display: flex; gap: 14px; }
   .dialog .badge { width: 40px; height: 40px; border-radius: 10px; display: grid; place-items: center; flex: none; }
   .dialog .badge svg.ic { width: 20px; height: 20px; }
@@ -247,16 +359,18 @@
   .dialog .btns { display: flex; justify-content: flex-end; gap: 8px; margin-top: 18px; }
   .dialog .btns button { min-width: 84px; justify-content: center; }
 
-  .empty { text-align: center; padding: 54px 20px; color: var(--dim); }
-  .empty svg.ic { width: 30px; height: 30px; margin-bottom: 10px; opacity: .5; display: block; margin-inline: auto; }
+  .empty { text-align: center; padding: 64px 20px; color: var(--dim); animation: fade .2s var(--ease); }
+  .empty svg.ic { width: 34px; height: 34px; margin-bottom: 10px; opacity: .45; display: block; margin-inline: auto; }
+  .empty .et { font-size: 14px; color: var(--text); margin-bottom: 4px; }
+  .empty .ed { font-size: 12px; color: var(--dim); }
   .closed { position: absolute; inset: 0; background: #131417; display: flex; flex-direction: column; align-items: center; justify-content: center;
-    gap: 12px; color: var(--dim); z-index: 40; }
+    gap: 12px; color: var(--dim); z-index: 40; animation: fade .18s var(--ease); }
 
   /* Simulated Remote Desktop / Terminal Overlay */
   .overlay-modal { position: fixed; inset: 0; background: rgba(7,9,13,.76); display: grid; place-items: center; z-index: 100;
     padding: 16px; animation: fade .18s; }
   .rd-win { width: 880px; max-width: 100%; height: 550px; border-radius: 8px; border: 1px solid #3a3d46; overflow: hidden;
-    background: var(--chrome); display: flex; flex-direction: column; box-shadow: 0 30px 90px rgba(0,0,0,.75); animation: pop .18s cubic-bezier(.2,.8,.2,1); }
+    background: var(--chrome); display: flex; flex-direction: column; box-shadow: 0 30px 90px rgba(0,0,0,.75); animation: pop .18s var(--ease); }
   .rd-bar { height: 32px; background: var(--chrome); display: flex; align-items: center;
     padding-left: 12px; gap: 6px; font-size: 12px; user-select: none; }
   .rd-bar .badge-net { display: inline-flex; align-items: center; gap: 6px; height: 22px; padding: 0 9px; border-radius: 11px;
@@ -272,10 +386,9 @@
     background: radial-gradient(circle at 22% 28%, #254a8a 0%, #152647 45%, #0e1424 100%); }
   .rd-screen.mon2 { background: radial-gradient(circle at 75% 30%, #1d574c 0%, #132e35 48%, #0d161d 100%); }
 
-  /* Fake Windows desktop inside remote screen */
   .fake-icons { position: absolute; top: 18px; left: 18px; display: flex; flex-direction: column; gap: 14px; }
   .fake-icon { width: 68px; padding: 6px 4px; border-radius: 6px; text-align: center; cursor: pointer; font-size: 11px; color: #eef2f8;
-    text-shadow: 0 1px 3px rgba(0,0,0,.8); border: 1px solid transparent; }
+    text-shadow: 0 1px 3px rgba(0,0,0,.8); border: 1px solid transparent; transition: background .14s; }
   .fake-icon:hover { background: rgba(255,255,255,.1); border-color: rgba(255,255,255,.14); }
   .fake-icon .box { width: 32px; height: 32px; margin: 0 auto 4px; border-radius: 7px; display: grid; place-items: center;
     background: rgba(59,127,224,.28); border: 1px solid rgba(255,255,255,.2); }
@@ -294,9 +407,8 @@
     display: flex; align-items: center; gap: 10px; }
   .hosted-pill .stop { color: var(--danger); font-size: 12px; }
 
-  /* Simulated Terminal (pure PowerShell) */
   .term-win { width: 720px; max-width: 100%; height: 430px; border-radius: 8px; border: 1px solid #3a3d46; overflow: hidden;
-    background: #0c0c0c; display: flex; flex-direction: column; box-shadow: 0 30px 90px rgba(0,0,0,.75); animation: pop .18s; }
+    background: #0c0c0c; display: flex; flex-direction: column; box-shadow: 0 30px 90px rgba(0,0,0,.75); animation: pop .18s var(--ease); }
   .term-bar { height: 32px; background: #1f1f1f; display: flex; align-items: center; padding-left: 12px; gap: 8px; font-size: 12px; color: var(--dim); }
   .term-bar .grow { flex: 1; }
   .term-body { flex: 1; padding: 12px 14px 4px; overflow-y: auto; font: 13px/1.55 Consolas, "Cascadia Mono", monospace; color: #cccccc; white-space: pre-wrap; }
@@ -314,9 +426,10 @@
 
 <div class="guide-wrap">
   <div class="guide-head">
-    <span class="brand">remote-control</span>
-    <span class="badge-pill">单窗口交互演示 · 全模拟数据</span>
+    <span class="brand">Remote Control</span>
+    <span class="badge-pill">交互演示</span>
     <div class="grow"></div>
+    <button onclick="toggleEmptyMode()" id="btn-empty" style="height:28px;font-size:12px">查看 0 设备空状态</button>
     <button onclick="reset()" style="height:28px;font-size:12px">重置演示</button>
   </div>
   <div class="steps" id="steps"></div>
@@ -331,9 +444,10 @@ const SVG = {
   desktop: `<rect x="2" y="3" width="12" height="8" rx="1.2"/><path d="M5 13h6M8 11v2"/>`,
   laptop: `<rect x="3" y="3" width="10" height="7" rx="1"/><path d="M1.5 12h13"/>`,
   copy: `<rect x="5" y="5" width="8" height="8" rx="1.2"/><path d="M3 10V3.5A1.5 1.5 0 0 1 4.5 2H11"/>`,
+  paste: `<path d="M6 3.5H4.5A1.5 1.5 0 0 0 3 5v8a1.5 1.5 0 0 0 1.5 1.5h7A1.5 1.5 0 0 0 13 13V5a1.5 1.5 0 0 0-1.5-1.5H10"/><rect x="5.5" y="2" width="5" height="3" rx=".8"/>`,
   link: `<path d="M6.5 9.5a3.5 3.5 0 0 0 5 0l2-2a3.5 3.5 0 0 0-5-5l-1 1"/><path d="M9.5 6.5a3.5 3.5 0 0 0-5 0l-2 2a3.5 3.5 0 0 0 5 5l1-1"/>`,
   devices: `<rect x="1.5" y="3" width="9" height="6.5" rx="1"/><path d="M4 11.5h4"/><rect x="10" y="6.5" width="4.5" height="7" rx=".8"/>`,
-  gear: `<circle cx="8" cy="8" r="2.2"/><path d="M8 2v1.3M8 12.7V14M2 8h1.3M12.7 8H14M3.8 3.8l.9.9M11.3 11.3l.9.9M12.2 3.8l-.9.9M4.7 11.3l-.9.9"/>`,
+  gear: `<g transform="scale(0.6667)" stroke-width="2.0"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/></g>`,
   more: `<circle cx="3.5" cy="8" r="1"/><circle cx="8" cy="8" r="1"/><circle cx="12.5" cy="8" r="1"/>`,
   del: `<path d="M3 4.5h10M6 4.5V3h4v1.5M5 4.5l.5 8.5h5l.5-8.5"/>`,
   rename: `<path d="M10.5 2.5l3 3L5.5 13.5H2.5v-3z"/>`,
@@ -362,56 +476,86 @@ const SVG = {
 };
 const ic = (k, cls = '') => `<svg class="ic ${cls}" viewBox="0 0 16 16">${SVG[k] || ''}</svg>`;
 
+function appIconSvg() {
+  return `<svg class="app-icon" viewBox="0 0 16 16" xmlns="http://www.w3.org/2000/svg">
+    <defs><linearGradient id="rc-ig" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#2563C9"/><stop offset="1" stop-color="#153B80"/></linearGradient></defs>
+    <rect x="6" y="1" width="10" height="8" rx="1.5" fill="#7DB8FF"/>
+    <rect x="0" y="5" width="12" height="10" rx="1.5" fill="url(#rc-ig)"/>
+    <rect x="1" y="7" width="10" height="7" rx="0.5" fill="#0B1A36"/>
+    <rect x="2" y="6" width="2" height="1" fill="#7DB8FF"/>
+    <path fill="#0B1A36" d="M10 4h1v1h-1zM9 5h1v1h-1zM11 5h1v1h-1zM9 6h1v1h-1zM12 6h1v1h-1zM9 7h1v1h-1zM13 7h1v1h-1zM9 8h1v1h-1zM14 8h1v1h-1zM9 9h1v1h-1zM12 9h2v1h-2zM9 10h1v1h-1zM11 10h1v1h-1zM10 11h1v1h-1z"/>
+    <path fill="#FFFFFF" d="M10 5h1v1h-1zM10 6h2v1h-2zM10 7h3v1h-3zM10 8h4v1h-4zM10 9h2v1h-2zM10 10h1v1h-1z"/>
+  </svg>`;
+}
+
 const KIND = {
-  mine:    { title: '我的电脑', note: '控制本机不用问' },
-  trusted: { title: '信任设备', note: '控制本机要先问' },
-  temp:    { title: '临时设备', note: '控制本机要先问，关窗口就断开' },
+  mine:    { title: '我的电脑', note: '连入本机免确认' },
+  trusted: { title: '信任设备', note: '连入本机需确认' },
+  temp:    { title: '临时设备', note: '关窗口后移除' },
 };
 
 const STEPS = [
-  { id: 'ctl', title: '1. 免确认远程桌面', tip: '点 <b>PeterBook</b>（我的电脑）的 <b>控制</b>，不用对方确认，直接打开远程桌面。', page: 'devices', target: 'ctl-pb' },
-  { id: 'term', title: '2. 远程终端', tip: '点任意设备右侧的 <b>··· → 终端</b>，打开对方 PowerShell（可输入 git status / dir / ipconfig 回车）。', page: 'devices', target: 'menu-pb' },
-  { id: 'code', title: '3. 连接码与记住', tip: '在连接码输入框按 Ctrl+V，或点右侧体验按钮连入新设备，再点 <b>记住</b> 加入信任列表。', page: 'devices', target: 'paste-demo', action: ['模拟粘贴连接码', 'pasteDemoCode()'] },
-  { id: 'set', title: '4. 设置与自建中转', tip: '在 <b>设置</b> 里管理开机后台服务（锁屏控制）、自建中转顺序，以及一键写入 AI Skill。', page: 'settings', target: 'nav-settings' },
+  { id: 'input', title: '1. 添加新设备', tip: '点进顶部输入框粘贴连接码，或直接按 Ctrl+V，即可将对方加入临时设备，再点「控制」或「记住」。', page: 'devices', target: 'connect-box' },
+  { id: 'copy', title: '2. 分享本机连接码', tip: '点右上角 <b>复制本机连接码</b>，一次性有效（1 小时），对方连入时会先弹窗等你允许。', page: 'devices', target: 'copy-btn' },
+  { id: 'settings', title: '3. 设置与后台服务', tip: '切到 <b>设置</b> 查看设备名称、网络与发现、自建中转、后台服务与 AI Skills 配置。', page: 'settings', target: 'nav-settings' },
+  { id: 'relay', title: '4. 快捷跳转与控制', tip: '点击左下角自建中转或左上角本机卡片可直达对应设置；双击在线设备行发起远程控制。', page: 'devices', target: 'relay-box' },
 ];
 
 let S, menu = null, modal = null, copied = 0, why = null, renaming = null, ui, codeSeq = 0;
-let stepIdx = 0, doneSteps = new Set();
-let remote = null, term = null, timerHandle = null;
+let stepIdx = 0, activePulse = null, doneSteps = new Set();
+let remote = null, term = null, timerHandle = null, waitTimer = null;
+let savedDevsForEmpty = null;
+let sbarCleanup = null, pasteTimer = null;
 
 function reset() {
   clearInterval(timerHandle);
+  clearInterval(waitTimer);
+  clearTimeout(pasteTimer);
+  if (S?.devs) S.devs.forEach(d => { if (d._reqTimer) clearTimeout(d._reqTimer); });
+  savedDevsForEmpty = null;
+  const initPage = new URLSearchParams(location.search).get('page') === 'settings' ? 'settings' : 'devices';
   S = {
-    name: 'Peter',
+    name: 'PETER',
     icon: 'desktop',
     relays: [
       { host: 'sg-relay.example.com:7843', state: 'home' },
-      { host: '203.0.113.7:7843', state: 'idle' },
+      { host: 'sgnew-relay.example.com:7843', state: 'idle' },
     ],
-    set: { public: true, lan: true, svc: 'run', boot: true, lock: true, awake: false },
-    suggest: false,
+    set: { public: true, lan: true, svc: 'none', boot: true, lock: true, awake: false, skills: 'none' },
     codes: [],
     closed: false,
-    hosting: null,
     controlling: null,
-    page: 'devices',
+    page: initPage,
     devs: [
-      { id: 'pb', name: 'PeterBook', icon: 'laptop', kind: 'mine', online: true, info: '在线 · 3 ms · 直连' },
-      { id: 'desk', name: '台式机', icon: 'desktop', kind: 'trusted', online: true, info: '在线 · 8 ms · 直连' },
-      { id: 'office', name: '公司电脑', icon: 'desktop', kind: 'trusted', online: false, unreach: true, info: '打不通' },
-      { id: 'friend', name: '朋友的电脑', icon: 'laptop', kind: 'temp', via: '连接码', online: true, info: '在线 · 41 ms · 经自建中转' },
+      { id: 'pb', name: 'PETERBOOK', icon: 'laptop', kind: 'mine', online: true, info: '在线 · 9 ms · 直连' },
+      { id: 'desk', name: '台式机', icon: 'desktop', kind: 'trusted', online: true, info: '在线 · 3 ms · 直连' },
+      { id: 'office', name: '公司电脑', icon: 'desktop', kind: 'trusted', online: false, unreach: true, info: '无法连接' },
       { id: 'study', name: '书房笔记本', icon: 'laptop', kind: 'temp', via: '局域网', online: true, info: '在线 · 1 ms · 直连' },
     ],
   };
   menu = null; modal = null; copied = 0; why = null; renaming = null; remote = null; term = null;
   ui = { adding: false, busy: null, saved: 0 };
-  stepIdx = 0; doneSteps = new Set();
+  stepIdx = initPage === 'settings' ? 2 : 0;
+  activePulse = null;
+  doneSteps = new Set();
   document.querySelectorAll('.toast').forEach(t => t.remove());
   render();
 }
 
 const esc = t => String(t).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 const dev = id => S.devs.find(d => d.id === id);
+
+function toggleEmptyMode() {
+  if (savedDevsForEmpty === null) {
+    savedDevsForEmpty = S.devs;
+    S.devs = [];
+    S.page = 'devices';
+  } else {
+    S.devs = savedDevsForEmpty;
+    savedDevsForEmpty = null;
+  }
+  render();
+}
 
 function markStep(id) {
   doneSteps.add(id);
@@ -421,10 +565,10 @@ function markStep(id) {
 function selectStep(i) {
   stepIdx = i;
   const st = STEPS[i];
-  if (st.page && S.page !== st.page && st.id !== 'set') {
-    S.page = st.page;
-  }
+  if (st.page && S.page !== st.page) S.page = st.page;
+  activePulse = st.target;
   render();
+  setTimeout(() => { activePulse = null; }, 2200);
 }
 
 function renderGuide() {
@@ -433,8 +577,9 @@ function renderGuide() {
     return `<button class="step-btn ${cls}" onclick="selectStep(${i})">${doneSteps.has(s.id) ? ic('check') : ''}${s.title}</button>`;
   }).join('');
   const cur = STEPS[stepIdx];
-  const act = cur.action ? `<button class="soft" style="height:26px;font-size:12px" onclick="${cur.action[1]}">${cur.action[0]}</button>` : '';
-  document.getElementById('guide-tip').innerHTML = `${ic('info')}<span>${cur.tip}</span><span class="grow"></span>${act}`;
+  document.getElementById('guide-tip').innerHTML = `${ic('info')}<span>${cur.tip}</span><span class="grow"></span>`;
+  const btn = document.getElementById('btn-empty');
+  if (btn) btn.textContent = savedDevsForEmpty === null ? '查看 0 设备空状态' : '恢复设备列表';
 }
 
 function toast(text, tone = 'info', action) {
@@ -444,11 +589,16 @@ function toast(text, tone = 'info', action) {
   el.className = `toast ${tone}`;
   el.innerHTML = ic({ ok: 'ok', warn: 'warn', err: 'err' }[tone] || 'info') + `<span>${esc(text)}</span>`;
   let done = false;
-  const finish = () => { if (!done) { done = true; el.remove(); } };
+  const finish = () => {
+    if (done) return;
+    done = true;
+    el.classList.add('out');
+    setTimeout(() => el.remove(), 190);
+  };
   if (action) {
     const b = document.createElement('button');
     b.className = 'link'; b.textContent = action[0];
-    b.onclick = () => { done = true; el.remove(); action[1](); };
+    b.onclick = () => { finish(); action[1](); };
     el.appendChild(b);
   }
   const x = document.createElement('button');
@@ -458,11 +608,104 @@ function toast(text, tone = 'info', action) {
   el.appendChild(x);
   box.appendChild(el);
   while (box.children.length > 3) box.firstChild.remove();
-  setTimeout(() => { if (!done) { finish(); action?.[2]?.(); } }, action ? 6000 : 3800);
+  setTimeout(() => { if (!done) { finish(); action?.[2]?.(); } }, action ? 6500 : 4800);
 }
 
-function flash(id) {
-  requestAnimationFrame(() => document.querySelector(`.row[data-id="${id}"]`)?.classList.add('flash'));
+function revealRow(id) {
+  requestAnimationFrame(() => {
+    const el = document.querySelector(`.row[data-id="${id}"]`);
+    if (!el) return;
+    el.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    el.classList.remove('flash');
+    void el.offsetWidth;
+    el.classList.add('flash');
+  });
+}
+
+function jumpToSettings(sectionId) {
+  S.page = 'settings';
+  menu = null;
+  markStep('relay');
+  render();
+  if (sectionId) {
+    requestAnimationFrame(() => {
+      const el = document.getElementById(sectionId);
+      if (el) {
+        el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        el.classList.remove('hi');
+        void el.offsetWidth;
+        el.classList.add('hi');
+        if (sectionId === 'sec-self') {
+          const inp = document.getElementById('device-name-in');
+          if (inp) { inp.focus(); inp.select(); }
+        }
+      }
+    });
+  }
+}
+
+/* ---------- Custom Hover-Expanding Scrollbar ---------- */
+function bindScrollbar() {
+  if (sbarCleanup) { sbarCleanup(); sbarCleanup = null; }
+  const sc = document.querySelector('#win .scroll');
+  const track = document.querySelector('#win .sbar-track');
+  const thumb = document.querySelector('#win .sbar-thumb');
+  if (!sc || !track || !thumb) return;
+
+  const update = () => {
+    const sh = sc.scrollHeight, ch = sc.clientHeight;
+    if (sh <= ch + 1) {
+      track.classList.remove('visible');
+      return;
+    }
+    track.classList.add('visible');
+    const th = track.clientHeight;
+    const h = Math.max(28, (ch / sh) * th);
+    const maxTop = th - h;
+    const y = (sc.scrollTop / (sh - ch)) * maxTop;
+    thumb.style.height = h + 'px';
+    thumb.style.top = y + 'px';
+  };
+
+  const onScroll = () => {
+    update();
+    if (menu) { menu = null; render(); }
+  };
+  sc.addEventListener('scroll', onScroll, { passive: true });
+  requestAnimationFrame(update);
+
+  let dragging = false, startY = 0, startScroll = 0;
+  thumb.addEventListener('mousedown', e => {
+    e.preventDefault();
+    dragging = true;
+    startY = e.clientY;
+    startScroll = sc.scrollTop;
+    track.classList.add('drag');
+  });
+  track.addEventListener('mousedown', e => {
+    if (e.target === thumb) return;
+    const rect = track.getBoundingClientRect();
+    const ratio = (e.clientY - rect.top) / rect.height;
+    sc.scrollTop = ratio * (sc.scrollHeight - sc.clientHeight);
+  });
+  const onMove = e => {
+    if (!dragging) return;
+    const sh = sc.scrollHeight, ch = sc.clientHeight, th = track.clientHeight;
+    const h = Math.max(28, (ch / sh) * th);
+    const ratio = (sh - ch) / Math.max(1, th - h);
+    sc.scrollTop = startScroll + (e.clientY - startY) * ratio;
+  };
+  const onUp = () => {
+    if (!dragging) return;
+    dragging = false;
+    track.classList.remove('drag');
+  };
+  window.addEventListener('mousemove', onMove);
+  window.addEventListener('mouseup', onUp);
+  sbarCleanup = () => {
+    window.removeEventListener('mousemove', onMove);
+    window.removeEventListener('mouseup', onUp);
+  };
 }
 
 /* ---------- Device Actions ---------- */
@@ -470,18 +713,28 @@ function remember(id) {
   const d = dev(id);
   if (!d) return;
   d.req = 'out';
+  clearTimeout(d._reqTimer);
   render();
-  setTimeout(() => {
+  d._reqTimer = setTimeout(() => {
     const x = dev(id);
     if (!x || x.req !== 'out') return;
     x.req = null;
+    x._reqTimer = null;
     x.kind = 'trusted';
     x.via = null;
-    markStep('code');
     render();
-    flash(id);
-    toast(`「${x.name}」同意了，已互相记住`, 'ok');
-  }, 1400);
+    revealRow(id);
+    toast(`已和「${x.name}」互相记住；若为自己的电脑，可在 ··· 设为「我的电脑」`, 'ok');
+  }, 1000);
+}
+
+function cancelRemember(id) {
+  const d = dev(id);
+  if (!d) return;
+  clearTimeout(d._reqTimer);
+  d._reqTimer = null;
+  d.req = null;
+  render();
 }
 
 function setKind(id, kind) {
@@ -489,8 +742,13 @@ function setKind(id, kind) {
   if (!d || d.kind === kind) return;
   d.kind = kind;
   render();
-  flash(id);
-  toast(kind === 'mine' ? `「${d.name}」以后控制本机不用问` : `「${d.name}」以后控制本机要先问`, 'ok');
+  revealRow(id);
+  toast(
+    kind === 'mine'
+      ? `「${d.name}」以后连入本机免确认（如需双向免确认，请在对方电脑同样设置）`
+      : `「${d.name}」以后连入本机需确认`,
+    'ok'
+  );
 }
 
 function askDelete(id) {
@@ -530,31 +788,54 @@ function control(id) {
   const d = dev(id);
   if (!d || !d.online) return;
   if (d.kind === 'mine') {
-    markStep('ctl');
-    openRemote(d, '对方把本机设成了「我的电脑」，免确认直接连入');
+    openRemote(d, '对方已将本机设为「我的电脑」，免确认直接连入');
     return;
   }
+  clearInterval(waitTimer);
   d.waiting = true;
-  render();
-  // Simulate the remote user's consent popup so visitors see both sides.
+  d.waitLeft = 30;
+  waitTimer = setInterval(() => {
+    const x = dev(id);
+    if (!x || !x.waiting) { clearInterval(waitTimer); return; }
+    x.waitLeft = Math.max(0, (x.waitLeft || 1) - 1);
+    if (x.waitLeft <= 0) {
+      clearInterval(waitTimer);
+      x.waiting = false;
+      if (modal) modal = null;
+      render();
+      toast(`「${x.name}」超时未响应`, 'warn');
+      return;
+    }
+    const lbl = document.querySelector(`.row[data-id="${id}"] .wait-sec`);
+    if (lbl) lbl.textContent = x.waitLeft;
+  }, 1000);
   modal = {
     icon: 'shield', tone: 'amber',
     title: `模拟对方屏幕：「${S.name}」想控制「${d.name}」`,
-    text: `${KIND[d.kind].title}${d.via ? ' · 经' + d.via : ''}。对方电脑只会出现「允许」和「拒绝」（30 秒倒计时）。`,
+    text: `${KIND[d.kind].title}${d.via ? ' · 经' + d.via : ''}。对方电脑会出现「允许」和「拒绝」（30 秒倒计时）。`,
     bar: true,
     btns: [
-      ['模拟对方拒绝', '', () => {
+      ['模拟对方拒绝', 'danger-solid', () => {
+        clearInterval(waitTimer);
         const x = dev(id); if (x) x.waiting = false;
         render();
         toast(`「${d.name}」拒绝了连接请求`, 'warn');
       }],
       ['模拟对方点允许', 'primary', () => {
+        clearInterval(waitTimer);
         const x = dev(id); if (x) x.waiting = false;
-        markStep('ctl');
         openRemote(d, `「${d.name}」允许了控制`);
       }],
     ],
   };
+  render();
+}
+
+function cancelWait(id) {
+  clearInterval(waitTimer);
+  const d = dev(id);
+  if (d) d.waiting = false;
+  if (modal) modal = null;
   render();
 }
 
@@ -570,15 +851,15 @@ function openRemote(d, note) {
   S.controlling = d.id;
   remote = {
     id: d.id, name: d.name, mon: 1, fps: 60, released: false,
-    ms: d.id === 'pb' ? 3 : d.id === 'desk' ? 8 : d.id === 'study' ? 1 : 41,
+    ms: d.id === 'pb' ? 9 : d.id === 'desk' ? 3 : d.id === 'study' ? 1 : 26,
     path: d.info.includes('自建中转') ? '经自建中转' : '直连',
     toast: note,
-    notepad: 'README.md — 记事本\n\n- 画面优先走两端直连，延迟 3 ms\n- 剪贴板在会话内自动同步\n- 装上后台服务后，锁屏、登录界面与 UAC 弹窗下照常控制',
+    notepad: 'README.md — 记事本\n\n- 画面优先走两端直连\n- 剪贴板在会话内自动同步\n- 装上后台服务后，锁屏、登录界面与 UAC 弹窗下照常控制',
   };
   clearInterval(timerHandle);
   timerHandle = setInterval(() => {
     if (!remote) return;
-    const base = remote.path === '直连' ? 3 : 40;
+    const base = remote.path === '直连' ? 6 : 40;
     remote.ms = Math.max(1, base + Math.round((Math.random() - 0.5) * 3));
     const el = document.getElementById('rd-stat');
     if (el) el.textContent = `${remote.path} · ${remote.ms} ms`;
@@ -591,7 +872,6 @@ function openRemote(d, note) {
 function openTerm(id) {
   const d = dev(id);
   if (!d) return;
-  markStep('term');
   term = {
     id: d.id,
     name: d.name,
@@ -616,7 +896,7 @@ function runTermCmd(cmd) {
   if (low === 'cls' || low === 'clear') {
     term.lines = [];
   } else if (low.includes('git status')) {
-    term.lines.push('On branch main', 'Your branch is up to date with \'origin/main\'.', 'nothing to commit, working tree clean');
+    term.lines.push('On branch main', "Your branch is up to date with 'origin/main'.", 'nothing to commit, working tree clean');
   } else if (low === 'dir' || low === 'ls') {
     term.lines.push('Mode                 LastWriteTime         Length Name',
       '----                 -------------         ------ ----',
@@ -639,52 +919,87 @@ function runTermCmd(cmd) {
   }, 20);
 }
 
-/* ---------- Codes & Paste ---------- */
+/* ---------- Codes & Modern Connect Input ---------- */
+function fmtTime(d) {
+  const pad = n => String(n).padStart(2, '0');
+  return `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
 function copyCode() {
   copied = Date.now();
-  S.codes.push({ n: ++codeSeq, t: Date.now() });
+  const now = new Date();
+  S.codes.push({ n: ++codeSeq, label: `${fmtTime(now)} 复制` });
+  markStep('copy');
+  if (navigator.clipboard?.writeText) {
+    navigator.clipboard.writeText('rc1-demo-7K9mPq2x8nVw').catch(() => {});
+  }
   render();
   setTimeout(render, 2100);
 }
+
 function revoke(n) {
-  const c = S.codes.find(x => x.n === n);
-  if (!c) return;
-  c.hidden = true;
+  const idx = S.codes.findIndex(x => x.n === n);
+  if (idx === -1) return;
+  S.codes.splice(idx, 1);
   render();
-  toast('已撤销连接码', 'info', ['撤回', () => { c.hidden = false; render(); }, () => { S.codes = S.codes.filter(x => x !== c); render(); }]);
+  toast('已撤销，这个连接码不能再用了', 'info');
 }
+
+function syncConnectAction() {
+  const input = document.getElementById('connect-code-in');
+  const slot = document.getElementById('connect-action-slot');
+  if (!input || !slot) return;
+  const hasVal = input.value.trim().length > 0;
+  const curMode = slot.dataset.mode;
+  const nextMode = hasVal ? 'add' : 'empty';
+  if (curMode === nextMode) return;
+  slot.dataset.mode = nextMode;
+  slot.innerHTML = hasVal
+    ? `<button class="soft act-go" type="button" onclick="pasteCode(document.getElementById('connect-code-in').value)">添加</button>`
+    : '';
+}
+
+function onConnectInput(el) {
+  syncConnectAction();
+  if (/rc1-[A-Za-z0-9_-]{8,}/.test(el.value)) {
+    const val = el.value;
+    clearTimeout(pasteTimer);
+    pasteTimer = setTimeout(() => pasteCode(val), 120);
+  }
+}
+
 function pasteCode(text) {
+  clearTimeout(pasteTimer);
   const v = (text || '').trim();
   if (!v) return;
+  markStep('input');
+  if (savedDevsForEmpty !== null) savedDevsForEmpty = null;
   if (dev('guest-new')) {
-    toast('这位朋友已在临时设备里', 'info');
+    const input = document.getElementById('connect-code-in');
+    if (input) { input.value = ''; syncConnectAction(); }
+    revealRow('guest-new');
+    toast('「新添加的笔记本」已在临时设备里', 'info');
     return;
   }
-  const input = document.querySelector('.connect input');
-  if (input) input.value = '';
+  const input = document.getElementById('connect-code-in');
+  if (input) { input.value = ''; syncConnectAction(); }
   S.devs.push({
-    id: 'guest-new', name: '临时访客-笔记本', icon: 'laptop', kind: 'temp',
+    id: 'guest-new', name: '新添加的笔记本', icon: 'laptop', kind: 'temp',
     via: '连接码', online: true, info: '在线 · 26 ms · 直连',
   });
-  markStep('code');
   render();
-  flash('guest-new');
-  toast('已通过连接码找到「临时访客-笔记本」', 'ok');
-}
-function pasteDemoCode() {
-  const input = document.querySelector('.connect input');
-  if (input) input.value = 'rc1-demo-7K9mPq2x...';
-  setTimeout(() => pasteCode('rc1-demo-7K9mPq2x'), 280);
+  revealRow('guest-new');
+  toast('已添加「新添加的笔记本」，点「控制」开始或点「记住」保存', 'ok');
 }
 
 function retry(id) {
   const d = dev(id);
   if (!d) return;
-  d.unreach = false; d.info = '正在找…'; why = null;
+  d.unreach = false; d.info = '正在连接…'; why = null;
   render();
   setTimeout(() => {
     const x = dev(id);
-    if (x) { x.unreach = true; x.info = '打不通'; render(); }
+    if (x) { x.unreach = true; x.info = '无法连接'; render(); }
   }, 1300);
 }
 
@@ -697,8 +1012,8 @@ function service(install) {
     ui.busy = null;
     S.set.svc = install ? 'run' : 'none';
     render();
-    toast(install ? '后台服务已装好，关掉窗口也在线' : '后台服务已卸载', 'ok');
-  }, 1300);
+    toast(install ? '后台服务已安装，关闭窗口后仍保持在线' : '后台服务已卸载', 'ok');
+  }, 1100);
 }
 function saveName(v) {
   v = v.trim();
@@ -712,7 +1027,7 @@ function useRelay(i) {
   r.state = 'home';
   S.relays.unshift(r);
   render();
-  toast(`已改用中转 ${r.host}`, 'ok');
+  toast(`已将 ${r.host} 设为首选`, 'ok');
 }
 function removeRelay(i) {
   const r = S.relays[i]; r.hidden = true;
@@ -726,18 +1041,26 @@ function addRelay() {
   render();
   setTimeout(() => {
     ui.adding = false;
-    S.relays.push({ host: 'relay2.example.com:7843', state: 'idle' });
+    const isFirst = S.relays.filter(r => !r.hidden).length === 0;
+    S.relays.push({ host: 'jp-relay.example.com:7843', state: isFirst ? 'home' : 'idle' });
     render();
-    toast('已加上中转 relay2.example.com:7843', 'ok');
-  }, 1100);
+    toast('已添加中转 jp-relay.example.com:7843', 'ok');
+  }, 900);
 }
 
-/* ---------- Menu ---------- */
+/* ---------- Menu (auto-flip when near window bottom) ---------- */
 function openMenu(ev, id) {
   ev.stopPropagation();
+  if (menu && menu.id === id) { menu = null; render(); return; }
+  const d = dev(id);
   const r = ev.currentTarget.getBoundingClientRect();
   const w = document.getElementById('win').getBoundingClientRect();
-  menu = (menu && menu.id === id) ? null : { id, x: Math.max(12, r.right - w.left - 210), y: r.bottom - w.top + 4 };
+  const estH = d && d.kind !== 'temp' ? 218 : 96;
+  const x = Math.max(12, r.right - w.left - 210);
+  const below = r.bottom - w.top + 4;
+  const flipUp = below + estH > w.height - 8;
+  const y = flipUp ? Math.max(40, r.top - w.top - estH - 4) : below;
+  menu = { id, x, y, up: flipUp };
   render();
 }
 function menuHtml() {
@@ -745,67 +1068,66 @@ function menuHtml() {
   if (!d) return '';
   const it = (icon, label, fn, cls = '', extra = '') =>
     `<div class="it ${cls}" onclick="event.stopPropagation();menu=null;${fn}">${icon ? ic(icon) : '<span style="width:15px"></span>'}<span>${label}</span>${extra}</div>`;
-  let h = it('term', '终端', `render();openTerm('${d.id}')`);
+  let h = it('term', '终端', d.online ? `render();openTerm('${d.id}')` : '', d.online ? '' : 'dis');
   if (d.kind !== 'temp') {
     h += it('rename', '重命名', `startRename('${d.id}')`);
     h += `<div class="sep"></div><div class="mhead">它控制本机时</div>`;
     for (const k of ['mine', 'trusted']) {
-      h += it('', `${KIND[k].title} <span class="sub">${k === 'mine' ? '不用问' : '先问'}</span>`, `setKind('${d.id}','${k}')`, '',
+      h += it('', `${KIND[k].title} <span class="sub">${k === 'mine' ? '免确认' : '需确认'}</span>`, `setKind('${d.id}','${k}')`, '',
         d.kind === k ? `<span class="tick">${ic('check')}</span>` : '');
     }
   }
   h += `<div class="sep"></div>` + it('del', '删除', `askDelete('${d.id}')`, 'danger');
-  return `<div class="menu" style="left:${menu.x}px;top:${menu.y}px" onclick="event.stopPropagation()">${h}</div>`;
+  return `<div class="menu ${menu.up ? 'up' : ''}" style="left:${menu.x}px;top:${menu.y}px" onclick="event.stopPropagation()">${h}</div>`;
 }
 document.addEventListener('click', () => { if (menu) { menu = null; render(); } });
 
 /* ---------- Render Devices & Settings ---------- */
 function rowHtml(d) {
-  const target = STEPS[stepIdx]?.target;
-  let sub = `${d.kind === 'temp' && d.via ? d.via + ' · ' : ''}${esc(d.info)}`;
+  let sub = `${esc(d.info)}${d.kind === 'temp' && d.via ? ' · ' + d.via : ''}`;
   let subCls = d.unreach ? 'amber' : '', acts = '';
   const ctl = S.controlling === d.id;
 
   if (d.req === 'out') {
     sub = `<span class="spin"></span>等对方同意`;
+    acts += `<button class="ghost" onclick="event.stopPropagation();cancelRemember('${d.id}')">取消</button>`;
   } else if (d.kind === 'temp') {
-    acts += `<button class="ghost" onclick="remember('${d.id}')">${ic('add')}记住</button>`;
+    acts += `<button class="ghost" onclick="event.stopPropagation();remember('${d.id}')">${ic('add')}记住</button>`;
   }
 
   if (ctl) { sub = '控制中'; subCls = 'blue'; }
-  if (d.waiting) sub = `<span class="spin"></span>等对方允许`;
-  if (d.info === '正在找…') sub = `<span class="spin"></span>正在找…`;
+  if (d.waiting) sub = `<span class="spin"></span>等对方允许 · <span class="wait-sec">${d.waitLeft ?? 30}</span> 秒`;
+  if (d.info === '正在连接…') sub = `<span class="spin"></span>正在连接…`;
 
   if (ctl) {
-    acts += `<button class="danger" onclick="disconnect()">断开</button>`;
+    acts += `<button class="danger" onclick="event.stopPropagation();disconnect()">断开</button>`;
+  } else if (d.waiting) {
+    acts += `<button class="ghost" onclick="event.stopPropagation();cancelWait('${d.id}')">取消</button>`;
   } else if (d.unreach) {
-    acts += `<button class="ghost" onclick="why=why==='${d.id}'?null:'${d.id}';render()">为什么</button>`;
+    acts += `<button class="ghost" onclick="event.stopPropagation();why=why==='${d.id}'?null:'${d.id}';render()">查看原因</button>`;
   } else {
-    const pCls = (target === 'ctl-pb' && d.id === 'pb') ? 'pulse' : '';
-    acts += `<button class="soft ${pCls}" ${d.online && !d.waiting ? '' : 'disabled'} onclick="control('${d.id}')">控制</button>`;
+    acts += `<button class="soft" ${d.online ? '' : 'disabled'} onclick="event.stopPropagation();control('${d.id}')">控制</button>`;
   }
 
   const name = renaming === d.id
-    ? `<input class="field" value="${esc(d.name)}" onkeydown="if(event.key==='Enter')this.blur();if(event.key==='Escape'){renaming=null;render()}" onblur="endRename('${d.id}',this.value,true)">`
-    : `<span ${d.kind !== 'temp' ? `ondblclick="startRename('${d.id}')" title="双击改名"` : ''} style="cursor:${d.kind !== 'temp' ? 'text' : 'default'}">${esc(d.name)}</span>`;
+    ? `<input class="field" value="${esc(d.name)}" onclick="event.stopPropagation()" ondblclick="event.stopPropagation()" onkeydown="if(event.key==='Enter')this.blur();if(event.key==='Escape'){renaming=null;render()}" onblur="endRename('${d.id}',this.value,true)">`
+    : `<span>${esc(d.name)}</span>`;
 
-  const dot = d.online ? 'on' : d.unreach ? 'amber' : '';
-  const mCls = (target === 'menu-pb' && d.id === 'pb') ? 'pulse' : '';
+  const dot = ctl ? 'ctl' : d.online ? 'on' : d.unreach ? 'amber' : '';
   let h = `<div class="row" data-id="${d.id}" ondblclick="if('${d.online}'==='true' && !renaming) control('${d.id}')">
     <div class="av ${d.kind}">${ic(d.icon)}<span class="dot ${dot}"></span></div>
     <div class="txt"><div class="nm">${name}</div><div class="sub ${subCls}">${sub}</div></div>
-    <div class="acts">${acts}<button class="icon ${mCls}" title="更多" onclick="openMenu(event,'${d.id}')">${ic('more')}</button></div>
+    <div class="acts" ondblclick="event.stopPropagation()">${acts}<button class="icon" title="更多" onclick="openMenu(event,'${d.id}')">${ic('more')}</button></div>
   </div>`;
 
   if (why === d.id && d.unreach) {
-    h += `<div class="why">找不到直连。打开路由器的 IPv6，或者加一台自建中转。
-      <div class="btns"><button onclick="retry('${d.id}')">重试</button><button onclick="S.page='settings';why=null;render()">去设置</button></div></div>`;
+    h += `<div class="why">两台电脑之间无法直连，通常是网络限制。可开启路由器 IPv6，或在设置中添加自建中转。
+      <div class="btns"><button onclick="retry('${d.id}')">重试</button><button onclick="jumpToSettings('sec-relays');why=null;">去设置</button></div></div>`;
   }
   return h;
 }
 
 function devicesHtml() {
-  const target = STEPS[stepIdx]?.target;
   let list = '';
   for (const k of ['mine', 'trusted', 'temp']) {
     const ds = S.devs.filter(d => d.kind === k);
@@ -814,7 +1136,7 @@ function devicesHtml() {
       <div class="group">${ds.map(rowHtml).join('')}</div></div>`;
   }
   if (!list) {
-    list = `<div class="empty">${ic('devices')}还没有设备<br><span style="font-size:12px">复制连接码发给对方，或把对方的连接码粘贴到上面</span></div>`;
+    list = `<div class="empty">${ic('devices')}<div class="et">还没有设备</div><div class="ed">同一局域网会自动出现；跨网请复制连接码发给对方，或贴到上方</div></div>`;
   }
   let banner = '';
   if (S.controlling) {
@@ -828,58 +1150,98 @@ function devicesHtml() {
   const codes = S.codes.filter(c => !c.hidden);
   return `
     <div class="head"><h1>设备</h1><span class="grow"></span>
-      <button onclick="copyCode()" ${isCopied ? 'class="copied"' : ''}>${isCopied ? ic('check') + '已复制，1 小时内有效' : ic('copy') + '复制本机连接码'}</button>
+      <span class="tip-wrap">
+        <button class="${isCopied ? 'copied' : ''} ${activePulse === 'copy-btn' ? 'pulse' : ''}" onclick="copyCode()">${isCopied ? ic('check') + '已复制，1 小时内有效' : ic('copy') + '复制本机连接码'}</button>
+        <span class="tip-box">一次性有效（1 小时），对方连入时会弹窗等你允许</span>
+      </span>
     </div>
-    <div class="connect ${target === 'paste-demo' ? 'pulse' : ''}">${ic('link')}<input id="connect-code-in" name="connect-code" placeholder="粘贴对方的连接码" onkeydown="if(event.key==='Enter')pasteCode(this.value)" onpaste="setTimeout(()=>pasteCode(this.value),10)"><kbd>Ctrl V</kbd></div>
-    ${codes.length ? `<div class="codes">还没用掉的连接码${codes.map(c => `<span class="chip">刚才复制<button class="ghost" onclick="revoke(${c.n})">撤销</button></span>`).join('')}</div>` : ''}
+    <div class="connect ${activePulse === 'connect-box' ? 'pulse' : ''}" onclick="document.getElementById('connect-code-in')?.focus()">
+      ${ic('link')}
+      <input id="connect-code-in" name="connect-code" placeholder="粘贴对方连接码，加入设备列表"
+        onfocus="markStep('input')"
+        oninput="onConnectInput(this)"
+        onkeydown="if(event.key==='Enter')pasteCode(this.value)">
+      <span id="connect-action-slot" data-mode="empty" onclick="event.stopPropagation()"></span>
+    </div>
+    ${codes.length ? `<div class="codes">还没用掉的连接码（连入时会先问你）${codes.map(c => `<span class="chip">${esc(c.label)}<button class="ghost" onclick="revoke(${c.n})">撤销</button></span>`).join('')}</div>` : ''}
     <div class="gap18"></div>
     ${banner}${list}`;
 }
 
-const sw = (key, dis) => `<span class="sw ${S.set[key] ? 'on' : ''} ${dis ? 'off-dis' : ''}" onclick="toggle('${key}')"></span>`;
+const sw = (key, dis) => `<span class="sw ${!dis && S.set[key] ? 'on' : ''} ${dis ? 'off-dis' : ''}" onclick="toggle('${key}')"></span>`;
 const item = (icon, t, d, right, cls = '') =>
   `<div class="item ${cls}">${ic(icon)}<div class="txt2"><div class="t">${t}</div>${d ? `<div class="d">${d}</div>` : ''}</div><div class="r">${right}</div></div>`;
+
+function setSkills(next) {
+  S.set.skills = next;
+  render();
+  if (next === 'installed') {
+    toast('已写入 ~/.claude/skills、~/.agents/skills，新开的 AI 对话即生效', 'ok');
+  } else {
+    toast('已卸载 AI Skills', 'info');
+  }
+}
 
 function settingsHtml() {
   const st = S.set, busy = !!ui.busy;
   const saved = Date.now() - ui.saved < 1800 ? `<span class="saved">✓ 已保存</span>` : '';
   let h = `<div class="head"><h1>设置</h1></div>`;
-  h += `<div class="sec"><div class="sh"><b>本机</b></div><div class="group">
-    ${item('rename', '名字', '对方看到的名字', `${saved}<input id="device-name-in" name="device-name" class="field" style="width:200px" value="${esc(S.name)}" onkeydown="if(event.key==='Enter')this.blur()" onblur="saveName(this.value)">`)}
+  h += `<div class="sec" id="sec-self"><div class="sh"><b>本机</b></div><div class="group">
+    ${item('rename', '设备名称', '其他设备看到的本机名称', `${saved}<input id="device-name-in" name="device-name" class="field" style="width:200px" value="${esc(S.name)}" onkeydown="if(event.key==='Enter')this.blur()" onblur="saveName(this.value)">`)}
   </div></div>`;
-  h += `<div class="sec"><div class="sh"><b>连接</b></div><div class="group">
-    ${item('globe', '公共节点牵线', '只交换地址，不传画面', sw('public'))}
-    ${item('wifi', '局域网可见', '同一个局域网里的电脑能看到本机', sw('lan'))}
+  h += `<div class="sec"><div class="sh"><b>网络与发现</b></div><div class="group">
+    ${item('globe', '公网辅助连接', '跨网直连时用于交换地址，不转发画面和数据', sw('public'))}
+    ${item('wifi', '局域网发现', '允许同一局域网内的设备自动发现本机', sw('lan'))}
   </div></div>`;
 
   const relays = S.relays.filter(r => !r.hidden);
-  const rstate = { home: ['在用', ''], idle: ['未使用，名单照常同步', 'grey'], fail: ['连不上', 'amber'] };
-  h += `<div class="sec"><div class="sh"><b>自建中转</b><span>从上往下用，第一台连不上时下一台临时顶替</span></div><div class="group">
+  const rstate = {
+    home: ['已连接（首选） · 42 ms', ''],
+    temp: ['临时接管（首选不可用）', ''],
+    idle: ['备用 · 首选不可用时接管 · 58 ms', 'grey'],
+    fail: ['连接失败', 'amber'],
+  };
+  h += `<div class="sec" id="sec-relays"><div class="sh"><b>自建中转</b><span>按顺序优先使用，直连受阻时自动接管</span></div><div class="group">
     ${relays.map((r, i) => `<div class="item"><span class="pdot ${rstate[r.state][1]}" style="margin:0 6px"></span>
       <div class="txt2"><div class="t mono" style="font-size:13px">${esc(r.host)}</div><div class="d">${rstate[r.state][0]}</div></div>
-      <div class="r">${i ? `<button class="ghost" onclick="useRelay(${S.relays.indexOf(r)})">使用</button>` : ''}
+      <div class="r">${i ? `<button class="ghost" onclick="useRelay(${S.relays.indexOf(r)})">设为首选</button>` : ''}
       <button class="icon red" title="移除" onclick="removeRelay(${S.relays.indexOf(r)})">${ic('del')}</button></div></div>`).join('')}
     ${ui.adding
-      ? `<div class="item">${ic('server')}<input class="field relay-in" style="flex:1" placeholder="粘贴中转码" ${ui.adding === 'busy' ? 'disabled' : ''}
-           onkeydown="if(event.key==='Enter')addRelay();if(event.key==='Escape'){ui.adding=false;render()}">
-         <button class="ghost" onclick="ui.adding=false;render()">取消</button>
-         ${ui.adding === 'busy' ? '<button disabled><span class="spin"></span>正在添加…</button>' : `<button class="primary" onclick="addRelay()">添加</button>`}</div>`
-      : `<div class="item add" onclick="ui.adding=true;render();document.querySelector('#win .relay-in')?.focus()">${ic('add')}<div class="txt2">添加中转</div></div>`}
+      ? `<div class="item add-form" style="align-items:flex-start;padding-top:12px;padding-bottom:12px">${ic('server')}
+           <div class="txt2" style="display:flex;flex-direction:column;gap:5px">
+             <input class="field relay-in" style="width:100%" placeholder="粘贴中转码" ${ui.adding === 'busy' ? 'disabled' : ''}
+               onkeydown="if(event.key==='Enter')addRelay();if(event.key==='Escape'){ui.adding=false;render()}">
+             <div class="d">在自建服务器运行 <span class="mono">rc-relay ui</span> 获取中转码</div>
+           </div>
+           <div class="r">
+             <button class="ghost" onclick="ui.adding=false;render()">取消</button>
+             ${ui.adding === 'busy' ? '<button disabled><span class="spin"></span>添加中…</button>' : `<button class="primary" onclick="addRelay()">添加</button>`}
+           </div>
+         </div>`
+      : `<div class="item add" onclick="ui.adding=true;render();document.querySelector('#win .relay-in')?.focus()">${ic('add')}<div class="txt2">添加中转服务器</div></div>`}
   </div></div>`;
 
   const on = st.svc === 'run';
   const svcRight = busy ? `<button disabled><span class="spin"></span>${ui.busy.replace('正在', '').replace('后台服务…', '中…')}</button>`
-    : on ? `<button onclick="service(false)">卸载</button>` : `<button class="primary" onclick="service(true)">安装</button>`;
+    : on ? `<button onclick="service(false)">${ic('shield')}卸载</button>` : `<button class="primary" onclick="service(true)">${ic('shield')}安装</button>`;
   h += `<div class="sec"><div class="sh"><b>后台服务</b></div><div class="group">
-    ${item('service', on ? '运行中' : '没装', on ? '关掉窗口也在线' : '装上后锁屏时也能被控制', svcRight)}
-    ${item('power', '开机自动在线', '', sw('boot', !on), on ? '' : 'dis')}
-    ${item('lock', '锁屏时可被控制', '仅限我的电脑', sw('lock', !on), on ? '' : 'dis')}
-    ${item('bolt', '插电时不睡眠', '屏幕照常熄灭', sw('awake', !on), on ? '' : 'dis')}
+    ${item('service', on ? '运行中' : '未安装', on ? '关闭窗口后仍保持在线' : '安装后支持开机在线与锁屏控制（需要管理员权限）', svcRight)}
+    ${item('power', '开机自启', on ? '系统启动后自动在后台保持在线' : '安装后台服务后可用', sw('boot', !on), on ? '' : 'dis')}
+    ${item('lock', '允许锁屏控制', on ? '仅限「我的电脑」免确认连入' : '安装后台服务后可用', sw('lock', !on), on ? '' : 'dis')}
+    ${item('bolt', '接通电源时阻止睡眠', on ? '保持在线，显示器仍按系统设置熄屏' : '安装后台服务后可用', sw('awake', !on), on ? '' : 'dis')}
   </div></div>`;
 
-  h += `<div class="sec"><div class="sh"><b>AI</b></div><div class="group">
-    ${item('bot', '让本机的 AI 会用', 'Claude Code、Codex 学会用终端操作设备列表里的电脑',
-      `<button onclick="markStep('set');toast('已写入 ~/.claude/skills、~/.agents/skills，新开的 AI 对话就会用','ok')">写入</button>`)}
+  const sk = st.skills || 'none';
+  const skDesc = sk === 'installed' ? '已安装 · 支持 Claude Code、Codex'
+    : sk === 'outdated' ? '已安装（当前程序路径或版本有变化）'
+    : '为 Claude Code、Codex 安装远程控制 Skill，支持通过终端操作设备';
+  const skRight = sk === 'installed'
+    ? `<button onclick="setSkills('none')">卸载</button>`
+    : sk === 'outdated'
+    ? `<button class="primary" onclick="setSkills('installed')">更新</button><button onclick="setSkills('none')">卸载</button>`
+    : `<button onclick="setSkills('installed')">安装</button>`;
+  h += `<div class="sec"><div class="sh"><b>AI 集成</b></div><div class="group">
+    ${item('bot', '配置 AI Skills', skDesc, skRight)}
   </div></div>`;
   return h;
 }
@@ -890,32 +1252,45 @@ function render() {
   const old = [...w.querySelectorAll('.toast')];
   const top = w.querySelector('.scroll')?.scrollTop || 0;
   const prevPage = w.dataset.page;
+  const pageChanged = Boolean(prevPage && prevPage !== S.page);
   const val = w.querySelector('.connect input')?.value || '';
   const relayIn = w.querySelector('.relay-in')?.value || '';
 
-  const target = STEPS[stepIdx]?.target;
   const nav = (page, icon, label, extra = '') => {
-    const pCls = (target === 'nav-settings' && page === 'settings' && S.page !== 'settings') ? 'pulse' : '';
-    return `<div class="nav ${S.page === page ? 'on' : ''} ${pCls}" onclick="S.page='${page}';menu=null;if('${page}'==='settings')markStep('set');render()">${ic(icon)}<span>${label}</span>${extra}</div>`;
+    const pCls = (activePulse === 'nav-settings' && page === 'settings' && S.page !== 'settings') ? 'pulse' : '';
+    const onCls = S.page === page ? (pageChanged ? 'on anim' : 'on') : '';
+    return `<div class="nav ${onCls} ${pCls}" onclick="S.page='${page}';menu=null;if('${page}'==='settings')markStep('settings');render()">${ic(icon)}<span>${label}</span>${extra}</div>`;
   };
-  const rlabel = { home: '在用', temp: '临时在用', fail: '连不上', idle: '备用' };
+
+  const rlabel = { home: '已连', temp: '临时接管', fail: '连不上', idle: '备用' };
+  const visibleRelays = S.relays.filter(r => !r.hidden);
+  const relayBlock = visibleRelays.length
+    ? `<div class="relays ${activePulse === 'relay-box' ? 'pulse' : ''}" title="前往设置管理自建中转" onclick="jumpToSettings('sec-relays')">
+        <div class="h"><span>自建中转</span><span class="go">管理</span></div>
+        ${visibleRelays.map(r =>
+          `<div class="r"><span class="pdot ${r.state === 'home' || r.state === 'temp' ? '' : r.state === 'fail' ? 'amber' : 'grey'}"></span><span>${esc(shortHost(r.host))}</span><span>${rlabel[r.state] || '…'}</span></div>`).join('')}
+      </div>`
+    : '';
 
   w.innerHTML = `
-    <div class="titlebar">remote control
+    <div class="titlebar">
+      ${appIconSvg()}Remote Control
       <div class="caps"><span>${ic('min')}</span><span>${ic('max')}</span><span class="x" onclick="S.closed=true;menu=null;render()" title="关闭窗口到托盘">${ic('close')}</span></div>
     </div>
     <div class="body">
       <div class="pane">
-        <div class="me"><div class="av mine" style="width:40px;height:40px;border-radius:10px">${ic(S.icon)}</div>
-          <div><div class="nm">${esc(S.name)}</div><div class="st"><span class="pdot"></span>本机 · 在线</div></div>
+        <div class="me" title="点击前往设置修改设备名称" onclick="jumpToSettings('sec-self')">
+          <div class="av mine" style="width:40px;height:40px;border-radius:10px">${ic(S.icon)}</div>
+          <div><div class="nm">${esc(S.name)}</div><div class="st"><span class="pdot live"></span>本机 · 在线</div></div>
         </div>
         ${nav('devices', 'devices', '设备', `<span class="count">${S.devs.length}</span>`)}
         ${nav('settings', 'gear', '设置')}
-        <div class="relays"><div class="h">自建中转</div>${S.relays.filter(r => !r.hidden).map(r =>
-          `<div class="r"><span class="pdot ${r.state === 'home' ? '' : r.state === 'fail' ? 'amber' : 'grey'}"></span><span>${esc(shortHost(r.host))}</span><span>${rlabel[r.state] || '…'}</span></div>`).join('')}
-        </div>
+        ${relayBlock}
       </div>
-      <div class="content"><div class="scroll">${S.page === 'devices' ? devicesHtml() : settingsHtml()}</div></div>
+      <div class="content">
+        <div class="scroll ${pageChanged ? 'page-enter' : ''}">${S.page === 'devices' ? devicesHtml() : settingsHtml()}</div>
+        <div class="sbar-track"><div class="sbar-thumb"></div></div>
+      </div>
     </div>
     ${menu ? menuHtml() : ''}
     ${modal ? `<div class="veil"><div class="dialog"><div class="top2"><div class="badge ${modal.tone}">${ic(modal.icon)}</div>
@@ -928,8 +1303,13 @@ function render() {
   const box = w.querySelector('.toasts');
   old.forEach(t => box.appendChild(t));
   if (prevPage === S.page) w.querySelector('.scroll').scrollTop = top;
-  const c = w.querySelector('.connect input'); if (c) c.value = val;
+  const c = w.querySelector('.connect input');
+  if (c) {
+    c.value = val;
+    syncConnectAction();
+  }
   const r = w.querySelector('.relay-in'); if (r) r.value = relayIn;
+  bindScrollbar();
 }
 
 function shortHost(h) {
@@ -999,6 +1379,13 @@ function renderOverlay() {
   }
   box.innerHTML = '';
 }
+
+document.addEventListener('paste', e => {
+  const tag = document.activeElement?.tagName;
+  if (tag === 'INPUT' || tag === 'TEXTAREA' || modal || remote || term) return;
+  const t = e.clipboardData?.getData('text') || '';
+  if (t.trim()) pasteCode(t);
+});
 
 reset();
 </script>
