@@ -156,19 +156,20 @@
 
   .content { flex: 1; position: relative; background: var(--layer); border-top-left-radius: 8px;
     border: 1px solid rgba(255,255,255,.047); border-right: 0; border-bottom: 0; min-width: 0; overflow: hidden; }
-  .scroll { position: absolute; inset: 0; overflow-y: auto; padding: 22px 28px 24px; scroll-behavior: smooth;
+  .scroll { position: absolute; inset: 0; overflow-y: auto; padding: 22px 28px 24px;
     scrollbar-width: none; -ms-overflow-style: none; }
   .scroll::-webkit-scrollbar { display: none; }
   .scroll.page-enter { animation: page-in .2s var(--ease); }
   @keyframes page-in { from { opacity: 0; transform: translateY(7px); } to { opacity: 1; transform: translateY(0); } }
 
-  /* Win11-style hover-expanding overlay scrollbar */
+  /* Win11-style hover-expanding overlay scrollbar with idle fade */
   .sbar-track {
     position: absolute; top: 6px; right: 2px; bottom: 6px; width: 14px; z-index: 15;
-    border-radius: 7px; transition: background .16s var(--ease), opacity .2s var(--ease); opacity: 0; pointer-events: none;
+    border-radius: 7px; transition: background .16s var(--ease), opacity .25s var(--ease); opacity: 0; pointer-events: none;
   }
   .sbar-track.visible { opacity: 1; pointer-events: auto; }
-  .sbar-track:hover, .sbar-track.drag { background: rgba(255,255,255,.035); }
+  .sbar-track.visible.idle { opacity: 0; }
+  .sbar-track.visible:hover, .sbar-track.visible.drag { opacity: 1; background: rgba(255,255,255,.035); }
   .sbar-thumb {
     position: absolute; right: 3px; width: 3px; min-height: 28px; border-radius: 99px;
     background: rgba(255,255,255,.22); cursor: grab;
@@ -231,10 +232,12 @@
     animation: slide-down .22s var(--ease); }
   .banner.red { background: rgba(229,83,75,.12); border: 1px solid rgba(229,83,75,.25); }
   .banner.blue { background: rgba(59,127,224,.1); border: 1px solid rgba(59,127,224,.22); }
+  .banner.amber { background: rgba(210,153,34,.12); border: 1px solid rgba(210,153,34,.25); }
   .banner .grow { flex: 1; }
   .banner > svg.ic { width: 18px; height: 18px; }
   .banner.red > svg.ic { color: var(--danger); }
   .banner.blue > svg.ic { color: var(--link); }
+  .banner.amber > svg.ic { color: var(--amber-text); }
 
   /* Sections & Rows */
   .sec { margin-bottom: 20px; scroll-margin-top: 14px; }
@@ -243,15 +246,18 @@
     0% { box-shadow: 0 0 0 1.5px var(--accent); background: rgba(59,127,224,.1); }
     100% { box-shadow: 0 0 0 0 transparent; background: var(--card); }
   }
-  .sh { display: flex; align-items: baseline; gap: 8px; padding: 0 4px 8px; font-size: 13px; }
+  .sh { display: flex; align-items: center; gap: 8px; padding: 0 4px 8px; font-size: 13px; }
   .sh b { font-size: 13px; }
   .sh span { color: var(--dim); font-size: 12px; }
+  .sh .sh-act { margin-left: auto; width: 22px; height: 22px; padding: 0; border-radius: 5px; }
+  .sh .sh-act svg.ic { width: 13px; height: 13px; }
+  .sh .sh-act.spinning svg.ic { animation: spin .75s linear infinite; }
   .group { background: var(--card); border-radius: 10px; border: 1px solid rgba(255,255,255,.035); overflow: hidden; }
   .group > * { position: relative; }
   .group > * + *::before { content: ""; position: absolute; top: 0; right: 0; height: 1px; background: rgba(255,255,255,.05); left: 0; }
   .group > .row + *::before { left: 62px; }
   .row { display: flex; align-items: center; gap: 12px; height: 62px; padding: 0 10px 0 14px;
-    transition: background .15s var(--ease); cursor: default; }
+    transition: background .15s var(--ease); cursor: default; user-select: none; }
   .row:hover { background: rgba(255,255,255,.032); }
   .row:hover .av { transform: scale(1.03); }
   .row.flash { animation: flash-row 1.2s var(--ease); }
@@ -322,7 +328,7 @@
     transition: background .12s var(--ease); }
   .menu .it:hover { background: rgba(255,255,255,.075); }
   .menu .it svg.ic { width: 15px; height: 15px; color: var(--dim); }
-  .menu .it .sub { font-size: 12px; color: var(--dim); margin-left: 2px; }
+  .menu .it .msub { font-size: 12px; color: var(--dim); margin-left: 4px; }
   .menu .it .tick { margin-left: auto; color: var(--link); }
   .menu .it.danger { color: var(--danger); } .menu .it.danger svg.ic { color: var(--danger); }
   .menu .it.danger:hover { background: rgba(229,83,75,.14); }
@@ -356,7 +362,8 @@
   .dialog .bar { height: 3px; border-radius: 2px; background: rgba(255,255,255,.07); margin: 16px 0 0; overflow: hidden; }
   .dialog .bar div { height: 100%; background: var(--amber); width: 100%; animation: drain 30s linear forwards; }
   @keyframes drain { to { width: 0; } }
-  .dialog .btns { display: flex; justify-content: flex-end; gap: 8px; margin-top: 18px; }
+  .dialog .btns { display: flex; align-items: center; justify-content: flex-end; gap: 8px; margin-top: 18px; }
+  .dialog .btns .foot-note { margin-right: auto; font-size: 12px; color: var(--dim); }
   .dialog .btns button { min-width: 84px; justify-content: center; }
 
   .empty { text-align: center; padding: 64px 20px; color: var(--dim); animation: fade .2s var(--ease); }
@@ -429,6 +436,7 @@
     <span class="brand">Remote Control</span>
     <span class="badge-pill">交互演示</span>
     <div class="grow"></div>
+    <button onclick="simulateIncoming()" style="height:28px;font-size:12px">模拟他人连入本机</button>
     <button onclick="toggleEmptyMode()" id="btn-empty" style="height:28px;font-size:12px">查看 0 设备空状态</button>
     <button onclick="reset()" style="height:28px;font-size:12px">重置演示</button>
   </div>
@@ -473,6 +481,7 @@ const SVG = {
   monitor: `<rect x="2" y="3" width="12" height="8" rx="1.2"/><path d="M5 13h6M8 11v2"/>`,
   cad: `<rect x="2.5" y="4" width="11" height="8" rx="1.2"/><path d="M5 7h1.5M9.5 7H11M5.5 9.5h5"/>`,
   unlock: `<path d="M5.5 7V5a2.5 2.5 0 0 1 4.6-1.3"/><rect x="3.5" y="7" width="9" height="6.5" rx="1.2"/>`,
+  refresh: `<path d="M13 8a5 5 0 1 1-1.3-3.4M13 2.5v2.8h-2.8"/>`,
 };
 const ic = (k, cls = '') => `<svg class="ic ${cls}" viewBox="0 0 16 16">${SVG[k] || ''}</svg>`;
 
@@ -501,30 +510,60 @@ const STEPS = [
   { id: 'relay', title: '4. 快捷跳转与控制', tip: '点击左下角自建中转或左上角本机卡片可直达对应设置；双击在线设备行发起远程控制。', page: 'devices', target: 'relay-box' },
 ];
 
+const DEFAULT_HOST = 'PETER-PC';
+const SAMPLE_PEER_CODE = 'rc1-peer-8Q4nLm9x2KvR';
+
 let S, menu = null, modal = null, copied = 0, why = null, renaming = null, ui, codeSeq = 0;
 let stepIdx = 0, activePulse = null, doneSteps = new Set();
-let remote = null, term = null, timerHandle = null, waitTimer = null;
+let remote = null, term = null, timerHandle = null, waitTimer = null, incomingTimer = null;
 let savedDevsForEmpty = null;
-let sbarCleanup = null, pasteTimer = null;
+let shellMounted = false, updateScrollbar = null, sbarIdleTimer = null, pasteTimer = null;
+
+function mountShell() {
+  if (shellMounted) return;
+  shellMounted = true;
+  const w = document.getElementById('win');
+  w.innerHTML = `
+    <div class="titlebar">
+      ${appIconSvg()}Remote Control
+      <div class="caps"><span>${ic('min')}</span><span>${ic('max')}</span><span class="x" onclick="S.closed=true;menu=null;render()" title="关闭窗口到托盘">${ic('close')}</span></div>
+    </div>
+    <div class="body">
+      <div class="pane"></div>
+      <div class="content">
+        <div class="scroll"></div>
+        <div class="sbar-track"><div class="sbar-thumb"></div></div>
+      </div>
+    </div>
+    <div class="menu-layer"></div>
+    <div class="modal-layer"></div>
+    <div class="closed-layer"></div>
+    <div class="toasts"></div>`;
+  bindScrollbarOnce();
+}
 
 function reset() {
   clearInterval(timerHandle);
   clearInterval(waitTimer);
+  clearInterval(incomingTimer);
   clearTimeout(pasteTimer);
   if (S?.devs) S.devs.forEach(d => { if (d._reqTimer) clearTimeout(d._reqTimer); });
   savedDevsForEmpty = null;
+  mountShell();
   const initPage = new URLSearchParams(location.search).get('page') === 'settings' ? 'settings' : 'devices';
   S = {
     name: 'PETER',
     icon: 'desktop',
     relays: [
-      { host: 'sg-relay.example.com:7843', state: 'home' },
-      { host: 'sgnew-relay.example.com:7843', state: 'idle' },
+      { host: 'sg-relay.example.com:7843', state: 'home', rtt: 42 },
+      { host: 'sgnew-relay.example.com:7843', state: 'idle', rtt: 58 },
     ],
     set: { public: true, lan: true, svc: 'none', boot: true, lock: true, awake: false, skills: 'none' },
     codes: [],
     closed: false,
     controlling: null,
+    hostedBy: null,
+    incoming: null,
     page: initPage,
     devs: [
       { id: 'pb', name: 'PETERBOOK', icon: 'laptop', kind: 'mine', online: true, info: '在线 · 9 ms · 直连' },
@@ -534,12 +573,13 @@ function reset() {
     ],
   };
   menu = null; modal = null; copied = 0; why = null; renaming = null; remote = null; term = null;
-  ui = { adding: false, busy: null, saved: 0 };
+  ui = { adding: false, busy: null, saved: 0, probing: false };
   stepIdx = initPage === 'settings' ? 2 : 0;
   activePulse = null;
   doneSteps = new Set();
-  document.querySelectorAll('.toast').forEach(t => t.remove());
+  document.querySelectorAll('#win .toast').forEach(t => t.remove());
   render();
+  renderOverlay();
 }
 
 const esc = t => String(t).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
@@ -555,6 +595,13 @@ function toggleEmptyMode() {
     savedDevsForEmpty = null;
   }
   render();
+}
+
+function copySamplePeerCode() {
+  if (navigator.clipboard?.writeText) {
+    navigator.clipboard.writeText(SAMPLE_PEER_CODE).catch(() => {});
+  }
+  toast(`已复制测试连接码 ${SAMPLE_PEER_CODE}，按 Ctrl+V 或贴到顶部输入框即可试连`, 'info');
 }
 
 function markStep(id) {
@@ -577,7 +624,10 @@ function renderGuide() {
     return `<button class="step-btn ${cls}" onclick="selectStep(${i})">${doneSteps.has(s.id) ? ic('check') : ''}${s.title}</button>`;
   }).join('');
   const cur = STEPS[stepIdx];
-  document.getElementById('guide-tip').innerHTML = `${ic('info')}<span>${cur.tip}</span><span class="grow"></span>`;
+  const extra = cur.id === 'input'
+    ? `<button class="soft" style="height:24px;font-size:12px;padding:0 10px" onclick="copySamplePeerCode()">复制测试连接码</button>`
+    : '';
+  document.getElementById('guide-tip').innerHTML = `${ic('info')}<span>${cur.tip}</span><span class="grow"></span>${extra}`;
   const btn = document.getElementById('btn-empty');
   if (btn) btn.textContent = savedDevsForEmpty === null ? '查看 0 设备空状态' : '恢复设备列表';
 }
@@ -644,18 +694,25 @@ function jumpToSettings(sectionId) {
   }
 }
 
-/* ---------- Custom Hover-Expanding Scrollbar ---------- */
-function bindScrollbar() {
-  if (sbarCleanup) { sbarCleanup(); sbarCleanup = null; }
+/* ---------- Custom Hover-Expanding Scrollbar (bound once on persistent shell) ---------- */
+function bindScrollbarOnce() {
   const sc = document.querySelector('#win .scroll');
   const track = document.querySelector('#win .sbar-track');
   const thumb = document.querySelector('#win .sbar-thumb');
   if (!sc || !track || !thumb) return;
 
-  const update = () => {
+  const kickIdle = () => {
+    track.classList.remove('idle');
+    clearTimeout(sbarIdleTimer);
+    sbarIdleTimer = setTimeout(() => {
+      if (!track.classList.contains('drag')) track.classList.add('idle');
+    }, 1500);
+  };
+
+  updateScrollbar = (keepVisible = false) => {
     const sh = sc.scrollHeight, ch = sc.clientHeight;
     if (sh <= ch + 1) {
-      track.classList.remove('visible');
+      track.classList.remove('visible', 'idle');
       return;
     }
     track.classList.add('visible');
@@ -665,14 +722,14 @@ function bindScrollbar() {
     const y = (sc.scrollTop / (sh - ch)) * maxTop;
     thumb.style.height = h + 'px';
     thumb.style.top = y + 'px';
+    if (keepVisible) kickIdle();
   };
 
-  const onScroll = () => {
-    update();
-    if (menu) { menu = null; render(); }
-  };
-  sc.addEventListener('scroll', onScroll, { passive: true });
-  requestAnimationFrame(update);
+  sc.addEventListener('scroll', () => updateScrollbar(true), { passive: true });
+  sc.addEventListener('wheel', () => {
+    kickIdle();
+    if (menu) { menu = null; renderMenu(); }
+  }, { passive: true });
 
   let dragging = false, startY = 0, startScroll = 0;
   thumb.addEventListener('mousedown', e => {
@@ -681,31 +738,30 @@ function bindScrollbar() {
     startY = e.clientY;
     startScroll = sc.scrollTop;
     track.classList.add('drag');
+    track.classList.remove('idle');
+    if (menu) { menu = null; renderMenu(); }
   });
   track.addEventListener('mousedown', e => {
     if (e.target === thumb) return;
     const rect = track.getBoundingClientRect();
     const ratio = (e.clientY - rect.top) / rect.height;
-    sc.scrollTop = ratio * (sc.scrollHeight - sc.clientHeight);
+    sc.scrollTo({ top: ratio * (sc.scrollHeight - sc.clientHeight), behavior: 'smooth' });
+    kickIdle();
+    if (menu) { menu = null; renderMenu(); }
   });
-  const onMove = e => {
+  window.addEventListener('mousemove', e => {
     if (!dragging) return;
     const sh = sc.scrollHeight, ch = sc.clientHeight, th = track.clientHeight;
     const h = Math.max(28, (ch / sh) * th);
     const ratio = (sh - ch) / Math.max(1, th - h);
     sc.scrollTop = startScroll + (e.clientY - startY) * ratio;
-  };
-  const onUp = () => {
+  });
+  window.addEventListener('mouseup', () => {
     if (!dragging) return;
     dragging = false;
     track.classList.remove('drag');
-  };
-  window.addEventListener('mousemove', onMove);
-  window.addEventListener('mouseup', onUp);
-  sbarCleanup = () => {
-    window.removeEventListener('mousemove', onMove);
-    window.removeEventListener('mouseup', onUp);
-  };
+    kickIdle();
+  });
 }
 
 /* ---------- Device Actions ---------- */
@@ -801,19 +857,24 @@ function control(id) {
     if (x.waitLeft <= 0) {
       clearInterval(waitTimer);
       x.waiting = false;
-      if (modal) modal = null;
+      if (modal?.kind === 'wait') modal = null;
       render();
       toast(`「${x.name}」超时未响应`, 'warn');
       return;
     }
     const lbl = document.querySelector(`.row[data-id="${id}"] .wait-sec`);
     if (lbl) lbl.textContent = x.waitLeft;
+    const foot = document.getElementById('modal-countdown');
+    if (foot && modal?.kind === 'wait') foot.textContent = `${x.waitLeft} 秒没人点就算拒绝`;
   }, 1000);
   modal = {
+    kind: 'wait',
     icon: 'shield', tone: 'amber',
     title: `模拟对方屏幕：「${S.name}」想控制「${d.name}」`,
-    text: `${KIND[d.kind].title}${d.via ? ' · 经' + d.via : ''}。对方电脑会出现「允许」和「拒绝」（30 秒倒计时）。`,
+    text: `${KIND[d.kind].title}${d.via ? ' · 经' + d.via : ''}。对方电脑弹出确认窗，你也可以取消等待。`,
     bar: true,
+    foot: '30 秒没人点就算拒绝',
+    onCancel: () => cancelWait(id),
     btns: [
       ['模拟对方拒绝', 'danger-solid', () => {
         clearInterval(waitTimer);
@@ -835,8 +896,65 @@ function cancelWait(id) {
   clearInterval(waitTimer);
   const d = dev(id);
   if (d) d.waiting = false;
-  if (modal) modal = null;
+  if (modal?.kind === 'wait') modal = null;
   render();
+}
+
+function simulateIncoming() {
+  if (S.hostedBy) {
+    toast(`「${S.hostedBy}」已经在控制本机了`, 'info');
+    return;
+  }
+  S.page = 'devices';
+  S.closed = false;
+  menu = null;
+  clearInterval(incomingTimer);
+  const who = '台式机';
+  S.incoming = { name: who, left: 30 };
+  const reject = (reason) => {
+    clearInterval(incomingTimer);
+    S.incoming = null;
+    if (modal?.kind === 'incoming') modal = null;
+    render();
+    toast(reason || `已拒绝「${who}」的控制请求`, 'info');
+  };
+  incomingTimer = setInterval(() => {
+    if (!S.incoming) { clearInterval(incomingTimer); return; }
+    S.incoming.left = Math.max(0, S.incoming.left - 1);
+    if (S.incoming.left <= 0) {
+      reject(`超时未确认，已自动拒绝「${who}」`);
+      return;
+    }
+    const foot = document.getElementById('modal-countdown');
+    if (foot && modal?.kind === 'incoming') foot.textContent = `${S.incoming.left} 秒没人点就算拒绝`;
+  }, 1000);
+  modal = {
+    kind: 'incoming',
+    icon: 'shield', tone: 'amber',
+    title: `「${who}」想控制这台电脑`,
+    text: '信任设备 · 仅本次连接有效，可随时点顶部的红色「断开」结束',
+    bar: true,
+    foot: '30 秒没人点就算拒绝',
+    onCancel: () => reject(),
+    btns: [
+      ['拒绝', 'danger-solid', () => reject()],
+      ['允许', 'primary', () => {
+        clearInterval(incomingTimer);
+        S.incoming = null;
+        S.hostedBy = who;
+        render();
+        toast(`已允许「${who}」控制本机`, 'ok');
+      }],
+    ],
+  };
+  render();
+}
+
+function stopHosting() {
+  const who = S.hostedBy;
+  S.hostedBy = null;
+  render();
+  if (who) toast(`已断开「${who}」的控制`, 'info');
 }
 
 function disconnect() {
@@ -931,7 +1049,7 @@ function copyCode() {
   S.codes.push({ n: ++codeSeq, label: `${fmtTime(now)} 复制` });
   markStep('copy');
   if (navigator.clipboard?.writeText) {
-    navigator.clipboard.writeText('rc1-demo-7K9mPq2x8nVw').catch(() => {});
+    navigator.clipboard.writeText('rc1-self-7K9mPq2x8nVw').catch(() => {});
   }
   render();
   setTimeout(render, 2100);
@@ -961,10 +1079,10 @@ function syncConnectAction() {
 
 function onConnectInput(el) {
   syncConnectAction();
-  if (/rc1-[A-Za-z0-9_-]{8,}/.test(el.value)) {
+  if (/^rc1-[A-Za-z0-9_-]{8,}$/.test(el.value.trim())) {
     const val = el.value;
     clearTimeout(pasteTimer);
-    pasteTimer = setTimeout(() => pasteCode(val), 120);
+    pasteTimer = setTimeout(() => pasteCode(val), 140);
   }
 }
 
@@ -972,17 +1090,33 @@ function pasteCode(text) {
   clearTimeout(pasteTimer);
   const v = (text || '').trim();
   if (!v) return;
-  markStep('input');
-  if (savedDevsForEmpty !== null) savedDevsForEmpty = null;
-  if (dev('guest-new')) {
+  const clearInput = () => {
     const input = document.getElementById('connect-code-in');
     if (input) { input.value = ''; syncConnectAction(); }
+  };
+  if (/^rc-relay-/i.test(v)) {
+    clearInput();
+    toast('这是中转码，请贴到「设置 → 自建中转」里', 'warn');
+    return;
+  }
+  if (/^rc1-self-/i.test(v)) {
+    clearInput();
+    toast('这是本机发出的连接码，要发给对方用', 'warn');
+    return;
+  }
+  if (!/^rc1-[A-Za-z0-9_-]{8,}$/.test(v)) {
+    clearInput();
+    toast(/^rc1/i.test(v) ? '连接码不完整或者有错字，请对方重新复制一次' : '这不是连接码', 'warn');
+    return;
+  }
+  markStep('input');
+  if (savedDevsForEmpty !== null) savedDevsForEmpty = null;
+  clearInput();
+  if (dev('guest-new')) {
     revealRow('guest-new');
     toast('「新添加的笔记本」已在临时设备里', 'info');
     return;
   }
-  const input = document.getElementById('connect-code-in');
-  if (input) { input.value = ''; syncConnectAction(); }
   S.devs.push({
     id: 'guest-new', name: '新添加的笔记本', icon: 'laptop', kind: 'temp',
     via: '连接码', online: true, info: '在线 · 26 ms · 直连',
@@ -1004,7 +1138,15 @@ function retry(id) {
 }
 
 /* ---------- Settings ---------- */
-function toggle(key) { S.set[key] = !S.set[key]; render(); }
+function toggle(key, el) {
+  if ((key === 'boot' || key === 'lock' || key === 'awake') && S.set.svc !== 'run') return;
+  S.set[key] = !S.set[key];
+  if (el) {
+    el.classList.toggle('on', S.set[key]);
+    return;
+  }
+  render();
+}
 function service(install) {
   ui.busy = install ? '正在安装后台服务…' : '正在卸载后台服务…';
   render();
@@ -1017,9 +1159,28 @@ function service(install) {
 }
 function saveName(v) {
   v = v.trim();
-  if (!v || v === S.name) return;
-  S.name = v; ui.saved = Date.now();
+  const next = v || DEFAULT_HOST;
+  if (next === S.name) {
+    const inp = document.getElementById('device-name-in');
+    if (inp && inp.value !== S.name) inp.value = S.name;
+    return;
+  }
+  S.name = next; ui.saved = Date.now();
   render();
+}
+function refreshRelays() {
+  if (ui.probing) return;
+  ui.probing = true;
+  render();
+  setTimeout(() => {
+    ui.probing = false;
+    S.relays.forEach((r, idx) => {
+      if (r.state === 'fail') return;
+      const base = idx === 0 ? 40 : 56;
+      r.rtt = base + Math.round((Math.random() - 0.5) * 10);
+    });
+    render();
+  }, 750);
 }
 function useRelay(i) {
   const r = S.relays.splice(i, 1)[0];
@@ -1035,52 +1196,83 @@ function removeRelay(i) {
   toast(`已移除中转 ${r.host}`, 'info', ['撤回', () => { r.hidden = false; render(); }, () => { S.relays = S.relays.filter(x => x !== r); render(); }]);
 }
 function addRelay() {
-  const v = document.querySelector('#win .relay-in')?.value.trim();
+  const inp = document.querySelector('#win .relay-in');
+  const v = inp?.value.trim();
   if (!v) return;
+  if (/^rc1-/i.test(v)) {
+    toast('这是连接码，请贴到「设备」页顶部输入框', 'warn');
+    return;
+  }
+  if (!/^rc-relay-/i.test(v)) {
+    toast('这不是中转码，请在服务器运行 rc-relay ui 获取', 'warn');
+    return;
+  }
   ui.adding = 'busy';
   render();
   setTimeout(() => {
     ui.adding = false;
     const isFirst = S.relays.filter(r => !r.hidden).length === 0;
-    S.relays.push({ host: 'jp-relay.example.com:7843', state: isFirst ? 'home' : 'idle' });
+    S.relays.push({ host: 'jp-relay.example.com:7843', state: isFirst ? 'home' : 'idle', rtt: 35 });
     render();
     toast('已添加中转 jp-relay.example.com:7843', 'ok');
   }, 900);
 }
 
-/* ---------- Menu (auto-flip when near window bottom) ---------- */
+/* ---------- Menu (auto-flip using actual rendered height) ---------- */
 function openMenu(ev, id) {
   ev.stopPropagation();
-  if (menu && menu.id === id) { menu = null; render(); return; }
-  const d = dev(id);
+  if (menu && menu.id === id) { menu = null; renderMenu(); return; }
   const r = ev.currentTarget.getBoundingClientRect();
   const w = document.getElementById('win').getBoundingClientRect();
-  const estH = d && d.kind !== 'temp' ? 218 : 96;
-  const x = Math.max(12, r.right - w.left - 210);
-  const below = r.bottom - w.top + 4;
-  const flipUp = below + estH > w.height - 8;
-  const y = flipUp ? Math.max(40, r.top - w.top - estH - 4) : below;
-  menu = { id, x, y, up: flipUp };
-  render();
+  menu = {
+    id,
+    x: Math.max(12, r.right - w.left - 210),
+    topRef: r.top - w.top,
+    botRef: r.bottom - w.top,
+    winH: w.height,
+  };
+  renderMenu();
 }
-function menuHtml() {
+function renderMenu() {
+  const layer = document.querySelector('#win .menu-layer');
+  if (!layer) return;
+  if (!menu) { layer.innerHTML = ''; return; }
   const d = dev(menu.id);
-  if (!d) return '';
+  if (!d) { menu = null; layer.innerHTML = ''; return; }
   const it = (icon, label, fn, cls = '', extra = '') =>
-    `<div class="it ${cls}" onclick="event.stopPropagation();menu=null;${fn}">${icon ? ic(icon) : '<span style="width:15px"></span>'}<span>${label}</span>${extra}</div>`;
-  let h = it('term', '终端', d.online ? `render();openTerm('${d.id}')` : '', d.online ? '' : 'dis');
+    `<div class="it ${cls}" onclick="event.stopPropagation();menu=null;renderMenu();${fn}">${icon ? ic(icon) : '<span style="width:15px"></span>'}<span>${label}</span>${extra}</div>`;
+  let h = it('term', '终端', d.online ? `openTerm('${d.id}')` : '', d.online ? '' : 'dis');
   if (d.kind !== 'temp') {
     h += it('rename', '重命名', `startRename('${d.id}')`);
     h += `<div class="sep"></div><div class="mhead">它控制本机时</div>`;
     for (const k of ['mine', 'trusted']) {
-      h += it('', `${KIND[k].title} <span class="sub">${k === 'mine' ? '免确认' : '需确认'}</span>`, `setKind('${d.id}','${k}')`, '',
+      h += it('', `${KIND[k].title} <span class="msub">${k === 'mine' ? '免确认' : '需确认'}</span>`, `setKind('${d.id}','${k}')`, '',
         d.kind === k ? `<span class="tick">${ic('check')}</span>` : '');
     }
   }
   h += `<div class="sep"></div>` + it('del', '删除', `askDelete('${d.id}')`, 'danger');
-  return `<div class="menu ${menu.up ? 'up' : ''}" style="left:${menu.x}px;top:${menu.y}px" onclick="event.stopPropagation()">${h}</div>`;
+  layer.innerHTML = `<div class="menu" style="left:${menu.x}px;top:${menu.botRef + 4}px" onclick="event.stopPropagation()">${h}</div>`;
+  const mEl = layer.firstElementChild;
+  if (mEl) {
+    const mh = mEl.offsetHeight;
+    if (menu.botRef + 4 + mh > menu.winH - 8) {
+      mEl.classList.add('up');
+      mEl.style.top = Math.max(40, menu.topRef - mh - 4) + 'px';
+    }
+  }
 }
-document.addEventListener('click', () => { if (menu) { menu = null; render(); } });
+document.addEventListener('click', () => { if (menu) { menu = null; renderMenu(); } });
+document.addEventListener('keydown', e => {
+  if (e.key !== 'Escape') return;
+  if (term) { term = null; renderOverlay(); return; }
+  if (menu) { menu = null; renderMenu(); return; }
+  if (modal) {
+    const cb = modal.onCancel;
+    modal = null;
+    render();
+    if (cb) cb();
+  }
+});
 
 /* ---------- Render Devices & Settings ---------- */
 function rowHtml(d) {
@@ -1139,10 +1331,11 @@ function devicesHtml() {
     list = `<div class="empty">${ic('devices')}<div class="et">还没有设备</div><div class="ed">同一局域网会自动出现；跨网请复制连接码发给对方，或贴到上方</div></div>`;
   }
   let banner = '';
-  if (S.controlling) {
-    const d = dev(S.controlling);
-    banner = `<div class="banner red">${ic('desktop')}<div class="grow">正在控制 <b>${esc(d ? d.name : '')}</b></div>
-      <button class="danger" onclick="disconnect()">断开</button></div>`;
+  if (S.hostedBy) {
+    banner = `<div class="banner red">${ic('desktop')}<div class="grow"><b>「${esc(S.hostedBy)}」</b> 正在控制本机</div>
+      <button class="danger" onclick="stopHosting()">断开</button></div>`;
+  } else if (S.incoming) {
+    banner = `<div class="banner amber">${ic('shield')}<div class="grow"><b>「${esc(S.incoming.name)}」</b> 想控制本机，等待确认</div></div>`;
   } else if (ui.busy) {
     banner = `<div class="banner blue"><span class="spin big"></span><div class="grow">${ui.busy}</div></div>`;
   }
@@ -1168,7 +1361,7 @@ function devicesHtml() {
     ${banner}${list}`;
 }
 
-const sw = (key, dis) => `<span class="sw ${!dis && S.set[key] ? 'on' : ''} ${dis ? 'off-dis' : ''}" onclick="toggle('${key}')"></span>`;
+const sw = (key, dis) => `<span class="sw ${!dis && S.set[key] ? 'on' : ''} ${dis ? 'off-dis' : ''}" onclick="toggle('${key}', this)"></span>`;
 const item = (icon, t, d, right, cls = '') =>
   `<div class="item ${cls}">${ic(icon)}<div class="txt2"><div class="t">${t}</div>${d ? `<div class="d">${d}</div>` : ''}</div><div class="r">${right}</div></div>`;
 
@@ -1187,7 +1380,7 @@ function settingsHtml() {
   const saved = Date.now() - ui.saved < 1800 ? `<span class="saved">✓ 已保存</span>` : '';
   let h = `<div class="head"><h1>设置</h1></div>`;
   h += `<div class="sec" id="sec-self"><div class="sh"><b>本机</b></div><div class="group">
-    ${item('rename', '设备名称', '其他设备看到的本机名称', `${saved}<input id="device-name-in" name="device-name" class="field" style="width:200px" value="${esc(S.name)}" onkeydown="if(event.key==='Enter')this.blur()" onblur="saveName(this.value)">`)}
+    ${item('rename', '设备名称', '其他设备看到的本机名称', `${saved}<input id="device-name-in" name="device-name" class="field" style="width:200px" placeholder="默认：${DEFAULT_HOST}" value="${esc(S.name)}" onkeydown="if(event.key==='Enter')this.blur();if(event.key==='Escape'){this.value=S.name;this.blur()}" onblur="saveName(this.value)">`)}
   </div></div>`;
   h += `<div class="sec"><div class="sh"><b>网络与发现</b></div><div class="group">
     ${item('globe', '公网辅助连接', '跨网直连时用于交换地址，不转发画面和数据', sw('public'))}
@@ -1195,21 +1388,28 @@ function settingsHtml() {
   </div></div>`;
 
   const relays = S.relays.filter(r => !r.hidden);
-  const rstate = {
-    home: ['已连接（首选） · 42 ms', ''],
-    temp: ['临时接管（首选不可用）', ''],
-    idle: ['备用 · 首选不可用时接管 · 58 ms', 'grey'],
-    fail: ['连接失败', 'amber'],
+  const relayDesc = r => {
+    const rtt = ui.probing ? ' · 测速中…' : (r.rtt ? ` · ${r.rtt} ms` : '');
+    if (r.state === 'home') return [`已连接（首选）${rtt}`, ''];
+    if (r.state === 'temp') return [`临时接管（首选不可用）${rtt}`, ''];
+    if (r.state === 'fail') return ['连接失败', 'amber'];
+    return [`备用 · 首选不可用时接管${rtt}`, 'grey'];
   };
-  h += `<div class="sec" id="sec-relays"><div class="sh"><b>自建中转</b><span>按顺序优先使用，直连受阻时自动接管</span></div><div class="group">
-    ${relays.map((r, i) => `<div class="item"><span class="pdot ${rstate[r.state][1]}" style="margin:0 6px"></span>
-      <div class="txt2"><div class="t mono" style="font-size:13px">${esc(r.host)}</div><div class="d">${rstate[r.state][0]}</div></div>
+  const probeBtn = relays.length
+    ? `<button class="icon sh-act ${ui.probing ? 'spinning' : ''}" title="${ui.probing ? '测速中…' : '重新测速'}" ${ui.probing ? 'disabled' : ''} onclick="refreshRelays()">${ic('refresh')}</button>`
+    : '';
+  h += `<div class="sec" id="sec-relays"><div class="sh"><b>自建中转</b><span>按顺序优先使用，直连受阻时自动接管</span>${probeBtn}</div><div class="group">
+    ${relays.map((r, i) => {
+      const [desc, dotCls] = relayDesc(r);
+      return `<div class="item"><span class="pdot ${dotCls}" style="margin:0 6px"></span>
+      <div class="txt2"><div class="t mono" style="font-size:13px">${esc(r.host)}</div><div class="d">${desc}</div></div>
       <div class="r">${i ? `<button class="ghost" onclick="useRelay(${S.relays.indexOf(r)})">设为首选</button>` : ''}
-      <button class="icon red" title="移除" onclick="removeRelay(${S.relays.indexOf(r)})">${ic('del')}</button></div></div>`).join('')}
+      <button class="icon red" title="移除" onclick="removeRelay(${S.relays.indexOf(r)})">${ic('del')}</button></div></div>`;
+    }).join('')}
     ${ui.adding
       ? `<div class="item add-form" style="align-items:flex-start;padding-top:12px;padding-bottom:12px">${ic('server')}
            <div class="txt2" style="display:flex;flex-direction:column;gap:5px">
-             <input class="field relay-in" style="width:100%" placeholder="粘贴中转码" ${ui.adding === 'busy' ? 'disabled' : ''}
+             <input class="field relay-in" style="width:100%" placeholder="粘贴中转码（如 rc-relay-...）" ${ui.adding === 'busy' ? 'disabled' : ''}
                onkeydown="if(event.key==='Enter')addRelay();if(event.key==='Escape'){ui.adding=false;render()}">
              <div class="d">在自建服务器运行 <span class="mono">rc-relay ui</span> 获取中转码</div>
            </div>
@@ -1247,14 +1447,16 @@ function settingsHtml() {
 }
 
 function render() {
+  mountShell();
   renderGuide();
   const w = document.getElementById('win');
-  const old = [...w.querySelectorAll('.toast')];
-  const top = w.querySelector('.scroll')?.scrollTop || 0;
+  const pane = w.querySelector('.pane');
+  const sc = w.querySelector('.scroll');
   const prevPage = w.dataset.page;
   const pageChanged = Boolean(prevPage && prevPage !== S.page);
-  const val = w.querySelector('.connect input')?.value || '';
-  const relayIn = w.querySelector('.relay-in')?.value || '';
+  const top = sc.scrollTop;
+  const val = sc.querySelector('.connect input')?.value || '';
+  const relayIn = sc.querySelector('.relay-in')?.value || '';
 
   const nav = (page, icon, label, extra = '') => {
     const pCls = (activePulse === 'nav-settings' && page === 'settings' && S.page !== 'settings') ? 'pulse' : '';
@@ -1272,44 +1474,43 @@ function render() {
       </div>`
     : '';
 
-  w.innerHTML = `
-    <div class="titlebar">
-      ${appIconSvg()}Remote Control
-      <div class="caps"><span>${ic('min')}</span><span>${ic('max')}</span><span class="x" onclick="S.closed=true;menu=null;render()" title="关闭窗口到托盘">${ic('close')}</span></div>
+  pane.innerHTML = `
+    <div class="me" title="点击前往设置修改设备名称" onclick="jumpToSettings('sec-self')">
+      <div class="av mine" style="width:40px;height:40px;border-radius:10px">${ic(S.icon)}</div>
+      <div><div class="nm">${esc(S.name)}</div><div class="st"><span class="pdot live"></span>本机 · 在线</div></div>
     </div>
-    <div class="body">
-      <div class="pane">
-        <div class="me" title="点击前往设置修改设备名称" onclick="jumpToSettings('sec-self')">
-          <div class="av mine" style="width:40px;height:40px;border-radius:10px">${ic(S.icon)}</div>
-          <div><div class="nm">${esc(S.name)}</div><div class="st"><span class="pdot live"></span>本机 · 在线</div></div>
-        </div>
-        ${nav('devices', 'devices', '设备', `<span class="count">${S.devs.length}</span>`)}
-        ${nav('settings', 'gear', '设置')}
-        ${relayBlock}
-      </div>
-      <div class="content">
-        <div class="scroll ${pageChanged ? 'page-enter' : ''}">${S.page === 'devices' ? devicesHtml() : settingsHtml()}</div>
-        <div class="sbar-track"><div class="sbar-thumb"></div></div>
-      </div>
-    </div>
-    ${menu ? menuHtml() : ''}
-    ${modal ? `<div class="veil"><div class="dialog"><div class="top2"><div class="badge ${modal.tone}">${ic(modal.icon)}</div>
-      <div><h4>${esc(modal.title)}</h4><p>${esc(modal.text)}</p></div></div>${modal.bar ? '<div class="bar"><div></div></div>' : ''}
-      <div class="btns">${modal.btns.map((b, i) => `<button class="${b[1]}" onclick="modalBtn(${i})">${b[0]}</button>`).join('')}</div></div></div>` : ''}
-    ${S.closed ? `<div class="closed">窗口已关闭（缩到托盘，后台服务保持在线）<button onclick="S.closed=false;render()">从托盘打开</button></div>` : ''}
-    <div class="toasts"></div>`;
+    ${nav('devices', 'devices', '设备', `<span class="count">${S.devs.length}</span>`)}
+    ${nav('settings', 'gear', '设置')}
+    ${relayBlock}`;
+
+  sc.innerHTML = S.page === 'devices' ? devicesHtml() : settingsHtml();
+  if (pageChanged) {
+    sc.scrollTop = 0;
+    sc.classList.remove('page-enter');
+    void sc.offsetWidth;
+    sc.classList.add('page-enter');
+  } else {
+    sc.scrollTop = top;
+  }
+
+  renderMenu();
+
+  const modalLayer = w.querySelector('.modal-layer');
+  modalLayer.innerHTML = modal ? `<div class="veil"><div class="dialog"><div class="top2"><div class="badge ${modal.tone}">${ic(modal.icon)}</div>
+    <div><h4>${esc(modal.title)}</h4><p>${esc(modal.text)}</p></div></div>${modal.bar ? '<div class="bar"><div></div></div>' : ''}
+    <div class="btns">${modal.foot ? `<span class="foot-note" id="modal-countdown">${esc(modal.foot)}</span>` : ''}${modal.btns.map((b, i) => `<button class="${b[1]}" onclick="modalBtn(${i})">${b[0]}</button>`).join('')}</div></div></div>` : '';
+
+  const closedLayer = w.querySelector('.closed-layer');
+  closedLayer.innerHTML = S.closed ? `<div class="closed">窗口已关闭（缩到托盘，后台服务保持在线）<button onclick="S.closed=false;render()">从托盘打开</button></div>` : '';
 
   w.dataset.page = S.page;
-  const box = w.querySelector('.toasts');
-  old.forEach(t => box.appendChild(t));
-  if (prevPage === S.page) w.querySelector('.scroll').scrollTop = top;
-  const c = w.querySelector('.connect input');
+  const c = sc.querySelector('.connect input');
   if (c) {
     c.value = val;
     syncConnectAction();
   }
-  const r = w.querySelector('.relay-in'); if (r) r.value = relayIn;
-  bindScrollbar();
+  const r = sc.querySelector('.relay-in'); if (r) r.value = relayIn;
+  requestAnimationFrame(() => updateScrollbar?.(pageChanged));
 }
 
 function shortHost(h) {
