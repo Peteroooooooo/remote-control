@@ -320,11 +320,25 @@ impl HostMuteGuard {
     }
 
     pub fn set_muted(&mut self, mute: bool) {
+        let prev_want = self.want_muted;
         self.want_muted = mute;
         if !mute {
             self.restore();
             return;
         }
+        if self.saved.is_some() || prev_want {
+            return;
+        }
+        self.apply_mute();
+    }
+
+    pub fn poll(&mut self) {
+        if self.want_muted {
+            self.apply_mute();
+        }
+    }
+
+    fn apply_mute(&mut self) {
         let Ok((dev, id)) = default_render_device(&self.enumerator) else {
             return;
         };
@@ -342,12 +356,6 @@ impl HostMuteGuard {
             return;
         }
         self.saved = Some((id, orig));
-    }
-
-    pub fn poll(&mut self) {
-        if self.want_muted {
-            self.set_muted(true);
-        }
     }
 
     pub fn restore(&mut self) {
@@ -925,7 +933,12 @@ impl Player {
             super::config::set_active_rate_hz(active_rate);
             let buffer_frames = unsafe { audio_client.GetBufferSize() }?;
             let render_client: IAudioRenderClient = unsafe { audio_client.GetService() }?;
-            unsafe { audio_client.Start() }?;
+            let mut stream_running = if super::config::viewer_enabled() {
+                unsafe { audio_client.Start() }?;
+                true
+            } else {
+                false
+            };
 
             resampler.reset();
             pcm_queue.clear();
@@ -935,7 +948,11 @@ impl Player {
             let mut underrun_armed = false;
             let mut last_dev_check = Instant::now();
             let mut timer_guard: Option<super::TimerPeriodGuard> = None;
-            let mut cur_gain = volume_gain(super::config::viewer_volume());
+            let mut cur_gain = if stream_running {
+                volume_gain(super::config::viewer_volume())
+            } else {
+                0.0
+            };
             let dev_ch = fmt.channels as usize;
             let dev_10ms_floats = (fmt.rate as usize / 100).max(1) * dev_ch;
             let max_queue_floats = dev_10ms_floats * 12; // ~120 ms cap
@@ -952,6 +969,53 @@ impl Player {
                     underrun_armed = false;
                     jitter.reset_stream();
                     resampler.reset();
+                }
+
+                if !super::config::viewer_enabled() {
+                    if !drain_rx(rx) {
+                        if stream_running {
+                            let _ = unsafe { audio_client.Stop() };
+                        }
+                        return Ok(());
+                    }
+                    timer_guard = None;
+                    if stream_running {
+                        let _ = unsafe { audio_client.Stop() };
+                        let _ = unsafe { audio_client.Reset() };
+                        stream_running = false;
+                    }
+                    cur_gain = 0.0;
+                    pending.clear();
+                    pcm_queue.clear();
+                    expected_seq = None;
+                    last_rx = None;
+                    last_rx_at = None;
+                    primed = false;
+                    first_pending_at = None;
+                    underrun_armed = false;
+                    jitter.reset_stream();
+                    resampler.reset();
+                    std::thread::sleep(Duration::from_millis(40));
+                    continue 'reopen;
+                }
+
+                if !stream_running {
+                    if let Some((id, r)) = default_render_rate(&enumerator) {
+                        super::config::set_viewer_rate_hz(r);
+                        if id != cur_id {
+                            log!("audio playback: default output device switched");
+                            break 'reopen;
+                        }
+                    }
+                    last_dev_check = Instant::now();
+                    if let Err(e) = unsafe { audio_client.Start() } {
+                        if e.code() == AUDCLNT_E_DEVICE_INVALIDATED {
+                            break 'reopen;
+                        }
+                        return Err(e.into());
+                    }
+                    stream_running = true;
+                    timer_guard = Some(super::TimerPeriodGuard::enter(1));
                 }
 
                 loop {
@@ -1300,7 +1364,9 @@ impl Player {
                 std::thread::sleep(Duration::from_millis(4));
             }
 
-            let _ = unsafe { audio_client.Stop() };
+            if stream_running {
+                let _ = unsafe { audio_client.Stop() };
+            }
             if !stop.load(Ordering::Relaxed) {
                 std::thread::sleep(Duration::from_millis(80));
             }

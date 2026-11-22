@@ -10,6 +10,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+use reed_solomon_simd::ReedSolomonEncoder;
+
 use crate::wire::{Report, SHARD_HDR, ShardHeader};
 
 /// Upper bound on data shards per frame (about 45 MB at 1400-byte datagrams).
@@ -24,51 +26,97 @@ pub fn parity_count(data: usize, parity_pct: u32, min_parity: u16) -> usize {
     (data * parity_pct as usize).div_ceil(100).max(min_parity as usize).min(MAX_DATA_SHARDS)
 }
 
+/// Reusable Reed-Solomon frame encoder that caches its working buffers across
+/// frames and writes each shard directly into its outgoing datagram buffer.
+#[derive(Default)]
+pub struct FrameEncoder {
+    rs: Option<ReedSolomonEncoder>,
+}
+
+impl FrameEncoder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Splits `data` into datagrams of at most `max_datagram` bytes (header included),
+    /// data shards first, then parity shards.
+    ///
+    /// Panics if `max_datagram` leaves no room for payload or the frame would need
+    /// more than 32 768 data shards.
+    pub fn encode_frame(
+        &mut self,
+        frame: u32,
+        data: &[u8],
+        max_datagram: usize,
+        parity_pct: u32,
+        min_parity: u16,
+    ) -> Vec<Vec<u8>> {
+        assert!(max_datagram >= SHARD_HDR + 2, "datagram too small");
+        // The Reed-Solomon library needs shard sizes that are a multiple of 2.
+        let max_shard = (max_datagram - SHARD_HDR) & !1;
+        let k = data.len().div_ceil(max_shard).max(1);
+        assert!(k <= MAX_DATA_SHARDS, "frame too large");
+        let shard_len = (data.len().div_ceil(k).max(2) + 1) & !1;
+        let m = parity_count(k, parity_pct, min_parity).min(u16::MAX as usize - k);
+
+        let mut rs = if m > 0 {
+            if self.rs.as_mut().is_none_or(|rs| rs.reset(k, m, shard_len).is_err()) {
+                self.rs = Some(ReedSolomonEncoder::new(k, m, shard_len).expect("shard counts and sizes are valid"));
+            }
+            self.rs.as_mut()
+        } else {
+            None
+        };
+
+        let mut datagrams = Vec::with_capacity(k + m);
+        for i in 0..k {
+            let mut d = Vec::with_capacity(SHARD_HDR + shard_len);
+            ShardHeader {
+                frame,
+                index: i as u16,
+                data: k as u16,
+                parity: m as u16,
+                frame_len: data.len() as u32,
+            }
+            .write(&mut d);
+            let start = (i * shard_len).min(data.len());
+            let end = (start + shard_len).min(data.len());
+            d.extend_from_slice(&data[start..end]);
+            d.resize(SHARD_HDR + shard_len, 0);
+            if let Some(rs) = rs.as_mut() {
+                rs.add_original_shard(&d[SHARD_HDR..]).expect("shard count and size are valid");
+            }
+            datagrams.push(d);
+        }
+
+        if let Some(rs) = rs {
+            let result = rs.encode().expect("shard counts and sizes are valid");
+            for (j, parity_shard) in result.recovery_iter().enumerate() {
+                let mut d = Vec::with_capacity(SHARD_HDR + shard_len);
+                ShardHeader {
+                    frame,
+                    index: u16::try_from(k + j).expect("total shards fit in u16"),
+                    data: k as u16,
+                    parity: m as u16,
+                    frame_len: data.len() as u32,
+                }
+                .write(&mut d);
+                d.extend_from_slice(parity_shard);
+                datagrams.push(d);
+            }
+        }
+
+        datagrams
+    }
+}
+
 /// Splits `data` into datagrams of at most `max_datagram` bytes (header included),
 /// data shards first, then parity shards.
 ///
 /// Panics if `max_datagram` leaves no room for payload or the frame would need
 /// more than 32 768 data shards.
 pub fn encode_frame(frame: u32, data: &[u8], max_datagram: usize, parity_pct: u32, min_parity: u16) -> Vec<Vec<u8>> {
-    assert!(max_datagram >= SHARD_HDR + 2, "datagram too small");
-    // The Reed-Solomon library needs shard sizes that are a multiple of 2.
-    let max_shard = (max_datagram - SHARD_HDR) & !1;
-    let k = data.len().div_ceil(max_shard).max(1);
-    assert!(k <= MAX_DATA_SHARDS, "frame too large");
-    let shard_len = (data.len().div_ceil(k).max(2) + 1) & !1;
-    let m = parity_count(k, parity_pct, min_parity).min(u16::MAX as usize - k);
-
-    let mut shards: Vec<Vec<u8>> = (0..k)
-        .map(|i| {
-            let start = (i * shard_len).min(data.len());
-            let end = (start + shard_len).min(data.len());
-            let mut s = data[start..end].to_vec();
-            s.resize(shard_len, 0);
-            s
-        })
-        .collect();
-    if m > 0 {
-        let parity = reed_solomon_simd::encode(k, m, &shards).expect("shard counts and sizes are valid");
-        shards.extend(parity);
-    }
-
-    shards
-        .into_iter()
-        .enumerate()
-        .map(|(i, s)| {
-            let mut d = Vec::with_capacity(SHARD_HDR + s.len());
-            ShardHeader {
-                frame,
-                index: u16::try_from(i).expect("total shards fit in u16"),
-                data: k as u16,
-                parity: m as u16,
-                frame_len: data.len() as u32,
-            }
-            .write(&mut d);
-            d.extend_from_slice(&s);
-            d
-        })
-        .collect()
+    FrameEncoder::new().encode_frame(frame, data, max_datagram, parity_pct, min_parity)
 }
 
 /// A frame the receiver can hand to the decoder.
@@ -336,5 +384,42 @@ mod tests {
         assert_eq!(first.parity, 32_767);
         let (last, _) = ShardHeader::parse(pkts.last().unwrap()).expect("last shard parses");
         assert_eq!(last.index, u16::MAX - 1);
+    }
+
+    #[test]
+    fn frame_encoder_reuses_across_varying_sizes_and_parity() {
+        let mut enc = FrameEncoder::new();
+        let cases: &[(u32, usize, usize, u32, u16)] = &[
+            (1, 0, 1400, 20, 2),
+            (2, 3, 1400, 20, 2),
+            (3, 5_000, 1200, 0, 2),
+            (4, 41_666, 1400, 20, 2),
+            (5, 1_200, 1400, 50, 2),
+            (6, 90_000, 1200, 10, 2),
+            (7, 10_000, 1400, 0, 2),
+            (8, 25_000, 1400, 35, 2),
+        ];
+
+        for &(frame, len, max_datagram, parity_pct, min_parity) in cases {
+            let data = frame_bytes(len);
+            let reused = enc.encode_frame(frame, &data, max_datagram, parity_pct, min_parity);
+            let fresh = encode_frame(frame, &data, max_datagram, parity_pct, min_parity);
+            assert_eq!(reused, fresh, "mismatch on frame {frame} (len={len}, parity={parity_pct})");
+
+            let (h, _) = ShardHeader::parse(&reused[0]).unwrap();
+            let mut a = Assembler::new(Duration::from_millis(100));
+            let now = Instant::now();
+            // Drop up to `h.parity` data shards when parity is enabled to verify RS recovery.
+            let drop_count = (h.parity as usize).min(h.data as usize);
+            let mut out = None;
+            for p in reused.iter().skip(drop_count) {
+                if let Some(c) = a.push(p, now) {
+                    out = Some(c);
+                }
+            }
+            let c = out.expect("frame decodes");
+            assert_eq!(c.frame, frame);
+            assert_eq!(c.data, data);
+        }
     }
 }

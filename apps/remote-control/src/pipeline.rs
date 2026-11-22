@@ -97,10 +97,12 @@ const REFINE: Duration = Duration::from_secs(4);
 /// re-encode the still picture, so refining never races a live 60 Hz drag or
 /// scroll and steals its encode slot.
 const REFINE_IDLE: Duration = Duration::from_millis(80);
-/// ...or until this many frames in a row came out nearly empty
-/// (`REFINE_DONE`). The NVIDIA encoder above paused for up to 10 nearly
+/// ...or until ~330 ms of consecutive frames came out nearly empty
+/// (`refine_done`). The NVIDIA encoder above paused for up to 10 nearly
 /// empty frames before it went on refining.
-const REFINE_TINY_RUN: u32 = 20;
+fn refine_tiny_run(fps: u32) -> u32 {
+    (fps / 3).max(10)
+}
 
 /// How long to wait in `cap.grab` given whether a frame is already pending and
 /// when the still-frame refiner should next run.
@@ -119,9 +121,9 @@ fn capture_wait(has_pending: bool, refine_armed: bool, since_new: Duration, next
     Duration::from_millis(50)
 }
 
-/// A frame this small adds nothing: a tenth of its budget, at least 1 KB.
+/// A frame this small adds nothing: a tenth of its budget, at least 250 bytes.
 fn refine_done(bytes: usize, budget: usize) -> bool {
-    bytes < (budget / 10).max(1000)
+    bytes < (budget / 10).max(250)
 }
 
 fn qpc() -> i64 {
@@ -377,7 +379,10 @@ enum Convert {
     Nv12Agent(crate::nv12::ToNv12, Vec<crate::nv12::Nv12Views>),
     Nv12(crate::nv12::ToNv12, crate::nv12::Nv12Views),
     Vp(Vp, vp::VpViews),
-    Ayuv(crate::yuv444::ToAyuv),
+    /// Zero-copy 4:4:4 path for `wgc::Agent`: runs `ToAyuv` straight from the
+    /// acquired shared ring texture into `pic` during grab.
+    AyuvAgent(crate::yuv444::ToAyuv, Vec<crate::yuv444::AyuvViews>),
+    Ayuv(crate::yuv444::ToAyuv, crate::yuv444::AyuvViews),
 }
 
 /// Minimum spacing between encoded frames. When streaming at the display's
@@ -507,9 +512,21 @@ fn run_once(
     let (pic_w, pic_h) = if yuv444 { (w, h) } else { enc.preferred_input_size().unwrap_or((w, h)) };
     let pic = yuv_texture(&gpu, pic_w, pic_h, yuv444)?;
     let conv = if yuv444 {
-        let img = cap.image(&gpu)?;
-        match crate::yuv444::ToAyuv::new(&gpu, img, &pic, (w, h)) {
-            Ok(c) => Convert::Ayuv(c),
+        let ayuv_res = crate::yuv444::ToAyuv::shader(&gpu, (w, h)).and_then(|shader| {
+            if let Some(ring) = cap.agent_ring() {
+                let views = ring
+                    .iter()
+                    .map(|t| shader.make_views(&gpu, t, &pic))
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(Convert::AyuvAgent(shader, views))
+            } else {
+                let img = cap.image(&gpu)?;
+                let views = shader.make_views(&gpu, img, &pic)?;
+                Ok(Convert::Ayuv(shader, views))
+            }
+        });
+        match ayuv_res {
+            Ok(c) => c,
             Err(e) => {
                 log!("4:4:4: {e:#}; 4:2:0 from now on");
                 quirks.no_444 = true;
@@ -577,6 +594,7 @@ fn run_once(
     let full = RECT { left: 0, top: 0, right: w as i32, bottom: h as i32 };
     let mut pending: Option<i64> = None;
     let mut have_image = false;
+    let mut pic_dirty = false;
     // Encoding the still picture again until then (see the module notes),
     // and how many nearly empty frames came out of that in a row.
     let mut refine_until: Option<Instant> = None;
@@ -590,6 +608,8 @@ fn run_once(
     let mut tried = quirks.rekeys || quirks.dies;
     // When the encoder's bitrate was last changed in place.
     let mut changed_at: Option<Instant> = None;
+    // Backoff after a failed or clamped set_bitrate so we don't spin Reset every frame.
+    let mut rate_cooldown_until: Option<Instant> = None;
     // Since when the encoder has been handing back nothing.
     let mut no_output_since: Option<Instant> = None;
     let mut frames = 0u64;
@@ -628,6 +648,9 @@ fn run_once(
             Convert::Nv12Agent(shader, views) => cap
                 .grab_agent_with(wait_ms, |slot| shader.run(&gpu, &views[slot]))
                 .expect("Nv12Agent is only constructed for Agent capture"),
+            Convert::AyuvAgent(shader, views) => cap
+                .grab_agent_with(wait_ms, |slot| shader.run_views(&gpu, &views[slot]))
+                .expect("AyuvAgent is only constructed for Agent capture"),
             _ => cap.grab(&gpu, wait_ms),
         };
         let grab = match grab_res {
@@ -646,6 +669,7 @@ fn run_once(
             Grab::New { present_qpc } => {
                 pending = Some(present_qpc);
                 have_image = true;
+                pic_dirty = true;
                 last_new_frame = Instant::now();
                 refining = false;
             }
@@ -689,7 +713,9 @@ fn run_once(
             enc.set_bitrate((enc.bitrate as f64 * 0.98) as u32);
             changed_at = Some(Instant::now());
             tried = true;
-        } else if should_change(enc.bitrate, if shrunk { bitrate } else { chosen }, last_change.elapsed(), expensive) {
+        } else if rate_cooldown_until.is_none_or(|t| Instant::now() >= t)
+            && should_change(enc.bitrate, if shrunk { bitrate } else { chosen }, last_change.elapsed(), expensive)
+        {
             let rate = if shrunk { bitrate } else { chosen };
             if quirks.dies {
                 // A new encoder starts with a key frame, like a change on an
@@ -697,8 +723,16 @@ fn run_once(
                 enc = new_encoder(&gpu, w, h, fps, &cfg, quirks, rate, yuv444)?;
                 no_output_since = None;
             } else {
+                let prev = enc.bitrate;
                 enc.set_bitrate(rate);
-                changed_at = Some(Instant::now());
+                if enc.bitrate != prev {
+                    changed_at = Some(Instant::now());
+                }
+                if should_change(enc.bitrate, rate, Duration::MAX, false) {
+                    rate_cooldown_until = Some(Instant::now() + Duration::from_secs(3));
+                } else {
+                    rate_cooldown_until = None;
+                }
             }
             last_change = Instant::now();
         }
@@ -708,10 +742,20 @@ fn run_once(
         let t_enc = Instant::now();
         let enc_start_qpc = qpc();
         match &conv {
-            Convert::Nv12Agent(_, _) => {}
-            Convert::Nv12(s, views) => s.run(&gpu, views),
-            Convert::Vp(v, views) => v.blt_views(views, full)?,
-            Convert::Ayuv(a) => a.run(&gpu),
+            Convert::Nv12Agent(_, _) | Convert::AyuvAgent(_, _) => pic_dirty = false,
+            Convert::Nv12(s, views) if pic_dirty => {
+                s.run(&gpu, views);
+                pic_dirty = false;
+            }
+            Convert::Vp(v, views) if pic_dirty => {
+                v.blt_views(views, full)?;
+                pic_dirty = false;
+            }
+            Convert::Ayuv(a, views) if pic_dirty => {
+                a.run_views(&gpu, views);
+                pic_dirty = false;
+            }
+            Convert::Nv12(_, _) | Convert::Vp(_, _) | Convert::Ayuv(_, _) => {}
         }
         pending = None;
         let r = match enc.encode(&pic, Duration::from_millis(100), None) {
@@ -732,8 +776,14 @@ fn run_once(
                 log!("HEVC encoder failed ({err:#}); using H.264 from now on");
                 quirks.no_hevc = true;
                 changed_at = None;
+                rate_cooldown_until = None;
                 no_output_since = None;
-                enc = new_encoder(&gpu, w, h, fps, &cfg, quirks, enc.bitrate, false)?;
+                let prev_bitrate = enc.bitrate;
+                let init_bitrate = if quirks.dies { prev_bitrate } else { max_bps };
+                enc = new_encoder(&gpu, w, h, fps, &cfg, quirks, init_bitrate, false)?;
+                if !quirks.dies && prev_bitrate < max_bps {
+                    enc.set_bitrate(prev_bitrate);
+                }
                 if enc.preferred_input_size().unwrap_or((w, h)) != (pic_w, pic_h) {
                     return Ok(());
                 }
@@ -745,9 +795,11 @@ fn run_once(
                 log!("encoder died after a bitrate change ({err:#}); changing the bitrate by rebuilding it from now on");
                 quirks.dies = true;
                 changed_at = None;
+                rate_cooldown_until = None;
                 no_output_since = None;
                 tried = true;
-                enc = new_encoder(&gpu, w, h, fps, &cfg, quirks, enc.bitrate, yuv444)?;
+                let prev_bitrate = enc.bitrate;
+                enc = new_encoder(&gpu, w, h, fps, &cfg, quirks, prev_bitrate, yuv444)?;
                 if !yuv444 && enc.preferred_input_size().unwrap_or((w, h)) != (pic_w, pic_h) {
                     return Ok(());
                 }
@@ -771,7 +823,7 @@ fn run_once(
             tiny_run = if refine_done(e.data.len(), budget) { tiny_run + 1 } else { 0 };
             refined.0 += 1;
             refined.1 += e.data.len();
-            if tiny_run >= REFINE_TINY_RUN {
+            if tiny_run >= refine_tiny_run(fps) {
                 log_refined(&refined, "nothing left to add");
                 refine_until = None;
             }
@@ -861,8 +913,14 @@ mod tests {
         // 20 Mbps at 60 fps: a 41 KB budget.
         assert!(super::refine_done(3_000, 41_666));
         assert!(!super::refine_done(5_000, 41_666));
-        // A tiny budget still counts frames under 1 KB as empty.
-        assert!(super::refine_done(900, 4_000));
+        // At 2 Mbps / 120 fps (~2 KB budget), real 500 B detail deltas
+        // still refine; only frames under 250 B count as empty.
+        assert!(!super::refine_done(500, 2_083));
+        assert!(super::refine_done(200, 2_083));
+        assert_eq!(super::refine_tiny_run(60), 20);
+        assert_eq!(super::refine_tiny_run(120), 40);
+        assert_eq!(super::refine_tiny_run(144), 48);
+        assert_eq!(super::refine_tiny_run(15), 10);
     }
 
     #[test]

@@ -4,17 +4,22 @@
 //! We keep one frame in flight and wait for its output, which is the lowest
 //! latency.
 
-use std::time::{Duration, Instant};
+use std::{
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result, bail};
 use windows::{
     Win32::{
-        Foundation::LUID,
+        Foundation::{CloseHandle, HANDLE, LUID, WAIT_OBJECT_0, WAIT_TIMEOUT},
         Graphics::Direct3D11::{ID3D11Device, ID3D11Texture2D},
         Media::MediaFoundation::*,
+        System::Threading::{CreateEventW, SetEvent, WaitForSingleObject},
     },
-    core::{GUID, Interface},
+    core::{GUID, Interface, PCWSTR},
 };
+use windows_core::{Ref, implement};
 
 use crate::mf::{self, Codec, pack};
 
@@ -28,9 +33,65 @@ pub struct Encoded {
     pub padding: usize,
 }
 
+struct EventHandle(HANDLE);
+
+// Kernel handles may be used from any thread.
+unsafe impl Send for EventHandle {}
+unsafe impl Sync for EventHandle {}
+
+impl Drop for EventHandle {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = CloseHandle(self.0);
+        }
+    }
+}
+
+struct EventSlot {
+    ev: EventHandle,
+    result: Mutex<Option<IMFAsyncResult>>,
+}
+
+// `IMFAsyncResult` is a free-threaded Media Foundation object produced on the
+// multithreaded callback queue and transferred under `Mutex` to the encoder thread.
+unsafe impl Send for EventSlot {}
+unsafe impl Sync for EventSlot {}
+
+#[implement(IMFAsyncCallback)]
+struct EventCallback {
+    slot: Arc<EventSlot>,
+}
+
+impl IMFAsyncCallback_Impl for EventCallback_Impl {
+    fn GetParameters(&self, pdwflags: *mut u32, pdwqueue: *mut u32) -> windows_core::Result<()> {
+        unsafe {
+            if !pdwflags.is_null() {
+                *pdwflags = 0;
+            }
+            if !pdwqueue.is_null() {
+                *pdwqueue = MFASYNC_CALLBACK_QUEUE_MULTITHREADED;
+            }
+        }
+        Ok(())
+    }
+
+    fn Invoke(&self, pasyncresult: Ref<IMFAsyncResult>) -> windows_core::Result<()> {
+        if let Some(res) = pasyncresult.as_ref() {
+            *self.slot.result.lock().unwrap() = Some(res.clone());
+        }
+        unsafe {
+            let _ = SetEvent(self.slot.ev.0);
+        }
+        Ok(())
+    }
+}
+
 struct MfEncoder {
     mft: IMFTransform,
     events: IMFMediaEventGenerator,
+    event_slot: Arc<EventSlot>,
+    event_cb: IMFAsyncCallback,
+    event_pending: bool,
     codec: ICodecAPI,
     _mgr: IMFDXGIDeviceManager,
     credits: u32,
@@ -88,8 +149,8 @@ pub fn encoder_name(luid: LUID, codec: Codec) -> Option<String> {
 #[derive(Clone, Copy, Debug)]
 pub struct EncOptions {
     pub codec: Codec,
-    /// Quality-versus-speed, 0 (fastest) to 100 (best quality); `None` keeps
-    /// the encoder's default.
+    /// Quality-versus-speed, 0 (fastest) to 100 (best quality); `None` picks
+    /// a balanced preset automatically based on the GPU vendor and frame rate.
     pub speed: Option<u32>,
     /// Rate buffer, in frames' worth of bits; `None` picks it per encoder
     /// (`default_vbv_frames`).
@@ -133,6 +194,23 @@ impl Default for EncOptions {
 /// loses 2 dB on its key frames at three quarters, so it keeps one frame.
 fn default_vbv_frames(encoder: &str) -> f64 {
     if encoder.contains("Intel") { 0.75 } else { 1.0 }
+}
+
+/// Auto quality-vs-speed preset when `EncOptions::speed` is `None`.
+/// At <= 60 fps every hardware encoder has plenty of frame budget for a balanced
+/// preset (noticeably cleaner text/motion at low-to-medium WAN/relay bitrates).
+/// Above 60 fps Intel integrated GPUs drop back to fastest (0) to protect frame
+/// pacing, while discrete GPUs (NVIDIA/AMD) keep a moderate quality preset.
+fn default_speed(encoder: &str, fps: u32) -> u32 {
+    if encoder.contains("Intel") {
+        if fps <= 60 { 50 } else { 0 }
+    } else if fps <= 60 {
+        50
+    } else if fps <= 100 {
+        33
+    } else {
+        20
+    }
 }
 
 impl Encoder {
@@ -230,7 +308,7 @@ impl Encoder {
             let scenario =
                 hint(opts.scenario_hint, &CODECAPI_AVScenarioInfo, eAVScenarioInfo_DisplayRemoting.0 as u32);
             crate::log!("encoder hints: one temporal layer {layers}, desktop streaming {scenario}");
-            let speed = opts.speed.unwrap_or(0).min(100);
+            let speed = opts.speed.unwrap_or_else(|| default_speed(&name, fps)).min(100);
             match mf::set_u32(&codec, &CODECAPI_AVEncCommonQualityVsSpeed, speed) {
                 Ok(()) => crate::log!("encoder quality-vs-speed set to {speed}"),
                 Err(e) => crate::log!("encoder ignores quality-vs-speed: {e}"),
@@ -275,9 +353,15 @@ impl Encoder {
             mft.ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0)?;
             mft.ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0)?;
             let seq_header = sequence_header(&mft);
+            let ev = CreateEventW(None, false, false, PCWSTR::null()).context("CreateEventW")?;
+            let event_slot = Arc::new(EventSlot { ev: EventHandle(ev), result: Mutex::new(None) });
+            let event_cb: IMFAsyncCallback = EventCallback { slot: event_slot.clone() }.into();
             let mf_enc = MfEncoder {
                 mft,
                 events,
+                event_slot,
+                event_cb,
+                event_pending: false,
                 codec,
                 _mgr: mgr,
                 credits: 0,
@@ -402,36 +486,63 @@ impl MfEncoder {
         Ok(self.ready.pop_front())
     }
 
-    /// Handles one event. With a deadline, waits for it; returns false when the
-    /// deadline passed without an event.
+    /// Handles one event. With a deadline, waits for it via `BeginGetEvent`;
+    /// returns false when the deadline passed without an event.
     fn pump(&mut self, deadline: Option<Instant>, rekeys_on_rate_change: &mut bool) -> Result<bool> {
-        loop {
-            let ev = match unsafe { self.events.GetEvent(MF_EVENT_FLAG_NO_WAIT) } {
-                Ok(ev) => ev,
+        if !self.event_pending {
+            match unsafe { self.events.GetEvent(MF_EVENT_FLAG_NO_WAIT) } {
+                Ok(ev) => return self.handle_event(&ev, rekeys_on_rate_change),
                 Err(e) if e.code() == MF_E_NO_EVENTS_AVAILABLE => {
                     if deadline.is_none_or(|d| Instant::now() >= d) {
                         return Ok(false);
                     }
-                    std::thread::sleep(Duration::from_micros(200));
-                    continue;
+                    unsafe { self.events.BeginGetEvent(&self.event_cb, None::<&windows::core::IUnknown>) }
+                        .context("BeginGetEvent")?;
+                    self.event_pending = true;
                 }
                 Err(e) => return Err(e).context("GetEvent"),
-            };
-            let t = unsafe { ev.GetType()? };
-            if t == METransformNeedInput.0 as u32 {
-                self.credits += 1;
-            } else if t == METransformHaveOutput.0 as u32 {
-                self.pull(rekeys_on_rate_change)?;
-            } else if t == MEError.0 as u32 {
-                // Intel sends this, with a status that says success, after a
-                // bitrate change it cannot take. The frame in flight never
-                // comes out and the encoder asks for no more input (or the
-                // next ProcessInput fails with E_FAIL): it is dead.
-                let hr = unsafe { ev.GetStatus()? };
-                bail!("encoder error event (status {hr:?})");
             }
-            return Ok(true);
         }
+
+        let wait_ms = match deadline {
+            None => 0,
+            Some(d) => {
+                let rem = d.saturating_duration_since(Instant::now());
+                if rem.is_zero() {
+                    0
+                } else {
+                    rem.as_micros().div_ceil(1000).min(u32::MAX as u128 - 1) as u32
+                }
+            }
+        };
+        let wait = unsafe { WaitForSingleObject(self.event_slot.ev.0, wait_ms) };
+        if wait == WAIT_TIMEOUT {
+            return Ok(false);
+        }
+        if wait != WAIT_OBJECT_0 {
+            bail!("WaitForSingleObject on encoder event failed: {wait:?}");
+        }
+        let res = self.event_slot.result.lock().unwrap().take().context("encoder callback signaled without result")?;
+        self.event_pending = false;
+        let ev = unsafe { self.events.EndGetEvent(&res) }.context("EndGetEvent")?;
+        self.handle_event(&ev, rekeys_on_rate_change)
+    }
+
+    fn handle_event(&mut self, ev: &IMFMediaEvent, rekeys_on_rate_change: &mut bool) -> Result<bool> {
+        let t = unsafe { ev.GetType()? };
+        if t == METransformNeedInput.0 as u32 {
+            self.credits += 1;
+        } else if t == METransformHaveOutput.0 as u32 {
+            self.pull(rekeys_on_rate_change)?;
+        } else if t == MEError.0 as u32 {
+            // Intel sends this, with a status that says success, after a
+            // bitrate change it cannot take. The frame in flight never
+            // comes out and the encoder asks for no more input (or the
+            // next ProcessInput fails with E_FAIL): it is dead.
+            let hr = unsafe { ev.GetStatus()? };
+            bail!("encoder error event (status {hr:?})");
+        }
+        Ok(true)
     }
 
     fn pull(&mut self, rekeys_on_rate_change: &mut bool) -> Result<()> {
@@ -504,5 +615,19 @@ fn sequence_header(mft: &IMFTransform) -> Vec<u8> {
             return Vec::new();
         }
         v
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::default_speed;
+
+    #[test]
+    fn default_speed_balances_quality_and_high_refresh() {
+        assert_eq!(default_speed("Intel Quick Sync Video H.264 Encoder MFT", 60), 50);
+        assert_eq!(default_speed("Intel Quick Sync Video H.264 Encoder MFT", 120), 0);
+        assert_eq!(default_speed("NVIDIA H.264 Encoder MFT", 60), 50);
+        assert_eq!(default_speed("NVIDIA H.264 Encoder MFT", 90), 33);
+        assert_eq!(default_speed("NVIDIA H.264 Encoder MFT", 144), 20);
     }
 }

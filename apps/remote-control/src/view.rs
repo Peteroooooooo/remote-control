@@ -27,11 +27,11 @@ use crate::{
     log,
     mf::{self, Codec},
     net,
-    present::Presenter,
+    present::{Presenter, is_minimized},
     proto::{CAN_HEVC, CAN_HEVC444, HostStats, Msg, read_msg},
     stats::{now_us, percentile},
     toolbar,
-    video_rx::{self, FrameQueue, RxCounters},
+    video_rx::{self, Delivered, FrameQueue, RxCounters},
     window::{self, WindowState},
 };
 
@@ -1077,13 +1077,97 @@ fn refusal(conn: &iroh::endpoint::Connection) -> Option<String> {
     })
 }
 
-/// Presents; false when the window is already gone (closing), which is not an error.
-fn show(pres: &mut Presenter, gpu: &Gpu, p: &Picture, size: (u32, u32), hwnd: HWND) -> Result<bool> {
+enum Show {
+    Shown,
+    Skipped,
+    Closed,
+}
+
+struct DecodedFrame {
+    pic: Picture,
+    size: (u32, u32),
+    complete_at: Instant,
+    host_us: u32,
+    frame: u32,
+}
+
+/// Presents; `Show::Closed` when the window is already gone (closing), which is not an error.
+fn show(pres: &mut Presenter, gpu: &Gpu, p: &Picture, size: (u32, u32), hwnd: HWND) -> Result<Show> {
     match pres.present(gpu, p, size) {
-        Ok(()) => Ok(true),
-        Err(_) if !unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindow(Some(hwnd)) }.as_bool() => Ok(false),
+        Ok(Some(())) => Ok(Show::Shown),
+        Ok(None) => Ok(Show::Skipped),
+        Err(_) if !unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindow(Some(hwnd)) }.as_bool() => Ok(Show::Closed),
         Err(e) => Err(e),
     }
+}
+
+fn maybe_request_key(sh: &Shared, last_key_req: &mut Option<Instant>, now: Instant) {
+    if last_key_req.is_none_or(|t| now.duration_since(t) >= Duration::from_millis(300)) {
+        *last_key_req = Some(now);
+        let _ = sh.ctrl.send(Msg::RequestKeyframe);
+    }
+}
+
+fn decode_batch(
+    batch: Vec<Delivered>,
+    sh: &Shared,
+    gpu: &Gpu,
+    pres: &mut Presenter,
+    dec: &mut Option<(Decoder, (u32, u32), Codec, bool)>,
+    last_size: Option<(u32, u32)>,
+    last_key_req: &mut Option<Instant>,
+) -> (Option<DecodedFrame>, bool) {
+    let mut newest = None;
+    let mut switched = false;
+    for f in batch {
+        let size = (f.header.width as u32, f.header.height as u32);
+        let codec = if f.header.hevc { Codec::Hevc } else { Codec::H264 };
+        if dec.as_ref().is_none_or(|d| d.1 != size || d.2 != codec || d.3 != f.header.yuv444) {
+            if !f.header.key {
+                maybe_request_key(sh, last_key_req, Instant::now());
+                continue;
+            }
+            *dec = None;
+            pres.clear_cache();
+            match Decoder::new(&gpu.device, size.0, size.1, codec) {
+                Ok(d) => {
+                    *dec = Some((d, size, codec, f.header.yuv444));
+                    switched = true;
+                    if last_size.is_some_and(|l| l != size) {
+                        log!("stream now {}x{}", size.0, size.1);
+                    }
+                    window::set_stream(size);
+                }
+                Err(e) => {
+                    log!("decoder init ({}x{} {codec:?}): {e:#}", size.0, size.1);
+                    sh.render.lock().unwrap().errors += 1;
+                    maybe_request_key(sh, last_key_req, Instant::now());
+                    std::thread::sleep(Duration::from_millis(50));
+                    continue;
+                }
+            }
+        }
+        let t0 = Instant::now();
+        let r = dec.as_mut().expect("created above").0.decode(&f.data);
+        match r {
+            Ok(Some(pic)) => {
+                crate::trace::mark(f.frame, "decoded", None);
+                let mut rs = sh.render.lock().unwrap();
+                rs.decoded += 1;
+                rs.decode_ms.push(t0.elapsed().as_secs_f64() * 1000.0);
+                newest = Some(DecodedFrame { pic, size, complete_at: f.complete_at, host_us: f.header.host_us, frame: f.frame });
+            }
+            Ok(None) => {}
+            Err(e) => {
+                log!("decode: {e:#}");
+                sh.render.lock().unwrap().errors += 1;
+                *dec = None;
+                pres.clear_cache();
+                maybe_request_key(sh, last_key_req, Instant::now());
+            }
+        }
+    }
+    (newest, switched)
 }
 
 /// Decodes every frame (delta frames depend on each other) and presents the newest.
@@ -1098,12 +1182,8 @@ fn render_loop(sh: &Shared, frames: Arc<FrameQueue>, hwnd: HWND) -> Result<()> {
     let mut last_shown: Option<Instant> = None;
     let mut last_key_req: Option<Instant> = None;
     let mut dec_switched = false;
-    let mut req_key = |now: Instant| {
-        if last_key_req.is_none_or(|t| now.duration_since(t) >= Duration::from_millis(300)) {
-            last_key_req = Some(now);
-            let _ = sh.ctrl.send(Msg::RequestKeyframe);
-        }
-    };
+    let mut pending_present = false;
+    let mut was_minimized = false;
     while !sh.quit.load(Ordering::Relaxed) {
         if let Some((p, s)) = &last
             && let Some(path) = sh.shot.lock().unwrap().take()
@@ -1114,91 +1194,85 @@ fn render_loop(sh: &Shared, frames: Arc<FrameQueue>, hwnd: HWND) -> Result<()> {
         let Some(batch) = frames.take_wait(Duration::from_millis(50)) else {
             break;
         };
-        if batch.is_empty() {
-            // The window was resized while the picture is still: draw the last frame again.
-            if let Some((p, s)) = &last
-                && pres.resized()
-            {
-                match show(&mut pres, &gpu, p, *s, hwnd) {
-                    Ok(true) => {}
-                    Ok(false) => break,
-                    Err(e) => {
-                        log!("present on resize failed ({e:#}); rebuilding renderer");
-                        dec = None;
-                        last = None;
-                        pres.clear_cache();
-                        if let Ok(g) = Gpu::default_adapter()
-                            && let Ok(np) = Presenter::new(&g, hwnd)
-                        {
-                            gpu = g;
-                            pres = np;
-                            req_key(Instant::now());
-                        } else {
-                            std::thread::sleep(Duration::from_millis(100));
-                        }
-                    }
-                }
-            }
-            continue;
+        let minimized = is_minimized(hwnd);
+        if was_minimized && !minimized && last.is_some() {
+            pending_present = true;
         }
+        was_minimized = minimized;
+
         let mut newest = None;
-        for f in batch {
-            let size = (f.header.width as u32, f.header.height as u32);
-            let codec = if f.header.hevc { Codec::Hevc } else { Codec::H264 };
-            if dec.as_ref().is_none_or(|d| d.1 != size || d.2 != codec || d.3 != f.header.yuv444) {
-                if !f.header.key {
-                    req_key(Instant::now());
-                    continue;
-                }
-                dec = None;
-                pres.clear_cache();
-                match Decoder::new(&gpu.device, size.0, size.1, codec) {
-                    Ok(d) => {
-                        dec = Some((d, size, codec, f.header.yuv444));
-                        dec_switched = true;
-                        if last.as_ref().is_some_and(|l| l.1 != size) {
-                            log!("stream now {}x{}", size.0, size.1);
-                        }
-                        window::set_stream(size);
-                    }
-                    Err(e) => {
-                        log!("decoder init ({}x{} {codec:?}): {e:#}", size.0, size.1);
-                        sh.render.lock().unwrap().errors += 1;
-                        req_key(Instant::now());
-                        std::thread::sleep(Duration::from_millis(50));
-                        continue;
-                    }
-                }
+        if !batch.is_empty() {
+            let (d, switched) = decode_batch(batch, sh, &gpu, &mut pres, &mut dec, last.as_ref().map(|l| l.1), &mut last_key_req);
+            if switched {
+                dec_switched = true;
             }
-            let t0 = Instant::now();
-            let r = dec.as_mut().expect("created above").0.decode(&f.data);
-            match r {
-                Ok(Some(p)) => {
-                    crate::trace::mark(f.frame, "decoded", None);
-                    let mut rs = sh.render.lock().unwrap();
-                    rs.decoded += 1;
-                    rs.decode_ms.push(t0.elapsed().as_secs_f64() * 1000.0);
-                    newest = Some((p, size, f.complete_at, f.header.host_us, f.frame));
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    log!("decode: {e:#}");
-                    sh.render.lock().unwrap().errors += 1;
-                    dec = None;
-                    pres.clear_cache();
-                    req_key(Instant::now());
-                }
-            }
+            newest = d;
         }
-        if let Some((p, size, complete_at, host_us, frame)) = newest {
-            match show(&mut pres, &gpu, &p, size, hwnd) {
-                Ok(true) => {}
-                Ok(false) => break,
+
+        if let Some(mut f) = newest {
+            if minimized {
+                last = Some((f.pic, f.size));
+                pending_present = true;
+                if dec_switched {
+                    pres.clear_cache();
+                    dec_switched = false;
+                }
+                continue;
+            }
+            if !pres.wait_ready(100) {
+                last = Some((f.pic, f.size));
+                pending_present = true;
+                if dec_switched {
+                    pres.clear_cache();
+                    dec_switched = false;
+                }
+                continue;
+            }
+            // Swapchain is ready now; drain any newer frames that arrived during the wait.
+            if let Some(more) = frames.take_wait(Duration::ZERO)
+                && !more.is_empty()
+            {
+                let (newer, switched) =
+                    decode_batch(more, sh, &gpu, &mut pres, &mut dec, last.as_ref().map(|l| l.1), &mut last_key_req);
+                if switched {
+                    dec_switched = true;
+                }
+                if let Some(n) = newer {
+                    f = n;
+                }
+            }
+            match show(&mut pres, &gpu, &f.pic, f.size, hwnd) {
+                Ok(Show::Shown) => {
+                    pending_present = false;
+                    crate::trace::mark(f.frame, "shown", None);
+                    let mut rs = sh.render.lock().unwrap();
+                    rs.presented += 1;
+                    rs.local_ms.push(f.complete_at.elapsed().as_secs_f64() * 1000.0);
+                    rs.host_ms.push(f.host_us as f64 / 1000.0);
+                    if let Some(t) = last_shown {
+                        rs.max_gap_ms = rs.max_gap_ms.max(t.elapsed().as_secs_f64() * 1000.0);
+                    }
+                    last_shown = Some(Instant::now());
+                    *sh.last_picture.lock().unwrap() = last_shown;
+                    drop(rs);
+                    let mut first = sh.first_present.lock().unwrap();
+                    if first.is_none() {
+                        *first = Some(Instant::now());
+                        log!("first picture shown");
+                    }
+                    drop(first);
+                }
+                Ok(Show::Skipped) => {
+                    pending_present = true;
+                }
+                Ok(Show::Closed) => break,
                 Err(e) => {
                     log!("present failed ({e:#}); rebuilding renderer");
                     sh.render.lock().unwrap().errors += 1;
                     dec = None;
                     last = None;
+                    pending_present = false;
+                    dec_switched = false;
                     pres.clear_cache();
                     if let Ok(g) = Gpu::default_adapter()
                         && let Ok(np) = Presenter::new(&g, hwnd)
@@ -1208,32 +1282,48 @@ fn render_loop(sh: &Shared, frames: Arc<FrameQueue>, hwnd: HWND) -> Result<()> {
                     } else {
                         std::thread::sleep(Duration::from_millis(100));
                     }
-                    req_key(Instant::now());
+                    maybe_request_key(sh, &mut last_key_req, Instant::now());
                     continue;
                 }
             }
-            crate::trace::mark(frame, "shown", None);
-            let mut rs = sh.render.lock().unwrap();
-            rs.presented += 1;
-            rs.local_ms.push(complete_at.elapsed().as_secs_f64() * 1000.0);
-            rs.host_ms.push(host_us as f64 / 1000.0);
-            if let Some(t) = last_shown {
-                rs.max_gap_ms = rs.max_gap_ms.max(t.elapsed().as_secs_f64() * 1000.0);
-            }
-            last_shown = Some(Instant::now());
-            *sh.last_picture.lock().unwrap() = last_shown;
-            drop(rs);
-            let mut first = sh.first_present.lock().unwrap();
-            if first.is_none() {
-                *first = Some(Instant::now());
-                log!("first picture shown");
-            }
-            drop(first);
-            last = Some((p, size));
+            last = Some((f.pic, f.size));
             if dec_switched {
                 // Drop SRVs cached for the previous decoder's `last` picture.
                 pres.clear_cache();
                 dec_switched = false;
+            }
+        } else if !minimized
+            && let Some((p, s)) = &last
+            && (pending_present || pres.resized())
+        {
+            match show(&mut pres, &gpu, p, *s, hwnd) {
+                Ok(Show::Shown) => {
+                    if pending_present {
+                        sh.render.lock().unwrap().presented += 1;
+                    }
+                    pending_present = false;
+                }
+                Ok(Show::Skipped) => {
+                    pending_present = true;
+                }
+                Ok(Show::Closed) => break,
+                Err(e) => {
+                    log!("present on resize failed ({e:#}); rebuilding renderer");
+                    dec = None;
+                    last = None;
+                    pending_present = false;
+                    dec_switched = false;
+                    pres.clear_cache();
+                    if let Ok(g) = Gpu::default_adapter()
+                        && let Ok(np) = Presenter::new(&g, hwnd)
+                    {
+                        gpu = g;
+                        pres = np;
+                        maybe_request_key(sh, &mut last_key_req, Instant::now());
+                    } else {
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                }
             }
         }
     }

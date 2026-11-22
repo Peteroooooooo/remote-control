@@ -263,6 +263,10 @@ struct State {
     bar: RECT,
     panel: Option<RECT>,
     origin: POINT,
+    /// Whether the collapsed 4 px fullscreen handle has already been painted
+    /// for `collapsed_geom` `(origin.x, origin.y, client_w, dpi)`.
+    collapsed_drawn: bool,
+    collapsed_geom: (i32, i32, i32, i32),
 }
 
 thread_local! {
@@ -375,6 +379,8 @@ fn open(owner: HWND) -> windows::core::Result<()> {
             bar: RECT::default(),
             panel: None,
             origin: POINT::default(),
+            collapsed_drawn: false,
+            collapsed_geom: (0, 0, 0, 0),
         }));
         TOOLBAR.store(hwnd.0 as isize, Ordering::Relaxed);
         SetTimer(Some(hwnd), TIMER_WATCH, 50, None);
@@ -394,10 +400,14 @@ fn redraw(hwnd: HWND) {
     with(|s| draw(hwnd, s));
 }
 
-/// Something shown changed: draw this window and the title bar again.
+/// Something shown changed: draw this window and, in windowed mode, the title bar again.
 fn changed() {
-    redraw(toolbar());
-    if let Some(owner) = with(|s| s.owner) {
+    let hwnd = toolbar();
+    if let Some((owner, full)) = with(|s| {
+        draw(hwnd, s);
+        (s.owner, s.full)
+    }) && !full
+    {
         invalidate_caption(owner);
     }
 }
@@ -1164,6 +1174,12 @@ fn present(c: &Canvas, hwnd: HWND, at: POINT, shapes: &[([f32; 4], f32)]) {
     });
 }
 
+fn owner_geom(owner: HWND) -> (i32, i32, i32, i32) {
+    let (origin, client_w) = owner_top(owner);
+    let dpi = gdi::scale(owner)(96);
+    (origin.x, origin.y, client_w, dpi)
+}
+
 fn draw(hwnd: HWND, st: &mut State) {
     let look = look();
     if st.stats && look.rows.is_empty() {
@@ -1171,6 +1187,7 @@ fn draw(hwnd: HWND, st: &mut State) {
     }
     if look.full != st.full {
         st.full = look.full;
+        st.collapsed_drawn = false;
         st.hover = None;
         st.pressed = None;
         st.r_pressed = None;
@@ -1183,12 +1200,30 @@ fn draw(hwnd: HWND, st: &mut State) {
         }
     }
     if look.full {
+        let is_collapsed = st.t == 0.0
+            && !look.hold
+            && !look.released
+            && !st.menu
+            && !st.audio_menu
+            && !st.stats
+            && st.hover.is_none();
+        let geom = owner_geom(st.owner);
+        if is_collapsed && st.collapsed_drawn && st.collapsed_geom == geom {
+            return;
+        }
         draw_bar(hwnd, st, &look);
+        if is_collapsed {
+            st.collapsed_drawn = true;
+            st.collapsed_geom = geom;
+        } else {
+            st.collapsed_drawn = false;
+        }
         if (look.hold || look.released) && !st.open {
             st.open = true;
             start_animation(hwnd, st);
         }
     } else {
+        st.collapsed_drawn = false;
         draw_popups(hwnd, st, &look);
     }
 }
@@ -1658,7 +1693,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 LRESULT(0)
             }
             WM_APP_FOLLOW => {
-                redraw(hwnd);
+                with(|s| {
+                    s.collapsed_drawn = false;
+                    draw(hwnd, s);
+                });
                 LRESULT(0)
             }
             WM_MOUSEACTIVATE => LRESULT(MA_NOACTIVATE as isize),

@@ -77,6 +77,7 @@ const MFX_RATECONTROL_CBR: u16 = 1;
 const MFX_RATECONTROL_CQP: u16 = 3;
 
 const MFX_TARGETUSAGE_BEST_QUALITY: u16 = 1;
+const MFX_TARGETUSAGE_BALANCED: u16 = 4;
 const MFX_TARGETUSAGE_BEST_SPEED: u16 = 7;
 
 const MFX_CODINGOPTION_ON: u16 = 0x10;
@@ -858,6 +859,7 @@ pub struct QsvEncoder {
     key_next: bool,
     rate_changed: bool,
     qp_control: bool,
+    reset_failed_until: Option<Instant>,
 }
 
 fn create_aligned_tex(device: &ID3D11Device, aligned_w: u32, aligned_h: u32) -> Result<ID3D11Texture2D> {
@@ -990,7 +992,13 @@ impl QsvEncoder {
             let aligned_h = (height + 15) & !15;
             let vbv_frames = opts.vbv_frames.unwrap_or(1.0);
             let target_usage = match opts.speed {
-                None => MFX_TARGETUSAGE_BEST_SPEED,
+                None => {
+                    if fps <= 60 {
+                        MFX_TARGETUSAGE_BALANCED
+                    } else {
+                        MFX_TARGETUSAGE_BEST_SPEED
+                    }
+                }
                 Some(s) => (7 - (s.min(100) * 6 / 100) as u16).clamp(MFX_TARGETUSAGE_BEST_QUALITY, MFX_TARGETUSAGE_BEST_SPEED),
             };
 
@@ -1140,6 +1148,7 @@ impl QsvEncoder {
                 key_next: true,
                 rate_changed: false,
                 qp_control: opts.qp_control,
+                reset_failed_until: None,
             })
         }
     }
@@ -1152,6 +1161,9 @@ impl QsvEncoder {
         if self.qp_control {
             return;
         }
+        if self.reset_failed_until.is_some_and(|t| Instant::now() < t) {
+            return;
+        }
         let prev = self.params;
         // Keep buffer_size_in_kb & initial_delay_in_kb fixed across Reset and
         // stay within the initial HRD ceiling (`init_max_kbps`): QSV adjusts
@@ -1159,6 +1171,9 @@ impl QsvEncoder {
         let mult = self.params.mfx.brc_param_multiplier.max(1) as u32;
         let kbps = (bps / 1000).max(100);
         let scaled = (kbps / mult).clamp(1, self.init_max_kbps as u32) as u16;
+        if scaled == self.params.mfx.target_kbps && scaled == self.params.mfx.max_kbps {
+            return;
+        }
         self.params.mfx.target_kbps = scaled;
         self.params.mfx.max_kbps = scaled;
         self.params.ext_param = self.ext_ptrs.as_mut_ptr();
@@ -1167,6 +1182,7 @@ impl QsvEncoder {
             let actual_mult = self.params.mfx.brc_param_multiplier.max(1) as u32;
             self.bitrate = (scaled as u32) * actual_mult * 1000;
             self.rate_changed = true;
+            self.reset_failed_until = None;
         } else {
             crate::log!(
                 "QSV set_bitrate({bps}) reset failed: {sts} (mult={mult}, buf={}, init_delay={})",
@@ -1174,6 +1190,7 @@ impl QsvEncoder {
                 self.params.mfx.initial_delay_in_kb
             );
             self.params = prev;
+            self.reset_failed_until = Some(Instant::now() + Duration::from_secs(3));
         }
     }
 

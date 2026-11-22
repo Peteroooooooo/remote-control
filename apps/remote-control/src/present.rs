@@ -19,7 +19,7 @@
 use anyhow::{Context, Result};
 use windows::{
     Win32::{
-        Foundation::{CloseHandle, HANDLE, HWND, RECT},
+        Foundation::{CloseHandle, HANDLE, HWND, RECT, WAIT_OBJECT_0},
         Graphics::{
             Direct3D11::{ID3D11RenderTargetView, ID3D11Texture2D},
             Dxgi::{
@@ -30,7 +30,7 @@ use windows::{
             },
         },
         System::Threading::WaitForSingleObjectEx,
-        UI::WindowsAndMessaging::GetClientRect,
+        UI::WindowsAndMessaging::{GA_ROOT, GetAncestor, GetClientRect, IsIconic},
     },
     core::Interface,
 };
@@ -46,6 +46,7 @@ pub struct Presenter {
     hwnd: HWND,
     swap: IDXGISwapChain1,
     waitable: Option<HANDLE>,
+    wait_acquired: bool,
     size: (u32, u32),
     /// None once it failed: the video processor draws from then on.
     shader: Option<ToRgb>,
@@ -53,12 +54,26 @@ pub struct Presenter {
     vp: Option<Vp>,
 }
 
-fn client_size(hwnd: HWND) -> (u32, u32) {
+fn raw_client_size(hwnd: HWND) -> (i32, i32) {
     let mut r = RECT::default();
     unsafe {
         let _ = GetClientRect(hwnd, &mut r);
     }
-    ((r.right - r.left).max(1) as u32, (r.bottom - r.top).max(1) as u32)
+    (r.right - r.left, r.bottom - r.top)
+}
+
+fn client_size(hwnd: HWND) -> (u32, u32) {
+    let (w, h) = raw_client_size(hwnd);
+    (w.max(1) as u32, h.max(1) as u32)
+}
+
+/// True when the top-level window owning `hwnd` (a child picture window or root) is minimized.
+pub fn is_minimized(hwnd: HWND) -> bool {
+    unsafe {
+        let root = GetAncestor(hwnd, GA_ROOT);
+        let top = if root.is_invalid() { hwnd } else { root };
+        IsIconic(top).as_bool()
+    }
 }
 
 impl Presenter {
@@ -94,7 +109,7 @@ impl Presenter {
                 None
             };
             let shader = ToRgb::new(gpu).inspect_err(|e| crate::log!("picture shader: {e:#}; the video processor draws")).ok();
-            Ok(Presenter { hwnd, swap, waitable, size, shader, rtv: None, vp: None })
+            Ok(Presenter { hwnd, swap, waitable, wait_acquired: false, size, shader, rtv: None, vp: None })
         }
     }
 
@@ -104,10 +119,35 @@ impl Presenter {
         }
     }
 
+    /// Waits up to `timeout_ms` for the swap chain's waitable frame-latency
+    /// object if not already acquired. Returns `false` on timeout (or wait
+    /// failure), in which case `Present` must NOT be called.
+    pub fn wait_ready(&mut self, timeout_ms: u32) -> bool {
+        let Some(h) = self.waitable else { return true };
+        if self.wait_acquired {
+            return true;
+        }
+        let r = unsafe { WaitForSingleObjectEx(h, timeout_ms, false) };
+        if r == WAIT_OBJECT_0 {
+            self.wait_acquired = true;
+            true
+        } else {
+            false
+        }
+    }
+
     /// Draws `pic` (showing the top-left `stream` pixels of it) letterboxed into the window.
-    pub fn present(&mut self, gpu: &Gpu, pic: &Picture, stream: (u32, u32)) -> Result<()> {
+    /// Returns `Ok(None)` when skipped (window minimized, zero-sized, or wait timed out).
+    pub fn present(&mut self, gpu: &Gpu, pic: &Picture, stream: (u32, u32)) -> Result<Option<()>> {
         unsafe {
-            let now = client_size(self.hwnd);
+            if is_minimized(self.hwnd) {
+                return Ok(None);
+            }
+            let raw = raw_client_size(self.hwnd);
+            if raw.0 <= 0 || raw.1 <= 0 {
+                return Ok(None);
+            }
+            let now = (raw.0 as u32, raw.1 as u32);
             if now != self.size {
                 self.vp = None;
                 self.rtv = None;
@@ -122,8 +162,8 @@ impl Presenter {
                     .context("ResizeBuffers")?;
                 self.size = now;
             }
-            if let Some(h) = self.waitable {
-                WaitForSingleObjectEx(h, 100, false);
+            if !self.wait_ready(100) {
+                return Ok(None);
             }
             let dest = vp::letterbox(stream, self.size);
             let back: ID3D11Texture2D = self.swap.GetBuffer(0)?;
@@ -135,7 +175,9 @@ impl Presenter {
             }
             drop(back);
             let own_refresh = !crate::window::fullscreen() && crate::quality::frames_fit_screen();
-            self.swap.Present(u32::from(own_refresh), DXGI_PRESENT(0)).ok().context("Present")
+            self.wait_acquired = false;
+            self.swap.Present(u32::from(own_refresh), DXGI_PRESENT(0)).ok().context("Present")?;
+            Ok(Some(()))
         }
     }
 
@@ -148,7 +190,7 @@ impl Presenter {
                 unsafe { gpu.device.CreateRenderTargetView(back, None, Some(&mut v)) }.context("CreateRenderTargetView")?;
                 self.rtv = v;
             }
-            shader.draw(gpu, pic, stream, self.rtv.as_ref().context("no render target")?, dest)
+            shader.draw_target(gpu, pic, stream, self.rtv.as_ref().context("no render target")?, dest, self.size)
         })();
         if let Err(e) = r {
             crate::log!("picture shader: {e:#}; the video processor draws");
@@ -161,7 +203,11 @@ impl Presenter {
 
     /// The window's client area no longer matches the back buffers.
     pub fn resized(&self) -> bool {
-        client_size(self.hwnd) != self.size
+        if is_minimized(self.hwnd) {
+            return false;
+        }
+        let raw = raw_client_size(self.hwnd);
+        raw.0 > 0 && raw.1 > 0 && (raw.0 as u32, raw.1 as u32) != self.size
     }
 }
 

@@ -9,9 +9,10 @@
 //! The shader takes well under a millisecond on any D3D11 GPU.
 //!
 //! Colours as the host makes them (`nv12.rs`, `yuv444.rs`): BT.709, limited
-//! range, 4:2:0 chroma sited left. Scaling: exact at 1:1, Catmull-Rom on
-//! luma when enlarging, 2x2 or 4x4 samples per pixel when shrinking (so
-//! text does not shimmer).
+//! range, 4:2:0 chroma sited left. Scaling: exact at 1:1, Catmull-Rom when
+//! enlarging or shrinking mildly (> 0.70, e.g. maximized / 85% windows so text
+//! stays crisp), and 2x2 or 4x4 box supersampling when shrinking further (so
+//! fine text does not shimmer).
 
 use anyhow::{Context, Result, bail};
 use windows::{
@@ -217,11 +218,13 @@ fn bytes(b: &ID3DBlob) -> &[u8] {
     unsafe { std::slice::from_raw_parts(b.GetBufferPointer() as *const u8, b.GetBufferSize()) }
 }
 
-/// How to sample: exact at 1:1, Catmull-Rom when enlarging, several samples per pixel when shrinking.
+/// How to sample: exact at 1:1, Catmull-Rom when enlarging or shrinking mildly
+/// (> 0.70, covering windowed/maximized scaling without box-blurring text),
+/// and 2x2 / 4x4 supersampling for stronger downscales to prevent shimmer.
 fn mode(ratio: f64) -> f32 {
     if (ratio - 1.0).abs() < 0.002 {
         0.0
-    } else if ratio > 1.0 {
+    } else if ratio > 0.70 {
         1.0
     } else if ratio >= 0.5 {
         2.0
@@ -353,6 +356,33 @@ impl ToRgb {
     /// Draws the top-left `stream` pixels of `pic` into `dest` of the target;
     /// the rest of the target becomes black.
     pub fn draw(&mut self, gpu: &Gpu, pic: &Picture, stream: (u32, u32), rtv: &ID3D11RenderTargetView, dest: RECT) -> Result<()> {
+        self.draw_inner(gpu, pic, stream, rtv, dest, true)
+    }
+
+    /// Like [`Self::draw`], but skips clearing the render target when `dest`
+    /// covers the entire `rt_size` back buffer.
+    pub fn draw_target(
+        &mut self,
+        gpu: &Gpu,
+        pic: &Picture,
+        stream: (u32, u32),
+        rtv: &ID3D11RenderTargetView,
+        dest: RECT,
+        rt_size: (u32, u32),
+    ) -> Result<()> {
+        let needs_clear = dest.left > 0 || dest.top > 0 || dest.right < rt_size.0 as i32 || dest.bottom < rt_size.1 as i32;
+        self.draw_inner(gpu, pic, stream, rtv, dest, needs_clear)
+    }
+
+    fn draw_inner(
+        &mut self,
+        gpu: &Gpu,
+        pic: &Picture,
+        stream: (u32, u32),
+        rtv: &ID3D11RenderTargetView,
+        dest: RECT,
+        needs_clear: bool,
+    ) -> Result<()> {
         const NONE_SRVS: [Option<ID3D11ShaderResourceView>; 2] = [None, None];
         let mut desc = D3D11_TEXTURE2D_DESC::default();
         unsafe { pic.tex.GetDesc(&mut desc) };
@@ -377,7 +407,9 @@ impl ToRgb {
         let (ps, first) = if nv12 { (&self.ps_nv12, 0) } else { (&self.ps_ayuv, 2) };
         unsafe {
             let c = &gpu.ctx;
-            c.ClearRenderTargetView(rtv, &[0.0, 0.0, 0.0, 1.0]);
+            if needs_clear {
+                c.ClearRenderTargetView(rtv, &[0.0, 0.0, 0.0, 1.0]);
+            }
             c.IASetInputLayout(None);
             c.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
             c.VSSetShader(&self.vs, None);
@@ -412,7 +444,9 @@ mod tests {
     fn sampling_follows_the_scale() {
         assert_eq!(super::mode(1.0), 0.0, "1:1 is exact");
         assert_eq!(super::mode(1.5), 1.0, "enlarging");
-        assert_eq!(super::mode(0.75), 2.0, "shrinking a little");
+        assert_eq!(super::mode(0.92), 1.0, "maximized window mild downscale stays sharp");
+        assert_eq!(super::mode(0.85), 1.0, "default window mild downscale stays sharp");
+        assert_eq!(super::mode(0.65), 2.0, "moderate downscale uses 2x2 supersampling");
         assert_eq!(super::mode(0.3), 3.0, "shrinking a lot");
     }
 }

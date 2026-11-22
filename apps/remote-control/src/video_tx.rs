@@ -15,10 +15,10 @@ use bytes::Bytes;
 use iroh::endpoint::Connection;
 use rc_stream::{
     budget::{Budget, Frame},
-    fec::encode_frame,
+    fec::{FrameEncoder, parity_count},
     pacer,
     rate::{RateConfig, RateController},
-    wire::{Ack, Report, T_ACK, T_REPORT},
+    wire::{Ack, Report, SHARD_HDR, T_ACK, T_REPORT},
 };
 use tokio::sync::mpsc;
 
@@ -105,6 +105,9 @@ struct PaceFrame {
 pub struct VideoTx {
     conn: Connection,
     st: Mutex<State>,
+    /// Reusable Reed-Solomon encoder; kept outside `st` so feedback/control
+    /// tasks never block behind FEC encoding.
+    encoder: Mutex<FrameEncoder>,
     /// Frames per second the encoder runs at now (see `configure`).
     fps: Arc<AtomicU32>,
     pacer: mpsc::UnboundedSender<PaceFrame>,
@@ -141,6 +144,7 @@ impl VideoTx {
                 last_key_frame: None,
                 last_timeout_rekey: None,
             }),
+            encoder: Mutex::new(FrameEncoder::new()),
             fps: fps.clone(),
             pacer: ptx,
             pacer_bytes: pacer_bytes.clone(),
@@ -183,16 +187,18 @@ impl VideoTx {
     /// rarely (`Encoder::rekeys_on_rate_change`) may lag the chosen rate.
     /// `shrink`: see `SHRINKING`.
     pub fn plan(&self, encoder_bps: u32, shrink: bool) -> Plan {
+        let max_datagram = self.conn.max_datagram_size().unwrap_or(1200).min(MAX_DATAGRAM);
         let mut s = self.st.lock().unwrap();
         let chosen = s.rc.bitrate();
         let bits = encoder_bps as f64;
         let normal = ((bits / 8.0 / self.fps.load(Ordering::Relaxed) as f64) as usize).max(1);
+        let wire_normal = wire_frame_bytes(normal, s.rc.fec_pct(), max_datagram, MIN_PARITY);
         let queued = SEND_BUFFER.saturating_sub(self.conn.datagram_send_buffer_space())
             + self.pacer_bytes.load(Ordering::Relaxed);
         s.sec.queued_max = s.sec.queued_max.max(queued);
         let link_signal = s.own_backlog_until.is_none_or(|t| Instant::now() >= t);
         let budget = if shrink { SHRINKING } else { WHOLE_FRAMES };
-        match budget.decide(normal, queued) {
+        match budget.decide(wire_normal, queued) {
             Frame::Skip => {
                 s.sec.skipped += 1;
                 if link_signal {
@@ -201,12 +207,12 @@ impl VideoTx {
                 }
                 Plan::Skip
             }
-            Frame::Send(n) if n < normal => {
+            Frame::Send(n) if n < wire_normal => {
                 s.sec.shrunk += 1;
                 if link_signal {
                     s.rc.on_backlog();
                 }
-                let bitrate = (bits * n as f64 / normal as f64) as u32;
+                let bitrate = (bits * n as f64 / wire_normal as f64) as u32;
                 Plan::Encode { chosen: chosen as u32, bitrate, normal, shrunk: true }
             }
             Frame::Send(_) => Plan::Encode { chosen: chosen as u32, bitrate: bits as u32, normal, shrunk: false },
@@ -221,7 +227,7 @@ impl VideoTx {
             return 0;
         }
         let max = self.conn.max_datagram_size().unwrap_or(1200).min(MAX_DATAGRAM);
-        let (f, packets, rate_bps) = {
+        let (f, fec_pct, rate_bps) = {
             let mut s = self.st.lock().unwrap();
             let f = s.frame;
             s.frame = s.frame.wrapping_add(1);
@@ -236,7 +242,6 @@ impl VideoTx {
             if is_key {
                 s.last_key_frame = Some(f);
             }
-            let packets = encode_frame(f, payload, max, s.rc.fec_pct(), MIN_PARITY);
             s.in_flight.insert(f, (Instant::now(), payload.len() as u64));
             s.sec.sent += 1;
             s.sec.bytes += payload.len() as u64;
@@ -246,8 +251,9 @@ impl VideoTx {
             if payload.len() > 3 * budget {
                 s.sec.big.push((payload.len(), budget, is_key));
             }
-            (f, packets, s.rc.bitrate())
+            (f, s.rc.fec_pct(), s.rc.bitrate())
         };
+        let packets = self.encoder.lock().unwrap().encode_frame(f, payload, max, fec_pct, MIN_PARITY);
         let bytes: usize = packets.iter().map(Vec::len).sum();
         let link_bps = net::path_congestion(&self.conn)
             .and_then(|(_, bw, _, _)| bw)
@@ -393,6 +399,42 @@ impl VideoTx {
     }
 }
 
+/// Estimates the wire datagram bytes (payload + FEC parity + shard headers)
+/// emitted for a frame of `payload` bytes. Monotonically non-decreasing in
+/// both `payload` and `fec_pct`.
+fn wire_frame_bytes(payload: usize, fec_pct: u32, max_datagram: usize, min_parity: u16) -> usize {
+    let max_payload = (max_datagram.saturating_sub(SHARD_HDR) & !1).max(2);
+    let data_shards = payload.div_ceil(max_payload).max(1);
+    let parity_shards = parity_count(data_shards, fec_pct, min_parity);
+    let wire_payload = payload.saturating_mul(100 + fec_pct as usize).div_ceil(100);
+    wire_payload.saturating_add((data_shards + parity_shards) * SHARD_HDR)
+}
+
+/// Tracks queued `pacer_bytes` for one frame in `pace()`, subtracting each
+/// packet immediately after `send_datagram` and any remaining bytes on drop.
+struct PacerBytesGuard<'a> {
+    counter: &'a AtomicUsize,
+    remaining: usize,
+}
+
+impl PacerBytesGuard<'_> {
+    fn take(&mut self, bytes: usize) {
+        let sub = bytes.min(self.remaining);
+        self.remaining -= sub;
+        if sub > 0 {
+            self.counter.fetch_sub(sub, Ordering::Relaxed);
+        }
+    }
+}
+
+impl Drop for PacerBytesGuard<'_> {
+    fn drop(&mut self) {
+        if self.remaining > 0 {
+            self.counter.fetch_sub(self.remaining, Ordering::Relaxed);
+        }
+    }
+}
+
 /// Ratio to percent for the stats message; 0 when there were no frames.
 fn pct(ratio: f64) -> u16 {
     if ratio.is_nan() { 0 } else { (ratio * 100.0).min(65535.0) as u16 }
@@ -423,8 +465,8 @@ async fn pace(
 ) {
     let ctrl_backlog_threshold = MAX_DATAGRAM * 4;
     while let Some(frame) = rx.recv().await {
-        let frame_bytes = frame.bytes;
-        let spread = pace_spread(frame.packets.len(), frame_bytes, fps.load(Ordering::Relaxed), frame.link_bps, frame.fast_lan);
+        let mut guard = PacerBytesGuard { counter: &pacer_bytes, remaining: frame.bytes };
+        let spread = pace_spread(frame.packets.len(), frame.bytes, fps.load(Ordering::Relaxed), frame.link_bps, frame.fast_lan);
         let plan = pacer::plan(frame.packets.len(), spread, PACE_GAP);
         let start = tokio::time::Instant::now();
         let mut it = frame.packets.into_iter();
@@ -447,10 +489,12 @@ async fn pace(
                         }
                     }
                 }
+                let len = p.len();
                 let _ = conn.send_datagram(p);
+                guard.take(len);
             }
         }
-        pacer_bytes.fetch_sub(frame_bytes, Ordering::Relaxed);
+        drop(guard);
         if conn.close_reason().is_some() {
             return;
         }
@@ -478,5 +522,49 @@ mod tests {
         assert!((wifi_big.as_secs_f64() - (PACE_SHARE / 120.0)).abs() < 1e-6);
         // Slow WAN (4 Mbps, 60 fps), 20 KB frame: capped at PACE_MAX (5 ms).
         assert_eq!(pace_spread(16, 20_000, 60, 4e6, false), PACE_MAX);
+    }
+
+    #[test]
+    fn wire_frame_bytes_is_monotonic_and_accounts_for_fec_and_headers() {
+        for fec_pct in [0, 10, 20, 50] {
+            let mut prev = 0;
+            for payload in (1..=10_000).chain((10_000..=150_000).step_by(977)) {
+                let wire = wire_frame_bytes(payload, fec_pct, MAX_DATAGRAM, MIN_PARITY);
+                assert!(wire >= prev, "non-monotonic at payload={payload}, fec={fec_pct}: {wire} < {prev}");
+                assert!(wire > payload, "missing header/FEC overhead at payload={payload}");
+                prev = wire;
+            }
+        }
+
+        // Monotonic in FEC percentage as well.
+        let payload = 50_000;
+        let w0 = wire_frame_bytes(payload, 0, MAX_DATAGRAM, MIN_PARITY);
+        let w10 = wire_frame_bytes(payload, 10, MAX_DATAGRAM, MIN_PARITY);
+        let w50 = wire_frame_bytes(payload, 50, MAX_DATAGRAM, MIN_PARITY);
+        assert!(w0 < w10 && w10 < w50);
+        // 50% FEC adds ~50% payload plus parity shard headers.
+        assert!(w50 >= payload * 3 / 2);
+    }
+
+    #[test]
+    fn pacer_bytes_guard_subtracts_per_packet_and_on_early_drop() {
+        let counter = AtomicUsize::new(5000);
+        {
+            let mut g = PacerBytesGuard { counter: &counter, remaining: 3000 };
+            g.take(1200);
+            assert_eq!(counter.load(Ordering::Relaxed), 3800);
+            g.take(1200);
+            assert_eq!(counter.load(Ordering::Relaxed), 2600);
+            // Simulate early exit / task cancellation with 600 bytes still unsent.
+        }
+        assert_eq!(counter.load(Ordering::Relaxed), 2000);
+
+        // Guard clamps to `remaining` so it cannot underflow `counter`.
+        {
+            let mut g = PacerBytesGuard { counter: &counter, remaining: 1000 };
+            g.take(1500);
+            assert_eq!(counter.load(Ordering::Relaxed), 1000);
+        }
+        assert_eq!(counter.load(Ordering::Relaxed), 1000);
     }
 }
