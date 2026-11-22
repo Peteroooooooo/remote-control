@@ -1,14 +1,16 @@
-# remote-control
-
-单exe文件、P2P直连优先的 Windows 远程桌面、终端与 **AI Agent 跨设备控制工具**，基于 Rust 与 iroh 构建。
-
-单个 `remote-control.exe` 直接运行，免账号、免配 SSH 和内网穿透，就能远程看屏幕、传文件、跑命令；一键装上 Skill 后，也能让 **Claude Code / Codex** 直接跨电脑查日志、执行命令、分发文件。默认在两台电脑之间打洞直连，不经过第三方服务器；网络受限时可用 Docker 自建**私有中转**。
-
-**[在线试一试 →](https://peteroooooooo.github.io/remote-control/)**（网页模拟的主界面，可以点控制、开终端、贴连接码，数据为虚拟）
-
-| 设备                                     | 设置                                      |
-| ---------------------------------------- | ----------------------------------------- |
-| ![设备页](docs/images/lobby-devices.png) | ![设置页](docs/images/lobby-settings.png) |
+<div align="center">
+  <img src="apps/remote-control/assets/icon.svg" width="76" alt="Remote Control" />
+  <h1>REMOTE CONTROL</h1>
+  <p><strong>单 exe、P2P 直连优先的 Windows 远程桌面、终端与 AI Agent 跨设备控制工具</strong></p>
+  <p>
+    基于 Rust 与 iroh。免账号、免配 SSH 与内网穿透，默认打洞直连不经第三方服务器；<br />
+    一键接入 <strong>Claude Code / Codex</strong> 跨设备查日志、跑命令、传文件，受限网络可用 Docker 自建私有中转。
+  </p>
+  <p>
+    <a href="https://peteroooooooo.github.io/remote-control/"><strong>在线试一试 →</strong></a>（网页模拟界面，可体验控制、终端与连接码，数据为虚拟）
+  </p>
+  <img src="docs/images/lobby-devices.png" width="760" alt="Remote Control" />
+</div>
 
 ---
 
@@ -24,7 +26,7 @@
 
 ## 与 RustDesk、ToDesk 等软件对比
 
-|                             | remote-control                                                    | RustDesk                                              | ToDesk / 向日葵                                 |
+|                             | Remote Control                                                    | RustDesk                                              | ToDesk / 向日葵                                 |
 | --------------------------- | ----------------------------------------------------------------- | ----------------------------------------------------- | ----------------------------------------------- |
 | **AI Agent / 命令行** | 原生内置 `devices` / `shell` / `exec` / `cp` 与一键 Skill | 无内置远程终端 / AI Skill                             | 无内置远程终端 / AI Skill                       |
 | **账号**              | 不需要，靠本地密钥和连接码                                        | 不需要，ID + 密码                                     | 主控 / 无人值守需注册登录（临时被控可免登）     |
