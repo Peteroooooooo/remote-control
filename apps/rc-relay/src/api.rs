@@ -209,9 +209,9 @@ pub enum Kind {
     /// Not said (lists from older apps).
     #[default]
     Unknown,
-    /// 我的电脑: in the device list, may control without asking.
+    /// My PC: in the device list, may control without asking.
     Mine,
-    /// 信任设备: in the device list.
+    /// Trusted device: in the device list.
     Trusted,
     /// Met with a connection code, not in the device list: listed while the
     /// owner's window is open.
@@ -604,10 +604,10 @@ mod tests {
 
     #[test]
     fn claim_round_trip_and_forgery() {
-        let r = ClaimRequest::new([9; 16], &key(1), "书房");
+        let r = ClaimRequest::new([9; 16], &key(1), "Study");
         assert_eq!(ClaimRequest::decode(&r.encode()).unwrap(), r);
         // Someone else's key with a signature not made by it.
-        let mut f = ClaimRequest::new([9; 16], &key(2), "书房");
+        let mut f = ClaimRequest::new([9; 16], &key(2), "Study");
         f.device = key(1).public();
         assert_eq!(ClaimRequest::decode(&f.encode()), Err(Error::Signature));
         // Same signature, another claim key or another name.
@@ -615,9 +615,9 @@ mod tests {
         f.claim_key = [8; 16];
         assert_eq!(ClaimRequest::decode(&f.encode()), Err(Error::Signature));
         let mut f = r.clone();
-        f.name = "客厅".into();
+        f.name = "Living Room".into();
         assert_eq!(ClaimRequest::decode(&f.encode()), Err(Error::Signature));
-        // A long name is cut on a character boundary.
+        // A long name is cut on a character boundary (3-byte UTF-8 chars).
         let long = ClaimRequest::new([9; 16], &key(1), &"设".repeat(40));
         assert_eq!(long.name, "设".repeat(21));
         assert_eq!(ClaimRequest::decode(&long.encode()).unwrap(), long);

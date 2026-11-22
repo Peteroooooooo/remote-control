@@ -58,9 +58,21 @@ impl Default for Choice {
     }
 }
 
-/// The menu's chips, in order (0 = 自动).
-pub const RESOLUTIONS: [(Res, &str); 5] =
-    [(Res::Auto, "自动"), (Res::Native, "原生"), (Res::Short(1440), "1440p"), (Res::Short(1080), "1080p"), (Res::Short(720), "720p")];
+impl Res {
+    pub fn label(self) -> &'static str {
+        match self {
+            Res::Auto => crate::i18n::tr("自动", "Auto"),
+            Res::Native => crate::i18n::tr("原生", "Native"),
+            Res::Short(1440) => "1440p",
+            Res::Short(1080) => "1080p",
+            Res::Short(720) => "720p",
+            Res::Short(_) => "",
+        }
+    }
+}
+
+/// The menu's chips, in order (0 = Auto).
+pub const RESOLUTIONS: [Res; 5] = [Res::Auto, Res::Native, Res::Short(1440), Res::Short(1080), Res::Short(720)];
 pub const FRAME_RATES: [u8; 5] = [0, 30, 60, 120, 144];
 pub const BITRATES: [u16; 6] = [0, 5, 10, 20, 40, 80];
 

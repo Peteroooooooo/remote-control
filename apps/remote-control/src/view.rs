@@ -23,6 +23,7 @@ use crate::{
     clipsync::ClipSync,
     decode::{Decoder, Picture},
     gpu::Gpu,
+    i18n::{is_en, tr},
     log,
     mf::{self, Codec},
     net,
@@ -56,7 +57,7 @@ pub struct ViewArgs {
     /// The host's name, for the window title.
     #[arg(long)]
     name: Option<String>,
-    /// Highest bitrate in Mbit/s, instead of this device's choice in the 画面
+    /// Highest bitrate in Mbit/s, instead of this device's choice in the Display
     /// menu (for tests; not saved).
     #[arg(long)]
     mbps: Option<f64>,
@@ -93,7 +94,7 @@ pub struct ViewArgs {
     /// (hex scan codes, pressed in order, released in reverse), `sas`,
     /// `monitor next|prev|N` (N from 1, may be out of range), `probe` (as --probe, now),
     /// `shot FILE.bmp` (save the picture shown now, half size), `picture res|fps|mbps V`
-    /// (as the 画面 menu, see `picture_line`), `full` (full screen on or off).
+    /// (as the Display menu, see `picture_line`), `full` (full screen on or off).
     #[arg(long)]
     script: Option<PathBuf>,
     /// The keyboard hook also takes injected keys marked as test keys, and
@@ -165,18 +166,63 @@ fn hint_text(what: u8) -> Option<(&'static str, Vec<(String, String)>)> {
     let row = |k: &str, v: &str| (k.to_string(), v.to_string());
     Some(match what {
         HINT_NO_DISPLAY => (
-            "对方没有可用的屏幕",
-            vec![row("原因", "笔记本合上了盖子，又没接显示器"), row("画面", "打开盖子或接上显示器后自动回来")],
+            tr("对方没有可用的屏幕", "No display available on remote PC"),
+            vec![
+                row(
+                    tr("原因", "Reason"),
+                    tr("笔记本合上了盖子，又没接显示器", "Laptop lid is closed with no external monitor"),
+                ),
+                row(
+                    tr("画面", "Display"),
+                    tr("打开盖子或接上显示器后自动回来", "Will return automatically when lid opens or monitor connects"),
+                ),
+            ],
         ),
         HINT_UAC => (
-            "对方屏幕上有管理员确认，请对方在自己电脑上点“是”",
-            vec![row("画面", "对方点完后自动回来"), row("以后", "对方装上后台服务，就能远程点管理员确认")],
+            tr(
+                "对方屏幕上有管理员确认，请对方在自己电脑上点“是”",
+                "UAC prompt on remote PC — ask them to click Yes",
+            ),
+            vec![
+                row(
+                    tr("画面", "Display"),
+                    tr("对方点完后自动回来", "Will return automatically once confirmed"),
+                ),
+                row(
+                    tr("以后", "Tip"),
+                    tr(
+                        "对方装上后台服务，就能远程点管理员确认",
+                        "Install the background service on remote PC to interact with UAC",
+                    ),
+                ),
+            ],
         ),
         HINT_LOCKED => (
-            "对方已锁屏，请对方解锁",
-            vec![row("画面", "对方解锁后自动回来"), row("以后", "对方装上后台服务，锁屏时也能远程解锁")],
+            tr("对方已锁屏，请对方解锁", "Remote PC is locked — ask them to unlock"),
+            vec![
+                row(
+                    tr("画面", "Display"),
+                    tr("对方解锁后自动回来", "Will return automatically once unlocked"),
+                ),
+                row(
+                    tr("以后", "Tip"),
+                    tr(
+                        "对方装上后台服务，锁屏时也能远程解锁",
+                        "Install the background service on remote PC to unlock remotely",
+                    ),
+                ),
+            ],
         ),
-        HINT_NO_SAS => ("Ctrl+Alt+Del 没发过去", vec![row("原因", "对方没装后台服务；装上后才能远程按 Ctrl+Alt+Del")]),
+        HINT_NO_SAS => (
+            tr("Ctrl+Alt+Del 没发过去", "Could not send Ctrl+Alt+Del"),
+            vec![row(
+                tr("原因", "Reason"),
+                tr(
+                    "对方没装后台服务；装上后才能远程按 Ctrl+Alt+Del",
+                    "Background service is not installed on remote PC",
+                ),
+            )],
+        ),
         _ => return None,
     })
 }
@@ -206,6 +252,7 @@ fn session_key(a: &ViewArgs) -> Result<(SecretKey, String)> {
 }
 
 pub fn run(a: ViewArgs) -> Result<()> {
+    crate::i18n::init_from_key(&a.key.clone().unwrap_or_else(net::default_key_path));
     let r = run_inner(&a);
     if let Err(e) = &r {
         status(&format!("failed\t{e:#}"));
@@ -239,12 +286,15 @@ fn run_inner(a: &ViewArgs) -> Result<()> {
     }
     let target = net::dial_addr(a.id, ips, &via);
     let dial = async { tokio::time::timeout(Duration::from_secs(15), ep.connect(target.clone(), crate::proto::ALPN)).await };
-    let no_answer = "连不上对方：没有回应（对方没开机、没联网、睡着了，或者找不到通路）";
+    let no_answer = tr(
+        "连不上对方：没有回应（对方没开机、没联网、睡着了，或者找不到通路）",
+        "Cannot connect: no response (remote PC is off, offline, asleep, or unreachable)",
+    );
     let connected = match rt.block_on(dial) {
         Ok(Ok(conn)) => Ok(conn),
         // The handshake gave up: quinn's idle timeout.
         Ok(Err(e)) if format!("{e:#}").contains("timed out") => Err(anyhow!(no_answer)),
-        Ok(Err(e)) => Err(anyhow!("连不上对方：{e:#}")),
+        Ok(Err(e)) => Err(anyhow!("{}{e:#}", tr("连不上对方：", "Cannot connect: "))),
         Err(_) => Err(anyhow!(no_answer)),
     };
     let r = connected.and_then(|conn| {
@@ -607,7 +657,12 @@ fn run_connected(
                     let limit = if sh.waiting.load(Ordering::SeqCst) { 40 } else { 10 };
                     if conn.close_reason().is_some() || asked.elapsed() > Duration::from_secs(limit) {
                         tokio::time::sleep(Duration::from_millis(300)).await;
-                        break Err(format!("对方 {limit} 秒内没有发来画面"));
+                        let msg = if is_en() {
+                            format!("No video from remote PC within {limit}s")
+                        } else {
+                            format!("对方 {limit} 秒内没有发来画面")
+                        };
+                        break Err(msg);
                     }
                     tokio::select! {
                         r = info_rx.recv() => {
@@ -668,7 +723,7 @@ fn run_connected(
             })?;
             continue;
         }
-        bail!("{}", refusal(&conn).or(open_err).unwrap_or_else(|| "连接失败".into()));
+        bail!("{}", refusal(&conn).or(open_err).unwrap_or_else(|| tr("连接失败", "Connection failed").into()));
     };
 
     log!("stream {sw}x{sh_}, host encoder {encoder}");
@@ -739,7 +794,7 @@ fn run_connected(
                         ConnectionError::ApplicationClosed(c) if c.error_code.into_inner() == u64::from(net::CLOSE_HANDOFF)
                     );
                 if !handoff {
-                    let why = if silent { Some(SILENT_TEXT) } else { why_closed(&reason) };
+                    let why = if silent { Some(silent_text()) } else { why_closed(&reason) };
                     let Some(why) = why else { return };
                     let since = sh.last_picture.lock().unwrap().map_or(f64::NAN, |t| t.elapsed().as_secs_f64());
                     log!("connection closed: {reason} ({why}); last picture {since:.2} s before");
@@ -754,7 +809,12 @@ fn run_connected(
                 let prev_monitor = sh.current_monitor.load(Ordering::SeqCst);
                 sh.reconnecting.store(true, Ordering::SeqCst);
                 status("connecting");
-                crate::toolbar::update(crate::toolbar::Tone::Fair, "对方正在切换后台服务，正在重连…".into(), vec![], true);
+                crate::toolbar::update(
+                    crate::toolbar::Tone::Fair,
+                    tr("对方正在切换后台服务，正在重连…", "Remote PC switching to service, reconnecting…").into(),
+                    vec![],
+                    true,
+                );
                 let _ = writer_tx.send(None);
                 read_handle.abort();
                 video_handle.abort();
@@ -917,8 +977,8 @@ fn run_connected(
                 let Some((new_conn, new_send, new_read, new_video, new_uni)) = reconnected else {
                     if !sh.quit.load(Ordering::Relaxed) && !wstate.closed.load(Ordering::Relaxed) {
                         log!("reconnect timed out after 45 s");
-                        status("closed\t重连超时");
-                        crate::toolbar::closed("重连超时，连接已断开");
+                        status(&format!("closed\t{}", tr("重连超时", "Reconnect timed out")));
+                        crate::toolbar::closed(tr("重连超时，连接已断开", "Reconnect timed out; disconnected"));
                         tokio::time::sleep(CLOSED_NOTICE).await;
                         window::close();
                     }
@@ -934,7 +994,7 @@ fn run_connected(
                 sh.silent.store(false, Ordering::SeqCst);
                 sh.reconnecting.store(false, Ordering::SeqCst);
                 status("connected");
-                crate::toolbar::update(crate::toolbar::Tone::Good, "已重连".into(), vec![], false);
+                crate::toolbar::update(crate::toolbar::Tone::Good, tr("已重连", "Reconnected").into(), vec![], false);
                 let new_watchdog = spawn_watchdog(&rt_handle, sh.clone(), new_conn.clone());
 
                 conn = new_conn;
@@ -974,22 +1034,25 @@ const CLOSED_NOTICE: Duration = Duration::from_secs(2);
 /// the idle timer when a packet goes out on a path that heard something since
 /// its last send, and iroh keeps trying paths.
 const HOST_SILENT: Duration = Duration::from_secs(6);
-const SILENT_TEXT: &str = "对方没有回应，连接已断开";
+
+fn silent_text() -> &'static str {
+    tr("对方没有回应，连接已断开", "Remote PC stopped responding; disconnected")
+}
 
 /// Why the host closed the connection, in words.
 pub fn close_text(code: u32) -> &'static str {
     match code {
-        net::CLOSE_NOT_MET => "对方不认识本机，先贴对方的连接码",
-        net::CLOSE_BUSY => "对方正被别的设备控制",
-        net::CLOSE_SHUTDOWN => "对方在重启或关机",
-        net::CLOSE_STOPPED => "对方关闭了软件",
-        net::CLOSE_DENIED => "对方拒绝了",
-        net::CLOSE_NO_ANSWER => "对方没有确认",
-        net::CLOSE_LOCKED => "对方锁屏了",
-        net::CLOSE_NO_DIRECT => "找不到直连",
-        net::CLOSE_DISCONNECTED => "对方点了断开",
-        net::CLOSE_HANDOFF => "对方正在切换后台服务",
-        _ => "对方结束了会话",
+        net::CLOSE_NOT_MET => tr("对方不认识本机，先贴对方的连接码", "Not paired yet — enter their connection code first"),
+        net::CLOSE_BUSY => tr("对方正被别的设备控制", "Remote PC is being controlled by another device"),
+        net::CLOSE_SHUTDOWN => tr("对方在重启或关机", "Remote PC is restarting or shutting down"),
+        net::CLOSE_STOPPED => tr("对方关闭了软件", "Remote PC closed the app"),
+        net::CLOSE_DENIED => tr("对方拒绝了", "Connection was denied"),
+        net::CLOSE_NO_ANSWER => tr("对方没有确认", "No response on remote PC"),
+        net::CLOSE_LOCKED => tr("对方锁屏了", "Remote PC is locked"),
+        net::CLOSE_NO_DIRECT => tr("找不到直连", "Could not establish direct connection"),
+        net::CLOSE_DISCONNECTED => tr("对方点了断开", "Disconnected by remote PC"),
+        net::CLOSE_HANDOFF => tr("对方正在切换后台服务", "Remote PC is switching to background service"),
+        _ => tr("对方结束了会话", "Session ended by remote PC"),
     }
 }
 
@@ -999,8 +1062,8 @@ fn why_closed(e: &iroh::endpoint::ConnectionError) -> Option<&'static str> {
     Some(match e {
         ConnectionError::LocallyClosed => return None,
         ConnectionError::ApplicationClosed(c) => close_text(c.error_code.into_inner() as u32),
-        ConnectionError::TimedOut => SILENT_TEXT,
-        _ => "连接已断开",
+        ConnectionError::TimedOut => silent_text(),
+        _ => tr("连接已断开", "Disconnected"),
     })
 }
 
@@ -1009,8 +1072,8 @@ fn refusal(conn: &iroh::endpoint::Connection) -> Option<String> {
     use iroh::endpoint::ConnectionError;
     Some(match conn.close_reason()? {
         ConnectionError::ApplicationClosed(c) => close_text(c.error_code.into_inner() as u32).to_string(),
-        ConnectionError::TimedOut => SILENT_TEXT.to_string(),
-        e => format!("连接断开：{e}"),
+        ConnectionError::TimedOut => silent_text().to_string(),
+        e => format!("{}{e}", tr("连接断开：", "Disconnected: ")),
     })
 }
 
@@ -1238,22 +1301,45 @@ async fn stats_loop(
         let rate_mbps = host.rate_kbps as f64 / 1000.0;
         let decode_ms = percentile(&r.decode_ms, 50.0);
         let (sw, sh_) = *wstate.stream.lock().unwrap();
+        let path_ui = match path {
+            net::PathKind::None => tr("无通路", "No path"),
+            net::PathKind::Direct => tr("直连", "Direct"),
+            net::PathKind::Relay => tr("中转", "Relay"),
+            net::PathKind::Public => tr("公共节点", "Public relay"),
+        };
         let rows = vec![
-            ("画面".to_string(), format!("{sw}×{sh_} · {} 帧/秒 · {mbps:.1} Mbps", r.presented)),
-            ("线路".to_string(), format!("{} · 往返 {path_rtt:.0} ms", path.label())),
-            ("画面延迟约".to_string(), format!("{total:.0} ms")),
-            ("被控端 + 网络 + 本机".to_string(), format!("{host_ms:.1} + {net_ms:.1} + {local_ms:.1} ms")),
-            ("键鼠往返".to_string(), format!("{in50:.0} ms")),
-            ("跳帧".to_string(), format!("{skipped:.1}%")),
+            (
+                tr("画面", "Display").to_string(),
+                if is_en() {
+                    format!("{sw}×{sh_} · {} fps · {mbps:.1} Mbps", r.presented)
+                } else {
+                    format!("{sw}×{sh_} · {} 帧/秒 · {mbps:.1} Mbps", r.presented)
+                },
+            ),
+            (
+                tr("线路", "Route").to_string(),
+                if is_en() {
+                    format!("{path_ui} · RTT {path_rtt:.0} ms")
+                } else {
+                    format!("{path_ui} · 往返 {path_rtt:.0} ms")
+                },
+            ),
+            (tr("画面延迟约", "Display latency").to_string(), format!("{total:.0} ms")),
+            (
+                tr("被控端 + 网络 + 本机", "Host + Net + Local").to_string(),
+                format!("{host_ms:.1} + {net_ms:.1} + {local_ms:.1} ms"),
+            ),
+            (tr("键鼠往返", "Input RTT").to_string(), format!("{in50:.0} ms")),
+            (tr("跳帧", "Skipped frames").to_string(), format!("{skipped:.1}%")),
         ];
         let paused = sh.paused.load(Ordering::Relaxed);
         let hint = hint_text(sh.hint.load(Ordering::Relaxed));
         let no_sas = sh.no_sas.lock().unwrap().is_some_and(|t| t.elapsed() < NO_SAS_SHOWN);
         let (tone, badge) = match path {
-            _ if paused => (toolbar::Tone::Bad, "正在找直连…".to_string()),
-            net::PathKind::Direct => (toolbar::Tone::Good, format!("直连 · {path_rtt:.0} ms")),
-            net::PathKind::Relay => (toolbar::Tone::Fair, format!("中转 · {path_rtt:.0} ms")),
-            p => (toolbar::Tone::Bad, p.label().to_string()),
+            _ if paused => (toolbar::Tone::Bad, tr("正在找直连…", "Finding direct path…").to_string()),
+            net::PathKind::Direct => (toolbar::Tone::Good, format!("{} · {path_rtt:.0} ms", tr("直连", "Direct"))),
+            net::PathKind::Relay => (toolbar::Tone::Fair, format!("{} · {path_rtt:.0} ms", tr("中转", "Relay"))),
+            _ => (toolbar::Tone::Bad, path_ui.to_string()),
         };
         let shown = hint.or_else(|| no_sas.then(|| hint_text(crate::proto::HINT_NO_SAS)).flatten());
         match shown {

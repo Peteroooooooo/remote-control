@@ -8,7 +8,7 @@
 //!
 //! A code is a group: every device that joined with it is an owner, until
 //! it is removed or its code is deleted. A code works any number of times.
-//! Codes are named `码 1`, `码 2`, … (the smallest free number) until renamed.
+//! Codes are named `Code 1`, `Code 2`, … (the smallest free number) until renamed.
 
 use std::{
     collections::BTreeMap,
@@ -29,13 +29,13 @@ pub struct Code {
     /// Stays with the code for good; its name may change.
     pub n: u32,
     pub key: [u8; 16],
-    /// Empty: shown as `码 <n>`.
+    /// Empty: shown as `Code <n>`.
     pub name: String,
 }
 
 impl Code {
     pub fn shown_name(&self) -> String {
-        if self.name.is_empty() { format!("码 {}", self.n) } else { self.name.clone() }
+        if self.name.is_empty() { format!("Code {}", self.n) } else { self.name.clone() }
     }
 }
 
@@ -138,7 +138,7 @@ impl Store {
     }
 
     fn save_codes(&self, codes: &[Code]) -> Result<()> {
-        let mut text = String::from("# rc-relay codes: number, key (hex), name (empty: 码 <number>)\n");
+        let mut text = String::from("# rc-relay codes: number, key (hex), name (empty: Code <number>)\n");
         for c in codes {
             text += &format!("{}\t{}\t{}\n", c.n, hex(&c.key), clean(&c.name));
         }
@@ -328,7 +328,7 @@ impl Store {
 
     /// From an older relay: `owners.txt` without code numbers (device id,
     /// added, note) and one-time keys in `claims.txt`. The owners go into a
-    /// code of their own (`旧的主人`), the keys are dropped (a key printed
+    /// code of their own (`Legacy owners`), the keys are dropped (a key printed
     /// before was the first code, and nobody joins with it any more).
     pub fn upgrade(&self) -> Result<()> {
         let _lock = self.lock()?;
@@ -351,7 +351,7 @@ impl Store {
             let _ = std::fs::remove_file(&claims);
             return Ok(());
         }
-        let c = self.new_code_locked("旧的主人")?;
+        let c = self.new_code_locked("Legacy owners")?;
         let owners: Vec<Owner> = old.into_iter().map(|(id, added)| Owner { id, code: c.n, added, name: String::new() }).collect();
         self.save_owners(&owners)?;
         let _ = std::fs::remove_file(&claims);
@@ -708,11 +708,11 @@ mod tests {
     fn codes_take_the_smallest_free_number() {
         let s = temp("codes");
         let first = s.first_code().unwrap().unwrap();
-        assert_eq!((first.n, first.shown_name()), (1, "码 1".to_string()));
+        assert_eq!((first.n, first.shown_name()), (1, "Code 1".to_string()));
         assert_eq!(s.first_code().unwrap().unwrap(), first, "kept across restarts");
         let two = s.new_code("").unwrap();
-        let three = s.new_code("爸妈").unwrap();
-        assert_eq!((two.n, three.n, three.shown_name().as_str()), (2, 3, "爸妈"));
+        let three = s.new_code("Parents").unwrap();
+        assert_eq!((two.n, three.n, three.shown_name().as_str()), (2, 3, "Parents"));
         s.delete_code(2).unwrap();
         assert_eq!(s.new_code("").unwrap().n, 2, "a deleted number is used again");
         s.delete_code(1).unwrap();
@@ -720,10 +720,10 @@ mod tests {
         s.delete_code(3).unwrap();
         assert!(s.first_code().unwrap().is_none(), "all deleted on purpose: none made");
         assert_eq!(s.new_code("").unwrap().n, 1);
-        s.rename_code(1, "公司\t三楼").unwrap();
-        assert_eq!(s.codes().unwrap()[0].shown_name(), "公司 三楼");
+        s.rename_code(1, "Office\t3F").unwrap();
+        assert_eq!(s.codes().unwrap()[0].shown_name(), "Office 3F");
         s.rename_code(1, "").unwrap();
-        assert_eq!(s.codes().unwrap()[0].shown_name(), "码 1");
+        assert_eq!(s.codes().unwrap()[0].shown_name(), "Code 1");
         assert!(s.code_with(&s.codes().unwrap()[0].key).unwrap().is_some());
         assert!(s.code_with(&[0; 16]).unwrap().is_none());
     }
@@ -764,7 +764,7 @@ mod tests {
         s.upgrade().unwrap();
         let codes = s.codes().unwrap();
         assert_eq!(codes.len(), 1);
-        assert_eq!(codes[0].shown_name(), "旧的主人");
+        assert_eq!(codes[0].shown_name(), "Legacy owners");
         let o = s.owners().unwrap();
         assert_eq!(o.iter().map(|o| (o.id, o.code, o.added)).collect::<Vec<_>>(), [(id(1), 1, 1_700_000_000), (id(2), 1, 1_700_000_001)]);
         assert!(!s.dir.join("claims.txt").exists());

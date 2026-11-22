@@ -376,10 +376,10 @@ impl PathKind {
 
     pub fn label(self) -> &'static str {
         match self {
-            PathKind::None => "无通路",
-            PathKind::Direct => "直连",
-            PathKind::Relay => "中转",
-            PathKind::Public => "公共节点",
+            PathKind::None => crate::i18n::tr("无通路", "No path"),
+            PathKind::Direct => crate::i18n::tr("直连", "Direct"),
+            PathKind::Relay => crate::i18n::tr("中转", "Private Relay"),
+            PathKind::Public => crate::i18n::tr("公共节点", "Public Relay"),
         }
     }
 }
@@ -436,7 +436,7 @@ pub fn is_lan(ip: IpAddr) -> bool {
 }
 
 fn describe_ip(sa: &SocketAddr) -> String {
-    format!("{}{sa}", if is_lan(sa.ip()) { "局域网 " } else { "" })
+    format!("{}{sa}", if is_lan(sa.ip()) { crate::i18n::tr("局域网 ", "LAN ") } else { "" })
 }
 
 pub fn dial_addr(id: EndpointId, ips: &[SocketAddr], relays: &[RelayUrl]) -> EndpointAddr {

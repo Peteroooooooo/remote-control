@@ -30,6 +30,13 @@
   .guide-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
   .brand { font-size: 14px; font-weight: 700; color: var(--text); letter-spacing: .2px; }
   .badge-pill { font-size: 11px; padding: 2px 8px; border-radius: 99px; background: rgba(59,127,224,.15); color: var(--link); }
+  .lang-btn { height: 28px; padding: 0 4px; border-radius: 99px; font-size: 11.5px;
+    background: rgba(255,255,255,.04); border: 1px solid rgba(255,255,255,.08); color: var(--dim);
+    display: inline-flex; align-items: center; gap: 2px; cursor: pointer; }
+  .lang-btn:hover { background: rgba(255,255,255,.07); border-color: rgba(255,255,255,.14); }
+  .lang-btn span { padding: 2px 7px; border-radius: 99px; line-height: 1.2;
+    transition: background .15s var(--ease), color .15s var(--ease); }
+  .lang-btn span.on { background: rgba(59,127,224,.24); color: #d6e6ff; font-weight: 700; }
   .guide-head .grow { flex: 1; }
   .steps { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
   .step-btn { height: 30px; padding: 0 11px; border-radius: 99px; font-size: 12px;
@@ -318,7 +325,7 @@
   .saved { font-size: 12px; color: var(--green); animation: pop .18s var(--spring); }
 
   /* Menu */
-  .menu { position: absolute; z-index: 20; width: 210px; padding: 5px; border-radius: 8px; background: var(--raised);
+  .menu { position: absolute; z-index: 20; min-width: 210px; width: max-content; max-width: 260px; padding: 5px; border-radius: 8px; background: var(--raised);
     border: 1px solid rgba(255,255,255,.09); box-shadow: 0 12px 32px rgba(0,0,0,.55);
     transform-origin: top right; animation: pop .14s var(--spring); }
   .menu.up { transform-origin: bottom right; animation: pop-up .14s var(--spring); }
@@ -434,11 +441,12 @@
 <div class="guide-wrap">
   <div class="guide-head">
     <span class="brand">Remote Control</span>
-    <span class="badge-pill">交互演示</span>
+    <span class="badge-pill" id="badge-demo">交互演示</span>
     <div class="grow"></div>
-    <button onclick="simulateIncoming()" style="height:28px;font-size:12px">模拟他人连入本机</button>
+    <button onclick="simulateIncoming()" id="btn-incoming" style="height:28px;font-size:12px">模拟他人连入本机</button>
     <button onclick="toggleEmptyMode()" id="btn-empty" style="height:28px;font-size:12px">查看 0 设备空状态</button>
-    <button onclick="reset()" style="height:28px;font-size:12px">重置演示</button>
+    <button onclick="reset()" id="btn-reset" style="height:28px;font-size:12px">重置演示</button>
+    <button class="lang-btn" id="btn-lang" onclick="toggleLang()" title="Switch language / 切换语言"><span data-l="zh">中文</span><span data-l="en">EN</span></button>
   </div>
   <div class="steps" id="steps"></div>
   <div class="guide-tip" id="guide-tip"></div>
@@ -497,21 +505,489 @@ function appIconSvg() {
   </svg>`;
 }
 
-const KIND = {
-  mine:    { title: '我的电脑', note: '连入本机免确认' },
-  trusted: { title: '信任设备', note: '连入本机需确认' },
-  temp:    { title: '临时设备', note: '关窗口后移除' },
-};
-
-const STEPS = [
-  { id: 'input', title: '1. 添加新设备', tip: '点进顶部输入框粘贴连接码，或直接按 Ctrl+V，即可将对方加入临时设备，再点「控制」或「记住」。', page: 'devices', target: 'connect-box' },
-  { id: 'copy', title: '2. 分享本机连接码', tip: '点右上角 <b>复制本机连接码</b>，一次性有效（1 小时），对方连入时会先弹窗等你允许。', page: 'devices', target: 'copy-btn' },
-  { id: 'settings', title: '3. 设置与后台服务', tip: '切到 <b>设置</b> 查看设备名称、网络与发现、自建中转、后台服务与 AI Skills 配置。', page: 'settings', target: 'nav-settings' },
-  { id: 'relay', title: '4. 快捷跳转与控制', tip: '点击左下角自建中转或左上角本机卡片可直达对应设置；双击在线设备行发起远程控制。', page: 'devices', target: 'relay-box' },
-];
-
 const DEFAULT_HOST = 'DESKTOP-DEMO';
 const SAMPLE_PEER_CODE = 'rc1-peer-8Q4nLm9x2KvR';
+const LANG_STORAGE_KEY = 'rc-demo-lang';
+
+function normalizeLang(raw) {
+  if (!raw) return null;
+  const s = String(raw).trim().toLowerCase();
+  if (s.startsWith('zh')) return 'zh';
+  if (s.startsWith('en')) return 'en';
+  return null;
+}
+
+function detectInitialLang() {
+  const param = normalizeLang(new URLSearchParams(location.search).get('lang'));
+  if (param) return param;
+  try {
+    const saved = normalizeLang(localStorage.getItem(LANG_STORAGE_KEY));
+    if (saved) return saved;
+  } catch {}
+  return normalizeLang(navigator.language) || 'en';
+}
+
+let lang = detectInitialLang();
+
+const I18N = {
+  zh: {
+    docTitle: 'Remote Control · 交互演示',
+    badgeDemo: '交互演示',
+    btnIncoming: '模拟他人连入本机',
+    btnEmptyShow: '查看 0 设备空状态',
+    btnEmptyRestore: '恢复设备列表',
+    btnReset: '重置演示',
+    closeToTray: '关闭窗口到托盘',
+    selfDefaultName: '主力机',
+    devName_laptop: '笔记本',
+    devName_desk: '台式机',
+    devName_office: '公司电脑',
+    devName_study: '书房笔记本',
+    devName_guestNew: '新添加的笔记本',
+    kind_mine_title: '我的电脑',
+    kind_mine_note: '连入本机免确认',
+    kind_trusted_title: '信任设备',
+    kind_trusted_note: '连入本机需确认',
+    kind_temp_title: '临时设备',
+    kind_temp_note: '关窗口后移除',
+    step_input_title: '1. 添加新设备',
+    step_input_tip: '点进顶部输入框粘贴连接码，或直接按 Ctrl+V，即可将对方加入临时设备，再点「控制」或「记住」。',
+    step_copy_title: '2. 分享本机连接码',
+    step_copy_tip: '点右上角 <b>复制本机连接码</b>，一次性有效（1 小时），对方连入时会先弹窗等你允许。',
+    step_settings_title: '3. 设置与后台服务',
+    step_settings_tip: '切到 <b>设置</b> 查看设备名称、网络与发现、自建中转、后台服务与 AI Skills 配置。',
+    step_relay_title: '4. 快捷跳转与控制',
+    step_relay_tip: '点击左下角自建中转或左上角本机卡片可直达对应设置；双击在线设备行发起远程控制。',
+    copySampleBtn: '复制测试连接码',
+    toastSampleCopied: c => `已复制测试连接码 ${c}，按 Ctrl+V 或贴到顶部输入框即可试连`,
+    toastRemembered: n => `已和「${n}」互相记住；若为自己的电脑，可在 ··· 设为「我的电脑」`,
+    toastKindMine: n => `「${n}」以后连入本机免确认（如需双向免确认，请在对方电脑同样设置）`,
+    toastKindTrusted: n => `「${n}」以后连入本机需确认`,
+    delTitle: n => `删除「${n}」？`,
+    delText: '两台电脑都会忘掉对方，本机中转马上停止为它转发。以后要再连，重新发连接码。',
+    cancel: '取消',
+    del: '删除',
+    toastDeleted: n => `已删除「${n}」，对方那边也删掉了本机`,
+    noteAutoAccept: '对方已将本机设为「我的电脑」，免确认直接连入',
+    noteAllowed: n => `「${n}」允许了控制`,
+    toastWaitTimeout: n => `「${n}」超时未响应`,
+    countdown: s => `${s} 秒没人点就算拒绝`,
+    waitTitle: (self, peer) => `模拟对方屏幕：「${self}」想控制「${peer}」`,
+    waitText: (kindTitle, via) => `${kindTitle}${via ? ' · 经' + via : ''}。对方电脑弹出确认窗，你也可以取消等待。`,
+    simDecline: '模拟对方拒绝',
+    simAllow: '模拟对方点允许',
+    toastDeclined: n => `「${n}」拒绝了连接请求`,
+    toastAlreadyHosted: n => `「${n}」已经在控制本机了`,
+    toastIncomingDeclined: n => `已拒绝「${n}」的控制请求`,
+    toastIncomingTimeout: n => `超时未确认，已自动拒绝「${n}」`,
+    incomingTitle: n => `「${n}」想控制这台电脑`,
+    incomingText: '信任设备 · 仅本次连接有效，可随时点顶部的红色「断开」结束',
+    decline: '拒绝',
+    allow: '允许',
+    toastIncomingAllowed: n => `已允许「${n}」控制本机`,
+    toastStoppedHosting: n => `已断开「${n}」的控制`,
+    pathRelay: '经自建中转',
+    pathDirect: '直连',
+    onlineInfo: (ms, path) => `在线 · ${ms} ms · ${path}`,
+    unreach: '无法连接',
+    connecting: '正在连接…',
+    via_lan: '局域网',
+    via_code: '连接码',
+    notepadText: 'README.md — 记事本\n\n- 画面优先走两端直连\n- 剪贴板在会话内自动同步\n- 装上后台服务后，锁屏、登录界面与 UAC 弹窗下照常控制',
+    termConnecting: n => `正在连接「${n}」……`,
+    termDemoExec: (n, c) => `[演示输出] 已在 ${n} 上执行：${c}`,
+    codeCopiedAt: tm => `${tm} 复制`,
+    toastRevoked: '已撤销，这个连接码不能再用了',
+    add: '添加',
+    toastRelayCodeWrongBox: '这是中转码，请贴到「设置 → 自建中转」里',
+    toastSelfCode: '这是本机发出的连接码，要发给对方用',
+    toastCodeBad: '连接码不完整或者有错字，请对方重新复制一次',
+    toastNotCode: '这不是连接码',
+    toastAlreadyTemp: n => `「${n}」已在临时设备里`,
+    toastAddedTemp: n => `已添加「${n}」，点「控制」开始或点「记住」保存`,
+    busyInstall: '正在安装后台服务…',
+    busyUninstall: '正在卸载后台服务…',
+    busyInstallShort: '安装中…',
+    busyUninstallShort: '卸载中…',
+    toastSvcInstalled: '后台服务已安装，关闭窗口后仍保持在线',
+    toastSvcUninstalled: '后台服务已卸载',
+    toastRelayPrimary: h => `已将 ${h} 设为首选`,
+    toastRelayRemoved: h => `已移除中转 ${h}`,
+    undo: '撤回',
+    toastConnCodeInRelay: '这是连接码，请贴到「设备」页顶部输入框',
+    toastNotRelayCode: '这不是中转码，请在服务器运行 rc-relay ui 获取',
+    toastRelayAdded: h => `已添加中转 ${h}`,
+    menuTerminal: '终端',
+    menuRename: '重命名',
+    menuWhenCtrl: '它控制本机时',
+    menuAutoAccept: '免确认',
+    menuPrompt: '需确认',
+    menuRemove: '删除',
+    waitingPeer: '等对方同意',
+    remember: '记住',
+    controlling: '控制中',
+    waitingApprovalPrefix: '等对方允许 · ',
+    waitingApprovalSuffix: ' 秒',
+    disconnect: '断开',
+    details: '查看原因',
+    control: '控制',
+    more: '更多',
+    unreachWhy: '两台电脑之间无法直连，通常是网络限制。可开启路由器 IPv6，或在设置中添加自建中转。',
+    retry: '重试',
+    goSettings: '去设置',
+    emptyTitle: '还没有设备',
+    emptyDesc: '同一局域网会自动出现；跨网请复制连接码发给对方，或贴到上方',
+    bannerHosted: n => `<b>「${esc(n)}」</b> 正在控制本机`,
+    bannerIncoming: n => `<b>「${esc(n)}」</b> 想控制本机，等待确认`,
+    devicesTitle: '设备',
+    copiedValid: '已复制，1 小时内有效',
+    copyCodeBtn: '复制本机连接码',
+    copyCodeTip: '一次性有效（1 小时），对方连入时会弹窗等你允许',
+    connectPlaceholder: '粘贴对方连接码，加入设备列表',
+    unusedCodesLabel: '还没用掉的连接码（连入时会先问你）',
+    revoke: '撤销',
+    toastSkillsInstalled: '已写入 ~/.claude/skills、~/.agents/skills，新开的 AI 对话即生效',
+    toastSkillsUninstalled: '已卸载 AI Skills',
+    savedBadge: '✓ 已保存',
+    settingsTitle: '设置',
+    secSelf: '本机',
+    deviceName: '设备名称',
+    deviceNameDesc: '其他设备看到的本机名称',
+    defaultHostPrefix: '默认：',
+    secNet: '网络与发现',
+    publicRelay: '公网辅助连接',
+    publicRelayDesc: '跨网直连时用于交换地址，不转发画面和数据',
+    lanDiscovery: '局域网发现',
+    lanDiscoveryDesc: '允许同一局域网内的设备自动发现本机',
+    probingDot: ' · 测速中…',
+    relayPrimary: '已连接（首选）',
+    relayTemp: '临时接管（首选不可用）',
+    relayFail: '连接失败',
+    relayIdle: '备用 · 首选不可用时接管',
+    probingTitle: '测速中…',
+    reprobeTitle: '重新测速',
+    secRelays: '自建中转',
+    secRelaysNote: '按顺序优先使用，直连受阻时自动接管',
+    setPrimary: '设为首选',
+    remove: '移除',
+    relayPlaceholder: '粘贴中转码（如 rc-relay-...）',
+    relayHint: '在自建服务器运行 <span class="mono">rc-relay ui</span> 获取中转码',
+    addingBusy: '添加中…',
+    addRelayBtn: '添加中转服务器',
+    secService: '后台服务',
+    uninstall: '卸载',
+    install: '安装',
+    svcRunning: '运行中',
+    svcNotInstalled: '未安装',
+    svcRunningDesc: '关闭窗口后仍保持在线',
+    svcNotInstalledDesc: '安装后支持开机在线与锁屏控制（需要管理员权限）',
+    startAtBoot: '开机自启',
+    startAtBootDesc: '系统启动后自动在后台保持在线',
+    svcRequired: '安装后台服务后可用',
+    allowLock: '允许锁屏控制',
+    allowLockDesc: '仅限「我的电脑」免确认连入',
+    keepAwake: '接通电源时阻止睡眠',
+    keepAwakeDesc: '保持在线，显示器仍按系统设置熄屏',
+    secAI: 'AI 集成',
+    aiSkills: '配置 AI Skills',
+    skillsInstalledDesc: '已安装 · 支持 Claude Code、Codex',
+    skillsOutdatedDesc: '已安装（当前程序路径或版本有变化）',
+    skillsNoneDesc: '为 Claude Code、Codex 安装远程控制 Skill，支持通过终端操作设备',
+    update: '更新',
+    rlabel_home: '已连',
+    rlabel_temp: '临时接管',
+    rlabel_fail: '连不上',
+    rlabel_idle: '备用',
+    relaysSidebarTitle: '前往设置管理自建中转',
+    manage: '管理',
+    meSidebarTitle: '点击前往设置修改设备名称',
+    meStatus: '本机 · 在线',
+    navDevices: '设备',
+    navSettings: '设置',
+    closedMsg: '窗口已关闭（缩到托盘，后台服务保持在线）',
+    openFromTray: '从托盘打开',
+    rdInputReleased: '键鼠已释放，点画面继续',
+    rdMonitorTitle: m => `显示器 ${m}/2`,
+    rdMonitorToast: m => `已切换到显示器 ${m}/2`,
+    rdTermTitle: '终端：在对方电脑上开 PowerShell',
+    rdCadTitle: '发送 Ctrl+Alt+Del',
+    rdCadToast: n => `已向 ${n} 发送 Ctrl+Alt+Del`,
+    rdReleaseTitle: '释放键鼠',
+    rdHostedBy: n => `${n} 正在控制`,
+    rdShortcutToast: '双击打开了桌面快捷方式',
+    rdThisPC: '此电脑',
+    rdNotepadTitle: 'README.md — 记事本',
+    rdDisplay2Title: '工作区 — 副屏',
+    rdStart: '开始',
+    termHeader: n => `${n} · 终端`,
+  },
+  en: {
+    docTitle: 'Remote Control · Interactive Demo',
+    badgeDemo: 'Interactive Demo',
+    btnIncoming: 'Simulate Incoming',
+    btnEmptyShow: 'Empty State (0 Devices)',
+    btnEmptyRestore: 'Restore Devices',
+    btnReset: 'Reset Demo',
+    closeToTray: 'Close to tray',
+    selfDefaultName: 'Main PC',
+    devName_laptop: 'Laptop',
+    devName_desk: 'Desktop',
+    devName_office: 'Work PC',
+    devName_study: 'Study Laptop',
+    devName_guestNew: 'New Laptop',
+    kind_mine_title: 'My Devices',
+    kind_mine_note: 'Auto-accept incoming',
+    kind_trusted_title: 'Trusted Devices',
+    kind_trusted_note: 'Prompt on incoming',
+    kind_temp_title: 'Temporary Devices',
+    kind_temp_note: 'Removed when closed',
+    step_input_title: '1. Add Device',
+    step_input_tip: 'Click the top input to paste a connection code, or press Ctrl+V directly to add the peer to Temporary Devices, then click Control or Remember.',
+    step_copy_title: '2. Share Code',
+    step_copy_tip: 'Click <b>Copy Connection Code</b> in the top-right. Single-use (valid 1 hr); an approval prompt appears when the peer connects.',
+    step_settings_title: '3. Settings & Service',
+    step_settings_tip: 'Switch to <b>Settings</b> to view Device Name, Network & Discovery, Private Relays, Background Service, and AI Skills.',
+    step_relay_title: '4. Shortcuts & Control',
+    step_relay_tip: 'Click Private Relays (bottom-left) or This Device (top-left) to jump to settings; double-click an online device row to start remote control.',
+    copySampleBtn: 'Copy Test Code',
+    toastSampleCopied: c => `Copied test code ${c}. Press Ctrl+V or paste it into the top input to connect.`,
+    toastRemembered: n => `Mutually remembered "${n}". If this is your own PC, set it to "My Devices" in ···`,
+    toastKindMine: n => `"${n}" can now connect without confirmation (set this on the peer too for two-way auto-accept)`,
+    toastKindTrusted: n => `"${n}" will now require confirmation when connecting`,
+    delTitle: n => `Remove "${n}"?`,
+    delText: 'Both devices will forget each other and this relay will stop forwarding for it immediately. Send a new connection code to reconnect later.',
+    cancel: 'Cancel',
+    del: 'Remove',
+    toastDeleted: n => `Removed "${n}" (this device was also removed on the peer)`,
+    noteAutoAccept: 'Peer marked this PC under "My Devices" — connected without prompt',
+    noteAllowed: n => `"${n}" allowed control`,
+    toastWaitTimeout: n => `"${n}" did not respond in time`,
+    countdown: s => `Auto-declines in ${s}s if unanswered`,
+    waitTitle: (self, peer) => `Simulated Peer Screen: "${self}" wants to control "${peer}"`,
+    waitText: (kindTitle, via) => `${kindTitle}${via ? ' · via ' + via : ''}. A confirmation prompt appeared on the peer; you can also cancel waiting.`,
+    simDecline: 'Simulate Decline',
+    simAllow: 'Simulate Allow',
+    toastDeclined: n => `"${n}" declined the request`,
+    toastAlreadyHosted: n => `"${n}" is already controlling this PC`,
+    toastIncomingDeclined: n => `Declined control request from "${n}"`,
+    toastIncomingTimeout: n => `Timed out — auto-declined "${n}"`,
+    incomingTitle: n => `"${n}" wants to control this PC`,
+    incomingText: 'Trusted Device · Valid for this session only; click the red "Disconnect" button at the top anytime',
+    decline: 'Decline',
+    allow: 'Allow',
+    toastIncomingAllowed: n => `Allowed "${n}" to control this PC`,
+    toastStoppedHosting: n => `Disconnected "${n}"`,
+    pathRelay: 'Private Relay',
+    pathDirect: 'Direct',
+    onlineInfo: (ms, path) => `Online · ${ms} ms · ${path}`,
+    unreach: 'Unreachable',
+    connecting: 'Connecting…',
+    via_lan: 'LAN',
+    via_code: 'Connection code',
+    notepadText: 'README.md — Notepad\n\n- Video prefers direct P2P connection\n- Clipboard syncs automatically during the session\n- With Background Service installed, lock screen, sign-in & UAC prompts remain controllable',
+    termConnecting: n => `Connecting to "${n}"...`,
+    termDemoExec: (n, c) => `[Demo] Executed on ${n}: ${c}`,
+    codeCopiedAt: tm => `Copied ${tm}`,
+    toastRevoked: 'Revoked — this connection code can no longer be used',
+    add: 'Add',
+    toastRelayCodeWrongBox: 'This is a relay code — paste it under Settings → Private Relays',
+    toastSelfCode: 'This is your own connection code — send it to the other device',
+    toastCodeBad: 'Incomplete or invalid connection code — ask the peer to copy it again',
+    toastNotCode: 'Not a valid connection code',
+    toastAlreadyTemp: n => `"${n}" is already in Temporary Devices`,
+    toastAddedTemp: n => `Added "${n}" — click Control to connect or Remember to save`,
+    busyInstall: 'Installing Background Service…',
+    busyUninstall: 'Uninstalling Background Service…',
+    busyInstallShort: 'Installing…',
+    busyUninstallShort: 'Uninstalling…',
+    toastSvcInstalled: 'Background Service installed — stays online after closing window',
+    toastSvcUninstalled: 'Background Service uninstalled',
+    toastRelayPrimary: h => `Set ${h} as primary relay`,
+    toastRelayRemoved: h => `Removed relay ${h}`,
+    undo: 'Undo',
+    toastConnCodeInRelay: 'This is a connection code — paste it in the top input on the Devices page',
+    toastNotRelayCode: 'Not a valid relay code — run rc-relay ui on your server to get one',
+    toastRelayAdded: h => `Added relay ${h}`,
+    menuTerminal: 'Terminal',
+    menuRename: 'Rename',
+    menuWhenCtrl: 'When controlling this PC',
+    menuAutoAccept: 'Auto-accept',
+    menuPrompt: 'Prompt',
+    menuRemove: 'Remove',
+    waitingPeer: 'Waiting for peer…',
+    remember: 'Remember',
+    controlling: 'Controlling',
+    waitingApprovalPrefix: 'Waiting for approval · ',
+    waitingApprovalSuffix: 's',
+    disconnect: 'Disconnect',
+    details: 'Details',
+    control: 'Control',
+    more: 'More',
+    unreachWhy: 'Direct connection failed, usually due to strict NAT or firewall. Enable IPv6 on your router or add a Private Relay in Settings.',
+    retry: 'Retry',
+    goSettings: 'Open Settings',
+    emptyTitle: 'No devices yet',
+    emptyDesc: 'LAN devices appear automatically; across networks, copy your connection code or paste one above.',
+    bannerHosted: n => `<b>"${esc(n)}"</b> is controlling this PC`,
+    bannerIncoming: n => `<b>"${esc(n)}"</b> wants to control this PC — awaiting approval`,
+    devicesTitle: 'Devices',
+    copiedValid: 'Copied (valid 1 hr)',
+    copyCodeBtn: 'Copy Connection Code',
+    copyCodeTip: 'Single-use (valid 1 hr); prompts for approval when peer connects',
+    connectPlaceholder: 'Paste peer connection code to add device',
+    unusedCodesLabel: 'Unused connection codes (prompts on connect)',
+    revoke: 'Revoke',
+    toastSkillsInstalled: 'Written to ~/.claude/skills and ~/.agents/skills — active in new AI chats',
+    toastSkillsUninstalled: 'AI Skills uninstalled',
+    savedBadge: '✓ Saved',
+    settingsTitle: 'Settings',
+    secSelf: 'This Device',
+    deviceName: 'Device Name',
+    deviceNameDesc: 'Name visible to other devices',
+    defaultHostPrefix: 'Default: ',
+    secNet: 'Network & Discovery',
+    publicRelay: 'Public Relay Assist',
+    publicRelayDesc: 'Exchanges peer addresses for NAT traversal; never relays screen or data',
+    lanDiscovery: 'LAN Discovery',
+    lanDiscoveryDesc: 'Allow devices on the same LAN to discover this PC automatically',
+    probingDot: ' · Probing…',
+    relayPrimary: 'Connected (Primary)',
+    relayTemp: 'Failover active (Primary unavailable)',
+    relayFail: 'Connection failed',
+    relayIdle: 'Standby · Takes over if primary is unavailable',
+    probingTitle: 'Probing…',
+    reprobeTitle: 'Re-probe latency',
+    secRelays: 'Private Relays',
+    secRelaysNote: 'Tried in order; relays traffic only when direct connection fails',
+    setPrimary: 'Set Primary',
+    remove: 'Remove',
+    relayPlaceholder: 'Paste relay code (e.g. rc-relay-...)',
+    relayHint: 'Run <span class="mono">rc-relay ui</span> on your server to get a relay code',
+    addingBusy: 'Adding…',
+    addRelayBtn: 'Add Private Relay',
+    secService: 'Background Service',
+    uninstall: 'Uninstall',
+    install: 'Install',
+    svcRunning: 'Running',
+    svcNotInstalled: 'Not Installed',
+    svcRunningDesc: 'Stays online after closing window',
+    svcNotInstalledDesc: 'Enables online-at-boot and lock screen control (requires Admin)',
+    startAtBoot: 'Start at Boot',
+    startAtBootDesc: 'Automatically stay online in background after boot',
+    svcRequired: 'Available after installing Background Service',
+    allowLock: 'Allow Lock Screen Control',
+    allowLockDesc: 'Only "My Devices" can connect without prompt',
+    keepAwake: 'Prevent Sleep on AC Power',
+    keepAwakeDesc: 'Stays online; display still turns off per system settings',
+    secAI: 'AI Integration',
+    aiSkills: 'AI Skills',
+    skillsInstalledDesc: 'Installed · Supports Claude Code & Codex',
+    skillsOutdatedDesc: 'Installed (app path or version changed)',
+    skillsNoneDesc: 'Install remote-control Skills for Claude Code & Codex to operate devices via CLI',
+    update: 'Update',
+    rlabel_home: 'Active',
+    rlabel_temp: 'Failover',
+    rlabel_fail: 'Offline',
+    rlabel_idle: 'Standby',
+    relaysSidebarTitle: 'Manage Private Relays in Settings',
+    manage: 'Manage',
+    meSidebarTitle: 'Click to change device name in Settings',
+    meStatus: 'This PC · Online',
+    navDevices: 'Devices',
+    navSettings: 'Settings',
+    closedMsg: 'Window closed (minimized to tray; Background Service stays online)',
+    openFromTray: 'Open from Tray',
+    rdInputReleased: 'Input released — click screen to resume',
+    rdMonitorTitle: m => `Display ${m}/2`,
+    rdMonitorToast: m => `Switched to Display ${m}/2`,
+    rdTermTitle: 'Terminal: Open PowerShell on peer',
+    rdCadTitle: 'Send Ctrl+Alt+Del',
+    rdCadToast: n => `Sent Ctrl+Alt+Del to ${n}`,
+    rdReleaseTitle: 'Release Input',
+    rdHostedBy: n => `${n} is controlling`,
+    rdShortcutToast: 'Opened desktop shortcut',
+    rdThisPC: 'This PC',
+    rdNotepadTitle: 'README.md — Notepad',
+    rdDisplay2Title: 'Workspace — Display 2',
+    rdStart: 'Start',
+    termHeader: n => `${n} · Terminal`,
+  },
+};
+
+function t(key, ...args) {
+  const dict = I18N[lang] || I18N.en;
+  const val = dict[key];
+  return typeof val === 'function' ? val(...args) : val;
+}
+
+function getKindInfo(k) {
+  return { title: t(`kind_${k}_title`), note: t(`kind_${k}_note`) };
+}
+
+function getSteps() {
+  return [
+    { id: 'input', title: t('step_input_title'), tip: t('step_input_tip'), page: 'devices', target: 'connect-box' },
+    { id: 'copy', title: t('step_copy_title'), tip: t('step_copy_tip'), page: 'devices', target: 'copy-btn' },
+    { id: 'settings', title: t('step_settings_title'), tip: t('step_settings_tip'), page: 'settings', target: 'nav-settings' },
+    { id: 'relay', title: t('step_relay_title'), tip: t('step_relay_tip'), page: 'devices', target: 'relay-box' },
+  ];
+}
+
+function selfName() {
+  return S.selfNameCustom ? S.name : t('selfDefaultName');
+}
+
+function devName(d) {
+  if (!d) return '';
+  return d.customName ? d.name : t(`devName_${d.nameKey}`);
+}
+
+function devNameById(id, fallbackKey) {
+  const d = dev(id);
+  if (d) return devName(d);
+  return fallbackKey ? t(`devName_${fallbackKey}`) : '';
+}
+
+function devVia(d) {
+  return d.viaKey ? t(`via_${d.viaKey}`) : '';
+}
+
+function devInfo(d) {
+  if (d.retrying) return t('connecting');
+  if (d.unreach) return t('unreach');
+  return t('onlineInfo', d.ms, d.conn === 'relay' ? t('pathRelay') : t('pathDirect'));
+}
+
+function applyLangChrome() {
+  document.documentElement.lang = lang === 'zh' ? 'zh-CN' : 'en';
+  document.title = t('docTitle');
+  const badge = document.getElementById('badge-demo');
+  if (badge) badge.textContent = t('badgeDemo');
+  const btnIn = document.getElementById('btn-incoming');
+  if (btnIn) btnIn.textContent = t('btnIncoming');
+  const btnRst = document.getElementById('btn-reset');
+  if (btnRst) btnRst.textContent = t('btnReset');
+  const langBtn = document.getElementById('btn-lang');
+  if (langBtn) {
+    langBtn.querySelectorAll('span[data-l]').forEach(sp => {
+      sp.classList.toggle('on', sp.dataset.l === lang);
+    });
+  }
+  const closeCap = document.querySelector('#win .titlebar .caps span.x');
+  if (closeCap) closeCap.title = t('closeToTray');
+}
+
+function toggleLang() {
+  lang = lang === 'zh' ? 'en' : 'zh';
+  try { localStorage.setItem(LANG_STORAGE_KEY, lang); } catch {}
+  try {
+    const url = new URL(location.href);
+    url.searchParams.set('lang', lang);
+    history.replaceState(null, '', url.toString());
+  } catch {}
+  render();
+  renderOverlay();
+}
 
 let S, menu = null, modal = null, copied = 0, why = null, renaming = null, ui, codeSeq = 0;
 let stepIdx = 0, activePulse = null, doneSteps = new Set();
@@ -526,7 +1002,7 @@ function mountShell() {
   w.innerHTML = `
     <div class="titlebar">
       ${appIconSvg()}Remote Control
-      <div class="caps"><span>${ic('min')}</span><span>${ic('max')}</span><span class="x" onclick="S.closed=true;menu=null;render()" title="关闭窗口到托盘">${ic('close')}</span></div>
+      <div class="caps"><span>${ic('min')}</span><span>${ic('max')}</span><span class="x" onclick="S.closed=true;menu=null;render()" title="${esc(t('closeToTray'))}">${ic('close')}</span></div>
     </div>
     <div class="body">
       <div class="pane"></div>
@@ -552,7 +1028,8 @@ function reset() {
   mountShell();
   const initPage = new URLSearchParams(location.search).get('page') === 'settings' ? 'settings' : 'devices';
   S = {
-    name: '主力机',
+    name: '',
+    selfNameCustom: false,
     icon: 'desktop',
     relays: [
       { host: 'relay-a.example.com:7843', state: 'home', rtt: 42 },
@@ -562,14 +1039,14 @@ function reset() {
     codes: [],
     closed: false,
     controlling: null,
-    hostedBy: null,
+    hostedById: null,
     incoming: null,
     page: initPage,
     devs: [
-      { id: 'laptop', name: '笔记本', icon: 'laptop', kind: 'mine', online: true, info: '在线 · 9 ms · 直连' },
-      { id: 'desk', name: '台式机', icon: 'desktop', kind: 'trusted', online: true, info: '在线 · 3 ms · 直连' },
-      { id: 'office', name: '公司电脑', icon: 'desktop', kind: 'trusted', online: false, unreach: true, info: '无法连接' },
-      { id: 'study', name: '书房笔记本', icon: 'laptop', kind: 'temp', via: '局域网', online: true, info: '在线 · 1 ms · 直连' },
+      { id: 'laptop', nameKey: 'laptop', customName: false, name: '', icon: 'laptop', kind: 'mine', online: true, ms: 9, conn: 'direct' },
+      { id: 'desk', nameKey: 'desk', customName: false, name: '', icon: 'desktop', kind: 'trusted', online: true, ms: 3, conn: 'direct' },
+      { id: 'office', nameKey: 'office', customName: false, name: '', icon: 'desktop', kind: 'trusted', online: false, unreach: true },
+      { id: 'study', nameKey: 'study', customName: false, name: '', icon: 'laptop', kind: 'temp', viaKey: 'lan', online: true, ms: 1, conn: 'direct' },
     ],
   };
   menu = null; modal = null; copied = 0; why = null; renaming = null; remote = null; term = null;
@@ -601,7 +1078,7 @@ function copySamplePeerCode() {
   if (navigator.clipboard?.writeText) {
     navigator.clipboard.writeText(SAMPLE_PEER_CODE).catch(() => {});
   }
-  toast(`已复制测试连接码 ${SAMPLE_PEER_CODE}，按 Ctrl+V 或贴到顶部输入框即可试连`, 'info');
+  toast(t('toastSampleCopied', SAMPLE_PEER_CODE), 'info');
 }
 
 function markStep(id) {
@@ -611,7 +1088,7 @@ function markStep(id) {
 
 function selectStep(i) {
   stepIdx = i;
-  const st = STEPS[i];
+  const st = getSteps()[i];
   if (st.page && S.page !== st.page) S.page = st.page;
   activePulse = st.target;
   render();
@@ -619,17 +1096,19 @@ function selectStep(i) {
 }
 
 function renderGuide() {
-  document.getElementById('steps').innerHTML = STEPS.map((s, i) => {
+  applyLangChrome();
+  const steps = getSteps();
+  document.getElementById('steps').innerHTML = steps.map((s, i) => {
     const cls = (i === stepIdx ? 'active ' : '') + (doneSteps.has(s.id) ? 'done' : '');
     return `<button class="step-btn ${cls}" onclick="selectStep(${i})">${doneSteps.has(s.id) ? ic('check') : ''}${s.title}</button>`;
   }).join('');
-  const cur = STEPS[stepIdx];
+  const cur = steps[stepIdx];
   const extra = cur.id === 'input'
-    ? `<button class="soft" style="height:24px;font-size:12px;padding:0 10px" onclick="copySamplePeerCode()">复制测试连接码</button>`
+    ? `<button class="soft" style="height:24px;font-size:12px;padding:0 10px" onclick="copySamplePeerCode()">${t('copySampleBtn')}</button>`
     : '';
   document.getElementById('guide-tip').innerHTML = `${ic('info')}<span>${cur.tip}</span><span class="grow"></span>${extra}`;
   const btn = document.getElementById('btn-empty');
-  if (btn) btn.textContent = savedDevsForEmpty === null ? '查看 0 设备空状态' : '恢复设备列表';
+  if (btn) btn.textContent = savedDevsForEmpty === null ? t('btnEmptyShow') : t('btnEmptyRestore');
 }
 
 function toast(text, tone = 'info', action) {
@@ -777,10 +1256,10 @@ function remember(id) {
     x.req = null;
     x._reqTimer = null;
     x.kind = 'trusted';
-    x.via = null;
+    x.viaKey = null;
     render();
     revealRow(id);
-    toast(`已和「${x.name}」互相记住；若为自己的电脑，可在 ··· 设为「我的电脑」`, 'ok');
+    toast(t('toastRemembered', devName(x)), 'ok');
   }, 1000);
 }
 
@@ -799,28 +1278,27 @@ function setKind(id, kind) {
   d.kind = kind;
   render();
   revealRow(id);
-  toast(
-    kind === 'mine'
-      ? `「${d.name}」以后连入本机免确认（如需双向免确认，请在对方电脑同样设置）`
-      : `「${d.name}」以后连入本机需确认`,
-    'ok'
-  );
+  toast(t(kind === 'mine' ? 'toastKindMine' : 'toastKindTrusted', devName(d)), 'ok');
 }
 
 function askDelete(id) {
   const d = dev(id);
   if (!d) return;
   modal = {
-    icon: 'del', tone: 'red', title: `删除「${d.name}」？`,
-    text: '两台电脑都会忘掉对方，本机中转马上停止为它转发。以后要再连，重新发连接码。',
-    btns: [
-      ['取消', '', () => {}],
-      ['删除', 'danger', () => {
+    kind: 'delete',
+    devId: id,
+    icon: 'del',
+    tone: 'red',
+    actions: [
+      () => {},
+      () => {
+        const cur = dev(id);
+        const nm = cur ? devName(cur) : devName(d);
         S.devs = S.devs.filter(x => x.id !== id);
         if (S.controlling === id) disconnect();
         render();
-        toast(`已删除「${d.name}」，对方那边也删掉了本机`, 'ok');
-      }],
+        toast(t('toastDeleted', nm), 'ok');
+      },
     ],
   };
   render();
@@ -836,7 +1314,10 @@ function endRename(id, val, keep) {
   if (renaming !== id) return;
   renaming = null;
   const d = dev(id);
-  if (keep && val.trim() && d) d.name = val.trim();
+  if (keep && val.trim() && d && val.trim() !== devName(d)) {
+    d.customName = true;
+    d.name = val.trim();
+  }
   render();
 }
 
@@ -844,7 +1325,7 @@ function control(id) {
   const d = dev(id);
   if (!d || !d.online) return;
   if (d.kind === 'mine') {
-    openRemote(d, '对方已将本机设为「我的电脑」，免确认直接连入');
+    openRemote(d, 'autoAccept');
     return;
   }
   clearInterval(waitTimer);
@@ -859,34 +1340,33 @@ function control(id) {
       x.waiting = false;
       if (modal?.kind === 'wait') modal = null;
       render();
-      toast(`「${x.name}」超时未响应`, 'warn');
+      toast(t('toastWaitTimeout', devName(x)), 'warn');
       return;
     }
     const lbl = document.querySelector(`.row[data-id="${id}"] .wait-sec`);
     if (lbl) lbl.textContent = x.waitLeft;
     const foot = document.getElementById('modal-countdown');
-    if (foot && modal?.kind === 'wait') foot.textContent = `${x.waitLeft} 秒没人点就算拒绝`;
+    if (foot && modal?.kind === 'wait') foot.textContent = t('countdown', x.waitLeft);
   }, 1000);
   modal = {
     kind: 'wait',
-    icon: 'shield', tone: 'amber',
-    title: `模拟对方屏幕：「${S.name}」想控制「${d.name}」`,
-    text: `${KIND[d.kind].title}${d.via ? ' · 经' + d.via : ''}。对方电脑弹出确认窗，你也可以取消等待。`,
+    devId: id,
+    icon: 'shield',
+    tone: 'amber',
     bar: true,
-    foot: '30 秒没人点就算拒绝',
     onCancel: () => cancelWait(id),
-    btns: [
-      ['模拟对方拒绝', 'danger-solid', () => {
+    actions: [
+      () => {
         clearInterval(waitTimer);
         const x = dev(id); if (x) x.waiting = false;
         render();
-        toast(`「${d.name}」拒绝了连接请求`, 'warn');
-      }],
-      ['模拟对方点允许', 'primary', () => {
+        toast(t('toastDeclined', devName(x || d)), 'warn');
+      },
+      () => {
         clearInterval(waitTimer);
         const x = dev(id); if (x) x.waiting = false;
-        openRemote(d, `「${d.name}」允许了控制`);
-      }],
+        openRemote(x || d, 'allowed');
+      },
     ],
   };
   render();
@@ -901,60 +1381,59 @@ function cancelWait(id) {
 }
 
 function simulateIncoming() {
-  if (S.hostedBy) {
-    toast(`「${S.hostedBy}」已经在控制本机了`, 'info');
+  if (S.hostedById) {
+    toast(t('toastAlreadyHosted', devNameById(S.hostedById, 'desk')), 'info');
     return;
   }
   S.page = 'devices';
   S.closed = false;
   menu = null;
   clearInterval(incomingTimer);
-  const who = '台式机';
-  S.incoming = { name: who, left: 30 };
-  const reject = (reason) => {
+  const whoId = 'desk';
+  S.incoming = { whoId, left: 30 };
+  const reject = (reasonKey) => {
     clearInterval(incomingTimer);
     S.incoming = null;
     if (modal?.kind === 'incoming') modal = null;
     render();
-    toast(reason || `已拒绝「${who}」的控制请求`, 'info');
+    toast(t(reasonKey || 'toastIncomingDeclined', devNameById(whoId, 'desk')), 'info');
   };
   incomingTimer = setInterval(() => {
     if (!S.incoming) { clearInterval(incomingTimer); return; }
     S.incoming.left = Math.max(0, S.incoming.left - 1);
     if (S.incoming.left <= 0) {
-      reject(`超时未确认，已自动拒绝「${who}」`);
+      reject('toastIncomingTimeout');
       return;
     }
     const foot = document.getElementById('modal-countdown');
-    if (foot && modal?.kind === 'incoming') foot.textContent = `${S.incoming.left} 秒没人点就算拒绝`;
+    if (foot && modal?.kind === 'incoming') foot.textContent = t('countdown', S.incoming.left);
   }, 1000);
   modal = {
     kind: 'incoming',
-    icon: 'shield', tone: 'amber',
-    title: `「${who}」想控制这台电脑`,
-    text: '信任设备 · 仅本次连接有效，可随时点顶部的红色「断开」结束',
+    whoId,
+    icon: 'shield',
+    tone: 'amber',
     bar: true,
-    foot: '30 秒没人点就算拒绝',
     onCancel: () => reject(),
-    btns: [
-      ['拒绝', 'danger-solid', () => reject()],
-      ['允许', 'primary', () => {
+    actions: [
+      () => reject(),
+      () => {
         clearInterval(incomingTimer);
         S.incoming = null;
-        S.hostedBy = who;
+        S.hostedById = whoId;
         render();
-        toast(`已允许「${who}」控制本机`, 'ok');
-      }],
+        toast(t('toastIncomingAllowed', devNameById(whoId, 'desk')), 'ok');
+      },
     ],
   };
   render();
 }
 
 function stopHosting() {
-  const who = S.hostedBy;
-  S.hostedBy = null;
+  const whoId = S.hostedById;
+  S.hostedById = null;
   render();
-  if (who) toast(`已断开「${who}」的控制`, 'info');
+  if (whoId) toast(t('toastStoppedHosting', devNameById(whoId, 'desk')), 'info');
 }
 
 function disconnect() {
@@ -965,26 +1444,25 @@ function disconnect() {
   renderOverlay();
 }
 
-function openRemote(d, note) {
+function openRemote(d, noteKey) {
   S.controlling = d.id;
   remote = {
-    id: d.id, name: d.name, mon: 1, fps: 60, released: false,
-    ms: d.id === 'laptop' ? 9 : d.id === 'desk' ? 3 : d.id === 'study' ? 1 : 26,
-    path: d.info.includes('自建中转') ? '经自建中转' : '直连',
-    toast: note,
-    notepad: 'README.md — 记事本\n\n- 画面优先走两端直连\n- 剪贴板在会话内自动同步\n- 装上后台服务后，锁屏、登录界面与 UAC 弹窗下照常控制',
+    id: d.id, mon: 1, fps: 60, released: false,
+    ms: d.ms ?? (d.id === 'laptop' ? 9 : d.id === 'desk' ? 3 : d.id === 'study' ? 1 : 26),
+    pathKey: d.conn === 'relay' ? 'relay' : 'direct',
+    toastKey: noteKey,
   };
   clearInterval(timerHandle);
   timerHandle = setInterval(() => {
     if (!remote) return;
-    const base = remote.path === '直连' ? 6 : 40;
+    const base = remote.pathKey === 'direct' ? 6 : 40;
     remote.ms = Math.max(1, base + Math.round((Math.random() - 0.5) * 3));
     const el = document.getElementById('rd-stat');
-    if (el) el.textContent = `${remote.path} · ${remote.ms} ms`;
+    if (el) el.textContent = `${t(remote.pathKey === 'direct' ? 'pathDirect' : 'pathRelay')} · ${remote.ms} ms`;
   }, 1100);
   render();
   renderOverlay();
-  setTimeout(() => { if (remote) { remote.toast = ''; renderOverlay(); } }, 2600);
+  setTimeout(() => { if (remote) { remote.toastKey = ''; renderOverlay(); } }, 2600);
 }
 
 function openTerm(id) {
@@ -992,13 +1470,13 @@ function openTerm(id) {
   if (!d) return;
   term = {
     id: d.id,
-    name: d.name,
+    fallbackKey: d.nameKey,
     cwd: 'C:\\Users\\Demo',
-    lines: [
-      `正在连接「${d.name}」……`,
-      'Windows PowerShell',
-      'Copyright (C) Microsoft Corporation. All rights reserved.',
-      '',
+    entries: [
+      { type: 'connect', devId: d.id, fallbackKey: d.nameKey },
+      { type: 'raw', text: 'Windows PowerShell' },
+      { type: 'raw', text: 'Copyright (C) Microsoft Corporation. All rights reserved.' },
+      { type: 'raw', text: '' },
     ],
   };
   renderOverlay();
@@ -1009,26 +1487,37 @@ function runTermCmd(cmd) {
   if (!term) return;
   const c = cmd.trim();
   if (!c) return;
-  term.lines.push(`PS ${term.cwd}> ${c}`);
+  term.entries.push({ type: 'raw', text: `PS ${term.cwd}> ${c}` });
   const low = c.toLowerCase();
+  const targetName = devNameById(term.id, term.fallbackKey);
   if (low === 'cls' || low === 'clear') {
-    term.lines = [];
+    term.entries = [];
   } else if (low.includes('git status')) {
-    term.lines.push('On branch main', "Your branch is up to date with 'origin/main'.", 'nothing to commit, working tree clean');
+    term.entries.push(
+      { type: 'raw', text: 'On branch main' },
+      { type: 'raw', text: "Your branch is up to date with 'origin/main'." },
+      { type: 'raw', text: 'nothing to commit, working tree clean' }
+    );
   } else if (low === 'dir' || low === 'ls') {
-    term.lines.push('Mode                 LastWriteTime         Length Name',
-      '----                 -------------         ------ ----',
-      'd-----        2026/11/18     21:10                Desktop',
-      'd-----        2026/11/18     19:40                Projects',
-      '-a----        2026/11/18     23:30       14281728 remote-control.exe');
+    term.entries.push(
+      { type: 'raw', text: 'Mode                 LastWriteTime         Length Name' },
+      { type: 'raw', text: '----                 -------------         ------ ----' },
+      { type: 'raw', text: 'd-----        2026/11/18     21:10                Desktop' },
+      { type: 'raw', text: 'd-----        2026/11/18     19:40                Projects' },
+      { type: 'raw', text: '-a----        2026/11/18     23:30       14281728 remote-control.exe' }
+    );
   } else if (low.includes('hostname')) {
-    term.lines.push(term.name);
+    term.entries.push({ type: 'raw', text: targetName });
   } else if (low.includes('ipconfig')) {
-    term.lines.push('Ethernet adapter:', '   IPv4 Address . . . . . : 192.168.1.42', '   IPv6 Address . . . . . : 2001:db8::42');
+    term.entries.push(
+      { type: 'raw', text: 'Ethernet adapter:' },
+      { type: 'raw', text: '   IPv4 Address . . . . . : 192.168.1.42' },
+      { type: 'raw', text: '   IPv6 Address . . . . . : 2001:db8::42' }
+    );
   } else {
-    term.lines.push(`[演示输出] 已在 ${term.name} 上执行：${c}`);
+    term.entries.push({ type: 'demoExec', devId: term.id, fallbackKey: term.fallbackKey, cmd: c });
   }
-  term.lines.push('');
+  term.entries.push({ type: 'raw', text: '' });
   renderOverlay();
   setTimeout(() => {
     const body = document.querySelector('.term-body');
@@ -1046,7 +1535,7 @@ function fmtTime(d) {
 function copyCode() {
   copied = Date.now();
   const now = new Date();
-  S.codes.push({ n: ++codeSeq, label: `${fmtTime(now)} 复制` });
+  S.codes.push({ n: ++codeSeq, time: fmtTime(now) });
   markStep('copy');
   if (navigator.clipboard?.writeText) {
     navigator.clipboard.writeText('rc1-self-7K9mPq2x8nVw').catch(() => {});
@@ -1060,7 +1549,7 @@ function revoke(n) {
   if (idx === -1) return;
   S.codes.splice(idx, 1);
   render();
-  toast('已撤销，这个连接码不能再用了', 'info');
+  toast(t('toastRevoked'), 'info');
 }
 
 function syncConnectAction() {
@@ -1070,10 +1559,12 @@ function syncConnectAction() {
   const hasVal = input.value.trim().length > 0;
   const curMode = slot.dataset.mode;
   const nextMode = hasVal ? 'add' : 'empty';
-  if (curMode === nextMode) return;
+  const curLang = slot.dataset.lang;
+  if (curMode === nextMode && curLang === lang) return;
   slot.dataset.mode = nextMode;
+  slot.dataset.lang = lang;
   slot.innerHTML = hasVal
-    ? `<button class="soft act-go" type="button" onclick="pasteCode(document.getElementById('connect-code-in').value)">添加</button>`
+    ? `<button class="soft act-go" type="button" onclick="pasteCode(document.getElementById('connect-code-in').value)">${t('add')}</button>`
     : '';
 }
 
@@ -1096,44 +1587,46 @@ function pasteCode(text) {
   };
   if (/^rc-relay-/i.test(v)) {
     clearInput();
-    toast('这是中转码，请贴到「设置 → 自建中转」里', 'warn');
+    toast(t('toastRelayCodeWrongBox'), 'warn');
     return;
   }
   if (/^rc1-self-/i.test(v)) {
     clearInput();
-    toast('这是本机发出的连接码，要发给对方用', 'warn');
+    toast(t('toastSelfCode'), 'warn');
     return;
   }
   if (!/^rc1-[A-Za-z0-9_-]{8,}$/.test(v)) {
     clearInput();
-    toast(/^rc1/i.test(v) ? '连接码不完整或者有错字，请对方重新复制一次' : '这不是连接码', 'warn');
+    toast(/^rc1/i.test(v) ? t('toastCodeBad') : t('toastNotCode'), 'warn');
     return;
   }
   markStep('input');
   if (savedDevsForEmpty !== null) savedDevsForEmpty = null;
   clearInput();
-  if (dev('guest-new')) {
+  const existing = dev('guest-new');
+  if (existing) {
     revealRow('guest-new');
-    toast('「新添加的笔记本」已在临时设备里', 'info');
+    toast(t('toastAlreadyTemp', devName(existing)), 'info');
     return;
   }
-  S.devs.push({
-    id: 'guest-new', name: '新添加的笔记本', icon: 'laptop', kind: 'temp',
-    via: '连接码', online: true, info: '在线 · 26 ms · 直连',
-  });
+  const nd = {
+    id: 'guest-new', nameKey: 'guestNew', customName: false, name: '', icon: 'laptop', kind: 'temp',
+    viaKey: 'code', online: true, ms: 26, conn: 'direct',
+  };
+  S.devs.push(nd);
   render();
   revealRow('guest-new');
-  toast('已添加「新添加的笔记本」，点「控制」开始或点「记住」保存', 'ok');
+  toast(t('toastAddedTemp', devName(nd)), 'ok');
 }
 
 function retry(id) {
   const d = dev(id);
   if (!d) return;
-  d.unreach = false; d.info = '正在连接…'; why = null;
+  d.unreach = false; d.retrying = true; why = null;
   render();
   setTimeout(() => {
     const x = dev(id);
-    if (x) { x.unreach = true; x.info = '无法连接'; render(); }
+    if (x) { x.retrying = false; x.unreach = true; render(); }
   }, 1300);
 }
 
@@ -1148,24 +1641,27 @@ function toggle(key, el) {
   render();
 }
 function service(install) {
-  ui.busy = install ? '正在安装后台服务…' : '正在卸载后台服务…';
+  ui.busy = install ? 'install' : 'uninstall';
   render();
   setTimeout(() => {
     ui.busy = null;
     S.set.svc = install ? 'run' : 'none';
     render();
-    toast(install ? '后台服务已安装，关闭窗口后仍保持在线' : '后台服务已卸载', 'ok');
+    toast(t(install ? 'toastSvcInstalled' : 'toastSvcUninstalled'), 'ok');
   }, 1100);
 }
 function saveName(v) {
   v = v.trim();
+  const cur = selfName();
   const next = v || DEFAULT_HOST;
-  if (next === S.name) {
+  if (next === cur) {
     const inp = document.getElementById('device-name-in');
-    if (inp && inp.value !== S.name) inp.value = S.name;
+    if (inp && inp.value !== cur) inp.value = cur;
     return;
   }
-  S.name = next; ui.saved = Date.now();
+  S.selfNameCustom = true;
+  S.name = next;
+  ui.saved = Date.now();
   render();
 }
 function refreshRelays() {
@@ -1188,23 +1684,23 @@ function useRelay(i) {
   r.state = 'home';
   S.relays.unshift(r);
   render();
-  toast(`已将 ${r.host} 设为首选`, 'ok');
+  toast(t('toastRelayPrimary', r.host), 'ok');
 }
 function removeRelay(i) {
   const r = S.relays[i]; r.hidden = true;
   render();
-  toast(`已移除中转 ${r.host}`, 'info', ['撤回', () => { r.hidden = false; render(); }, () => { S.relays = S.relays.filter(x => x !== r); render(); }]);
+  toast(t('toastRelayRemoved', r.host), 'info', [t('undo'), () => { r.hidden = false; render(); }, () => { S.relays = S.relays.filter(x => x !== r); render(); }]);
 }
 function addRelay() {
   const inp = document.querySelector('#win .relay-in');
   const v = inp?.value.trim();
   if (!v) return;
   if (/^rc1-/i.test(v)) {
-    toast('这是连接码，请贴到「设备」页顶部输入框', 'warn');
+    toast(t('toastConnCodeInRelay'), 'warn');
     return;
   }
   if (!/^rc-relay-/i.test(v)) {
-    toast('这不是中转码，请在服务器运行 rc-relay ui 获取', 'warn');
+    toast(t('toastNotRelayCode'), 'warn');
     return;
   }
   ui.adding = 'busy';
@@ -1212,9 +1708,10 @@ function addRelay() {
   setTimeout(() => {
     ui.adding = false;
     const isFirst = S.relays.filter(r => !r.hidden).length === 0;
-    S.relays.push({ host: 'relay-c.example.com:7843', state: isFirst ? 'home' : 'idle', rtt: 35 });
+    const host = 'relay-c.example.com:7843';
+    S.relays.push({ host, state: isFirst ? 'home' : 'idle', rtt: 35 });
     render();
-    toast('已添加中转 relay-c.example.com:7843', 'ok');
+    toast(t('toastRelayAdded', host), 'ok');
   }, 900);
 }
 
@@ -1226,7 +1723,7 @@ function openMenu(ev, id) {
   const w = document.getElementById('win').getBoundingClientRect();
   menu = {
     id,
-    x: Math.max(12, r.right - w.left - 210),
+    rightRef: r.right - w.left,
     topRef: r.top - w.top,
     botRef: r.bottom - w.top,
     winH: w.height,
@@ -1241,19 +1738,21 @@ function renderMenu() {
   if (!d) { menu = null; layer.innerHTML = ''; return; }
   const it = (icon, label, fn, cls = '', extra = '') =>
     `<div class="it ${cls}" onclick="event.stopPropagation();menu=null;renderMenu();${fn}">${icon ? ic(icon) : '<span style="width:15px"></span>'}<span>${label}</span>${extra}</div>`;
-  let h = it('term', '终端', d.online ? `openTerm('${d.id}')` : '', d.online ? '' : 'dis');
+  let h = it('term', t('menuTerminal'), d.online ? `openTerm('${d.id}')` : '', d.online ? '' : 'dis');
   if (d.kind !== 'temp') {
-    h += it('rename', '重命名', `startRename('${d.id}')`);
-    h += `<div class="sep"></div><div class="mhead">它控制本机时</div>`;
+    h += it('rename', t('menuRename'), `startRename('${d.id}')`);
+    h += `<div class="sep"></div><div class="mhead">${t('menuWhenCtrl')}</div>`;
     for (const k of ['mine', 'trusted']) {
-      h += it('', `${KIND[k].title} <span class="msub">${k === 'mine' ? '免确认' : '需确认'}</span>`, `setKind('${d.id}','${k}')`, '',
+      h += it('', `${getKindInfo(k).title} <span class="msub">${k === 'mine' ? t('menuAutoAccept') : t('menuPrompt')}</span>`, `setKind('${d.id}','${k}')`, '',
         d.kind === k ? `<span class="tick">${ic('check')}</span>` : '');
     }
   }
-  h += `<div class="sep"></div>` + it('del', '删除', `askDelete('${d.id}')`, 'danger');
-  layer.innerHTML = `<div class="menu" style="left:${menu.x}px;top:${menu.botRef + 4}px" onclick="event.stopPropagation()">${h}</div>`;
+  h += `<div class="sep"></div>` + it('del', t('menuRemove'), `askDelete('${d.id}')`, 'danger');
+  layer.innerHTML = `<div class="menu" style="left:${Math.max(12, menu.rightRef - 210)}px;top:${menu.botRef + 4}px" onclick="event.stopPropagation()">${h}</div>`;
   const mEl = layer.firstElementChild;
   if (mEl) {
+    const mw = mEl.offsetWidth;
+    mEl.style.left = Math.max(12, menu.rightRef - mw) + 'px';
     const mh = mEl.offsetHeight;
     if (menu.botRef + 4 + mh > menu.winH - 8) {
       mEl.classList.add('up');
@@ -1276,45 +1775,47 @@ document.addEventListener('keydown', e => {
 
 /* ---------- Render Devices & Settings ---------- */
 function rowHtml(d) {
-  let sub = `${esc(d.info)}${d.kind === 'temp' && d.via ? ' · ' + d.via : ''}`;
+  const via = devVia(d);
+  let sub = `${esc(devInfo(d))}${d.kind === 'temp' && via ? ' · ' + esc(via) : ''}`;
   let subCls = d.unreach ? 'amber' : '', acts = '';
   const ctl = S.controlling === d.id;
 
   if (d.req === 'out') {
-    sub = `<span class="spin"></span>等对方同意`;
-    acts += `<button class="ghost" onclick="event.stopPropagation();cancelRemember('${d.id}')">取消</button>`;
+    sub = `<span class="spin"></span>${t('waitingPeer')}`;
+    acts += `<button class="ghost" onclick="event.stopPropagation();cancelRemember('${d.id}')">${t('cancel')}</button>`;
   } else if (d.kind === 'temp') {
-    acts += `<button class="ghost" onclick="event.stopPropagation();remember('${d.id}')">${ic('add')}记住</button>`;
+    acts += `<button class="ghost" onclick="event.stopPropagation();remember('${d.id}')">${ic('add')}${t('remember')}</button>`;
   }
 
-  if (ctl) { sub = '控制中'; subCls = 'blue'; }
-  if (d.waiting) sub = `<span class="spin"></span>等对方允许 · <span class="wait-sec">${d.waitLeft ?? 30}</span> 秒`;
-  if (d.info === '正在连接…') sub = `<span class="spin"></span>正在连接…`;
+  if (ctl) { sub = t('controlling'); subCls = 'blue'; }
+  if (d.waiting) sub = `<span class="spin"></span>${t('waitingApprovalPrefix')}<span class="wait-sec">${d.waitLeft ?? 30}</span>${t('waitingApprovalSuffix')}`;
+  if (d.retrying) sub = `<span class="spin"></span>${t('connecting')}`;
 
   if (ctl) {
-    acts += `<button class="danger" onclick="event.stopPropagation();disconnect()">断开</button>`;
+    acts += `<button class="danger" onclick="event.stopPropagation();disconnect()">${t('disconnect')}</button>`;
   } else if (d.waiting) {
-    acts += `<button class="ghost" onclick="event.stopPropagation();cancelWait('${d.id}')">取消</button>`;
+    acts += `<button class="ghost" onclick="event.stopPropagation();cancelWait('${d.id}')">${t('cancel')}</button>`;
   } else if (d.unreach) {
-    acts += `<button class="ghost" onclick="event.stopPropagation();why=why==='${d.id}'?null:'${d.id}';render()">查看原因</button>`;
+    acts += `<button class="ghost" onclick="event.stopPropagation();why=why==='${d.id}'?null:'${d.id}';render()">${t('details')}</button>`;
   } else {
-    acts += `<button class="soft" ${d.online ? '' : 'disabled'} onclick="event.stopPropagation();control('${d.id}')">控制</button>`;
+    acts += `<button class="soft" ${d.online ? '' : 'disabled'} onclick="event.stopPropagation();control('${d.id}')">${t('control')}</button>`;
   }
 
+  const dName = devName(d);
   const name = renaming === d.id
-    ? `<input class="field" value="${esc(d.name)}" onclick="event.stopPropagation()" ondblclick="event.stopPropagation()" onkeydown="if(event.key==='Enter')this.blur();if(event.key==='Escape'){renaming=null;render()}" onblur="endRename('${d.id}',this.value,true)">`
-    : `<span>${esc(d.name)}</span>`;
+    ? `<input class="field" value="${esc(dName)}" onclick="event.stopPropagation()" ondblclick="event.stopPropagation()" onkeydown="if(event.key==='Enter')this.blur();if(event.key==='Escape'){renaming=null;render()}" onblur="endRename('${d.id}',this.value,true)">`
+    : `<span>${esc(dName)}</span>`;
 
   const dot = ctl ? 'ctl' : d.online ? 'on' : d.unreach ? 'amber' : '';
   let h = `<div class="row" data-id="${d.id}" ondblclick="if('${d.online}'==='true' && !renaming) control('${d.id}')">
     <div class="av ${d.kind}">${ic(d.icon)}<span class="dot ${dot}"></span></div>
     <div class="txt"><div class="nm">${name}</div><div class="sub ${subCls}">${sub}</div></div>
-    <div class="acts" ondblclick="event.stopPropagation()">${acts}<button class="icon" title="更多" onclick="openMenu(event,'${d.id}')">${ic('more')}</button></div>
+    <div class="acts" ondblclick="event.stopPropagation()">${acts}<button class="icon" title="${esc(t('more'))}" onclick="openMenu(event,'${d.id}')">${ic('more')}</button></div>
   </div>`;
 
   if (why === d.id && d.unreach) {
-    h += `<div class="why">两台电脑之间无法直连，通常是网络限制。可开启路由器 IPv6，或在设置中添加自建中转。
-      <div class="btns"><button onclick="retry('${d.id}')">重试</button><button onclick="jumpToSettings('sec-relays');why=null;">去设置</button></div></div>`;
+    h += `<div class="why">${t('unreachWhy')}
+      <div class="btns"><button onclick="retry('${d.id}')">${t('retry')}</button><button onclick="jumpToSettings('sec-relays');why=null;">${t('goSettings')}</button></div></div>`;
   }
   return h;
 }
@@ -1324,126 +1825,173 @@ function devicesHtml() {
   for (const k of ['mine', 'trusted', 'temp']) {
     const ds = S.devs.filter(d => d.kind === k);
     if (!ds.length) continue;
-    list += `<div class="sec"><div class="sh"><b>${KIND[k].title}</b><span>${KIND[k].note}</span></div>
+    const ki = getKindInfo(k);
+    list += `<div class="sec"><div class="sh"><b>${ki.title}</b><span>${ki.note}</span></div>
       <div class="group">${ds.map(rowHtml).join('')}</div></div>`;
   }
   if (!list) {
-    list = `<div class="empty">${ic('devices')}<div class="et">还没有设备</div><div class="ed">同一局域网会自动出现；跨网请复制连接码发给对方，或贴到上方</div></div>`;
+    list = `<div class="empty">${ic('devices')}<div class="et">${t('emptyTitle')}</div><div class="ed">${t('emptyDesc')}</div></div>`;
   }
   let banner = '';
-  if (S.hostedBy) {
-    banner = `<div class="banner red">${ic('desktop')}<div class="grow"><b>「${esc(S.hostedBy)}」</b> 正在控制本机</div>
-      <button class="danger" onclick="stopHosting()">断开</button></div>`;
+  if (S.hostedById) {
+    banner = `<div class="banner red">${ic('desktop')}<div class="grow">${t('bannerHosted', devNameById(S.hostedById, 'desk'))}</div>
+      <button class="danger" onclick="stopHosting()">${t('disconnect')}</button></div>`;
   } else if (S.incoming) {
-    banner = `<div class="banner amber">${ic('shield')}<div class="grow"><b>「${esc(S.incoming.name)}」</b> 想控制本机，等待确认</div></div>`;
+    banner = `<div class="banner amber">${ic('shield')}<div class="grow">${t('bannerIncoming', devNameById(S.incoming.whoId, 'desk'))}</div></div>`;
   } else if (ui.busy) {
-    banner = `<div class="banner blue"><span class="spin big"></span><div class="grow">${ui.busy}</div></div>`;
+    banner = `<div class="banner blue"><span class="spin big"></span><div class="grow">${t(ui.busy === 'install' ? 'busyInstall' : 'busyUninstall')}</div></div>`;
   }
   const isCopied = Date.now() - copied < 2000;
   const codes = S.codes.filter(c => !c.hidden);
   return `
-    <div class="head"><h1>设备</h1><span class="grow"></span>
+    <div class="head"><h1>${t('devicesTitle')}</h1><span class="grow"></span>
       <span class="tip-wrap">
-        <button class="${isCopied ? 'copied' : ''} ${activePulse === 'copy-btn' ? 'pulse' : ''}" onclick="copyCode()">${isCopied ? ic('check') + '已复制，1 小时内有效' : ic('copy') + '复制本机连接码'}</button>
-        <span class="tip-box">一次性有效（1 小时），对方连入时会弹窗等你允许</span>
+        <button class="${isCopied ? 'copied' : ''} ${activePulse === 'copy-btn' ? 'pulse' : ''}" onclick="copyCode()">${isCopied ? ic('check') + t('copiedValid') : ic('copy') + t('copyCodeBtn')}</button>
+        <span class="tip-box">${t('copyCodeTip')}</span>
       </span>
     </div>
     <div class="connect ${activePulse === 'connect-box' ? 'pulse' : ''}" onclick="document.getElementById('connect-code-in')?.focus()">
       ${ic('link')}
-      <input id="connect-code-in" name="connect-code" placeholder="粘贴对方连接码，加入设备列表"
+      <input id="connect-code-in" name="connect-code" placeholder="${esc(t('connectPlaceholder'))}"
         onfocus="markStep('input')"
         oninput="onConnectInput(this)"
         onkeydown="if(event.key==='Enter')pasteCode(this.value)">
       <span id="connect-action-slot" data-mode="empty" onclick="event.stopPropagation()"></span>
     </div>
-    ${codes.length ? `<div class="codes">还没用掉的连接码（连入时会先问你）${codes.map(c => `<span class="chip">${esc(c.label)}<button class="ghost" onclick="revoke(${c.n})">撤销</button></span>`).join('')}</div>` : ''}
+    ${codes.length ? `<div class="codes">${t('unusedCodesLabel')}${codes.map(c => `<span class="chip">${esc(t('codeCopiedAt', c.time))}<button class="ghost" onclick="revoke(${c.n})">${t('revoke')}</button></span>`).join('')}</div>` : ''}
     <div class="gap18"></div>
     ${banner}${list}`;
 }
 
 const sw = (key, dis) => `<span class="sw ${!dis && S.set[key] ? 'on' : ''} ${dis ? 'off-dis' : ''}" onclick="toggle('${key}', this)"></span>`;
-const item = (icon, t, d, right, cls = '') =>
-  `<div class="item ${cls}">${ic(icon)}<div class="txt2"><div class="t">${t}</div>${d ? `<div class="d">${d}</div>` : ''}</div><div class="r">${right}</div></div>`;
+const item = (icon, title, d, right, cls = '') =>
+  `<div class="item ${cls}">${ic(icon)}<div class="txt2"><div class="t">${title}</div>${d ? `<div class="d">${d}</div>` : ''}</div><div class="r">${right}</div></div>`;
 
 function setSkills(next) {
   S.set.skills = next;
   render();
-  if (next === 'installed') {
-    toast('已写入 ~/.claude/skills、~/.agents/skills，新开的 AI 对话即生效', 'ok');
-  } else {
-    toast('已卸载 AI Skills', 'info');
-  }
+  toast(t(next === 'installed' ? 'toastSkillsInstalled' : 'toastSkillsUninstalled'), next === 'installed' ? 'ok' : 'info');
 }
 
 function settingsHtml() {
   const st = S.set, busy = !!ui.busy;
-  const saved = Date.now() - ui.saved < 1800 ? `<span class="saved">✓ 已保存</span>` : '';
-  let h = `<div class="head"><h1>设置</h1></div>`;
-  h += `<div class="sec" id="sec-self"><div class="sh"><b>本机</b></div><div class="group">
-    ${item('rename', '设备名称', '其他设备看到的本机名称', `${saved}<input id="device-name-in" name="device-name" class="field" style="width:200px" placeholder="默认：${DEFAULT_HOST}" value="${esc(S.name)}" onkeydown="if(event.key==='Enter')this.blur();if(event.key==='Escape'){this.value=S.name;this.blur()}" onblur="saveName(this.value)">`)}
+  const saved = Date.now() - ui.saved < 1800 ? `<span class="saved">${t('savedBadge')}</span>` : '';
+  const curSelfName = selfName();
+  let h = `<div class="head"><h1>${t('settingsTitle')}</h1></div>`;
+  h += `<div class="sec" id="sec-self"><div class="sh"><b>${t('secSelf')}</b></div><div class="group">
+    ${item('rename', t('deviceName'), t('deviceNameDesc'), `${saved}<input id="device-name-in" name="device-name" class="field" style="width:200px" placeholder="${esc(t('defaultHostPrefix') + DEFAULT_HOST)}" value="${esc(curSelfName)}" onkeydown="if(event.key==='Enter')this.blur();if(event.key==='Escape'){this.value=selfName();this.blur()}" onblur="saveName(this.value)">`)}
   </div></div>`;
-  h += `<div class="sec"><div class="sh"><b>网络与发现</b></div><div class="group">
-    ${item('globe', '公网辅助连接', '跨网直连时用于交换地址，不转发画面和数据', sw('public'))}
-    ${item('wifi', '局域网发现', '允许同一局域网内的设备自动发现本机', sw('lan'))}
+  h += `<div class="sec"><div class="sh"><b>${t('secNet')}</b></div><div class="group">
+    ${item('globe', t('publicRelay'), t('publicRelayDesc'), sw('public'))}
+    ${item('wifi', t('lanDiscovery'), t('lanDiscoveryDesc'), sw('lan'))}
   </div></div>`;
 
   const relays = S.relays.filter(r => !r.hidden);
   const relayDesc = r => {
-    const rtt = ui.probing ? ' · 测速中…' : (r.rtt ? ` · ${r.rtt} ms` : '');
-    if (r.state === 'home') return [`已连接（首选）${rtt}`, ''];
-    if (r.state === 'temp') return [`临时接管（首选不可用）${rtt}`, ''];
-    if (r.state === 'fail') return ['连接失败', 'amber'];
-    return [`备用 · 首选不可用时接管${rtt}`, 'grey'];
+    const rtt = ui.probing ? t('probingDot') : (r.rtt ? ` · ${r.rtt} ms` : '');
+    if (r.state === 'home') return [`${t('relayPrimary')}${rtt}`, ''];
+    if (r.state === 'temp') return [`${t('relayTemp')}${rtt}`, ''];
+    if (r.state === 'fail') return [t('relayFail'), 'amber'];
+    return [`${t('relayIdle')}${rtt}`, 'grey'];
   };
   const probeBtn = relays.length
-    ? `<button class="icon sh-act ${ui.probing ? 'spinning' : ''}" title="${ui.probing ? '测速中…' : '重新测速'}" ${ui.probing ? 'disabled' : ''} onclick="refreshRelays()">${ic('refresh')}</button>`
+    ? `<button class="icon sh-act ${ui.probing ? 'spinning' : ''}" title="${esc(t(ui.probing ? 'probingTitle' : 'reprobeTitle'))}" ${ui.probing ? 'disabled' : ''} onclick="refreshRelays()">${ic('refresh')}</button>`
     : '';
-  h += `<div class="sec" id="sec-relays"><div class="sh"><b>自建中转</b><span>按顺序优先使用，直连受阻时自动接管</span>${probeBtn}</div><div class="group">
+  h += `<div class="sec" id="sec-relays"><div class="sh"><b>${t('secRelays')}</b><span>${t('secRelaysNote')}</span>${probeBtn}</div><div class="group">
     ${relays.map((r, i) => {
       const [desc, dotCls] = relayDesc(r);
       return `<div class="item"><span class="pdot ${dotCls}" style="margin:0 6px"></span>
       <div class="txt2"><div class="t mono" style="font-size:13px">${esc(r.host)}</div><div class="d">${desc}</div></div>
-      <div class="r">${i ? `<button class="ghost" onclick="useRelay(${S.relays.indexOf(r)})">设为首选</button>` : ''}
-      <button class="icon red" title="移除" onclick="removeRelay(${S.relays.indexOf(r)})">${ic('del')}</button></div></div>`;
+      <div class="r">${i ? `<button class="ghost" onclick="useRelay(${S.relays.indexOf(r)})">${t('setPrimary')}</button>` : ''}
+      <button class="icon red" title="${esc(t('remove'))}" onclick="removeRelay(${S.relays.indexOf(r)})">${ic('del')}</button></div></div>`;
     }).join('')}
     ${ui.adding
       ? `<div class="item add-form" style="align-items:flex-start;padding-top:12px;padding-bottom:12px">${ic('server')}
            <div class="txt2" style="display:flex;flex-direction:column;gap:5px">
-             <input class="field relay-in" style="width:100%" placeholder="粘贴中转码（如 rc-relay-...）" ${ui.adding === 'busy' ? 'disabled' : ''}
+             <input class="field relay-in" style="width:100%" placeholder="${esc(t('relayPlaceholder'))}" ${ui.adding === 'busy' ? 'disabled' : ''}
                onkeydown="if(event.key==='Enter')addRelay();if(event.key==='Escape'){ui.adding=false;render()}">
-             <div class="d">在自建服务器运行 <span class="mono">rc-relay ui</span> 获取中转码</div>
+             <div class="d">${t('relayHint')}</div>
            </div>
            <div class="r">
-             <button class="ghost" onclick="ui.adding=false;render()">取消</button>
-             ${ui.adding === 'busy' ? '<button disabled><span class="spin"></span>添加中…</button>' : `<button class="primary" onclick="addRelay()">添加</button>`}
+             <button class="ghost" onclick="ui.adding=false;render()">${t('cancel')}</button>
+             ${ui.adding === 'busy' ? `<button disabled><span class="spin"></span>${t('addingBusy')}</button>` : `<button class="primary" onclick="addRelay()">${t('add')}</button>`}
            </div>
          </div>`
-      : `<div class="item add" onclick="ui.adding=true;render();document.querySelector('#win .relay-in')?.focus()">${ic('add')}<div class="txt2">添加中转服务器</div></div>`}
+      : `<div class="item add" onclick="ui.adding=true;render();document.querySelector('#win .relay-in')?.focus()">${ic('add')}<div class="txt2">${t('addRelayBtn')}</div></div>`}
   </div></div>`;
 
   const on = st.svc === 'run';
-  const svcRight = busy ? `<button disabled><span class="spin"></span>${ui.busy.replace('正在', '').replace('后台服务…', '中…')}</button>`
-    : on ? `<button onclick="service(false)">${ic('shield')}卸载</button>` : `<button class="primary" onclick="service(true)">${ic('shield')}安装</button>`;
-  h += `<div class="sec"><div class="sh"><b>后台服务</b></div><div class="group">
-    ${item('service', on ? '运行中' : '未安装', on ? '关闭窗口后仍保持在线' : '安装后支持开机在线与锁屏控制（需要管理员权限）', svcRight)}
-    ${item('power', '开机自启', on ? '系统启动后自动在后台保持在线' : '安装后台服务后可用', sw('boot', !on), on ? '' : 'dis')}
-    ${item('lock', '允许锁屏控制', on ? '仅限「我的电脑」免确认连入' : '安装后台服务后可用', sw('lock', !on), on ? '' : 'dis')}
-    ${item('bolt', '接通电源时阻止睡眠', on ? '保持在线，显示器仍按系统设置熄屏' : '安装后台服务后可用', sw('awake', !on), on ? '' : 'dis')}
+  const svcRight = busy ? `<button disabled><span class="spin"></span>${t(ui.busy === 'install' ? 'busyInstallShort' : 'busyUninstallShort')}</button>`
+    : on ? `<button onclick="service(false)">${ic('shield')}${t('uninstall')}</button>` : `<button class="primary" onclick="service(true)">${ic('shield')}${t('install')}</button>`;
+  h += `<div class="sec"><div class="sh"><b>${t('secService')}</b></div><div class="group">
+    ${item('service', t(on ? 'svcRunning' : 'svcNotInstalled'), t(on ? 'svcRunningDesc' : 'svcNotInstalledDesc'), svcRight)}
+    ${item('power', t('startAtBoot'), t(on ? 'startAtBootDesc' : 'svcRequired'), sw('boot', !on), on ? '' : 'dis')}
+    ${item('lock', t('allowLock'), t(on ? 'allowLockDesc' : 'svcRequired'), sw('lock', !on), on ? '' : 'dis')}
+    ${item('bolt', t('keepAwake'), t(on ? 'keepAwakeDesc' : 'svcRequired'), sw('awake', !on), on ? '' : 'dis')}
   </div></div>`;
 
   const sk = st.skills || 'none';
-  const skDesc = sk === 'installed' ? '已安装 · 支持 Claude Code、Codex'
-    : sk === 'outdated' ? '已安装（当前程序路径或版本有变化）'
-    : '为 Claude Code、Codex 安装远程控制 Skill，支持通过终端操作设备';
+  const skDesc = sk === 'installed' ? t('skillsInstalledDesc')
+    : sk === 'outdated' ? t('skillsOutdatedDesc')
+    : t('skillsNoneDesc');
   const skRight = sk === 'installed'
-    ? `<button onclick="setSkills('none')">卸载</button>`
+    ? `<button onclick="setSkills('none')">${t('uninstall')}</button>`
     : sk === 'outdated'
-    ? `<button class="primary" onclick="setSkills('installed')">更新</button><button onclick="setSkills('none')">卸载</button>`
-    : `<button onclick="setSkills('installed')">安装</button>`;
-  h += `<div class="sec"><div class="sh"><b>AI 集成</b></div><div class="group">
-    ${item('bot', '配置 AI Skills', skDesc, skRight)}
+    ? `<button class="primary" onclick="setSkills('installed')">${t('update')}</button><button onclick="setSkills('none')">${t('uninstall')}</button>`
+    : `<button onclick="setSkills('installed')">${t('install')}</button>`;
+  h += `<div class="sec"><div class="sh"><b>${t('secAI')}</b></div><div class="group">
+    ${item('bot', t('aiSkills'), skDesc, skRight)}
   </div></div>`;
   return h;
+}
+
+function modalView(m) {
+  if (!m) return null;
+  if (m.kind === 'delete') {
+    const d = dev(m.devId);
+    const nm = d ? devName(d) : '';
+    return {
+      icon: m.icon, tone: m.tone,
+      title: t('delTitle', nm),
+      text: t('delText'),
+      btns: [
+        [t('cancel'), '', m.actions[0]],
+        [t('del'), 'danger', m.actions[1]],
+      ],
+    };
+  }
+  if (m.kind === 'wait') {
+    const d = dev(m.devId);
+    const nm = d ? devName(d) : '';
+    const ki = d ? getKindInfo(d.kind).title : '';
+    const via = d ? devVia(d) : '';
+    const left = d?.waitLeft ?? 30;
+    return {
+      icon: m.icon, tone: m.tone, bar: m.bar,
+      title: t('waitTitle', selfName(), nm),
+      text: t('waitText', ki, via),
+      foot: t('countdown', left),
+      btns: [
+        [t('simDecline'), 'danger-solid', m.actions[0]],
+        [t('simAllow'), 'primary', m.actions[1]],
+      ],
+    };
+  }
+  if (m.kind === 'incoming') {
+    const nm = devNameById(m.whoId, 'desk');
+    const left = S.incoming?.left ?? 30;
+    return {
+      icon: m.icon, tone: m.tone, bar: m.bar,
+      title: t('incomingTitle', nm),
+      text: t('incomingText'),
+      foot: t('countdown', left),
+      btns: [
+        [t('decline'), 'danger-solid', m.actions[0]],
+        [t('allow'), 'primary', m.actions[1]],
+      ],
+    };
+  }
+  return null;
 }
 
 function render() {
@@ -1464,23 +2012,22 @@ function render() {
     return `<div class="nav ${onCls} ${pCls}" onclick="S.page='${page}';menu=null;if('${page}'==='settings')markStep('settings');render()">${ic(icon)}<span>${label}</span>${extra}</div>`;
   };
 
-  const rlabel = { home: '已连', temp: '临时接管', fail: '连不上', idle: '备用' };
   const visibleRelays = S.relays.filter(r => !r.hidden);
   const relayBlock = visibleRelays.length
-    ? `<div class="relays ${activePulse === 'relay-box' ? 'pulse' : ''}" title="前往设置管理自建中转" onclick="jumpToSettings('sec-relays')">
-        <div class="h"><span>自建中转</span><span class="go">管理</span></div>
+    ? `<div class="relays ${activePulse === 'relay-box' ? 'pulse' : ''}" title="${esc(t('relaysSidebarTitle'))}" onclick="jumpToSettings('sec-relays')">
+        <div class="h"><span>${t('secRelays')}</span><span class="go">${t('manage')}</span></div>
         ${visibleRelays.map(r =>
-          `<div class="r"><span class="pdot ${r.state === 'home' || r.state === 'temp' ? '' : r.state === 'fail' ? 'amber' : 'grey'}"></span><span>${esc(shortHost(r.host))}</span><span>${rlabel[r.state] || '…'}</span></div>`).join('')}
+          `<div class="r"><span class="pdot ${r.state === 'home' || r.state === 'temp' ? '' : r.state === 'fail' ? 'amber' : 'grey'}"></span><span>${esc(shortHost(r.host))}</span><span>${t(`rlabel_${r.state}`) || '…'}</span></div>`).join('')}
       </div>`
     : '';
 
   pane.innerHTML = `
-    <div class="me" title="点击前往设置修改设备名称" onclick="jumpToSettings('sec-self')">
+    <div class="me" title="${esc(t('meSidebarTitle'))}" onclick="jumpToSettings('sec-self')">
       <div class="av mine" style="width:40px;height:40px;border-radius:10px">${ic(S.icon)}</div>
-      <div><div class="nm">${esc(S.name)}</div><div class="st"><span class="pdot live"></span>本机 · 在线</div></div>
+      <div><div class="nm">${esc(selfName())}</div><div class="st"><span class="pdot live"></span>${t('meStatus')}</div></div>
     </div>
-    ${nav('devices', 'devices', '设备', `<span class="count">${S.devs.length}</span>`)}
-    ${nav('settings', 'gear', '设置')}
+    ${nav('devices', 'devices', t('navDevices'), `<span class="count">${S.devs.length}</span>`)}
+    ${nav('settings', 'gear', t('navSettings'))}
     ${relayBlock}`;
 
   sc.innerHTML = S.page === 'devices' ? devicesHtml() : settingsHtml();
@@ -1495,13 +2042,14 @@ function render() {
 
   renderMenu();
 
+  const mv = modalView(modal);
   const modalLayer = w.querySelector('.modal-layer');
-  modalLayer.innerHTML = modal ? `<div class="veil"><div class="dialog"><div class="top2"><div class="badge ${modal.tone}">${ic(modal.icon)}</div>
-    <div><h4>${esc(modal.title)}</h4><p>${esc(modal.text)}</p></div></div>${modal.bar ? '<div class="bar"><div></div></div>' : ''}
-    <div class="btns">${modal.foot ? `<span class="foot-note" id="modal-countdown">${esc(modal.foot)}</span>` : ''}${modal.btns.map((b, i) => `<button class="${b[1]}" onclick="modalBtn(${i})">${b[0]}</button>`).join('')}</div></div></div>` : '';
+  modalLayer.innerHTML = mv ? `<div class="veil"><div class="dialog"><div class="top2"><div class="badge ${mv.tone}">${ic(mv.icon)}</div>
+    <div><h4>${esc(mv.title)}</h4><p>${esc(mv.text)}</p></div></div>${mv.bar ? '<div class="bar"><div></div></div>' : ''}
+    <div class="btns">${mv.foot ? `<span class="foot-note" id="modal-countdown">${esc(mv.foot)}</span>` : ''}${mv.btns.map((b, i) => `<button class="${b[1]}" onclick="modalBtn(${i})">${b[0]}</button>`).join('')}</div></div></div>` : '';
 
   const closedLayer = w.querySelector('.closed-layer');
-  closedLayer.innerHTML = S.closed ? `<div class="closed">窗口已关闭（缩到托盘，后台服务保持在线）<button onclick="S.closed=false;render()">从托盘打开</button></div>` : '';
+  closedLayer.innerHTML = S.closed ? `<div class="closed">${t('closedMsg')}<button onclick="S.closed=false;render()">${t('openFromTray')}</button></div>` : '';
 
   w.dataset.page = S.page;
   const c = sc.querySelector('.connect input');
@@ -1518,58 +2066,79 @@ function shortHost(h) {
   return /[a-z]/i.test(h) && !h.includes(':') ? h.split('.')[0] : h;
 }
 function modalBtn(i) {
-  const f = modal.btns[i][2];
+  const mv = modalView(modal);
+  const f = mv?.btns[i]?.[2];
   modal = null;
   render();
-  f();
+  if (f) f();
 }
 
 /* ---------- Remote Screen & Terminal Overlays ---------- */
+function remoteToastText() {
+  if (!remote || !remote.toastKey) return '';
+  const nm = devNameById(remote.id);
+  if (remote.toastKey === 'autoAccept') return t('noteAutoAccept');
+  if (remote.toastKey === 'allowed') return t('noteAllowed', nm);
+  if (remote.toastKey === 'mon') return t('rdMonitorToast', remote.mon);
+  if (remote.toastKey === 'cad') return t('rdCadToast', nm);
+  if (remote.toastKey === 'shortcut') return t('rdShortcutToast');
+  return '';
+}
+
 function renderOverlay() {
   const box = document.getElementById('overlay');
   if (remote) {
+    const rName = devNameById(remote.id);
+    const rPath = t(remote.pathKey === 'direct' ? 'pathDirect' : 'pathRelay');
+    const rToast = remoteToastText();
     box.innerHTML = `<div class="overlay-modal" onclick="if(event.target===this)disconnect()">
       <div class="rd-win">
         <div class="rd-bar">
-          <b>${esc(remote.name)}</b>
-          <span class="badge-net"><span class="pdot"></span><span id="rd-stat">${remote.path} · ${remote.ms} ms</span></span>
-          ${remote.released ? `<span style="color:var(--amber-text);margin-left:6px">键鼠已释放，点画面继续</span>` : ''}
+          <b>${esc(rName)}</b>
+          <span class="badge-net"><span class="pdot"></span><span id="rd-stat">${rPath} · ${remote.ms} ms</span></span>
+          ${remote.released ? `<span style="color:var(--amber-text);margin-left:6px">${t('rdInputReleased')}</span>` : ''}
           <div class="grow"></div>
-          <button class="tb" title="显示器 ${remote.mon}/2" onclick="remote.mon=remote.mon===1?2:1;remote.toast='已切换到显示器 '+remote.mon+'/2';renderOverlay()">${ic('monitor')}</button>
-          <button class="tb" title="终端：在对方电脑上开 PowerShell" onclick="openTerm('${remote.id}')">${ic('term')}</button>
-          <button class="tb" title="发送 Ctrl+Alt+Del" onclick="remote.toast='已向 ${esc(remote.name)} 发送 Ctrl+Alt+Del';renderOverlay()">${ic('cad')}</button>
-          <button class="tb ${remote.released ? 'on' : ''}" title="释放键鼠" onclick="remote.released=!remote.released;renderOverlay()">${ic('unlock')}</button>
-          <button class="danger" onclick="disconnect()">断开</button>
+          <button class="tb" title="${esc(t('rdMonitorTitle', remote.mon))}" onclick="remote.mon=remote.mon===1?2:1;remote.toastKey='mon';renderOverlay()">${ic('monitor')}</button>
+          <button class="tb" title="${esc(t('rdTermTitle'))}" onclick="openTerm('${remote.id}')">${ic('term')}</button>
+          <button class="tb" title="${esc(t('rdCadTitle'))}" onclick="remote.toastKey='cad';renderOverlay()">${ic('cad')}</button>
+          <button class="tb ${remote.released ? 'on' : ''}" title="${esc(t('rdReleaseTitle'))}" onclick="remote.released=!remote.released;renderOverlay()">${ic('unlock')}</button>
+          <button class="danger" onclick="disconnect()">${t('disconnect')}</button>
           <div class="caps"><span>${ic('min')}</span><span>${ic('max')}</span><span class="x" onclick="disconnect()">${ic('close')}</span></div>
         </div>
         <div class="rd-screen ${remote.mon === 2 ? 'mon2' : ''}" onclick="if(remote.released){remote.released=false;renderOverlay()}">
-          <div class="hosted-pill"><span>${esc(S.name)} 正在控制</span><span class="stop">断开</span></div>
+          <div class="hosted-pill"><span>${esc(t('rdHostedBy', selfName()))}</span><span class="stop">${t('disconnect')}</span></div>
           <div class="fake-icons">
-            <div class="fake-icon" onclick="event.stopPropagation();remote.toast='双击打开了桌面快捷方式';renderOverlay()"><div class="box">${ic('desktop')}</div>此电脑</div>
+            <div class="fake-icon" onclick="event.stopPropagation();remote.toastKey='shortcut';renderOverlay()"><div class="box">${ic('desktop')}</div>${t('rdThisPC')}</div>
             <div class="fake-icon" onclick="event.stopPropagation();openTerm('${remote.id}')"><div class="box">${ic('term')}</div>PowerShell</div>
           </div>
           <div class="fake-app" onclick="event.stopPropagation()">
-            <div class="fake-app-bar">${remote.mon === 1 ? 'README.md — 记事本' : '工作区 — 副屏'}</div>
+            <div class="fake-app-bar">${remote.mon === 1 ? t('rdNotepadTitle') : t('rdDisplay2Title')}</div>
             <div class="fake-app-body">
-              <div style="white-space:pre-wrap">${esc(remote.notepad)}</div>
+              <div style="white-space:pre-wrap">${esc(t('notepadText'))}</div>
             </div>
           </div>
-          ${remote.toast ? `<div class="rd-toast">${esc(remote.toast)}</div>` : ''}
-          <div class="fake-taskbar"><span class="winbtn">${ic('desktop')}</span><span>开始</span><span style="margin-left:auto">${esc(remote.name)} · 2560×1440</span></div>
+          ${rToast ? `<div class="rd-toast">${esc(rToast)}</div>` : ''}
+          <div class="fake-taskbar"><span class="winbtn">${ic('desktop')}</span><span>${t('rdStart')}</span><span style="margin-left:auto">${esc(rName)} · 2560×1440</span></div>
         </div>
       </div>
     </div>`;
     return;
   }
   if (term) {
+    const tName = devNameById(term.id, term.fallbackKey);
+    const lines = term.entries.map(e => {
+      if (e.type === 'connect') return t('termConnecting', devNameById(e.devId, e.fallbackKey));
+      if (e.type === 'demoExec') return t('termDemoExec', devNameById(e.devId, e.fallbackKey), e.cmd);
+      return e.text;
+    });
     box.innerHTML = `<div class="overlay-modal" onclick="if(event.target===this){term=null;renderOverlay()}">
       <div class="term-win">
         <div class="term-bar">
-          ${ic('term')}<span>${esc(term.name)} · 终端</span>
+          ${ic('term')}<span>${esc(t('termHeader', tName))}</span>
           <div class="grow"></div>
           <div class="caps"><span>${ic('min')}</span><span>${ic('max')}</span><span class="x" onclick="term=null;renderOverlay()">${ic('close')}</span></div>
         </div>
-        <div class="term-body">${esc(term.lines.join('\n'))}</div>
+        <div class="term-body">${esc(lines.join('\n'))}</div>
         <div class="term-in">
           <span>PS ${esc(term.cwd)}&gt;</span>
           <input id="term-cmd" name="term-cmd" autocomplete="off" onkeydown="if(event.key==='Enter'){runTermCmd(this.value);this.value=''}">

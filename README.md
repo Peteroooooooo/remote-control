@@ -1,13 +1,14 @@
 <div align="center">
   <img src="apps/remote-control/assets/icon.svg" width="76" alt="Remote Control" />
   <h1>REMOTE CONTROL</h1>
+  <p><strong>简体中文</strong> · <a href="README.en.md">English</a></p>
   <p><strong>单 exe、P2P 直连优先的 Windows 远程桌面、终端与 AI Agent 跨设备控制工具</strong></p>
   <p>
     基于 Rust 与 iroh。免账号、免配 SSH 与内网穿透，默认打洞直连不经第三方服务器；<br />
     一键接入 <strong>Claude Code / Codex</strong> 跨设备查日志、跑命令、传文件，受限网络可用 Docker 自建私有中转。
   </p>
   <p>
-    <a href="https://peteroooooooo.github.io/remote-control/"><strong>在线试一试 →</strong></a>（网页模拟界面，可体验控制、终端与连接码，数据为虚拟）
+    <a href="https://peteroooooooo.github.io/remote-control/?lang=zh"><strong>在线试一试 →</strong></a>（网页模拟界面，可体验控制、终端与连接码，数据为虚拟）
   </p>
   <img src="docs/images/lobby-devices.png" width="760" alt="Remote Control" />
 </div>

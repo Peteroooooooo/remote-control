@@ -96,7 +96,7 @@ pub fn run(cfg: &Config, demo: bool) -> Result<()> {
     } else {
         let store = Store::new(&cfg.state_dir);
         store.upgrade()?;
-        let urls = cfg.saved_urls().context("先启动一次中转（rc-relay serve，容器默认就会），再打开管理界面")?;
+        let urls = cfg.saved_urls().context("start the relay once (`rc-relay serve`, which the container runs by default) before opening the UI")?;
         store.first_code()?;
         (store, urls, None)
     };
@@ -118,9 +118,9 @@ pub fn run(cfg: &Config, demo: bool) -> Result<()> {
     };
     app.reload()?;
     if !std::io::IsTerminal::is_terminal(&std::io::stdout()) {
-        bail!("管理界面需要一个终端（docker exec -it rc-relay ui）；只看文字用 rc-relay codes");
+        bail!("the management UI requires a terminal (docker exec -it rc-relay ui); use `rc-relay codes` for plain text output");
     }
-    let mut term = ratatui::try_init().context("打开全屏界面")?;
+    let mut term = ratatui::try_init().context("initialize terminal UI")?;
     let r = app.main_loop(&mut term);
     ratatui::restore();
     if let Some(d) = &app.demo {
@@ -202,7 +202,7 @@ impl App {
             // Devices joining and going on- and offline, without a key press.
             if last_read.elapsed() > Duration::from_secs(2) && self.modal.is_none() {
                 if let Err(e) = self.reload() {
-                    self.toast(format!("刷新失败：{e:#}"), false);
+                    self.toast(format!("Refresh failed: {e:#}"), false);
                 }
                 last_read = Instant::now();
             }
@@ -222,7 +222,7 @@ impl App {
                         self.store.rename_code(c.n, text.trim())?;
                         self.reload()?;
                         let now = self.code().map(Code::shown_name).unwrap_or_default();
-                        self.toast(format!("已改名为「{now}」"), true);
+                        self.toast(format!("Renamed to \"{now}\""), true);
                     }
                     KeyCode::Esc => {}
                     KeyCode::Backspace => {
@@ -254,9 +254,9 @@ impl App {
                             self.reload()?;
                             self.toast(
                                 if gone.is_empty() {
-                                    format!("已删除「{}」（按 u 撤回）", c.shown_name())
+                                    format!("Deleted \"{}\" (press u to undo)", c.shown_name())
                                 } else {
-                                    format!("已删除「{}」，{} 台电脑已移出（按 u 撤回）", c.shown_name(), gone.len())
+                                    format!("Deleted \"{}\", {} device(s) removed (press u to undo)", c.shown_name(), gone.len())
                                 },
                                 true,
                             );
@@ -267,14 +267,14 @@ impl App {
                                 self.store.remove_owner(&o.id)?;
                                 self.undo.push(Undo::Owner { owner: o.clone(), guests: gs });
                                 self.reload()?;
-                                self.toast(format!("已移除 {}（按 u 撤回）", shown_name(&o.name, o.id)), true);
+                                self.toast(format!("Removed {} (press u to undo)", shown_name(&o.name, o.id)), true);
                             }
                         }
                         Modal::KickGuest => {
                             if let Some(DeviceRow::Guest { owner, guest }) = self.rows().get(self.dsel).cloned() {
                                 self.store.kick(owner, guest.id)?;
                                 self.reload()?;
-                                self.toast(format!("已移除 {}", shown_name(&guest.name, guest.id)), true);
+                                self.toast(format!("Removed {}", shown_name(&guest.name, guest.id)), true);
                             }
                         }
                         Modal::Rename(_) => {}
@@ -315,13 +315,13 @@ impl App {
                 self.reload()?;
                 self.sel = self.codes.iter().position(|x| x.n == c.n).unwrap_or(0);
                 self.focus = Focus::Codes;
-                self.toast(format!("已生成「{}」，按 r 可以改名", c.shown_name()), true);
+                self.toast(format!("Created \"{}\"; press r to rename", c.shown_name()), true);
             }
             KeyCode::Char('c') if self.code().is_some() => {
                 if let Some(c) = self.code().cloned() {
                     let text = RelayCode { urls: self.urls.clone(), claim_key: c.key }.encode();
                     show_copy_line(term, &text, &c.shown_name())?;
-                    self.toast(format!("已尝试复制「{}」中转码", c.shown_name()), true);
+                    self.toast(format!("Copied \"{}\"", c.shown_name()), true);
                 }
             }
             KeyCode::Char('r') if self.code().is_some() => {
@@ -356,16 +356,16 @@ impl App {
                 self.reload()?;
                 self.sel = self.codes.iter().position(|x| x.n == restored.n).unwrap_or(0);
                 self.focus = Focus::Codes;
-                self.toast(format!("已撤回删除「{}」", restored.shown_name()), true);
+                self.toast(format!("Restored \"{}\"", restored.shown_name()), true);
             }
             Undo::Owner { owner, guests } => {
                 if !self.codes.iter().any(|c| c.n == owner.code) {
-                    self.toast("所属中转码已不在，请先撤回中转码", false);
+                    self.toast("Code no longer exists; undo the code deletion first", false);
                     return Ok(());
                 }
                 self.store.restore_owner(&owner, &guests)?;
                 self.reload()?;
-                self.toast(format!("已撤回移除 {}", shown_name(&owner.name, owner.id)), true);
+                self.toast(format!("Restored {}", shown_name(&owner.name, owner.id)), true);
             }
         }
         Ok(())
@@ -400,14 +400,14 @@ impl App {
             .map(|u| format!("{}{}", u.host_str().unwrap_or("?"), u.port().map(|p| format!(":{p}")).unwrap_or_default()))
             .collect();
         let state = if self.running() {
-            let up = if self.status.started > 0 { format!(" · 已运行 {}", ago(unix_now().saturating_sub(self.status.started))) } else { String::new() };
-            vec![Span::styled("● ", Style::new().fg(GREEN)), Span::styled(format!("运行中 · {}{up}", hosts.join(" · ")), Style::new().fg(DIM))]
+            let up = if self.status.started > 0 { format!(" · up {}", ago(unix_now().saturating_sub(self.status.started))) } else { String::new() };
+            vec![Span::styled("● ", Style::new().fg(GREEN)), Span::styled(format!("Running · {}{up}", hosts.join(" · ")), Style::new().fg(DIM))]
         } else {
-            vec![Span::styled("● ", Style::new().fg(RED)), Span::styled(format!("中转没有在运行 · {}", hosts.join(" · ")), Style::new().fg(DIM))]
+            vec![Span::styled("● ", Style::new().fg(RED)), Span::styled(format!("Relay stopped · {}", hosts.join(" · ")), Style::new().fg(DIM))]
         };
         let left = Line::from(vec![
             Span::styled("rc-relay", Style::new().fg(ACCENT).add_modifier(Modifier::BOLD)),
-            Span::styled(if self.demo.is_some() { "  自建中转 · 演示数据" } else { "  自建中转" }, Style::new().fg(DIM)),
+            Span::styled(if self.demo.is_some() { "  Self-hosted Relay · Demo" } else { "  Self-hosted Relay" }, Style::new().fg(DIM)),
         ]);
         let right = Line::from(state).right_aligned();
         let w = left.width() as u16 + 2;
@@ -435,11 +435,15 @@ impl App {
 
     fn draw_codes(&self, f: &mut Frame, area: Rect) {
         let focused = self.focus == Focus::Codes;
-        let block = self.panel("中转码".into(), focused);
+        let block = self.panel("Codes".into(), focused);
         let inner = block.inner(area);
         f.render_widget(block, area);
         if self.codes.is_empty() {
-            let p = Paragraph::new(vec![Line::from(""), Line::from(vec![Span::styled(" 没有中转码，按 ", Style::new().fg(DIM)), Span::styled("n", Style::new().fg(FG)), Span::styled(" 新建一个", Style::new().fg(DIM))])]);
+            let p = Paragraph::new(vec![
+                Line::from(""),
+                Line::from(vec![Span::styled(" No codes. Press ", Style::new().fg(DIM)), Span::styled("n", Style::new().fg(FG)), Span::styled(" to add", Style::new().fg(DIM))]),
+            ])
+            .wrap(Wrap { trim: false });
             f.render_widget(p, inner);
             return;
         }
@@ -451,7 +455,8 @@ impl App {
             let style = self.row_style(sel, focused);
             f.render_widget(Block::new().style(style), row);
             let bar = if sel && focused { Span::styled("▌", Style::new().fg(ACCENT)) } else { Span::raw(" ") };
-            let count = format!("{} 台 ", self.count(c));
+            let n = self.count(c);
+            let count = if n == 1 { "1 PC ".to_string() } else { format!("{n} PCs ") };
             let name_w = (inner.width as usize).saturating_sub(count.len() + 3);
             let line = Line::from(vec![bar, Span::raw(" "), Span::raw(fit(&c.shown_name(), name_w))]).style(style);
             f.render_widget(line, row);
@@ -461,7 +466,7 @@ impl App {
 
     fn draw_devices(&self, f: &mut Frame, area: Rect) {
         let focused = self.focus == Focus::Devices;
-        let title = self.code().map_or_else(|| "电脑".to_string(), |c| format!("「{}」的电脑", c.shown_name()));
+        let title = self.code().map_or_else(|| "Devices".to_string(), |c| format!("Devices · {}", c.shown_name()));
         let block = self.panel(title, focused);
         let inner = block.inner(area);
         f.render_widget(block, area);
@@ -470,9 +475,9 @@ impl App {
         if rows.is_empty() {
             let p = Paragraph::new(vec![
                 Line::from(""),
-                Line::styled(" 还没有电脑用这个码加入。", Style::new().fg(DIM)),
-                Line::from(vec![Span::styled(" 按 c 复制中转码，贴到软件 ", Style::new().fg(DIM)), Span::styled("「设置 → 自建中转」", Style::new().fg(FG))]),
-                Line::styled(" 那台电脑就会出现在这里。", Style::new().fg(DIM)),
+                Line::styled(" No devices have joined with this code yet.", Style::new().fg(DIM)),
+                Line::from(vec![Span::styled(" Press c to copy the code and paste it into ", Style::new().fg(DIM)), Span::styled("Settings -> Self-hosted Relay", Style::new().fg(FG))]),
+                Line::styled(" That device will appear here once connected.", Style::new().fg(DIM)),
             ])
             .wrap(Wrap { trim: false });
             f.render_widget(p, inner);
@@ -492,11 +497,11 @@ impl App {
                 DeviceRow::Owner(o) => {
                     let on = online.contains(&o.id);
                     let when = if on {
-                        "在线".to_string()
+                        "Online".to_string()
                     } else {
                         match self.status.seen.get(&o.id) {
-                            Some(t) => format!("{}前", ago(unix_now().saturating_sub(*t))),
-                            None => "离线".to_string(),
+                            Some(t) => format!("{} ago", ago(unix_now().saturating_sub(*t))),
+                            None => "Offline".to_string(),
                         }
                     };
                     let id = o.id.fmt_short().to_string();
@@ -514,15 +519,15 @@ impl App {
                     let (id, name) = (&guest.id, &guest.name);
                     let on = online.contains(id);
                     let (tag, tag_fg) = match guest.kind {
-                        Kind::Mine => ("我的电脑", CYAN),
-                        Kind::Trusted => ("信任设备", GUEST_FG),
-                        Kind::Unknown | Kind::Temp => ("访客", DIM),
+                        Kind::Mine => ("My PC", CYAN),
+                        Kind::Trusted => ("Trusted", GUEST_FG),
+                        Kind::Unknown | Kind::Temp => ("Guest", DIM),
                     };
                     let when = if on {
-                        "在线".to_string()
+                        "Online".to_string()
                     } else {
                         match self.status.seen.get(id) {
-                            Some(t) => format!("{}前", ago(unix_now().saturating_sub(*t))),
+                            Some(t) => format!("{} ago", ago(unix_now().saturating_sub(*t))),
                             None => String::new(),
                         }
                     };
@@ -559,13 +564,13 @@ impl App {
                 .title(Span::styled(format!(" {title} "), Style::new().fg(DIM)))
         };
         let Some(c) = self.code() else {
-            let block = code_block("完整中转码".into());
+            let block = code_block("Relay Code".into());
             let inner = block.inner(area);
             f.render_widget(block, area);
-            f.render_widget(Line::styled("按 n 新建一个中转码", Style::new().fg(DIM)), inner);
+            f.render_widget(Line::styled("Press n to create a relay code", Style::new().fg(DIM)), inner);
             return;
         };
-        let block = code_block(format!("完整中转码 · 「{}」", c.shown_name()));
+        let block = code_block(format!("Relay Code · {}", c.shown_name()));
         let inner = block.inner(area);
         f.render_widget(block, area);
         let text = RelayCode { urls: self.urls.clone(), claim_key: c.key }.encode();
@@ -573,9 +578,9 @@ impl App {
         f.render_widget(
             Line::from(vec![
                 Span::styled(preview, Style::new().fg(CYAN)),
-                Span::styled("   按 ", Style::new().fg(DIM)),
+                Span::styled("   Press ", Style::new().fg(DIM)),
                 Span::styled("c", Style::new().fg(FG)),
-                Span::styled(" 复制 / 展开整行（同一组的电脑贴同一个码）", Style::new().fg(DIM)),
+                Span::styled(" to copy / expand (shared by group)", Style::new().fg(DIM)),
             ]),
             inner,
         );
@@ -583,7 +588,7 @@ impl App {
 
     fn draw_keys(&self, f: &mut Frame, area: Rect) {
         let key = |k: &'static str, what: &'static str| {
-            vec![Span::styled(format!(" {k} "), Style::new().fg(FG).bg(KEY_BG)), Span::styled(format!(" {what}   "), Style::new().fg(DIM))]
+            vec![Span::styled(format!(" {k} "), Style::new().fg(FG).bg(KEY_BG)), Span::styled(format!(" {what} "), Style::new().fg(DIM))]
         };
         let rows = self.rows();
         let can_del = if self.focus == Focus::Devices {
@@ -591,18 +596,18 @@ impl App {
         } else {
             self.code().is_some()
         };
-        let mut pairs = vec![("↑↓", "选择"), ("Tab", "切换"), ("n", "新建码")];
+        let mut pairs = vec![("↑↓", "Nav"), ("Tab", "Panel"), ("n", "New")];
         if self.code().is_some() {
-            pairs.push(("c", "复制"));
-            pairs.push(("r", "改名"));
+            pairs.push(("c", "Copy"));
+            pairs.push(("r", "Rename"));
         }
         if can_del {
-            pairs.push(("d", "删除"));
+            pairs.push(("d", "Delete"));
         }
         if !self.undo.is_empty() {
-            pairs.push(("u", "撤回"));
+            pairs.push(("u", "Undo"));
         }
-        pairs.push(("q", "退出"));
+        pairs.push(("q", "Quit"));
         let line: Vec<Span> = pairs.into_iter().flat_map(|(k, w)| key(k, w)).collect();
         f.render_widget(Line::from(line), area);
         if let Some((t, _, ok)) = &self.toast {
@@ -630,27 +635,27 @@ impl App {
             Modal::Rename(text) => {
                 let c = self.code().map(Code::shown_name).unwrap_or_default();
                 (
-                    format!("给「{c}」改名"),
+                    format!("Rename \"{c}\""),
                     ACCENT,
                     vec![
-                        Line::styled("名字只给你自己看，方便区分是给谁的；留空就叫「码 N」", Style::new().fg(DIM)),
+                        Line::styled("Label for your reference only; leave blank for \"Code N\"", Style::new().fg(DIM)),
                         Line::from(""),
                         Line::from(vec![Span::styled(" ", Style::new()), Span::styled(text.clone(), Style::new().fg(FG)), Span::styled("▏", Style::new().fg(ACCENT))]),
                     ],
-                    vec![("Enter", "保存"), ("Esc", "取消")],
+                    vec![("Enter", "Save"), ("Esc", "Cancel")],
                 )
             }
             Modal::DeleteCode => {
                 let c = self.code().expect("a code is selected");
                 let n = self.count(c);
                 (
-                    format!("删除「{}」？", c.shown_name()),
+                    format!("Delete \"{}\"?", c.shown_name()),
                     RED,
                     vec![
-                        Line::styled(if n > 0 { format!("这个码作废，下面 {n} 台电脑立即不能再用中转。") } else { "这个码作废。".to_string() }, Style::new().fg(FG)),
-                        Line::styled("删错可以在界面里按 u 撤回。", Style::new().fg(DIM)),
+                        Line::styled(if n > 0 { format!("Revokes code; {n} device(s) below will lose relay access.") } else { "This relay code will be revoked.".to_string() }, Style::new().fg(FG)),
+                        Line::styled("Press u in the main view to undo.", Style::new().fg(DIM)),
                     ],
-                    vec![("y", "删除"), ("n", "取消")],
+                    vec![("y", "Delete"), ("n", "Cancel")],
                 )
             }
             Modal::DeleteDevice => {
@@ -658,15 +663,14 @@ impl App {
                     Some(DeviceRow::Owner(o)) => shown_name(&o.name, o.id),
                     _ => String::new(),
                 };
-                let c = self.code().map(Code::shown_name).unwrap_or_default();
                 (
-                    format!("移除 {name}？"),
+                    format!("Remove {name}?"),
                     RED,
                     vec![
-                        Line::styled("中转立即停止为它转发。", Style::new().fg(FG)),
-                        Line::styled(format!("它手里还有「{c}」的码，可以再贴回来；删错可按 u 撤回。"), Style::new().fg(DIM)),
+                        Line::styled("The relay will immediately stop forwarding for it.", Style::new().fg(FG)),
+                        Line::styled("It can rejoin with this group's code; press u to undo.", Style::new().fg(DIM)),
                     ],
-                    vec![("y", "移除"), ("n", "取消")],
+                    vec![("y", "Remove"), ("n", "Cancel")],
                 )
             }
             Modal::KickGuest => {
@@ -675,13 +679,14 @@ impl App {
                     _ => String::new(),
                 };
                 (
-                    format!("移除访客 {name}？"),
+                    format!("Remove guest {name}?"),
                     RED,
                     vec![
-                        Line::styled("中转立即停止为它转发，1 秒内通知成员电脑删除它，两台电脑都会忘掉对方。", Style::new().fg(FG)),
-                        Line::styled("删除后不能撤回；以后要再连，重新发连接码即可。", Style::new().fg(DIM)),
+                        Line::styled("Stops relay forwarding immediately and notifies", Style::new().fg(FG)),
+                        Line::styled("the owner to drop it so both devices unpair.", Style::new().fg(FG)),
+                        Line::styled("Cannot be undone; send a new invite to reconnect.", Style::new().fg(DIM)),
                     ],
-                    vec![("y", "移除"), ("n", "取消")],
+                    vec![("y", "Remove"), ("n", "Cancel")],
                 )
             }
         };
@@ -705,7 +710,7 @@ impl App {
 }
 
 fn shown_name(name: &str, id: EndpointId) -> String {
-    if name.is_empty() { format!("设备 {}", id.fmt_short()) } else { name.to_string() }
+    if name.is_empty() { format!("Device {}", id.fmt_short()) } else { name.to_string() }
 }
 
 fn short_code(text: &str) -> String {
@@ -730,11 +735,11 @@ fn show_copy_line(term: &mut ratatui::DefaultTerminal, text: &str, label: &str) 
     let _ = disable_raw_mode();
     let _ = execute!(out, Clear(ClearType::All), MoveTo(0, 0), Show);
     copy_osc52(text);
-    println!(" 「{label}」完整中转码\n");
+    println!(" Full relay code for \"{label}\"\n");
     println!("\x1b[36m{text}\x1b[0m\n");
-    println!(" 支持剪贴板的终端已直接复制，可去软件 Ctrl+V 粘贴");
-    println!(" 网页终端请三击上方蓝色整行，再按 Ctrl+Insert（或右键 → 复制）\n");
-    println!(" 按 空格 / 回车 / Esc 返回面板…");
+    println!(" Copied via OSC 52 if your terminal supports it (paste with Ctrl+V).");
+    println!(" In a web console, triple-click the cyan line above and press Ctrl+Insert (or right-click -> Copy).\n");
+    println!(" Press Space / Enter / Esc to return...");
     let _ = out.flush();
     let _ = enable_raw_mode();
     loop {
@@ -798,10 +803,10 @@ fn pad(text: &str, w: usize, right: bool) -> String {
 /// A span of seconds as people say it.
 fn ago(secs: u64) -> String {
     match secs {
-        0..60 => "1 分钟".into(),
-        60..3600 => format!("{} 分钟", secs / 60),
-        3600..86_400 => format!("{} 小时", secs / 3600),
-        _ => format!("{} 天", secs / 86_400),
+        0..60 => "1m".into(),
+        60..3600 => format!("{}m", secs / 60),
+        3600..86_400 => format!("{}h", secs / 3600),
+        _ => format!("{}d", secs / 86_400),
     }
 }
 
@@ -815,7 +820,7 @@ fn make_demo(dir: &std::path::Path) -> Result<Store> {
     let store = Store::new(dir);
     let key = |n: u8| iroh_base::SecretKey::from_bytes(&[n; 32]).public();
     let mine = store.new_code("")?;
-    let home = store.new_code("爸妈")?;
+    let home = store.new_code("Parents")?;
     store.new_code("")?;
     store.join(key(1), mine.n, "DESKTOP")?;
     store.join(key(2), mine.n, "laptop")?;
@@ -823,9 +828,9 @@ fn make_demo(dir: &std::path::Path) -> Result<Store> {
     store.set_guests(
         &key(1),
         &[
-            Guest::new(key(4), "朋友笔记本", Kind::Trusted),
-            Guest::new(key(5), "书房电脑", Kind::Mine),
-            Guest::new(key(6), "表弟手机", Kind::Temp),
+            Guest::new(key(4), "Friend Laptop", Kind::Trusted),
+            Guest::new(key(5), "Study PC", Kind::Mine),
+            Guest::new(key(6), "Cousin Phone", Kind::Temp),
         ],
     )?;
     let now = unix_now();
@@ -834,7 +839,7 @@ fn make_demo(dir: &std::path::Path) -> Result<Store> {
         written: now,
         online: vec![key(1), key(3), key(4), key(7)],
         seen: [(key(2), now - 3 * 86_400), (key(5), now - 7200)].into_iter().collect(),
-        meets: vec![crate::state::ActiveMeet { owner: key(3), guest: key(7), name: "表弟手机".into() }],
+        meets: vec![crate::state::ActiveMeet { owner: key(3), guest: key(7), name: "Cousin Phone".into() }],
     })?;
     Ok(store)
 }

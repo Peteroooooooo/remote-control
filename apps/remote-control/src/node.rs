@@ -320,7 +320,7 @@ const KEEP_WAIT: Duration = Duration::from_secs(15);
 const KEEP_WAIT_MAX: Duration = Duration::from_secs(300);
 
 fn short(id: &EndpointId) -> String {
-    format!("设备 {}", &id.to_string()[..6])
+    format!("{} {}", crate::i18n::tr("设备", "Device"), &id.to_string()[..6])
 }
 
 fn hex(b: &[u8]) -> String {
@@ -478,7 +478,8 @@ impl Shared {
     fn save(&self, st: &mut St) {
         if let Err(e) = st.store.save() {
             log!("{e:#}");
-            self.notice(st, format!("设备列表保存失败：{e:#}"));
+            let prefix = crate::i18n::tr("设备列表保存失败：", "Failed to save device list: ");
+            self.notice(st, format!("{prefix}{e:#}"));
         }
     }
 
@@ -525,7 +526,8 @@ impl Shared {
     /// point at where this computer no longer is.
     fn settings_changed(&self, st: &mut St, before: net::Relays) {
         if let Err(e) = st.settings.save(&store::settings_path(&self.opts.key)) {
-            let msg = format!("设置保存失败：{e:#}");
+            let prefix = crate::i18n::tr("设置保存失败：", "Failed to save settings: ");
+            let msg = format!("{prefix}{e:#}");
             self.notice(st, msg);
         }
         for p in st.peers.values() {
@@ -795,7 +797,17 @@ impl Shared {
             }
             meet::EVENT_ASK | meet::EVENT_REMEMBER if !listed && ask == Ask::Out => {
                 self.befriend(st, from, event == meet::EVENT_ASK);
-                let text = if event == meet::EVENT_ASK { format!("已和「{name}」互相记住") } else { format!("「{name}」同意了，已互相记住") };
+                let text = if crate::i18n::is_en() {
+                    if event == meet::EVENT_ASK {
+                        format!("You and \"{name}\" remembered each other")
+                    } else {
+                        format!("\"{name}\" agreed; you remembered each other")
+                    }
+                } else if event == meet::EVENT_ASK {
+                    format!("已和「{name}」互相记住")
+                } else {
+                    format!("「{name}」同意了，已互相记住")
+                };
                 self.notice(st, text);
             }
             // Listing this computer without being asked (an older version, or
@@ -815,7 +827,12 @@ impl Shared {
                     if listed && st.store.remove(&from) {
                         self.save(st);
                     }
-                    self.notice(st, format!("「{name}」没有同意"));
+                    let msg = if crate::i18n::is_en() {
+                        format!("\"{name}\" declined")
+                    } else {
+                        format!("「{name}」没有同意")
+                    };
+                    self.notice(st, msg);
                 }
             }
             _ => {}
@@ -936,14 +953,20 @@ impl Shared {
             meet::REFUSE_FORGOTTEN => {
                 if st.store.remove(id) {
                     self.save(st);
-                    self.notice(st, format!("「{name}」把这台电脑删除了"));
+                    let msg = if crate::i18n::is_en() {
+                        format!("\"{name}\" removed this computer")
+                    } else {
+                        format!("「{name}」把这台电脑删除了")
+                    };
+                    self.notice(st, msg);
                 }
                 if let Some(p) = st.peers.get_mut(id) {
                     p.met = None;
                 }
             }
             meet::REFUSE_CODE_EXPIRED | meet::REFUSE_CODE_USED | meet::REFUSE_CODE_UNKNOWN => {
-                self.notice(st, format!("连接失败：{}", meet::refusal_text(reason)));
+                let prefix = crate::i18n::tr("连接失败：", "Connection failed: ");
+                self.notice(st, format!("{prefix}{}", meet::refusal_text(reason)));
                 if let Some(p) = st.peers.get_mut(id) {
                     p.token = None;
                     if p.met == Some(Met::Code) {
@@ -1007,7 +1030,12 @@ impl Shared {
                 p.wake.notify_one();
             }
             if had {
-                self.notice(&mut st, format!("「{shown}」把这台电脑删除了"));
+                let msg = if crate::i18n::is_en() {
+                    format!("\"{shown}\" removed this computer")
+                } else {
+                    format!("「{shown}」把这台电脑删除了")
+                };
+                self.notice(&mut st, msg);
             }
             let w = welcome(&st, meet::EVENT_NONE);
             drop(st);
@@ -1262,6 +1290,7 @@ impl Node {
         let key = opts.key.clone();
         let lock = tokio::task::spawn_blocking(move || net::IdLock::acquire(&key, wait)).await??;
         let settings = Settings::load(&store::settings_path(&opts.key));
+        crate::i18n::set_pref(settings.language);
         let mut store = Store::load(&store::devices_path(&opts.key)).unwrap_or_else(|e| {
             log!("{e:#}; starting with an empty device list");
             Store::empty(&store::devices_path(&opts.key))
@@ -1480,6 +1509,7 @@ impl Node {
                 }
             }
             "set-name" => Ok(self.settings(|s| s.name = clean(f.get(1).copied().unwrap_or("")))),
+            "set-language" => Ok(self.settings(|s| s.language = crate::i18n::LangPref::parse(f.get(1).copied().unwrap_or("")))),
             "set-public" => Ok(self.settings(|s| s.public_relays = f.get(1) == Some(&"1"))),
             "relay-claim" => self.claim_relay(f.get(1).copied().unwrap_or("")),
             "relay-use" => self.use_relay(f.get(1).copied().unwrap_or("")),
@@ -1558,7 +1588,7 @@ impl Node {
         out += &format!("me\t{}\t{}\n", sh.me, sh.opts.service as u8);
         let s = &st.settings;
         out += &format!(
-            "settings\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            "settings\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
             s.shown_name(),
             s.name,
             s.public_relays as u8,
@@ -1566,6 +1596,7 @@ impl Node {
             s.boot_online as u8,
             s.lock_control as u8,
             s.stay_awake as u8,
+            s.language.as_str(),
         );
         // In the order of the list, the chosen relay first. home: in use;
         // temp: in use while the chosen one does not answer; idle: joined,
@@ -1668,12 +1699,25 @@ impl Node {
     fn paste(&self, text: &str) -> Result<String> {
         let Some((code, _)) = ConnCode::find(text) else {
             if RelayCode::find(text).is_some() {
-                return Err(anyhow!("这是中转码，请贴到「设置 → 自建中转」里"));
+                return Err(anyhow!("{}", crate::i18n::tr(
+                    "这是中转码，请贴到「设置 → 自建中转」里",
+                    "This is a relay code; paste it under Settings → Private Relay",
+                )));
             }
-            return Err(anyhow!("{}", if text.contains("rc1") { "连接码不完整或者有错字，请对方重新复制一次" } else { "这不是连接码" }));
+            return Err(anyhow!("{}", if text.contains("rc1") {
+                crate::i18n::tr(
+                    "连接码不完整或者有错字，请对方重新复制一次",
+                    "Connection code is incomplete or has a typo; ask them to copy it again",
+                )
+            } else {
+                crate::i18n::tr("这不是连接码", "This is not a connection code")
+            }));
         };
         if code.device == self.sh.me {
-            return Err(anyhow!("这是本机发出的连接码，要发给对方用"));
+            return Err(anyhow!("{}", crate::i18n::tr(
+                "这是本机发出的连接码，要发给对方用",
+                "This connection code is from this computer; send it to the other device",
+            )));
         }
         let mut st = self.sh.st.lock().unwrap();
         // A fresh code cancels any undelivered delete of this device; otherwise
@@ -1733,7 +1777,17 @@ impl Node {
         let Some(code) = RelayCode::find(text) else {
             return Err(anyhow!(
                 "{}",
-                if text.contains(rc_ident::relay_code::PREFIX) { "中转码不完整或者有错字，请重新复制一次" } else { "这不是中转码（中转码以 rcr1 开头）" }
+                if text.contains(rc_ident::relay_code::PREFIX) {
+                    crate::i18n::tr(
+                        "中转码不完整或者有错字，请重新复制一次",
+                        "Relay code is incomplete or has a typo; please copy it again",
+                    )
+                } else {
+                    crate::i18n::tr(
+                        "这不是中转码（中转码以 rcr1 开头）",
+                        "This is not a relay code (relay codes start with rcr1)",
+                    )
+                }
             ));
         };
         let ca = rc_relay::tls::ca();
@@ -1749,7 +1803,9 @@ impl Node {
     fn own_relay(&self, urls: &str) -> Result<Vec<RelayUrl>> {
         let urls = relay_urls(urls);
         let st = self.sh.st.lock().unwrap();
-        urls.iter().find_map(|u| group_of(&st.settings, u).cloned()).ok_or_else(|| anyhow!("还没有这个自建中转"))
+        urls.iter().find_map(|u| group_of(&st.settings, u).cloned()).ok_or_else(|| {
+            anyhow!("{}", crate::i18n::tr("还没有这个自建中转", "This private relay has not been added"))
+        })
     }
 
     fn remove_relay(&self, urls: &str) -> Result<String> {
@@ -1800,7 +1856,9 @@ impl Node {
         if st.store.get(&id).is_some() {
             return Ok("both".into());
         }
-        let Some(p) = st.peers.get_mut(&id) else { return Err(anyhow!("对方已经不在了")) };
+        let Some(p) = st.peers.get_mut(&id) else {
+            return Err(anyhow!("{}", crate::i18n::tr("对方已经不在了", "The other device is no longer available")));
+        };
         if p.ask == Ask::In {
             self.sh.befriend(&mut st, id, true);
             return Ok("both".into());
@@ -1815,7 +1873,7 @@ impl Node {
     fn agree(&self, id: EndpointId) -> Result<String> {
         let mut st = self.sh.st.lock().unwrap();
         if st.peers.get(&id).is_none_or(|p| p.ask != Ask::In) {
-            return Err(anyhow!("对方的请求已经没了"));
+            return Err(anyhow!("{}", crate::i18n::tr("对方的请求已经没了", "The request is no longer active")));
         }
         self.sh.befriend(&mut st, id, true);
         Ok(String::new())
@@ -1897,6 +1955,7 @@ impl Node {
             st.using = None;
         }
         crate::power::STAY_AWAKE.store(st.settings.stay_awake, std::sync::atomic::Ordering::SeqCst);
+        crate::i18n::set_pref(st.settings.language);
         if self.sh.opts.service
             && before_boot != st.settings.boot_online
             && let Err(e) = crate::install::set_auto_start(st.settings.boot_online)
@@ -1927,11 +1986,29 @@ fn same_relay(u: &RelayUrl, urls: &[RelayUrl]) -> bool {
 /// What a failed call to the own relay means to the user.
 fn relay_error(e: anyhow::Error) -> anyhow::Error {
     match e.downcast_ref::<Refusal>() {
-        Some(Refusal::UnknownKey) => anyhow!("这个中转码已经在中转上删掉了，请向中转的管理者要一个新的"),
-        Some(Refusal::NotOwner) => anyhow!("这台电脑已经被移出这台中转，请重新贴一次中转码"),
-        Some(Refusal::Clock) => anyhow!("这台电脑的时间和中转相差太多，请先校准时间"),
-        Some(r) => anyhow!("中转拒绝了（{}）", r.word()),
-        None => anyhow!("连不上中转：{e:#}"),
+        Some(Refusal::UnknownKey) => anyhow!("{}", crate::i18n::tr(
+            "这个中转码已经在中转上删掉了，请向中转的管理者要一个新的",
+            "This relay code was deleted on the relay; ask the relay admin for a new one",
+        )),
+        Some(Refusal::NotOwner) => anyhow!("{}", crate::i18n::tr(
+            "这台电脑已经被移出这台中转，请重新贴一次中转码",
+            "This computer was removed from this relay; please paste a relay code again",
+        )),
+        Some(Refusal::Clock) => anyhow!("{}", crate::i18n::tr(
+            "这台电脑的时间和中转相差太多，请先校准时间",
+            "This computer's clock differs too much from the relay; please sync your clock",
+        )),
+        Some(r) => {
+            if crate::i18n::is_en() {
+                anyhow!("Relay refused ({})", r.word())
+            } else {
+                anyhow!("中转拒绝了（{}）", r.word())
+            }
+        }
+        None => {
+            let prefix = crate::i18n::tr("连不上中转：", "Cannot reach relay: ");
+            anyhow!("{prefix}{e:#}")
+        }
     }
 }
 
@@ -2637,7 +2714,12 @@ fn lapse_asks(sh: &Shared, st: &mut St) -> bool {
     for id in unanswered {
         let name = sh.shown_name(st, &id);
         log!("{} ({name}) went away without answering the request to remember each other", id.fmt_short());
-        sh.notice(st, format!("「{name}」没有回应"));
+        let msg = if crate::i18n::is_en() {
+            format!("\"{name}\" did not respond")
+        } else {
+            format!("「{name}」没有回应")
+        };
+        sh.notice(st, msg);
     }
     any
 }
@@ -3688,14 +3770,14 @@ mod live {
         assert!(is(&nb, ida, false, "out"));
         wait("A is asked", &|| is(&na, idb, false, "in"));
         ask(&na, &format!("refuse\t{idb}"));
-        wait("B hears no", &|| is(&nb, ida, false, "-") && notice(&nb).contains("没有同意"));
+        wait("B hears no", &|| is(&nb, ida, false, "-") && (notice(&nb).contains("没有同意") || notice(&nb).contains("declined")));
         assert!(is(&na, idb, false, "-"));
 
         ask(&nb, &format!("remember\t{ida}"));
         wait("A is asked again", &|| is(&na, idb, false, "in"));
         ask(&na, &format!("agree\t{idb}"));
         assert!(is(&na, idb, true, "-"), "A lists B at once");
-        wait("B lists A", &|| is(&nb, ida, true, "-") && notice(&nb).contains("同意了"));
+        wait("B lists A", &|| is(&nb, ida, true, "-") && (notice(&nb).contains("同意了") || notice(&nb).contains("agreed")));
         std::thread::sleep(Duration::from_secs(3));
         assert!(is(&na, idb, true, "-") && is(&nb, ida, true, "-"), "a side changed its mind");
         assert!(!na.sh.st.lock().unwrap().store.get(&idb).unwrap().auto_accept, "trusted, not 我的电脑");
@@ -3706,7 +3788,7 @@ mod live {
         ask(&nb, &format!("remember\t{idc}"));
         wait("C is asked", &|| is(&nc, idb, false, "in"));
         rt.block_on(nc.stop());
-        wait("B hears nothing back", &|| notice(&nb).contains("没有回应"));
+        wait("B hears nothing back", &|| notice(&nb).contains("没有回应") || notice(&nb).contains("did not respond"));
         assert!(row(&nb, idc).is_none_or(|(l, a)| !l && a == "-"));
 
         NO_DIAL.lock().unwrap().remove(&ida);

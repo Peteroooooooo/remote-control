@@ -25,6 +25,7 @@ mod enctest;
 mod goaway;
 mod gpu;
 mod host;
+mod i18n;
 mod ident;
 mod inject;
 mod install;
@@ -98,24 +99,24 @@ enum Cmd {
     View(view::ViewArgs),
     /// List the device list (and, with --scan, devices on the LAN).
     Devices(cli::DevicesArgs),
-    /// 在一台设备上打开 PowerShell（在当前终端窗口里交互）。
+    /// Open an interactive PowerShell session on a remote device in this terminal.
     Shell {
-        /// 设备名（大厅里显示的名字，或名字的一部分）或设备码
+        /// Device name (exact or partial match from the lobby) or device id.
         device: String,
     },
-    /// 在一台设备上运行一条 PowerShell 命令，输出和退出码原样带回（给 AI 和脚本用）。
+    /// Run a single PowerShell command on a remote device and return its output and exit code.
     #[command(after_help = term::EXEC_HELP)]
     Exec {
-        /// 设备名（或名字的一部分）或设备码
+        /// Device name (exact or partial match) or device id.
         device: String,
-        /// 在对方的这个文件夹里运行（默认对方用户的主文件夹）
+        /// Working directory on the remote device (default: remote user's home folder).
         #[arg(long)]
         cwd: Option<String>,
-        /// 命令，整条写在一个参数里最稳妥
+        /// Command to run (passing the full command as one quoted argument is safest).
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
     },
-    /// 在本机和一台设备之间复制文件或文件夹；远程一边写成 设备:路径。
+    /// Copy files or folders between this computer and a remote device (use `device:path` for the remote side).
     #[command(after_help = term::CP_HELP)]
     Cp {
         from: String,

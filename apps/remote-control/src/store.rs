@@ -236,6 +236,8 @@ pub struct Settings {
     pub lock_control: bool,
     /// Prevent computer from sleeping while on mains power.
     pub stay_awake: bool,
+    /// UI language preference (auto follows Windows UI language).
+    pub language: crate::i18n::LangPref,
 }
 
 impl Default for Settings {
@@ -248,6 +250,7 @@ impl Default for Settings {
             boot_online: true,
             lock_control: true,
             stay_awake: true,
+            language: crate::i18n::LangPref::Auto,
         }
     }
 }
@@ -274,6 +277,7 @@ impl Settings {
                     Some(("boot_online", v)) => s.boot_online = v.trim() != "0",
                     Some(("lock_control", v)) => s.lock_control = v.trim() != "0",
                     Some(("stay_awake", v)) => s.stay_awake = v.trim() != "0",
+                    Some(("language", v)) => s.language = crate::i18n::LangPref::parse(v),
                     _ => {}
                 }
             }
@@ -288,12 +292,13 @@ impl Settings {
             text += &format!("relay={}\n", url_list(r));
         }
         text += &format!(
-            "public_relays={}\nlan_visible={}\nboot_online={}\nlock_control={}\nstay_awake={}\n",
+            "public_relays={}\nlan_visible={}\nboot_online={}\nlock_control={}\nstay_awake={}\nlanguage={}\n",
             self.public_relays as u8,
             self.lan_visible as u8,
             self.boot_online as u8,
             self.lock_control as u8,
             self.stay_awake as u8,
+            self.language.as_str(),
         );
         write_atomic(path, text.as_bytes())
     }
@@ -434,6 +439,7 @@ mod tests {
             boot_online: true,
             lock_control: false,
             stay_awake: true,
+            language: crate::i18n::LangPref::En,
         };
         s.save(&p).unwrap();
         assert_eq!(Settings::load(&p), s);

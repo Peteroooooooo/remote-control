@@ -191,10 +191,13 @@ pub async fn serve(mut send: SendStream, mut recv: RecvStream, path: impl FnOnce
     let index = u32::from_be_bytes(head[4..8].try_into()?);
     let offset = u64::from_be_bytes(head[8..16].try_into()?);
     let opened = match path(seq, index) {
-        None => Err(anyhow!("这份复制的文件已经不在了，请重新复制")),
+        None => Err(anyhow!("{}", crate::i18n::tr(
+            "这份复制的文件已经不在了，请重新复制",
+            "The copied files are no longer available; please copy them again",
+        ))),
         Some(p) => tokio::task::spawn_blocking(move || -> Result<(std::fs::File, u64)> {
             let mut f = crate::term_proc::as_user(service, || std::fs::File::open(&p))?
-                .map_err(|e| anyhow!("{}：{e}", p.display()))?;
+                .map_err(|e| anyhow!("{}{}{e}", p.display(), crate::i18n::tr("：", ": ")))?;
             let len = f.metadata()?.len();
             f.seek(SeekFrom::Start(offset.min(len)))?;
             Ok((f, len.saturating_sub(offset)))

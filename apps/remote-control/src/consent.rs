@@ -32,6 +32,7 @@ use windows::{
 
 use crate::{
     gdi::{self, Canvas, rect},
+    i18n::{is_en, tr},
     log, theme,
 };
 
@@ -163,7 +164,7 @@ fn run(mut popup: Popup, hwnd_out: &AtomicIsize, cancelled: &AtomicBool) -> wind
         let hwnd = CreateWindowExW(
             WS_EX_TOPMOST,
             class,
-            &HSTRING::from("Remote Control"),
+            &HSTRING::from(tr("远程控制", "Remote Control")),
             style,
             0,
             0,
@@ -372,11 +373,16 @@ fn paint(hwnd: HWND, p: &Popup) {
     let r = |l: i32, t: i32, rr: i32, b: i32| rect(px(l), px(t), px(rr), px(b));
     let mut c = Canvas::begin(hwnd, gdi::BG);
     let (title, body, bold, small) = (c.font(px(17), true), c.font(px(14), false), c.font(px(14), true), c.font(px(12), false));
-    c.text(&r(24, 20, WIDTH - 24, 48), &format!("「{}」想控制这台电脑", p.name), title, gdi::TEXT, false);
+    let heading = if is_en() {
+        format!("{} wants to control this PC", p.name)
+    } else {
+        format!("「{}」想控制这台电脑", p.name)
+    };
+    c.text(&r(24, 20, WIDTH - 24, 48), &heading, title, gdi::TEXT, false);
     let what = match p.kind {
-        Kind::Trusted => "信任设备",
-        Kind::New { via_code: true } => "临时设备 · 经连接码",
-        Kind::New { via_code: false } => "临时设备 · 来自局域网",
+        Kind::Trusted => tr("信任设备", "Trusted device"),
+        Kind::New { via_code: true } => tr("临时设备 · 经连接码", "Temporary device · via code"),
+        Kind::New { via_code: false } => tr("临时设备 · 来自局域网", "Temporary device · on LAN"),
     };
     c.text(&r(24, 50, WIDTH - 24, 72), what, body, gdi::DIM, false);
     // How long until it counts as refused.
@@ -392,14 +398,19 @@ fn paint(hwnd: HWND, p: &Popup) {
         match hit {
             Hit::Allow => {
                 c.round(&b, px(6), Some(if hovered { gdi::ACCENT_HOVER } else { gdi::ACCENT }), None);
-                c.text(&b, "允许", bold, gdi::TEXT, true);
+                c.text(&b, tr("允许", "Allow"), bold, gdi::TEXT, true);
             }
             Hit::Deny => {
                 c.round(&b, px(6), Some(if hovered { gdi::DANGER_BTN_HOVER } else { gdi::DANGER_BTN }), None);
-                c.text(&b, "拒绝", bold, gdi::TEXT, true);
+                c.text(&b, tr("拒绝", "Deny"), bold, gdi::TEXT, true);
             }
         }
     }
     let by = HEIGHT - 20 - 36;
-    c.text(&r(24, by, 220, by + 36), &format!("{} 秒没人点就算拒绝", p.left_s), small, gdi::DIM, false);
+    let countdown = if is_en() {
+        format!("Auto-deny in {}s", p.left_s)
+    } else {
+        format!("{} 秒没人点就算拒绝", p.left_s)
+    };
+    c.text(&r(24, by, 206, by + 36), &countdown, small, gdi::DIM, false);
 }

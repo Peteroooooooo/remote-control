@@ -30,7 +30,12 @@ use windows::Win32::{
 };
 
 use super::backend::{Ask, Backend, Dev, SessionInfo, SessionState, Snap, Status, Tone, Undoable};
-use crate::{meet, net::PathKind, theme};
+use crate::{
+    i18n::{self, LangPref, is_en, tr},
+    meet,
+    net::PathKind,
+    theme,
+};
 
 const fn hex(c: u32) -> Color32 {
     Color32::from_rgb((c >> 16) as u8, (c >> 8) as u8, c as u8)
@@ -79,7 +84,7 @@ const TOAST_OUT: f32 = 0.22;
 /// The toasts at most on screen; a newer one pushes out the oldest.
 const TOASTS_MAX: usize = 3;
 /// Width of a popup menu.
-const MENU_WIDTH: f32 = 210.0;
+const MENU_WIDTH: f32 = 236.0;
 /// A device row, and where its text starts (past the picture).
 const ROW_HEIGHT: f32 = 62.0;
 const ROW_TEXT: f32 = 62.0;
@@ -1005,10 +1010,18 @@ fn menu_head(ui: &mut egui::Ui, text: &str) {
 }
 
 fn ago(s: u64) -> String {
-    match s {
-        0..60 => "刚才".into(),
-        60..3600 => format!("{} 分钟前", s / 60),
-        _ => format!("{} 小时前", s / 3600),
+    if is_en() {
+        match s {
+            0..60 => "just now".into(),
+            60..3600 => format!("{} min ago", s / 60),
+            _ => format!("{} hr ago", s / 3600),
+        }
+    } else {
+        match s {
+            0..60 => "刚才".into(),
+            60..3600 => format!("{} 分钟前", s / 60),
+            _ => format!("{} 小时前", s / 3600),
+        }
     }
 }
 
@@ -1016,41 +1029,66 @@ fn ago(s: u64) -> String {
 /// going on (a spinner before it).
 fn sub_line(d: &Dev, session: Option<SessionInfo>) -> (String, Color32, bool) {
     if d.ask == Ask::In {
-        return ("想记住你。同意后互相记住，以后随时能连".into(), AMBER_TEXT, false);
+        return (
+            tr(
+                "想记住你。同意后互相记住，以后随时能连",
+                "Wants to remember you. Agree so both sides can connect anytime",
+            )
+            .into(),
+            AMBER_TEXT,
+            false,
+        );
     }
     match session {
-        Some(SessionInfo { state: SessionState::Connecting, .. }) => return ("正在连接…".into(), DIM, true),
+        Some(SessionInfo { state: SessionState::Connecting, .. }) => return (tr("正在连接…", "Connecting…").into(), DIM, true),
         Some(SessionInfo { state: SessionState::Waiting, since }) => {
             let left = 30u64.saturating_sub(since.elapsed().as_secs());
-            let s = if left > 0 { format!("等对方允许 · {left} 秒") } else { "等对方允许".into() };
+            let s = if is_en() {
+                if left > 0 {
+                    format!("Waiting for approval · {left}s")
+                } else {
+                    "Waiting for approval".into()
+                }
+            } else if left > 0 {
+                format!("等对方允许 · {left} 秒")
+            } else {
+                "等对方允许".into()
+            };
             return (s, DIM, true);
         }
-        Some(SessionInfo { state: SessionState::Connected, .. }) => return ("控制中".into(), LINK, false),
-        Some(SessionInfo { state: SessionState::Paused, .. }) => return ("控制中 · 画面暂停".into(), AMBER_TEXT, false),
+        Some(SessionInfo { state: SessionState::Connected, .. }) => return (tr("控制中", "Controlling").into(), LINK, false),
+        Some(SessionInfo { state: SessionState::Paused, .. }) => {
+            return (tr("控制中 · 画面暂停", "Controlling · Video paused").into(), AMBER_TEXT, false);
+        }
         None => {}
     }
     if d.ask == Ask::Out {
-        return ("等对方同意".into(), DIM, true);
+        return (tr("等对方同意", "Waiting for acceptance").into(), DIM, true);
     }
     let via = match d.met.as_str() {
         _ if d.listed => "",
-        "code" => " · 连接码",
-        "lan" => " · 局域网",
+        "code" => tr(" · 连接码", " · Code"),
+        "lan" => tr(" · 局域网", " · LAN"),
         _ => "",
     };
     let (s, color, busy) = match d.status {
         Status::Online { rtt_ms, path } => {
             let way = match path {
-                PathKind::Direct => " · 直连",
-                PathKind::Relay => " · 经自建中转",
-                PathKind::Public => " · 正在找直连",
+                PathKind::Direct => tr(" · 直连", " · Direct"),
+                PathKind::Relay => tr(" · 经自建中转", " · Private Relay"),
+                PathKind::Public => tr(" · 正在找直连", " · Finding Direct"),
                 PathKind::None => "",
             };
-            (format!("在线 · {:.0} ms{way}", rtt_ms.max(1.0)), DIM, false)
+            let label = if is_en() {
+                format!("Online · {:.0} ms{way}", rtt_ms.max(1.0))
+            } else {
+                format!("在线 · {:.0} ms{way}", rtt_ms.max(1.0))
+            };
+            (label, DIM, false)
         }
-        Status::Checking => ("正在连接…".into(), DIM, true),
-        Status::Offline => ("离线".into(), DIM, false),
-        Status::Unreachable => ("无法连接".into(), AMBER_TEXT, false),
+        Status::Checking => (tr("正在连接…", "Connecting…").into(), DIM, true),
+        Status::Offline => (tr("离线", "Offline").into(), DIM, false),
+        Status::Unreachable => (tr("无法连接", "Unable to connect").into(), AMBER_TEXT, false),
         Status::Refused(r) => (meet::refusal_text(r).into(), AMBER_TEXT, false),
     };
     (format!("{s}{via}"), color, busy)
@@ -1239,8 +1277,18 @@ impl App {
             self.renaming = None;
         }
         self.b.act(&format!("remove\t{}", c.id));
-        let there = if c.there { "对方那边也删掉了本机" } else { "对方上线时也会删掉本机" };
-        self.toast(Tone::Ok, format!("已删除「{}」，{there}", c.name));
+        let msg = if is_en() {
+            let there = if c.there {
+                "also removed from the remote device"
+            } else {
+                "it will also remove this device when back online"
+            };
+            format!("Removed \"{}\"; {there}", c.name)
+        } else {
+            let there = if c.there { "对方那边也删掉了本机" } else { "对方上线时也会删掉本机" };
+            format!("已删除「{}」，{there}", c.name)
+        };
+        self.toast(Tone::Ok, msg);
     }
 
     fn hidden_relay(&self, url: &str) -> bool {
@@ -1307,9 +1355,14 @@ impl App {
         {
             self.seen_notice = Some(n.clone());
             self.b.act(&format!("dismiss\t{n}"));
-            let tone = if text.contains("互相记住") { Tone::Ok } else { Tone::Warn };
-            let msg = if text.contains("互相记住") && !text.contains("我的电脑") {
-                format!("{text}；若为自己的电脑，可在 ··· 设为「我的电脑」")
+            let remembered = text.contains("互相记住") || text.contains("remembered each other");
+            let tone = if remembered { Tone::Ok } else { Tone::Warn };
+            let msg = if remembered && !text.contains("我的电脑") && !text.contains("My Devices") {
+                if is_en() {
+                    format!("{text}; if this is your own PC, set it as \"My Devices\" via ···")
+                } else {
+                    format!("{text}；若为自己的电脑，可在 ··· 设为「我的电脑」")
+                }
             } else {
                 text.clone()
             };
@@ -1355,10 +1408,20 @@ impl App {
                 let dev = snap.devs.iter().find(|d| d.id.to_string() == trimmed);
                 let text = match dev {
                     Some(d) if matches!(d.status, Status::Online { .. }) => {
-                        format!("已添加「{}」，点「控制」开始或点「记住」保存", d.name)
+                        if is_en() {
+                            format!("Added \"{}\". Click \"Control\" to start or \"Remember\" to save", d.name)
+                        } else {
+                            format!("已添加「{}」，点「控制」开始或点「记住」保存", d.name)
+                        }
                     }
-                    Some(d) => format!("已添加「{}」，正在查找连接…", d.name),
-                    None => "已提交连接码，正在查找对方…".to_string(),
+                    Some(d) => {
+                        if is_en() {
+                            format!("Added \"{}\", finding connection…", d.name)
+                        } else {
+                            format!("已添加「{}」，正在查找连接…", d.name)
+                        }
+                    }
+                    None => tr("已提交连接码，正在查找对方…", "Connection code submitted, looking up device…").to_string(),
                 };
                 self.toast(Tone::Ok, text);
             }
@@ -1370,7 +1433,7 @@ impl App {
         ui.spacing_mut().item_spacing.y = 2.0;
         // This computer (clickable to jump to device name in Settings).
         let (rect, me_resp) = ui.allocate_exact_size(vec2(ui.available_width(), 58.0), Sense::click());
-        me_resp.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, "修改本机设备名称"));
+        me_resp.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, tr("修改本机设备名称", "Change this device's name")));
         let me_ht = ui.ctx().animate_bool_with_time(me_resp.id.with("hot"), me_resp.hovered(), 0.14);
         let p = ui.painter();
         if me_ht > 0.0 {
@@ -1385,23 +1448,27 @@ impl App {
         let top = av.center().y - (g.size().y + 17.0) / 2.0;
         let gh = g.size().y;
         ui.painter().galley(pos2(x, top), g, TEXT);
-        let (dot, state) = if snap.me.is_empty() { (GONE, "本机 · 正在启动") } else { (GREEN, "本机 · 在线") };
+        let (dot, state) = if snap.me.is_empty() {
+            (GONE, tr("本机 · 正在启动", "This PC · Starting"))
+        } else {
+            (GREEN, tr("本机 · 在线", "This PC · Online"))
+        };
         let y = top + gh + 9.0;
         ui.painter().circle_filled(pos2(x + 3.5, y), 3.5, dot);
         ui.painter().text(pos2(x + 13.0, y), Align2::LEFT_CENTER, state, font(12.0), DIM);
         if me_resp
             .on_hover_cursor(egui::CursorIcon::PointingHand)
-            .on_hover_text("点击前往设置修改设备名称")
+            .on_hover_text(tr("点击前往设置修改设备名称", "Click to change device name in Settings"))
             .clicked()
         {
             self.jump_settings(SettingsTarget::SelfName);
         }
         ui.add_space(10.0);
 
-        if nav(ui, ic::DEVICES, "设备", self.page == Page::Devices, Some(snap.devs.len())).clicked() {
+        if nav(ui, ic::DEVICES, tr("设备", "Devices"), self.page == Page::Devices, Some(snap.devs.len())).clicked() {
             self.set_page(Page::Devices);
         }
-        if nav(ui, ic::GEAR, "设置", self.page == Page::Settings, None).clicked() {
+        if nav(ui, ic::GEAR, tr("设置", "Settings"), self.page == Page::Settings, None).clicked() {
             self.set_page(Page::Settings);
         }
 
@@ -1412,19 +1479,19 @@ impl App {
         ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
             let h = 16.0 + 18.0 + 4.0 + (relays.len() as f32) * 22.0;
             let (card, r) = ui.allocate_exact_size(vec2(ui.available_width(), h), Sense::click());
-            r.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, "管理自建中转"));
+            r.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, tr("管理自建中转", "Manage private relays")));
             let ht = ui.ctx().animate_bool_with_time(r.id.with("hot"), r.hovered(), 0.14);
             let p = ui.painter();
             if ht > 0.0 {
                 p.rect_filled(card, 8.0, veil((12.0 * ht).round() as u8));
             }
             let head_y = card.top() + 8.0 + 9.0;
-            p.text(pos2(card.left() + 8.0, head_y), Align2::LEFT_CENTER, "自建中转", font(12.0), DIM);
+            p.text(pos2(card.left() + 8.0, head_y), Align2::LEFT_CENTER, tr("自建中转", "Private Relays"), font(12.0), DIM);
             if ht > 0.02 {
                 p.text(
                     pos2(card.right() - 8.0, head_y),
                     Align2::RIGHT_CENTER,
-                    "管理",
+                    tr("管理", "Manage"),
                     font(11.0),
                     LINK.gamma_multiply(ht),
                 );
@@ -1433,10 +1500,10 @@ impl App {
             for relay in &relays {
                 let row_rect = Rect::from_min_size(pos2(card.left(), ry), vec2(card.width(), 22.0));
                 let (color, state) = match relay.state.as_str() {
-                    "home" => (GREEN, "已连"),
-                    "temp" => (GREEN, "临时接管"),
-                    "fail" => (AMBER, "连不上"),
-                    "idle" => (GONE, "备用"),
+                    "home" => (GREEN, tr("已连", "Connected")),
+                    "temp" => (GREEN, tr("临时接管", "Fallback")),
+                    "fail" => (AMBER, tr("连不上", "Unreachable")),
+                    "idle" => (GONE, tr("备用", "Standby")),
                     _ => (GONE, "…"),
                 };
                 let p = ui.painter();
@@ -1450,7 +1517,7 @@ impl App {
                 ry += 22.0;
             }
             if r.on_hover_cursor(egui::CursorIcon::PointingHand)
-                .on_hover_text("前往设置管理自建中转")
+                .on_hover_text(tr("前往设置管理自建中转", "Manage private relays in Settings"))
                 .clicked()
             {
                 self.jump_settings(SettingsTarget::Relays);
@@ -1477,20 +1544,28 @@ impl App {
         reveal(ui, Id::new("card-busy"), busy.is_some(), GAP, |ui| banner(ui, Tint::Blue, Lead::Spin, &text, |_| {}));
 
         if let Some(n) = &snap.hosting {
-            self.cards.hosting = format!("「{n}」正在控制本机");
+            self.cards.hosting = if is_en() {
+                format!("\"{n}\" is controlling this PC")
+            } else {
+                format!("「{n}」正在控制本机")
+            };
         }
         let text = self.cards.hosting.clone();
         let b = self.b.clone();
         reveal(ui, Id::new("card-hosting"), snap.hosting.is_some(), GAP, |ui| {
             banner(ui, Tint::Red, Lead::Icon(ic::DESKTOP), &text, |ui| {
-                if Btn::new("断开").look(Look::Danger).show(ui).clicked() {
+                if Btn::new(tr("断开", "Disconnect")).look(Look::Danger).show(ui).clicked() {
                     b.act("disconnect");
                 }
             })
         });
 
         if let Some(n) = &snap.asking {
-            self.cards.asking = format!("「{n}」请求控制本机，在弹窗里允许或拒绝");
+            self.cards.asking = if is_en() {
+                format!("\"{n}\" wants to control this PC — allow or decline in the prompt")
+            } else {
+                format!("「{n}」请求控制本机，在弹窗里允许或拒绝")
+            };
         }
         let text = self.cards.asking.clone();
         reveal(ui, Id::new("card-asking"), snap.asking.is_some(), GAP, |ui| {
@@ -1500,26 +1575,47 @@ impl App {
         let suggest = snap.suggest.is_some() && snap.hosting.is_none();
         let idle = self.b.busy().is_none();
         reveal(ui, Id::new("card-suggest"), suggest, GAP, |ui| {
-            banner(ui, Tint::Blue, Lead::Icon(ic::SERVICE), "装上后台服务，锁屏时也能被控制", |ui| {
-                if Btn::new("安装").icon(ic::SHIELD).look(Look::Primary).enabled(idle).show(ui).clicked() {
-                    b.act("unsuggest");
-                    b.service(true);
-                }
-                if Btn::new("以后").look(Look::Ghost).show(ui).clicked() {
-                    b.act("unsuggest");
-                }
-            })
+            banner(
+                ui,
+                Tint::Blue,
+                Lead::Icon(ic::SERVICE),
+                tr("装上后台服务，锁屏时也能被控制", "Install the background service to allow control on the lock screen"),
+                |ui| {
+                    if Btn::new(tr("安装", "Install")).icon(ic::SHIELD).look(Look::Primary).enabled(idle).show(ui).clicked() {
+                        b.act("unsuggest");
+                        b.service(true);
+                    }
+                    if Btn::new(tr("以后", "Later")).look(Look::Ghost).show(ui).clicked() {
+                        b.act("unsuggest");
+                    }
+                },
+            )
         });
 
         let other = self.b.service_other() && !self.update_later;
         let mut later = false;
         reveal(ui, Id::new("card-update"), other, GAP, |ui| {
-            banner(ui, Tint::Blue, Lead::Icon(ic::SERVICE), "后台服务用的是另一个位置的程序，改用这个", |ui| {
-                if Btn::new("改用这个").icon(ic::SHIELD).look(Look::Primary).enabled(idle).show(ui).clicked() {
-                    b.service(true);
-                }
-                later = Btn::new("以后").look(Look::Ghost).show(ui).clicked();
-            })
+            banner(
+                ui,
+                Tint::Blue,
+                Lead::Icon(ic::SERVICE),
+                tr(
+                    "后台服务用的是另一个位置的程序，改用这个",
+                    "The background service points to a different executable — switch to this one",
+                ),
+                |ui| {
+                    if Btn::new(tr("改用这个", "Use This Version"))
+                        .icon(ic::SHIELD)
+                        .look(Look::Primary)
+                        .enabled(idle)
+                        .show(ui)
+                        .clicked()
+                    {
+                        b.service(true);
+                    }
+                    later = Btn::new(tr("以后", "Later")).look(Look::Ghost).show(ui).clicked();
+                },
+            )
         });
         self.update_later |= later;
     }
@@ -1527,21 +1623,25 @@ impl App {
     fn devices(&mut self, ui: &mut egui::Ui, snap: &Snap) {
         ui.horizontal(|ui| {
             ui.spacing_mut().interact_size.y = 32.0;
-            ui.label(RichText::new("设备").font(bold(22.0)));
+            ui.label(RichText::new(tr("设备", "Devices")).font(bold(22.0)));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 let done = self.copied.is_some_and(|t| t.elapsed() < Duration::from_secs(2));
+                let tip = tr(
+                    "一次性有效（1 小时），对方连入时会弹窗等你允许",
+                    "One-time use (valid for 1 hour); you will be asked to approve incoming connections",
+                );
                 if done {
                     ui.ctx().request_repaint_after(Duration::from_millis(200));
-                    Btn::new("已复制，1 小时内有效")
+                    Btn::new(tr("已复制，1 小时内有效", "Copied · valid for 1 hr"))
                         .icon(ic::CHECK)
                         .color(GREEN)
                         .show(ui)
-                        .on_hover_text("一次性有效（1 小时），对方连入时会弹窗等你允许");
-                } else if Btn::new("复制本机连接码")
+                        .on_hover_text(tip);
+                } else if Btn::new(tr("复制本机连接码", "Copy Connection Code"))
                     .icon(ic::COPY)
                     .enabled(!snap.me.is_empty())
                     .show(ui)
-                    .on_hover_text("一次性有效（1 小时），对方连入时会弹窗等你允许")
+                    .on_hover_text(tip)
                     .clicked()
                 {
                     match self.b.request("code") {
@@ -1561,17 +1661,31 @@ impl App {
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
                 ui.spacing_mut().interact_size.y = 26.0;
-                ui.label(RichText::new("还没用掉的连接码（连入时会先问你）").size(12.0).color(DIM));
+                ui.label(
+                    RichText::new(tr(
+                        "还没用掉的连接码（连入时会先问你）",
+                        "Unused connection codes (you'll be asked before connecting)",
+                    ))
+                    .size(12.0)
+                    .color(DIM),
+                );
                 for c in codes {
                     Frame::new().fill(veil(13)).corner_radius(13).inner_margin(Margin { left: 10, right: 2, top: 2, bottom: 2 }).show(ui, |ui| {
                         ui.spacing_mut().item_spacing.x = 4.0;
                         ui.spacing_mut().interact_size.y = 22.0;
                         ui.horizontal(|ui| {
-                            ui.label(RichText::new(format!("{}复制", ago(c.age_s))).size(12.0));
-                            let r = Btn::new("撤销").look(Look::Ghost).small().name(format!("撤销 {}复制的连接码", ago(c.age_s))).show(ui);
+                            let age = ago(c.age_s);
+                            let label = if is_en() { format!("Copied {age}") } else { format!("{age}复制") };
+                            let acc = if is_en() {
+                                format!("Revoke connection code copied {age}")
+                            } else {
+                                format!("撤销 {age}复制的连接码")
+                            };
+                            ui.label(RichText::new(label).size(12.0));
+                            let r = Btn::new(tr("撤销", "Revoke")).look(Look::Ghost).small().name(acc).show(ui);
                             if r.clicked() {
                                 self.b.act(&format!("revoke\t{}", c.token));
-                                self.toast(Tone::Info, "已撤销，这个连接码不能再用了");
+                                self.toast(Tone::Info, tr("已撤销，这个连接码不能再用了", "Revoked — this connection code can no longer be used"));
                             }
                         });
                     });
@@ -1585,9 +1699,9 @@ impl App {
         let at_own_relay = snap.relays.iter().any(|r| r.state == "home");
         type Kind = (&'static str, &'static str, fn(&Dev) -> bool);
         let kinds: [Kind; 3] = [
-            ("我的电脑", "连入本机免确认", |d| d.listed && d.auto),
-            ("信任设备", "连入本机需确认", |d| d.listed && !d.auto),
-            ("临时设备", "关窗口后移除", |d| !d.listed),
+            (tr("我的电脑", "My Devices"), tr("连入本机免确认", "Auto-accept connections"), |d| d.listed && d.auto),
+            (tr("信任设备", "Trusted Devices"), tr("连入本机需确认", "Ask before connecting"), |d| d.listed && !d.auto),
+            (tr("临时设备", "Temporary Devices"), tr("关窗口后移除", "Removed when window closes"), |d| !d.listed),
         ];
         let mut any = false;
         for (title, note, is) in kinds {
@@ -1610,8 +1724,15 @@ impl App {
             ui.vertical_centered(|ui| {
                 ui.label(RichText::new(ic::DEVICES.to_string()).font(FontId::new(40.0, FontFamily::Name(ICONS.into()))).color(FAINT));
                 ui.add_space(4.0);
-                ui.label("还没有设备");
-                ui.label(RichText::new("同一局域网会自动出现；跨网请复制连接码发给对方，或贴到上方").size(12.0).color(DIM));
+                ui.label(tr("还没有设备", "No devices yet"));
+                ui.label(
+                    RichText::new(tr(
+                        "同一局域网会自动出现；跨网请复制连接码发给对方，或贴到上方",
+                        "Devices on the same LAN appear automatically; across networks, copy your code or paste one above",
+                    ))
+                    .size(12.0)
+                    .color(DIM),
+                );
             });
         }
     }
@@ -1645,7 +1766,9 @@ impl App {
                         .margin(Margin::symmetric(0, 4))
                         .desired_width((ui.available_width() - btn_w).max(60.0));
                     if !focused {
-                        edit = edit.hint_text(RichText::new("粘贴对方连接码，加入设备列表").color(FAINT));
+                        edit = edit.hint_text(
+                            RichText::new(tr("粘贴对方连接码，加入设备列表", "Paste a connection code to add a device")).color(FAINT),
+                        );
                     }
                     let e = ui.add(edit);
                     if e.changed() && ConnCode::find(&self.paste).is_some() {
@@ -1654,7 +1777,7 @@ impl App {
                     if e.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) && !self.paste.trim().is_empty() {
                         submit = Some(self.paste.clone());
                     }
-                    if !empty && Btn::new("添加").look(Look::Soft).small().show(ui).clicked() {
+                    if !empty && Btn::new(tr("添加", "Add")).look(Look::Soft).small().show(ui).clicked() {
                         submit = Some(self.paste.clone());
                     }
                 });
@@ -1733,54 +1856,71 @@ impl App {
         acts.spacing_mut().item_spacing.x = 6.0;
         self.row_menu(&mut acts, d);
         if asked {
-            if Btn::new("同意").look(Look::Primary).name(format!("同意 {}", d.name)).show(&mut acts).clicked() {
+            let agree_name = if is_en() { format!("Agree {}", d.name) } else { format!("同意 {}", d.name) };
+            if Btn::new(tr("同意", "Agree")).look(Look::Primary).name(agree_name).show(&mut acts).clicked() {
                 match self.b.request(&format!("agree\t{}", d.id)) {
                     Ok(_) => {
                         self.scroll_to_dev = Some(d.id);
                         self.highlight_dev = Some((d.id, Instant::now()));
-                        self.toast(Tone::Ok, format!("已和「{}」互相记住；若为自己的电脑，可在 ··· 设为「我的电脑」", d.name));
+                        let msg = if is_en() {
+                            format!("Remembered \"{}\" mutually; if this is your own PC, set it as \"My Devices\" via ···", d.name)
+                        } else {
+                            format!("已和「{}」互相记住；若为自己的电脑，可在 ··· 设为「我的电脑」", d.name)
+                        };
+                        self.toast(Tone::Ok, msg);
                     }
                     Err(e) => self.toast(Tone::Err, format!("{e:#}")),
                 }
             }
-            if Btn::new("拒绝").look(Look::Ghost).name(format!("拒绝 {}", d.name)).show(&mut acts).clicked() {
+            let decline_name = if is_en() { format!("Decline {}", d.name) } else { format!("拒绝 {}", d.name) };
+            if Btn::new(tr("拒绝", "Decline")).look(Look::Ghost).name(decline_name).show(&mut acts).clicked() {
                 self.b.act(&format!("refuse\t{}", d.id));
             }
         } else {
             match session {
                 Some(SessionInfo { state: SessionState::Connecting | SessionState::Waiting, .. }) => {
-                    if Btn::new("取消").look(Look::Ghost).name(format!("取消控制 {}", d.name)).show(&mut acts).clicked() {
+                    let acc = if is_en() { format!("Cancel controlling {}", d.name) } else { format!("取消控制 {}", d.name) };
+                    if Btn::new(tr("取消", "Cancel")).look(Look::Ghost).name(acc).show(&mut acts).clicked() {
                         self.b.cancel_control(d.id);
                     }
                 }
                 Some(_) => {}
                 None if unreachable => {
-                    if Btn::new("查看原因").look(Look::Ghost).name(format!("查看原因 {}", d.name)).show(&mut acts).clicked() {
+                    let acc = if is_en() { format!("Details for {}", d.name) } else { format!("查看原因 {}", d.name) };
+                    if Btn::new(tr("查看原因", "Details")).look(Look::Ghost).name(acc).show(&mut acts).clicked() {
                         self.why = if self.why == Some(d.id) { None } else { Some(d.id) };
                     }
                 }
                 None => {
-                    let r = Btn::new("控制").look(Look::Soft).enabled(online).name(format!("控制 {}", d.name)).show(&mut acts);
+                    let acc = if is_en() { format!("Control {}", d.name) } else { format!("控制 {}", d.name) };
+                    let r = Btn::new(tr("控制", "Control")).look(Look::Soft).enabled(online).name(acc).show(&mut acts);
                     if r.clicked() {
                         self.b.control(d.id, &d.name);
                     }
                 }
             }
             if !d.listed && d.ask == Ask::None {
-                let r = Btn::new("记住").look(Look::Ghost).icon(ic::ADD).name(format!("记住 {}", d.name)).show(&mut acts);
+                let acc = if is_en() { format!("Remember {}", d.name) } else { format!("记住 {}", d.name) };
+                let r = Btn::new(tr("记住", "Remember")).look(Look::Ghost).icon(ic::ADD).name(acc).show(&mut acts);
                 if r.clicked() {
                     match self.b.request(&format!("remember\t{}", d.id)) {
                         Ok(both) if both.trim() == "both" => {
                             self.scroll_to_dev = Some(d.id);
                             self.highlight_dev = Some((d.id, Instant::now()));
-                            self.toast(Tone::Ok, format!("已和「{}」互相记住；若为自己的电脑，可在 ··· 设为「我的电脑」", d.name));
+                            let msg = if is_en() {
+                                format!("Remembered \"{}\" mutually; if this is your own PC, set it as \"My Devices\" via ···", d.name)
+                            } else {
+                                format!("已和「{}」互相记住；若为自己的电脑，可在 ··· 设为「我的电脑」", d.name)
+                            };
+                            self.toast(Tone::Ok, msg);
                         }
                         Ok(_) => {}
                         Err(e) => self.toast(Tone::Err, format!("{e:#}")),
                     }
                 }
             } else if !d.listed && d.ask == Ask::Out && session.is_none() {
-                if Btn::new("取消").look(Look::Ghost).name(format!("取消记住 {}", d.name)).show(&mut acts).clicked() {
+                let acc = if is_en() { format!("Cancel remember {}", d.name) } else { format!("取消记住 {}", d.name) };
+                if Btn::new(tr("取消", "Cancel")).look(Look::Ghost).name(acc).show(&mut acts).clicked() {
                     self.b.act(&format!("cancel-remember\t{}", d.id));
                 }
             }
@@ -1836,17 +1976,23 @@ impl App {
                 ui.set_width(ui.available_width());
                 ui.spacing_mut().item_spacing.y = 8.0;
                 let why = if at_own_relay {
-                    "对方连不上你的自建中转，也无法建立直连。可能是它那边的网络连不到中转服务器。"
+                    tr(
+                        "对方连不上你的自建中转，也无法建立直连。可能是它那边的网络连不到中转服务器。",
+                        "The remote device cannot reach your private relay or establish a direct connection. Its network may be blocking access to the relay.",
+                    )
                 } else {
-                    "两台电脑之间无法直连，通常是网络限制。可开启路由器 IPv6，或在设置中添加自建中转。"
+                    tr(
+                        "两台电脑之间无法直连，通常是网络限制。可开启路由器 IPv6，或在设置中添加自建中转。",
+                        "Cannot establish a direct connection, usually due to NAT/firewall restrictions. Try enabling IPv6 on your router or adding a private relay in Settings.",
+                    )
                 };
                 ui.label(RichText::new(why).size(13.0).color(DIM));
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 6.0;
-                    if Btn::new("重试").show(ui).clicked() {
+                    if Btn::new(tr("重试", "Retry")).show(ui).clicked() {
                         b.act(&format!("retry\t{}", d.id));
                     }
-                    to_settings = Btn::new("去设置").show(ui).clicked();
+                    to_settings = Btn::new(tr("去设置", "Go to Settings")).show(ui).clicked();
                 });
             });
         });
@@ -1857,24 +2003,29 @@ impl App {
 
     fn row_menu(&mut self, ui: &mut egui::Ui, d: &Dev) {
         let online = matches!(d.status, Status::Online { .. });
-        let more = icon_button(ui, ic::MORE, 32.0, 16.0, &format!("更多 {}", d.name), false);
+        let more_label = if is_en() { format!("More for {}", d.name) } else { format!("更多 {}", d.name) };
+        let more = icon_button(ui, ic::MORE, 32.0, 16.0, &more_label, false);
         egui::Popup::menu(&more).align(RectAlign::BOTTOM_END).gap(4.0).show(|ui| {
             ui.set_width(MENU_WIDTH);
             ui.spacing_mut().item_spacing.y = 0.0;
-            if menu_item_enabled(ui, Some(ic::TERM), "终端", None, false, false, online).clicked() {
+            if menu_item_enabled(ui, Some(ic::TERM), tr("终端", "Terminal"), None, false, false, online).clicked() {
                 ui.close();
                 if let Err(e) = crate::term::open_window(d.id, &d.name) {
-                    self.toast(Tone::Err, format!("打不开终端：{e:#}"));
+                    let msg = if is_en() { format!("Could not open terminal: {e:#}") } else { format!("打不开终端：{e:#}") };
+                    self.toast(Tone::Err, msg);
                 }
             }
             if d.listed {
-                if menu_item(ui, Some(ic::RENAME), "重命名", None, false, false).clicked() {
+                if menu_item(ui, Some(ic::RENAME), tr("重命名", "Rename"), None, false, false).clicked() {
                     self.renaming = Some((d.id, d.name.clone()));
                     ui.close();
                 }
                 menu_sep(ui);
-                menu_head(ui, "它控制本机时");
-                for (auto, title, sub) in [(true, "我的电脑", "免确认"), (false, "信任设备", "需确认")] {
+                menu_head(ui, tr("它控制本机时", "When controlling this PC"));
+                for (auto, title, sub) in [
+                    (true, tr("我的电脑", "My Devices"), tr("免确认", "Auto-accept")),
+                    (false, tr("信任设备", "Trusted Devices"), tr("需确认", "Ask first")),
+                ] {
                     if menu_item(ui, None, title, Some(sub), d.auto == auto, false).clicked() {
                         ui.close();
                         if d.auto != auto {
@@ -1882,7 +2033,16 @@ impl App {
                             self.scroll_to_dev = Some(d.id);
                             self.highlight_dev = Some((d.id, Instant::now()));
                             let msg = if auto {
-                                format!("「{}」以后连入本机免确认（如需双向免确认，请在对方电脑同样设置）", d.name)
+                                if is_en() {
+                                    format!(
+                                        "\"{}\" can now connect without confirmation (set it on the other PC too for two-way auto-accept)",
+                                        d.name
+                                    )
+                                } else {
+                                    format!("「{}」以后连入本机免确认（如需双向免确认，请在对方电脑同样设置）", d.name)
+                                }
+                            } else if is_en() {
+                                format!("\"{}\" will now ask before connecting to this PC", d.name)
                             } else {
                                 format!("「{}」以后连入本机需确认", d.name)
                             };
@@ -1892,7 +2052,7 @@ impl App {
                 }
             }
             menu_sep(ui);
-            if menu_item(ui, Some(ic::DEL), "删除", None, false, true).clicked() {
+            if menu_item(ui, Some(ic::DEL), tr("删除", "Remove"), None, false, true).clicked() {
                 ui.close();
                 let there = matches!(d.status, Status::Online { .. } | Status::Unreachable);
                 self.confirm = Some(Confirm { id: d.id, name: d.name.clone(), there });
@@ -1925,12 +2085,16 @@ impl App {
                         glyph(ui.painter(), badge.center(), ic::DEL, 20.0, DANGER);
                         ui.vertical(|ui| {
                             ui.spacing_mut().item_spacing.y = 4.0;
-                            ui.add(egui::Label::new(RichText::new(format!("删除「{}」？", c.name)).font(bold(16.0))).wrap());
+                            let title = if is_en() { format!("Remove \"{}\"?", c.name) } else { format!("删除「{}」？", c.name) };
+                            ui.add(egui::Label::new(RichText::new(title).font(bold(16.0))).wrap());
                             ui.add(
                                 egui::Label::new(
-                                    RichText::new("两台电脑都会忘掉对方，本机中转马上停止为它转发。以后要再连，重新发连接码。")
-                                        .size(13.0)
-                                        .color(DIM),
+                                    RichText::new(tr(
+                                        "两台电脑都会忘掉对方，本机中转马上停止为它转发。以后要再连，重新发连接码。",
+                                        "Both PCs will forget each other, and this PC's relay will stop forwarding for it immediately. To reconnect later, share a new connection code.",
+                                    ))
+                                    .size(13.0)
+                                    .color(DIM),
                                 )
                                 .wrap(),
                             );
@@ -1940,8 +2104,8 @@ impl App {
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 8.0;
                         ui.add_space(ui.available_width() - 2.0 * 84.0 - 8.0);
-                        cancel = Btn::new("取消").min_width(84.0).show(ui).clicked();
-                        delete = Btn::new("删除").look(Look::Danger).min_width(84.0).show(ui).clicked();
+                        cancel = Btn::new(tr("取消", "Cancel")).min_width(84.0).show(ui).clicked();
+                        delete = Btn::new(tr("删除", "Remove")).look(Look::Danger).min_width(84.0).show(ui).clicked();
                     });
                 });
         });
@@ -1956,19 +2120,19 @@ impl App {
     fn settings(&mut self, ui: &mut egui::Ui, snap: &Snap) {
         ui.horizontal(|ui| {
             ui.spacing_mut().interact_size.y = 32.0;
-            ui.label(RichText::new("设置").font(bold(22.0)));
+            ui.label(RichText::new(tr("设置", "Settings")).font(bold(22.0)));
         });
         ui.add_space(6.0);
         let b = self.b.clone();
 
-        section_head(ui, "本机", None);
+        section_head(ui, tr("本机", "This Device"), None);
         let self_hi = self.settings_highlight(ui.ctx(), SettingsTarget::SelfName);
         let focus_name = std::mem::take(&mut self.focus_name);
         let self_resp = group_highlighted(ui, self_hi, |ui| {
             let name = &mut self.name;
             let saved = &mut self.saved;
-            Item::new(Lead::Icon(ic::RENAME), "设备名称")
-                .desc("其他设备看到的本机名称")
+            Item::new(Lead::Icon(ic::RENAME), tr("设备名称", "Device Name"))
+                .desc(tr("其他设备看到的本机名称", "Name shown to other devices"))
                 .first(true)
                 .right_width(276.0)
                 .show(ui, |ui| {
@@ -1994,9 +2158,38 @@ impl App {
                         let a = 1.0 - ((t.elapsed().as_secs_f32() - 1.4) / 0.3).clamp(0.0, 1.0);
                         if a > 0.0 {
                             ui.ctx().request_repaint();
-                            ui.label(RichText::new("✓ 已保存").size(12.0).color(GREEN.gamma_multiply(a)));
+                            ui.label(RichText::new(tr("✓ 已保存", "✓ Saved")).size(12.0).color(GREEN.gamma_multiply(a)));
                         }
                     }
+                });
+            let cur_lang = i18n::pref();
+            Item::new(Lead::Icon(ic::GLOBE), tr("语言", "Language"))
+                .desc(tr(
+                    "界面显示语言（跟随系统默认按 Windows 语言切换）",
+                    "Interface language (Auto follows Windows UI language)",
+                ))
+                .right_width(276.0)
+                .show(ui, |ui| {
+                    Frame::new()
+                        .fill(veil(8))
+                        .stroke(Stroke::new(1.0, veil(16)))
+                        .corner_radius(CONTROL_RADIUS + 1)
+                        .inner_margin(Margin::same(3))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 2.0;
+                                for (p, label) in [
+                                    (LangPref::Auto, tr("跟随系统", "Auto")),
+                                    (LangPref::Zh, "简体中文"),
+                                    (LangPref::En, "English"),
+                                ] {
+                                    let look = if cur_lang == p { Look::Soft } else { Look::Ghost };
+                                    if Btn::new(label).look(look).show(ui).clicked() && cur_lang != p {
+                                        b.set_language(p);
+                                    }
+                                }
+                            });
+                        });
                 });
         });
         if self.scroll_to_settings == Some(SettingsTarget::SelfName) {
@@ -2005,22 +2198,27 @@ impl App {
         }
 
         ui.add_space(12.0);
-        section_head(ui, "网络与发现", None);
+        section_head(ui, tr("网络与发现", "Network & Discovery"), None);
         group(ui, |ui| {
             let mut public = snap.public;
-            Item::new(Lead::Icon(ic::GLOBE), "公网辅助连接")
-                .desc("跨网直连时用于交换地址，不转发画面和数据")
+            let public_title = tr("公网辅助连接", "Public Relay Assist");
+            Item::new(Lead::Icon(ic::GLOBE), public_title)
+                .desc(tr(
+                    "跨网直连时用于交换地址，不转发画面和数据",
+                    "Exchanges addresses for cross-network P2P; never forwards video or data",
+                ))
                 .first(true)
                 .show(ui, |ui| {
-                    if switch(ui, &mut public, true, "公网辅助连接").changed() {
+                    if switch(ui, &mut public, true, public_title).changed() {
                         b.act(&format!("set\tpublic\t{}", public as u8));
                     }
                 });
             let mut lan = snap.lan;
-            Item::new(Lead::Icon(ic::WIFI), "局域网发现")
-                .desc("允许同一局域网内的设备自动发现本机")
+            let lan_title = tr("局域网发现", "LAN Discovery");
+            Item::new(Lead::Icon(ic::WIFI), lan_title)
+                .desc(tr("允许同一局域网内的设备自动发现本机", "Allow devices on the same LAN to discover this PC"))
                 .show(ui, |ui| {
-                    if switch(ui, &mut lan, true, "局域网发现").changed() {
+                    if switch(ui, &mut lan, true, lan_title).changed() {
                         b.act(&format!("set\tlan\t{}", lan as u8));
                     }
                 });
@@ -2031,41 +2229,75 @@ impl App {
 
         ui.add_space(12.0);
         let other = self.b.service_other();
-        section_head(ui, "后台服务", None);
+        section_head(ui, tr("后台服务", "Background Service"), None);
         group(ui, |ui| {
             let installed = b.service_installed();
             let busy = b.busy();
             let (title, desc) = match (installed, snap.service) {
-                (true, true) if other => ("运行中（程序路径不一致）", "点击「改用这个」以使用当前版本"),
-                (true, true) => ("运行中", "关闭窗口后仍保持在线"),
-                (true, false) => ("已安装（未运行）", "安装后支持开机在线与锁屏控制（需要管理员权限）"),
-                _ => ("未安装", "安装后支持开机在线与锁屏控制（需要管理员权限）"),
+                (true, true) if other => (
+                    tr("运行中（程序路径不一致）", "Running (different executable path)"),
+                    tr("点击「改用这个」以使用当前版本", "Click \"Use This Version\" to switch to this executable"),
+                ),
+                (true, true) => (
+                    tr("运行中", "Running"),
+                    tr("关闭窗口后仍保持在线", "Keeps this PC online after closing the window"),
+                ),
+                (true, false) => (
+                    tr("已安装（未运行）", "Installed (not running)"),
+                    tr("安装后支持开机在线与锁屏控制（需要管理员权限）", "Enables online at boot & lock-screen control (requires admin)"),
+                ),
+                _ => (
+                    tr("未安装", "Not installed"),
+                    tr("安装后支持开机在线与锁屏控制（需要管理员权限）", "Enables online at boot & lock-screen control (requires admin)"),
+                ),
             };
-            Item::new(Lead::Icon(ic::SERVICE), title).desc(desc).first(true).show(ui, |ui| {
+            Item::new(Lead::Icon(ic::SERVICE), title).desc(desc).first(true).right_width(280.0).show(ui, |ui| {
                 if let Some(what) = &busy {
-                    let label = if what.contains("卸载") { "卸载中…" } else { "安装中…" };
+                    let label = if what.contains("卸载") || what.to_ascii_lowercase().contains("uninstall") {
+                        tr("卸载中…", "Uninstalling…")
+                    } else {
+                        tr("安装中…", "Installing…")
+                    };
                     Btn::new(label).enabled(false).show(ui);
                 } else if !installed {
-                    if Btn::new("安装").icon(ic::SHIELD).look(Look::Primary).show(ui).clicked() {
+                    if Btn::new(tr("安装", "Install")).icon(ic::SHIELD).look(Look::Primary).show(ui).clicked() {
                         b.service(true);
                     }
                 } else {
-                    if installed && other && Btn::new("改用这个").icon(ic::SHIELD).look(Look::Primary).show(ui).clicked() {
+                    if installed && other && Btn::new(tr("改用这个", "Use This Version")).icon(ic::SHIELD).look(Look::Primary).show(ui).clicked() {
                         b.service(true);
                     }
-                    if Btn::new("卸载").icon(ic::SHIELD).show(ui).clicked() {
+                    if Btn::new(tr("卸载", "Uninstall")).icon(ic::SHIELD).show(ui).clicked() {
                         b.service(false);
                     }
                 }
             });
             let on = snap.service;
             for (key, icon, title, desc, value) in [
-                ("boot", ic::POWER, "开机自启", "系统启动后自动在后台保持在线", snap.boot),
-                ("lock", ic::LOCK, "允许锁屏控制", "仅限「我的电脑」免确认连入", snap.lock),
-                ("awake", ic::BOLT, "接通电源时阻止睡眠", "保持在线，显示器仍按系统设置熄屏", snap.awake),
+                (
+                    "boot",
+                    ic::POWER,
+                    tr("开机自启", "Start with Windows"),
+                    tr("系统启动后自动在后台保持在线", "Stay online in the background after Windows starts"),
+                    snap.boot,
+                ),
+                (
+                    "lock",
+                    ic::LOCK,
+                    tr("允许锁屏控制", "Allow Lock Screen Control"),
+                    tr("仅限「我的电脑」免确认连入", "Auto-accept connections from \"My Devices\" only"),
+                    snap.lock,
+                ),
+                (
+                    "awake",
+                    ic::BOLT,
+                    tr("接通电源时阻止睡眠", "Keep Awake on AC Power"),
+                    tr("保持在线，显示器仍按系统设置熄屏", "Stay online while allowing the display to turn off"),
+                    snap.awake,
+                ),
             ] {
                 let mut v = if on { value } else { false };
-                let shown_desc = if on { desc } else { "安装后台服务后可用" };
+                let shown_desc = if on { desc } else { tr("安装后台服务后可用", "Available after installing the background service") };
                 Item::new(Lead::Icon(icon), title)
                     .desc(shown_desc)
                     .enabled(on)
@@ -2085,31 +2317,34 @@ impl App {
         }
         let mut skill_act = None;
         let skill_desc = match self.skill_state {
-            crate::term::SkillState::NotInstalled => "为 Claude Code、Codex 安装远程控制 Skill，支持通过终端操作设备",
-            crate::term::SkillState::Installed => "已安装 · 支持 Claude Code、Codex",
-            crate::term::SkillState::Outdated => "已安装（当前程序路径或版本有变化）",
+            crate::term::SkillState::NotInstalled => tr(
+                "为 Claude Code、Codex 安装远程控制 Skill，支持通过终端操作设备",
+                "Install the remote-control Skill for Claude Code & Codex",
+            ),
+            crate::term::SkillState::Installed => tr("已安装 · 支持 Claude Code、Codex", "Installed · Claude Code & Codex"),
+            crate::term::SkillState::Outdated => tr("已安装（当前程序路径或版本有变化）", "Installed (executable path or version changed)"),
         };
-        section_head(ui, "AI 集成", None);
+        section_head(ui, tr("AI 集成", "AI Integration"), None);
         group(ui, |ui| {
-            Item::new(Lead::Icon(ic::BOT), "配置 AI Skills")
+            Item::new(Lead::Icon(ic::BOT), tr("配置 AI Skills", "Configure AI Skills"))
                 .desc(skill_desc)
                 .first(true)
                 .show(ui, |ui| match self.skill_state {
                     crate::term::SkillState::NotInstalled => {
-                        if Btn::new("安装").show(ui).clicked() {
+                        if Btn::new(tr("安装", "Install")).show(ui).clicked() {
                             skill_act = Some(SkillAct::Install);
                         }
                     }
                     crate::term::SkillState::Installed => {
-                        if Btn::new("卸载").show(ui).clicked() {
+                        if Btn::new(tr("卸载", "Uninstall")).show(ui).clicked() {
                             skill_act = Some(SkillAct::Uninstall);
                         }
                     }
                     crate::term::SkillState::Outdated => {
-                        if Btn::new("卸载").show(ui).clicked() {
+                        if Btn::new(tr("卸载", "Uninstall")).show(ui).clicked() {
                             skill_act = Some(SkillAct::Uninstall);
                         }
-                        if Btn::new("更新").look(Look::Primary).show(ui).clicked() {
+                        if Btn::new(tr("更新", "Update")).look(Look::Primary).show(ui).clicked() {
                             skill_act = Some(SkillAct::Update);
                         }
                     }
@@ -2118,16 +2353,32 @@ impl App {
         if let Some(act) = skill_act {
             match act {
                 SkillAct::Install => match crate::term::install_skill() {
-                    Ok(where_) => self.toast(Tone::Ok, format!("已写入 {where_}，新开的 AI 对话即生效")),
-                    Err(e) => self.toast(Tone::Err, format!("安装失败：{e:#}")),
+                    Ok(where_) => {
+                        let msg = if is_en() {
+                            format!("Installed to {where_}; takes effect in new AI chats")
+                        } else {
+                            format!("已写入 {where_}，新开的 AI 对话即生效")
+                        };
+                        self.toast(Tone::Ok, msg);
+                    }
+                    Err(e) => {
+                        let msg = if is_en() { format!("Install failed: {e:#}") } else { format!("安装失败：{e:#}") };
+                        self.toast(Tone::Err, msg);
+                    }
                 },
                 SkillAct::Update => match crate::term::install_skill() {
-                    Ok(_) => self.toast(Tone::Ok, "已更新 AI Skills"),
-                    Err(e) => self.toast(Tone::Err, format!("更新失败：{e:#}")),
+                    Ok(_) => self.toast(Tone::Ok, tr("已更新 AI Skills", "Updated AI Skills")),
+                    Err(e) => {
+                        let msg = if is_en() { format!("Update failed: {e:#}") } else { format!("更新失败：{e:#}") };
+                        self.toast(Tone::Err, msg);
+                    }
                 },
                 SkillAct::Uninstall => match crate::term::uninstall_skill() {
-                    Ok(()) => self.toast(Tone::Ok, "已卸载 AI Skills"),
-                    Err(e) => self.toast(Tone::Err, format!("卸载失败：{e:#}")),
+                    Ok(()) => self.toast(Tone::Ok, tr("已卸载 AI Skills", "Uninstalled AI Skills")),
+                    Err(e) => {
+                        let msg = if is_en() { format!("Uninstall failed: {e:#}") } else { format!("卸载失败：{e:#}") };
+                        self.toast(Tone::Err, msg);
+                    }
                 },
             }
             self.skill_state = crate::term::skill_state();
@@ -2145,7 +2396,7 @@ impl App {
             match (j.what.as_str(), answer) {
                 ("relay-claim", Ok(url)) => {
                     let host = host_of(url);
-                    self.toast(Tone::Ok, format!("已添加中转 {host}"));
+                    self.toast(Tone::Ok, if is_en() { format!("Added relay {host}") } else { format!("已添加中转 {host}") });
                     self.adding_relay = false;
                     self.relay_paste.clear();
                 }
@@ -2176,22 +2427,31 @@ impl App {
         }
 
         let mut manual_refresh = false;
-        section_head_with(ui, "自建中转", Some("按顺序优先使用，直连受阻时自动接管"), |ui| {
-            if urls.is_empty() {
-                return;
-            }
-            if in_flight {
-                let (rect, r) = ui.allocate_exact_size(Vec2::splat(22.0), Sense::hover());
-                r.widget_info(|| WidgetInfo::labeled(WidgetType::Button, false, "重新测速"));
-                glyph(ui.painter(), rect.center(), ic::REFRESH, 13.0, FAINT);
-                r.on_hover_text("重新测速");
-            } else if icon_button(ui, ic::REFRESH, 22.0, 13.0, "重新测速", false)
-                .on_hover_cursor(egui::CursorIcon::PointingHand)
-                .clicked()
-            {
-                manual_refresh = true;
-            }
-        });
+        section_head_with(
+            ui,
+            tr("自建中转", "Private Relays"),
+            Some(tr(
+                "按顺序优先使用，直连受阻时自动接管",
+                "Tried in order; takes over automatically when direct P2P fails",
+            )),
+            |ui| {
+                if urls.is_empty() {
+                    return;
+                }
+                let tip = tr("重新测速", "Re-test latency");
+                if in_flight {
+                    let (rect, r) = ui.allocate_exact_size(Vec2::splat(22.0), Sense::hover());
+                    r.widget_info(|| WidgetInfo::labeled(WidgetType::Button, false, tip));
+                    glyph(ui.painter(), rect.center(), ic::REFRESH, 13.0, FAINT);
+                    r.on_hover_text(tip);
+                } else if icon_button(ui, ic::REFRESH, 22.0, 13.0, tip, false)
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                    .clicked()
+                {
+                    manual_refresh = true;
+                }
+            },
+        );
         if manual_refresh && visible && !urls.is_empty() && !in_flight {
             self.relay_probe.start_wave(ui.ctx(), &urls);
         }
@@ -2200,24 +2460,24 @@ impl App {
         let relay_resp = group_highlighted(ui, relay_hi, |ui| {
             for (i, r) in relays.iter().enumerate() {
                 let (state, color) = match r.state.as_str() {
-                    "home" => ("已连接（首选）", GREEN),
-                    "temp" => ("临时接管（首选不可用）", GREEN),
-                    "fail" => ("连接失败", AMBER),
-                    "idle" => ("备用 · 首选不可用时接管", GONE),
-                    _ => ("正在连接…", GONE),
+                    "home" => (tr("已连接（首选）", "Connected (Primary)"), GREEN),
+                    "temp" => (tr("临时接管（首选不可用）", "Fallback (Primary unavailable)"), GREEN),
+                    "fail" => (tr("连接失败", "Connection failed"), AMBER),
+                    "idle" => (tr("备用 · 首选不可用时接管", "Standby · takes over if primary fails"), GONE),
+                    _ => (tr("正在连接…", "Connecting…"), GONE),
                 };
                 let desc_suffix = match probe_results.get(&r.url).copied() {
-                    Some(ProbeState::Probing) | None => Some((" · 测速中…".to_string(), DIM)),
+                    Some(ProbeState::Probing) | None => Some((tr(" · 测速中…", " · Testing…").to_string(), DIM)),
                     Some(ProbeState::Ok(d)) => {
                         let ms = d.as_millis().max(1);
                         let sc = if ms >= 200 { AMBER_TEXT } else { DIM };
                         Some((format!(" · {ms} ms"), sc))
                     }
                     Some(ProbeState::Fail) => {
-                        if state == "连接失败" {
+                        if r.state == "fail" {
                             None
                         } else {
-                            Some((" · 超时".to_string(), AMBER_TEXT))
+                            Some((tr(" · 超时", " · Timed out").to_string(), AMBER_TEXT))
                         }
                     }
                 };
@@ -2230,23 +2490,40 @@ impl App {
                     ..Item::new(Lead::Dot(color), &host).first(i == 0)
                 };
                 line.show(ui, |ui| {
-                    remove = icon_button(ui, ic::DEL, 32.0, 16.0, &format!("移除 {host}"), true).clicked();
+                    let rem_acc = if is_en() { format!("Remove {host}") } else { format!("移除 {host}") };
+                    remove = icon_button(ui, ic::DEL, 32.0, 16.0, &rem_acc, true).clicked();
                     if i != 0 {
-                        pick = Btn::new("设为首选")
+                        let pick_acc = if is_en() { format!("Set {host} as primary") } else { format!("设为首选 {host}") };
+                        pick = Btn::new(tr("设为首选", "Set as Primary"))
                             .look(Look::Ghost)
-                            .name(format!("设为首选 {host}"))
+                            .name(pick_acc)
                             .show(ui)
-                            .on_hover_text("以后优先使用这台中转")
+                            .on_hover_text(tr("以后优先使用这台中转", "Use this relay first"))
                             .clicked();
                     }
                 });
                 if pick {
                     self.b.act(&format!("relay-use\t{}", r.url));
-                    let note = if snap.codes.is_empty() || r.state == "temp" { "" } else { "，没用掉的连接码已作废" };
-                    self.toast(Tone::Ok, format!("已将 {host} 设为首选{note}"));
+                    let msg = if is_en() {
+                        let note = if snap.codes.is_empty() || r.state == "temp" {
+                            ""
+                        } else {
+                            "; unused connection codes are now void"
+                        };
+                        format!("Set {host} as primary{note}")
+                    } else {
+                        let note = if snap.codes.is_empty() || r.state == "temp" {
+                            ""
+                        } else {
+                            "，没用掉的连接码已作废"
+                        };
+                        format!("已将 {host} 设为首选{note}")
+                    };
+                    self.toast(Tone::Ok, msg);
                 }
                 if remove {
-                    self.undoable(Undoable::Relay(r.url.clone()), format!("已移除中转 {host}"));
+                    let msg = if is_en() { format!("Removed relay {host}") } else { format!("已移除中转 {host}") };
+                    self.undoable(Undoable::Relay(r.url.clone()), msg);
                 }
             }
             let first = relays.is_empty();
@@ -2262,14 +2539,17 @@ impl App {
                     ui.spacing_mut().item_spacing.x = 8.0;
                     let ready = !running && !self.relay_paste.trim().is_empty();
                     let add = if running {
-                        Btn::new("添加中…").enabled(false).show(ui)
+                        Btn::new(tr("添加中…", "Adding…")).enabled(false).show(ui)
                     } else {
-                        Btn::new("添加").look(Look::Primary).enabled(ready).show(ui)
+                        Btn::new(tr("添加", "Add")).look(Look::Primary).enabled(ready).show(ui)
                     };
-                    let cancel = Btn::new("取消").look(Look::Ghost).show(ui).clicked();
+                    let cancel = Btn::new(tr("取消", "Cancel")).look(Look::Ghost).show(ui).clicked();
                     let e = ui.add_enabled(
                         !running,
-                        TextEdit::singleline(&mut self.relay_paste).hint_text("粘贴中转码").desired_width(ui.available_width()).margin(FIELD_MARGIN),
+                        TextEdit::singleline(&mut self.relay_paste)
+                            .hint_text(tr("粘贴中转码", "Paste relay code"))
+                            .desired_width(ui.available_width())
+                            .margin(FIELD_MARGIN),
                     );
                     if ui.ctx().memory(|m| m.focused().is_none()) && !running && self.relay_paste.is_empty() {
                         e.request_focus();
@@ -2287,14 +2567,18 @@ impl App {
                 ui.painter().text(
                     pos2(rect.left() + 48.0, rect.top() + 50.0),
                     Align2::LEFT_TOP,
-                    "在自建服务器运行 rc-relay ui 获取中转码",
+                    tr(
+                        "在自建服务器运行 rc-relay ui 获取中转码",
+                        "Run rc-relay ui on your relay server to get a relay code",
+                    ),
                     font(11.5),
                     DIM,
                 );
                 ui.advance_cursor_after_rect(rect);
             } else {
                 let (rect, r) = ui.allocate_exact_size(vec2(ui.available_width(), 48.0), Sense::click());
-                r.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, "添加中转服务器"));
+                let add_label = tr("添加中转服务器", "Add Private Relay");
+                r.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, add_label));
                 if !first {
                     ui.painter().hline(rect.x_range(), rect.top(), Stroke::new(1.0, veil(13)));
                 }
@@ -2304,7 +2588,7 @@ impl App {
                     ui.painter().rect_filled(rect, corners, veil(6));
                 }
                 glyph(ui.painter(), pos2(rect.left() + 24.0, rect.center().y), ic::PLUS, 16.0, LINK);
-                ui.painter().text(pos2(rect.left() + 48.0, rect.center().y), Align2::LEFT_CENTER, "添加中转服务器", font(14.0), LINK);
+                ui.painter().text(pos2(rect.left() + 48.0, rect.center().y), Align2::LEFT_CENTER, add_label, font(14.0), LINK);
                 if r.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                     self.adding_relay = true;
                 }
@@ -2362,9 +2646,9 @@ impl App {
                                 ui.painter().galley(r.min, g, TEXT);
                                 ui.spacing_mut().item_spacing.x = 2.0;
                                 if t.undo.is_some() {
-                                    undo = Btn::new("撤回").look(Look::Link).show(ui).clicked();
+                                    undo = Btn::new(tr("撤回", "Undo")).look(Look::Link).show(ui).clicked();
                                 }
-                                close = icon_button(ui, ic::CLOSE, 28.0, 10.0, "关闭", false).clicked();
+                                close = icon_button(ui, ic::CLOSE, 28.0, 10.0, tr("关闭", "Close"), false).clicked();
                             });
                         });
                 });

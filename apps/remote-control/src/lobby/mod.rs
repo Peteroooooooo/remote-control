@@ -115,6 +115,7 @@ pub fn run(a: LobbyArgs) -> Result<()> {
     if let Some(dir) = key.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
+    crate::i18n::init_from_key(&key);
     let log = key.with_file_name("lobby.log");
     if !first_lobby(&key, &log) {
         return Ok(());

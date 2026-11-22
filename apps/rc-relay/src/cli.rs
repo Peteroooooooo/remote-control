@@ -116,7 +116,7 @@ pub fn main() -> Result<()> {
             let key = client.key()?;
             let rt = tokio::runtime::Runtime::new()?;
             let urls = rt.block_on(client::claim(&code, &key, &name, &client.ca()?))?;
-            println!("已加入：{} 现在是 {} 的主人", key.public(), urls[0]);
+            println!("Joined: {} is now an owner of {}", key.public(), urls[0]);
             Ok(())
         }
     }
@@ -141,22 +141,22 @@ fn codes(cfg: &Config) -> Result<()> {
     let kicked: HashSet<_> = store.kicked()?.into_iter().map(|k| (k.owner, k.guest)).collect();
     let owner_ids: HashSet<_> = owners.iter().map(|o| o.id).collect();
     if codes.is_empty() {
-        println!("没有中转码。执行 rc-relay，按 n 新建。");
+        println!("No relay codes. Run `rc-relay` and press n to create one.");
     }
     for c in codes {
         println!("{}\n  {}", c.shown_name(), RelayCode { urls: urls.clone(), claim_key: c.key }.encode());
         for o in owners.iter().filter(|o| o.code == c.n) {
-            println!("  - {}\t{}\t{}", if o.name.is_empty() { "（没有名字）" } else { &o.name }, o.id.fmt_short(), date(o.added));
+            println!("  - {}\t{}\t{}", if o.name.is_empty() { "(unnamed)" } else { &o.name }, o.id.fmt_short(), date(o.added));
             let mut seen = HashSet::new();
             if let Some(gs) = guests.get(&o.id) {
                 for g in gs {
                     if g.kind != Kind::Temp && !owner_ids.contains(&g.id) && !kicked.contains(&(o.id, g.id)) && seen.insert(g.id) {
                         let tag = match g.kind {
-                            Kind::Mine => "我的电脑",
-                            Kind::Trusted => "信任设备",
-                            Kind::Unknown | Kind::Temp => "访客",
+                            Kind::Mine => "My PC",
+                            Kind::Trusted => "Trusted",
+                            Kind::Unknown | Kind::Temp => "Guest",
                         };
-                        println!("    └ {}\t{}\t{tag}", if g.name.is_empty() { "（没有名字）" } else { &g.name }, g.id.fmt_short());
+                        println!("    └ {}\t{}\t{tag}", if g.name.is_empty() { "(unnamed)" } else { &g.name }, g.id.fmt_short());
                     }
                 }
             }

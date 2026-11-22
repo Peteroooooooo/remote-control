@@ -33,6 +33,7 @@ pub struct Snap {
     pub boot: bool,
     pub lock: bool,
     pub awake: bool,
+    pub language: crate::i18n::LangPref,
     /// Own relays, tried in turn.
     pub relays: Vec<Relay>,
     pub hosting: Option<String>,
@@ -103,8 +104,9 @@ pub enum Ask {
     In,
 }
 
-fn parse(text: &str) -> Snap {
+fn parse_snap(text: &str) -> (Snap, bool) {
     let mut s = Snap::default();
+    let mut has_lang = false;
     for line in text.lines() {
         let f: Vec<&str> = line.split('\t').collect();
         let g = |i: usize| f.get(i).copied().unwrap_or("").to_string();
@@ -119,6 +121,11 @@ fn parse(text: &str) -> Snap {
                 let on = |i: usize| g(i) == "1";
                 (s.public, s.lan) = (on(3), on(4));
                 (s.boot, s.lock, s.awake) = (on(5), on(6), on(7));
+                let lang_field = g(8);
+                if !lang_field.is_empty() {
+                    s.language = crate::i18n::LangPref::parse(&lang_field);
+                    has_lang = true;
+                }
             }
             "relay" => s.relays.push(Relay { url: g(1), state: g(2) }),
             "hosting" => s.hosting = Some(g(2)),
@@ -157,7 +164,12 @@ fn parse(text: &str) -> Snap {
             _ => {}
         }
     }
-    s
+    (s, has_lang)
+}
+
+#[allow(dead_code)]
+fn parse(text: &str) -> Snap {
+    parse_snap(text).0
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -262,7 +274,7 @@ impl Sh {
         let local = match &*self.mode.lock().unwrap() {
             Mode::Local(n) => Some(n.clone()),
             Mode::Remote => None,
-            Mode::Off => return Err(anyhow!("正在启动")),
+            Mode::Off => return Err(anyhow!("{}", crate::i18n::tr("正在启动", "Starting up"))),
         };
         let answer = match local {
             Some(n) => n.request(line),
@@ -398,12 +410,17 @@ impl Sh {
                 Ok(text) => {
                     remote_failing = None;
                     *self.trouble.lock().unwrap() = None;
-                    let s = parse(&text);
+                    let (s, has_lang) = parse_snap(&text);
                     let mut cur = self.snap.lock().unwrap();
-                    if self.snap_gen.load(Ordering::SeqCst) == seq && *cur != s {
-                        *cur = s;
-                        drop(cur);
-                        self.changed();
+                    if self.snap_gen.load(Ordering::SeqCst) == seq {
+                        if has_lang {
+                            crate::i18n::set_pref(s.language);
+                        }
+                        if *cur != s {
+                            *cur = s;
+                            drop(cur);
+                            self.changed();
+                        }
                     }
                 }
                 Err(e) => {
@@ -414,7 +431,9 @@ impl Sh {
                     }
                     let is_remote = matches!(*self.mode.lock().unwrap(), Mode::Remote);
                     if is_remote {
-                        *self.trouble.lock().unwrap() = Some("正在连接后台服务…".into());
+                        *self.trouble.lock().unwrap() = Some(
+                            crate::i18n::tr("正在连接后台服务…", "Connecting to background service…").into(),
+                        );
                         self.changed();
                     }
                 }
@@ -435,7 +454,7 @@ impl Backend {
             mode: Mutex::new(Mode::Off),
             snap: Mutex::default(),
             snap_gen: AtomicU64::new(0),
-            trouble: Mutex::new(Some("正在启动…".into())),
+            trouble: Mutex::new(Some(crate::i18n::tr("正在启动…", "Starting up…").into())),
             repaint: Mutex::default(),
             sessions: Mutex::default(),
             busy: Mutex::default(),
@@ -591,14 +610,22 @@ impl Backend {
         }
     }
 
+    pub fn set_language(&self, lang: crate::i18n::LangPref) {
+        crate::i18n::set_pref(lang);
+        self.act(&format!("set-language\t{}", lang.as_str()));
+    }
+
     /// Takes a new snapshot now rather than at the next poll.
     fn refresh(&self) {
         let seq = self.sh.snap_gen.fetch_add(1, Ordering::SeqCst) + 1;
         let ask = self.sh.snapshot_query();
         if let Ok(t) = self.sh.request(&ask) {
-            let s = parse(&t);
+            let (s, has_lang) = parse_snap(&t);
             let mut cur = self.sh.snap.lock().unwrap();
             if self.sh.snap_gen.load(Ordering::SeqCst) == seq {
+                if has_lang {
+                    crate::i18n::set_pref(s.language);
+                }
                 *cur = s;
             }
         }
@@ -628,7 +655,12 @@ impl Backend {
         let name = name.to_string();
         let r = std::thread::Builder::new().name("session".into()).spawn(move || {
             if let Err(e) = session(&sh, id, &name) {
-                sh.note(Tone::Err, format!("没能控制「{name}」：{e:#}"));
+                let msg = if crate::i18n::is_en() {
+                    format!("Could not control \"{name}\": {e:#}")
+                } else {
+                    format!("没能控制「{name}」：{e:#}")
+                };
+                sh.note(Tone::Err, msg);
             }
             sh.sessions.lock().unwrap().remove(&id);
             sh.changed();
@@ -664,8 +696,20 @@ impl Backend {
 
     /// Installs (`true`) or removes the service: one UAC prompt.
     pub fn service(&self, install: bool) {
-        *self.sh.busy.lock().unwrap() =
-            Some(if install { "正在安装后台服务，请在弹窗里点「是」" } else { "正在卸载后台服务，请在弹窗里点「是」" }.into());
+        *self.sh.busy.lock().unwrap() = Some(
+            if install {
+                crate::i18n::tr(
+                    "正在安装后台服务，请在弹窗里点「是」",
+                    "Installing background service — click \"Yes\" in the UAC prompt",
+                )
+            } else {
+                crate::i18n::tr(
+                    "正在卸载后台服务，请在弹窗里点「是」",
+                    "Uninstalling background service — click \"Yes\" in the UAC prompt",
+                )
+            }
+            .into(),
+        );
         self.sh.changed();
         let sh = self.sh.clone();
         let _ = std::thread::Builder::new().name("service-setup".into()).spawn(move || {
@@ -677,9 +721,19 @@ impl Backend {
             let update = install && install::service_running().is_some();
             let r = run_elevated(install, &sh.key);
             match r {
-                Ok(_) if update => sh.note(Tone::Ok, "后台服务已改用这个程序"),
+                Ok(_) if update => sh.note(
+                    Tone::Ok,
+                    crate::i18n::tr("后台服务已改用这个程序", "Background service updated to use this executable"),
+                ),
                 Ok(t) => sh.note(Tone::Ok, t),
-                Err(e) => sh.note(Tone::Err, format!("{}失败：{e:#}", if install { "安装" } else { "卸载" })),
+                Err(e) => {
+                    let msg = if crate::i18n::is_en() {
+                        format!("{} failed: {e:#}", if install { "Install" } else { "Uninstall" })
+                    } else {
+                        format!("{}失败：{e:#}", if install { "安装" } else { "卸载" })
+                    };
+                    sh.note(Tone::Err, msg);
+                }
             }
             if !install {
                 sh.stop_local();
@@ -723,7 +777,7 @@ impl Backend {
         let remote = matches!(*self.sh.mode.lock().unwrap(), Mode::Remote);
         self.goodbye(net::CLOSE_STOPPED);
         if remote {
-            *self.sh.busy.lock().unwrap() = Some("正在退出".into());
+            *self.sh.busy.lock().unwrap() = Some(crate::i18n::tr("正在退出", "Quitting…").into());
             match install::stop_service_now() {
                 Ok(()) => log!("lobby: quit: the service stopped"),
                 Err(e) => log!("lobby: quit: stopping the service: {e:#}"),
@@ -825,8 +879,12 @@ fn session(sh: &Arc<Sh>, id: EndpointId, name: &str) -> Result<()> {
     }
     let mut log_file = std::fs::File::create(&log_path)?;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let mut child = std::process::Command::new(std::env::current_exe()?)
-        .args(&args)
+    let mut cmd = std::process::Command::new(std::env::current_exe()?);
+    cmd.args(&args);
+    if !sh.view_args.iter().any(|x| x == "--key" || x.starts_with("--key=")) {
+        cmd.arg("--key").arg(&sh.key);
+    }
+    let mut child = cmd
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(log_file.try_clone()?)
@@ -868,7 +926,12 @@ fn session(sh: &Arc<Sh>, id: EndpointId, name: &str) -> Result<()> {
             "closed" => {
                 ending = Some(Ok(()));
                 if !text.is_empty() {
-                    sh.note(Tone::Warn, format!("已和「{name}」断开：{text}"));
+                    let msg = if crate::i18n::is_en() {
+                        format!("Disconnected from \"{name}\": {text}")
+                    } else {
+                        format!("已和「{name}」断开：{text}")
+                    };
+                    sh.note(Tone::Warn, msg);
                 }
                 None
             }
@@ -889,7 +952,14 @@ fn session(sh: &Arc<Sh>, id: EndpointId, name: &str) -> Result<()> {
     }
     match ending {
         Some(Err(e)) => Err(anyhow!("{e}")),
-        None if !status.success() => Err(anyhow!("会话窗口异常退出（{status}），详情见 {}", log_path.display())),
+        None if !status.success() => Err(anyhow!(
+            "{}",
+            if crate::i18n::is_en() {
+                format!("Session window exited unexpectedly ({status}); see {}", log_path.display())
+            } else {
+                format!("会话窗口异常退出（{status}），详情见 {}", log_path.display())
+            }
+        )),
         _ => Ok(()),
     }
 }
@@ -929,7 +999,11 @@ fn run_elevated(install: bool, key: &Path) -> Result<String> {
     };
     let code = unsafe {
         ShellExecuteExW(&mut info).map_err(|e: windows::core::Error| {
-            if e.code().0 as u32 == 0x8007_04C7 { anyhow!("管理员确认被取消了") } else { anyhow!("{e}") }
+            if e.code().0 as u32 == 0x8007_04C7 {
+                anyhow!("{}", crate::i18n::tr("管理员确认被取消了", "Administrator prompt was cancelled"))
+            } else {
+                anyhow!("{e}")
+            }
         })?;
         WaitForSingleObject(info.hProcess, INFINITE);
         let mut code = 1u32;
@@ -940,12 +1014,16 @@ fn run_elevated(install: bool, key: &Path) -> Result<String> {
     let out = std::fs::read_to_string(&report).unwrap_or_default();
     log!("{} exit {code}:\n{out}", if install { "install-service" } else { "uninstall-service" });
     if code != 0 {
-        let why = out.lines().rev().find_map(|l| l.strip_prefix("Error: ")).unwrap_or("没有输出");
+        let why = out
+            .lines()
+            .rev()
+            .find_map(|l| l.strip_prefix("Error: "))
+            .unwrap_or_else(|| crate::i18n::tr("没有输出", "no output"));
         return Err(anyhow!("{why}"));
     }
     Ok(if install {
-        "后台服务已装好".into()
+        crate::i18n::tr("后台服务已装好", "Background service installed").into()
     } else {
-        "后台服务已卸载".into()
+        crate::i18n::tr("后台服务已卸载", "Background service uninstalled").into()
     })
 }

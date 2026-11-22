@@ -37,6 +37,7 @@ use windows::{
 
 use crate::{
     gdi::{self, Canvas, coverage, rect, rgb},
+    i18n::{is_en, tr},
     log, theme,
     window::HOOK_TEST_MARK,
 };
@@ -61,7 +62,7 @@ impl Drop for Bar {
 /// Window units (96 DPI).
 const HEIGHT: i32 = 40;
 const RADIUS: i32 = 12;
-const BUTTON_W: i32 = 60;
+const MIN_BUTTON_W: i32 = 60;
 const BUTTON_H: i32 = 26;
 const TAB_W: i32 = 64;
 const TAB_H: i32 = 6;
@@ -95,6 +96,8 @@ struct State {
     /// Width in pixels, and the parts' places (from `layout`).
     width: i32,
     text_w: i32,
+    clock_w: i32,
+    button_w: i32,
     /// 0 folded up, 1 down.
     t: f32,
     open: bool,
@@ -119,6 +122,8 @@ pub fn show(name: &str, on_click: impl Fn() + Send + 'static) -> Bar {
         started: now,
         width: 0,
         text_w: 0,
+        clock_w: 0,
+        button_w: 0,
         t: 0.0,
         open: true,
         last_frame: now,
@@ -151,7 +156,15 @@ fn clock(d: Duration) -> String {
 }
 
 fn label(name: &str) -> String {
-    format!("「{name}」正在控制")
+    if is_en() {
+        format!("{name} is controlling this PC")
+    } else {
+        format!("「{name}」正在控制")
+    }
+}
+
+fn button_label() -> &'static str {
+    tr("断开", "Disconnect")
 }
 
 fn recompute_layout(hwnd: HWND, st: &mut State) {
@@ -159,8 +172,9 @@ fn recompute_layout(hwnd: HWND, st: &mut State) {
     let mut m = Canvas::offscreen(1, 1, rgb(FILL));
     let f = m.font(px(14), false);
     st.text_w = m.text_width(&label(&st.name), f);
-    let clock_w = m.text_width("00:00:00", f);
-    st.width = px(30) + st.text_w + px(12) + clock_w + px(12) + px(BUTTON_W) + px(8);
+    st.clock_w = m.text_width("00:00:00", f);
+    st.button_w = px(MIN_BUTTON_W).max(m.text_width(button_label(), f) + px(20));
+    st.width = px(30) + st.text_w + px(12) + st.clock_w + px(12) + st.button_w + px(8);
     st.x = (unsafe { GetSystemMetrics(SM_CXSCREEN) } - st.width) / 2;
     st.y = 0;
 }
@@ -217,7 +231,7 @@ fn eased(t: f32) -> f32 {
 
 /// The button's place in the window, with the bar `off` pixels up.
 fn button_rect(st: &State, px: &impl Fn(i32) -> i32, off: i32) -> windows::Win32::Foundation::RECT {
-    let (bw, bh) = (px(BUTTON_W), px(BUTTON_H));
+    let (bw, bh) = (st.button_w, px(BUTTON_H));
     let l = st.width - px(8) - bw;
     let t = (px(HEIGHT) - bh) / 2 - off;
     rect(l, t, l + bw, t + bh)
@@ -243,7 +257,7 @@ fn draw(hwnd: HWND, st: &mut State) {
     c.text(&rect(px(30), cy - h / 2, px(30) + st.text_w + 2, cy + h / 2), &label(&st.name), f, gdi::TEXT, false);
     st.shown_clock = clock(st.started.elapsed());
     let cx = px(30) + st.text_w + px(12);
-    c.text(&rect(cx, cy - h / 2, cx + px(70), cy + h / 2), &st.shown_clock, f, gdi::DIM, false);
+    c.text(&rect(cx, cy - h / 2, cx + st.clock_w + 2, cy + h / 2), &st.shown_clock, f, gdi::DIM, false);
     let b = button_rect(st, &px, off);
     let fill = if st.hover_button {
         if st.pressed { rgb(0x4a2b2c) } else { rgb(0x5a2f30) }
@@ -251,7 +265,7 @@ fn draw(hwnd: HWND, st: &mut State) {
         rgb(theme::BUTTON_HOVER)
     };
     c.round(&b, px(6), Some(fill), None);
-    c.text(&b, "断开", f, rgb(DANGER), true);
+    c.text(&b, button_label(), f, rgb(DANGER), true);
     let tab_a = 1.0 - eased(st.t);
     let (rr, tr) = (r as f32, px(3) as f32);
     c.present_layered(hwnd, st.x, st.y, |x, y| {

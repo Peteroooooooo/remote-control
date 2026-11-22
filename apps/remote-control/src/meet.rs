@@ -40,11 +40,26 @@ pub const REFUSE_CODE_UNKNOWN: u8 = 5;
 
 pub fn refusal_text(reason: u8) -> &'static str {
     match reason {
-        REFUSE_FORGOTTEN => "对方已把这台电脑从设备列表里删除",
-        REFUSE_CODE_EXPIRED => "连接码已过期（超过 1 小时没人用），请对方重新复制一个",
-        REFUSE_CODE_USED => "连接码已被别的设备用过了，请对方重新复制一个",
-        REFUSE_CODE_UNKNOWN => "连接码已被撤销，或者对方重启过软件，请对方重新复制一个",
-        _ => "对方不认识这台电脑",
+        REFUSE_FORGOTTEN => crate::i18n::tr(
+            "对方已把这台电脑从设备列表里删除",
+            "The other device has removed this computer from its device list",
+        ),
+        REFUSE_CODE_EXPIRED => crate::i18n::tr(
+            "连接码已过期（超过 1 小时没人用），请对方重新复制一个",
+            "Connection code expired (unused for over 1 hour); ask them to copy a new one",
+        ),
+        REFUSE_CODE_USED => crate::i18n::tr(
+            "连接码已被别的设备用过了，请对方重新复制一个",
+            "Connection code was already used by another device; ask them to copy a new one",
+        ),
+        REFUSE_CODE_UNKNOWN => crate::i18n::tr(
+            "连接码已被撤销，或者对方重启过软件，请对方重新复制一个",
+            "Connection code was revoked or the other device restarted; ask them to copy a new one",
+        ),
+        _ => crate::i18n::tr(
+            "对方不认识这台电脑",
+            "The other device does not recognize this computer",
+        ),
     }
 }
 

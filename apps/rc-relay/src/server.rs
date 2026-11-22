@@ -398,13 +398,12 @@ pub async fn run(cfg: Config, public: &[String]) -> Result<()> {
         .map(|u| format!("{}{}", u.host_str().unwrap_or("?"), u.port().map(|p| format!(":{p}")).unwrap_or_default()))
         .collect();
     let mut relay = Relay::spawn(&cfg, resolved).await?;
-    println!("rc-relay 已启动  {}", hosts.join(" · "));
+    println!("rc-relay started  {}", hosts.join(" · "));
     match relay.first_code()? {
-        Some(code) => println!("中转码（你的每台电脑都贴这一个，贴到软件「设置 → 自建中转」）：
-{code}"),
-        None => println!("没有可用的中转码：在容器控制台执行 rc-relay，按 n 新建"),
+        Some(code) => println!("Relay code (paste this on each of your computers under Settings -> Self-hosted Relay):\n{code}"),
+        None => println!("No relay codes available: run `rc-relay` in the container console and press n to create one"),
     }
-    println!("管理设备、分组和踢人：在容器控制台执行 rc-relay");
+    println!("Manage devices, groups, and kicks: run `rc-relay` in the container console");
     tokio::select! {
         r = relay.join() => r?,
         _ = stop_signal() => info!("stopping"),

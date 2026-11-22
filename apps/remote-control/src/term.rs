@@ -22,6 +22,7 @@ use iroh::endpoint::{Connection, RecvStream, SendStream};
 use tokio::sync::mpsc::{Receiver, Sender};
 
 use crate::{
+    i18n::{is_en, tr},
     net, node,
     term_proc::{self, Pty},
 };
@@ -29,25 +30,28 @@ use crate::{
 pub const ALPN: &[u8] = b"rc/term/1";
 
 pub const EXEC_HELP: &str = "\
-命令在对方的 PowerShell 里运行（装了 PowerShell 7 用 pwsh，否则 Windows PowerShell 5.1），
-输出是 UTF-8。stdout、stderr 分开带回，本命令的退出码就是对方命令的退出码：
-exit N 给 N；最后一条命令失败时是那个程序的退出码或 1；否则 0。
-连不上、被拒绝等本机这边的问题，退出码 255，原因写在 stderr。
-本机 stdin 不是终端时（管道、重定向），会转给对方命令的 stdin。
-权限和控制屏幕一样：对方是「我的电脑」直接运行，信任设备要对方点一次允许；
-对方装了后台服务时以管理员身份运行。
+Runs in the remote PowerShell (pwsh if PowerShell 7 is installed, else Windows PowerShell 5.1)
+with UTF-8 output. stdout and stderr are streamed separately, and this command exits with the remote
+command's exit code: N for `exit N`, the failing program's exit code (or 1) if the last command fails,
+or 0 otherwise. Local/connection errors (unreachable, refused, etc.) exit with 255 and write the
+reason to stderr. When local stdin is not a terminal (piped or redirected), it is forwarded to the
+remote command's stdin. Permissions match screen control: devices marked as My PC run immediately,
+trusted devices prompt the remote user once to allow, and hosts running the background service
+execute as Administrator.
 
-例子：
+Examples:
   remote-control exec laptop \"Get-ComputerInfo | Select-Object OsName, OsVersion\"
   remote-control exec laptop --cwd D:\\proj \"git status\"
   Get-Content a.ps1 | remote-control exec laptop \"$input | Out-String | Invoke-Expression\"";
 
 pub const CP_HELP: &str = "\
-一边是本机路径，一边是 设备:路径（C:\\… 这种单个字母加冒号是本机盘符）。
-对方的相对路径从对方用户的主文件夹算起，~ 就是那个文件夹。
-目标是已有的文件夹时复制到它里面；否则复制成这个名字。文件夹连同里面的东西一起复制，已有的同名文件会被覆盖。
+One side is a local path, the other is device:path (a single letter followed by a colon like C:\\… is
+treated as a local drive letter). Relative remote paths start from the remote user's home folder,
+and ~ refers to that folder. If the destination is an existing folder, items are copied into it;
+otherwise the destination is created with that name. Folders are copied recursively, and existing
+files with the same name are overwritten.
 
-例子：
+Examples:
   remote-control cp .\\report.pdf laptop:Desktop
   remote-control cp laptop:D:\\logs .\\laptop-logs";
 
@@ -209,19 +213,27 @@ pub fn resize(cols: u16, rows: u16) -> Vec<u8> {
 /// thread of its own (the host's impersonates its user there). The number of files.
 pub fn send_tree(src: &Path, out: &Sender<Frame>) -> Result<u64> {
     const MAX_DEPTH: usize = 64;
-    let name = src.file_name().ok_or_else(|| anyhow!("{} 不是文件或文件夹", src.display()))?.to_string_lossy().into_owned();
-    let send = |kind: u8, payload: Vec<u8>| out.blocking_send((kind, payload)).map_err(|_| anyhow!("连接断开了"));
+    let name = src
+        .file_name()
+        .ok_or_else(|| anyhow!("{} {}", src.display(), tr("不是文件或文件夹", "is not a file or folder")))?
+        .to_string_lossy()
+        .into_owned();
+    let send = |kind: u8, payload: Vec<u8>| out.blocking_send((kind, payload)).map_err(|_| anyhow!("{}", tr("连接断开了", "connection closed")));
     let mut files = 0u64;
     fn walk(path: &Path, rel: &str, depth: usize, send: &dyn Fn(u8, Vec<u8>) -> Result<()>, files: &mut u64) -> Result<()> {
         if depth > MAX_DEPTH {
-            bail!("{} 目录层级超过 {MAX_DEPTH} 层", path.display());
+            if is_en() {
+                bail!("{} exceeds {MAX_DEPTH} directory levels", path.display());
+            } else {
+                bail!("{} 目录层级超过 {MAX_DEPTH} 层", path.display());
+            }
         }
         let meta = if depth == 0 {
             std::fs::metadata(path)
         } else {
             std::fs::symlink_metadata(path)
         }
-        .map_err(|e| anyhow!("{}：{e}", path.display()))?;
+        .map_err(|e| anyhow!("{}{}{e}", path.display(), tr("：", ": ")))?;
         if depth > 0 && meta.file_type().is_symlink() {
             return Ok(());
         }
@@ -236,7 +248,7 @@ pub fn send_tree(src: &Path, out: &Sender<Frame>) -> Result<u64> {
             }
             return Ok(());
         }
-        let mut f = std::fs::File::open(path).map_err(|e| anyhow!("{}：{e}", path.display()))?;
+        let mut f = std::fs::File::open(path).map_err(|e| anyhow!("{}{}{e}", path.display(), tr("：", ": ")))?;
         head.extend_from_slice(&meta.len().to_be_bytes());
         send(FILE, head)?;
         let mut left = meta.len();
@@ -244,7 +256,7 @@ pub fn send_tree(src: &Path, out: &Sender<Frame>) -> Result<u64> {
         while left > 0 {
             let n = f.read(&mut buf[..CHUNK.min(left as usize)])?;
             if n == 0 {
-                bail!("{} 在复制时变短了", path.display());
+                bail!("{} {}", path.display(), tr("在复制时变短了", "was truncated during copy"));
             }
             send(DATA, buf[..n].to_vec())?;
             left -= n as u64;
@@ -271,19 +283,19 @@ fn dest(target: &Path, into_dir: bool, rel: &str) -> Result<PathBuf> {
 pub fn recv_tree(target: &Path, inp: &mut Receiver<Frame>) -> Result<(u64, u64)> {
     let into_dir = target.is_dir();
     let (mut files, mut bytes) = (0u64, 0u64);
-    let next = |inp: &mut Receiver<Frame>| inp.blocking_recv().ok_or_else(|| anyhow!("连接断开了"));
+    let next = |inp: &mut Receiver<Frame>| inp.blocking_recv().ok_or_else(|| anyhow!("{}", tr("连接断开了", "connection closed")));
     loop {
         let (kind, payload) = next(inp)?;
         let mut f = Fields::new(&payload);
         match kind {
             DIR => {
                 let d = dest(target, into_dir, &f.str()?)?;
-                std::fs::create_dir_all(&d).map_err(|e| anyhow!("{}：{e}", d.display()))?;
+                std::fs::create_dir_all(&d).map_err(|e| anyhow!("{}{}{e}", d.display(), tr("：", ": ")))?;
             }
             FILE => {
                 let d = dest(target, into_dir, &f.str()?)?;
                 let size = f.u64()?;
-                let mut out = std::fs::File::create(&d).map_err(|e| anyhow!("{}：{e}", d.display()))?;
+                let mut out = std::fs::File::create(&d).map_err(|e| anyhow!("{}{}{e}", d.display(), tr("：", ": ")))?;
                 let mut left = size;
                 while left > 0 {
                     let (k, data) = next(inp)?;
@@ -536,7 +548,15 @@ async fn serve_get(open: Open, out: Sender<Frame>, service: bool) -> Result<()> 
 
 /// One request to the running node; its answer without the `ok`.
 fn ask(req: &str) -> Result<String> {
-    let a = node::call(req).map_err(|_| anyhow!("remote-control 没在运行：先打开大厅窗口（或装后台服务）"))?;
+    let a = node::call(req).map_err(|_| {
+        anyhow!(
+            "{}",
+            tr(
+                "remote-control 没在运行：先打开大厅窗口（或装后台服务）",
+                "remote-control is not running: open the lobby window first (or install the background service)",
+            )
+        )
+    })?;
     match a.split_once('\t') {
         Some(("ok", rest)) => Ok(rest.to_string()),
         Some((_, e)) => bail!("{e}"),
@@ -578,11 +598,25 @@ pub fn find(query: &str) -> Result<(iroh::EndpointId, String)> {
         match hits.len() {
             0 => continue,
             1 => return Ok(hits[0].clone()),
-            _ => bail!("「{query}」对上了好几台：{}；写全名或设备码", hits.iter().map(|h| h.1.as_str()).collect::<Vec<_>>().join("、")),
+            _ => {
+                if is_en() {
+                    let list = hits.iter().map(|h| h.1.as_str()).collect::<Vec<_>>().join(", ");
+                    bail!("\"{query}\" matched multiple devices: {list}; specify the full name or device ID");
+                } else {
+                    let list = hits.iter().map(|h| h.1.as_str()).collect::<Vec<_>>().join("、");
+                    bail!("「{query}」对上了好几台：{list}；写全名或设备码");
+                }
+            }
         }
     }
     let names: Vec<&str> = all.iter().map(|d| d.1.as_str()).collect();
-    bail!("找不到「{query}」。大厅里有：{}", if names.is_empty() { "（没有设备）".to_string() } else { names.join("、") })
+    if is_en() {
+        let list = if names.is_empty() { "(none)".to_string() } else { names.join(", ") };
+        bail!("Device \"{query}\" not found. Available in lobby: {list}");
+    } else {
+        let list = if names.is_empty() { "（没有设备）".to_string() } else { names.join("、") };
+        bail!("找不到「{query}」。大厅里有：{list}");
+    }
 }
 
 /// A request the host has admitted.
@@ -651,15 +685,29 @@ pub async fn connect(id: iroh::EndpointId, mut open: Open) -> Result<Session> {
     let conn = match tokio::time::timeout(Duration::from_secs(15), ep.connect(target, ALPN)).await {
         Ok(Ok(c)) => c,
         Ok(Err(e)) if format!("{e:#}").contains("no application protocol") || format!("{e:#}").contains("ALPN") => {
-            bail!("对方的 remote-control 版本太旧，没有终端功能，请对方更新")
+            bail!(
+                "{}",
+                tr(
+                    "对方的 remote-control 版本太旧，没有终端功能，请对方更新",
+                    "The remote peer's remote-control version is too old and lacks terminal support; ask them to update",
+                )
+            )
         }
-        Ok(Err(e)) if !format!("{e:#}").contains("timed out") => bail!("连不上对方：{e:#}"),
-        _ => bail!("连不上对方：没有回应（对方没开机、没联网、睡着了，或者找不到通路）"),
+        Ok(Err(e)) if !format!("{e:#}").contains("timed out") => {
+            bail!("{}{e:#}", tr("连不上对方：", "Could not connect to peer: "))
+        }
+        _ => bail!(
+            "{}",
+            tr(
+                "连不上对方：没有回应（对方没开机、没联网、睡着了，或者找不到通路）",
+                "Could not connect to peer: no response (device may be powered off, offline, asleep, or unreachable)",
+            )
+        ),
     };
     bye_on_console_exit(&conn, &ep);
-    let refused =|conn: &Connection, e: &dyn std::fmt::Display| match conn.close_reason() {
+    let refused = |conn: &Connection, e: &dyn std::fmt::Display| match conn.close_reason() {
         Some(iroh::endpoint::ConnectionError::ApplicationClosed(c)) => anyhow!("{}", crate::view::close_text(c.error_code.into_inner() as u32)),
-        _ => anyhow!("连接断开：{e}"),
+        _ => anyhow!("{}{e}", tr("连接断开：", "Connection lost: ")),
     };
     let (mut send, mut recv) = conn.open_bi().await.map_err(|e| refused(&conn, &e))?;
     open.proof = proof;
@@ -667,9 +715,15 @@ pub async fn connect(id: iroh::EndpointId, mut open: Open) -> Result<Session> {
     loop {
         match read_frame(&mut recv).await {
             Ok(Some((READY, _))) => return Ok(Session { ep, conn, send, recv }),
-            Ok(Some((WAITING, _))) => eprintln!("等对方在弹窗里点【允许控制】……"),
+            Ok(Some((WAITING, _))) => eprintln!(
+                "{}",
+                tr(
+                    "等对方在弹窗里点【允许控制】……",
+                    "Waiting for the remote user to click \"Allow Control\" in the popup...",
+                )
+            ),
             Ok(Some(_)) => {}
-            Ok(None) => return Err(refused(&conn, &"对方结束了连接")),
+            Ok(None) => return Err(refused(&conn, &tr("对方结束了连接", "remote peer closed the connection"))),
             Err(e) => return Err(refused(&conn, &e)),
         }
     }
@@ -683,6 +737,7 @@ fn runtime() -> Result<tokio::runtime::Runtime> {
 /// `remote-control exec`: runs one command there; our exit code is its exit code.
 pub fn exec(device: &str, command: &str, cwd: Option<&str>) -> Result<i32> {
     use std::io::IsTerminal;
+    crate::i18n::init_from_key(&net::default_key_path());
     let rt = runtime()?;
     rt.block_on(async {
         let (id, _) = find(device)?;
@@ -721,7 +776,13 @@ pub fn exec(device: &str, command: &str, cwd: Option<&str>) -> Result<i32> {
                 Ok(Some((STDERR, b))) => std::io::stderr().lock().write_all(&b)?,
                 Ok(Some((EXIT, b))) => break Fields::new(&b).u32()? as i32,
                 Ok(Some(_)) => {}
-                _ => bail!("连接断开了，命令可能还没跑完"),
+                _ => bail!(
+                    "{}",
+                    tr(
+                        "连接断开了，命令可能还没跑完",
+                        "Connection lost; the command may not have finished",
+                    )
+                ),
             }
         };
         bye(&conn, &ep).await;
@@ -735,13 +796,26 @@ fn remote_side(s: &str) -> Option<(&str, &str)> {
     (d.chars().count() > 1).then_some((d, p))
 }
 
-/// `remote-control cp`: one side is `设备:路径`. A folder goes with everything in it.
+/// `remote-control cp`: one side is `device:path`. A folder goes with everything in it.
 pub fn cp(from: &str, to: &str) -> Result<()> {
+    crate::i18n::init_from_key(&net::default_key_path());
     let (what, device, remote, local) = match (remote_side(from), remote_side(to)) {
         (None, Some((d, p))) => (What::Put, d, p, from),
         (Some((d, p)), None) => (What::Get, d, p, to),
-        (Some(_), Some(_)) => bail!("两边都是远程路径；一次只能在本机和一台设备之间复制"),
-        (None, None) => bail!("有一边要写成 设备:路径，例如 laptop:D:\\Desktop\\a.txt"),
+        (Some(_), Some(_)) => bail!(
+            "{}",
+            tr(
+                "两边都是远程路径；一次只能在本机和一台设备之间复制",
+                "Both sides are remote paths; copy only works between this computer and one remote device",
+            )
+        ),
+        (None, None) => bail!(
+            "{}",
+            tr(
+                "有一边要写成 设备:路径，例如 laptop:D:\\Desktop\\a.txt",
+                "One side must be written as device:path, e.g. laptop:D:\\Desktop\\a.txt",
+            )
+        ),
     };
     let local = PathBuf::from(local);
     let rt = runtime()?;
@@ -763,7 +837,10 @@ pub fn cp(from: &str, to: &str) -> Result<()> {
                         Ok((f.u64()?, f.u64()?))
                     }
                     Ok(Some((ERROR, b))) => Err(anyhow!("{}", String::from_utf8_lossy(&b))),
-                    _ => Err(anyhow!("连接断开了，可能没复制完")),
+                    _ => Err(anyhow!(
+                        "{}",
+                        tr("连接断开了，可能没复制完", "Connection lost; the copy may be incomplete")
+                    )),
                 }
             }
             _ => {
@@ -782,7 +859,11 @@ pub fn cp(from: &str, to: &str) -> Result<()> {
         bye(&conn, &ep).await;
         r
     })?;
-    eprintln!("已复制 {files} 个文件，共 {}", size_text(bytes));
+    if is_en() {
+        eprintln!("Copied {files} file(s), {}", size_text(bytes));
+    } else {
+        eprintln!("已复制 {files} 个文件，共 {}", size_text(bytes));
+    }
     Ok(())
 }
 
@@ -791,7 +872,7 @@ fn size_text(b: u64) -> String {
         b if b >= 1 << 30 => format!("{:.1} GB", b as f64 / (1u64 << 30) as f64),
         b if b >= 1 << 20 => format!("{:.1} MB", b as f64 / (1u64 << 20) as f64),
         b if b >= 1 << 10 => format!("{:.1} KB", b as f64 / 1024.0),
-        b => format!("{b} 字节"),
+        b => format!("{b} {}", tr("字节", "bytes")),
     }
 }
 
@@ -810,7 +891,15 @@ impl RawConsole {
             let input = GetStdHandle(STD_INPUT_HANDLE)?;
             let output = GetStdHandle(STD_OUTPUT_HANDLE)?;
             let (mut mi, mut mo) = (CONSOLE_MODE(0), CONSOLE_MODE(0));
-            GetConsoleMode(input, &mut mi).map_err(|_| anyhow!("shell 要在终端窗口里用；给程序调用请用 exec"))?;
+            GetConsoleMode(input, &mut mi).map_err(|_| {
+                anyhow!(
+                    "{}",
+                    tr(
+                        "shell 要在终端窗口里用；给程序调用请用 exec",
+                        "shell must be run inside a terminal window; use exec for programmatic invocation",
+                    )
+                )
+            })?;
             GetConsoleMode(output, &mut mo)?;
             let me = RawConsole { input, output, modes: (mi.0, mo.0), cp: (GetConsoleCP(), GetConsoleOutputCP()) };
             SetConsoleMode(input, ENABLE_VIRTUAL_TERMINAL_INPUT | ENABLE_WINDOW_INPUT)?;
@@ -888,47 +977,47 @@ name: remote-control
 description: Run commands on, inspect, fix, and copy files to or from the user's other Windows computers (the devices in the remote-control lobby, e.g. a laptop or a family member's PC). Use when the user asks to do anything on another computer.
 ---
 
-# 操作别的电脑（remote-control）
+# Control Another Computer (remote-control)
 
-程序：`{exe}`（下面写成 `remote-control`）。它连的是本机 remote-control 大厅里的设备，权限和控制屏幕一样。
+Executable: `{exe}` (written below as `remote-control`). It connects to devices in this computer's remote-control lobby using the same permissions as screen control.
 
-## 先看有哪些设备
+## List Available Devices First
 
 ```
 remote-control devices
 ```
 
-每行：名字、状态（online / offline …）、设备码。命令里的「设备」写名字（不分大小写，写一部分也行，只要不重名）或设备码。
+Each line shows: name, status (`online` / `offline` …), and device ID. Pass either the device name (case-insensitive; any unique partial match works) or the device ID as `<device>`.
 
-## 运行命令
-
-```
-remote-control exec <设备> '<PowerShell 命令>'
-remote-control exec <设备> --cwd 'D:\proj' 'git status'
-```
-
-- 命令在对方的 PowerShell 里跑（有 PowerShell 7 用 pwsh），输出 UTF-8，stdout 和 stderr 分开带回。
-- 退出码就是对方命令的退出码；255 是本机这边的问题（连不上、被拒绝、对方没开机），原因在 stderr。
-- 每次 exec 都是一个新的 PowerShell 进程，变量和当前目录不会留到下一次；要在某个目录里做事，用 --cwd 或在同一条命令里先 Set-Location。默认目录是对方用户的主文件夹。
-- 没有终端：别跑要人输入的程序（会一直等）。用 -y、-Force、-NonInteractive 之类的参数，或者把输入从 stdin 管道给它：`Get-Content in.txt | remote-control exec <设备> '$input | ...'`。
-- 在 bash 里用单引号包住整条命令，免得 `$` 被 bash 展开；在 PowerShell 里也用单引号。
-- 第一次连信任设备时，对方屏幕上会弹窗，要对方点【允许控制】（最多等 30 秒，stderr 会提示）。之后 60 秒内的命令不再问。对方是「我的电脑」时直接运行。对方装了后台服务时以管理员身份运行。
-- 对方屏幕顶部会显示「本机名字正在控制」，对方可以随时点【断开】。
-
-## 复制文件
+## Run Commands
 
 ```
-remote-control cp .\report.pdf <设备>:Desktop
-remote-control cp '<设备>:D:\logs' .\logs
+remote-control exec <device> '<PowerShell command>'
+remote-control exec <device> --cwd 'D:\proj' 'git status'
 ```
 
-一边写成 `设备:路径`。对方的相对路径从对方用户的主文件夹算起。目标是已有文件夹时放进去，否则用这个名字；文件夹整个复制，同名文件会被覆盖。
+- Commands run in the remote PowerShell (`pwsh` if PowerShell 7 is installed, else Windows PowerShell 5.1) with UTF-8 output; `stdout` and `stderr` are returned separately.
+- The exit code matches the remote command's exit code; `255` indicates a local or connection failure (unreachable, refused, powered off), with the reason written to `stderr`.
+- Each `exec` spawns a fresh PowerShell process—variables and the current directory do not persist across calls. Use `--cwd` or `Set-Location` inside the command to work in a specific folder. Default directory is the remote user's home folder.
+- Non-interactive (no terminal): never run programs that wait for interactive input (they will hang). Pass `-y`, `-Force`, `-NonInteractive`, etc., or pipe input via stdin: `Get-Content in.txt | remote-control exec <device> '$input | ...'`.
+- Wrap the command in single quotes in bash (to prevent `$` expansion) and in PowerShell as well.
+- On the first connection to a trusted device, a prompt appears on the remote screen asking the user to allow control (waits up to 30 seconds; a notice is printed to `stderr`). Subsequent commands within 60 seconds do not prompt again. Devices marked as "My PC" run immediately without prompting. If the remote computer has the background service installed, commands run as Administrator.
+- A banner at the top of the remote screen shows that this computer is controlling it, and the remote user can disconnect at any time.
 
-## 习惯
+## Copy Files
 
-- 动手改对方的系统前，先用只读命令看清楚情况，把要做的事告诉用户。
-- 删除、重启、改网络和代理这类难以撤回的操作，先问用户。
-- 用户想自己操作时，告诉用户在大厅设备的 ⋯ 菜单或控制窗口标题栏点【终端】。
+```
+remote-control cp .\report.pdf <device>:Desktop
+remote-control cp '<device>:D:\logs' .\logs
+```
+
+Specify the remote side as `device:path`. Relative remote paths start from the remote user's home folder. If the destination is an existing folder, files are copied into it; otherwise the destination takes that name. Folders are copied recursively, and existing files with the same name are overwritten.
+
+## Best Practices
+
+- Before modifying the remote system, run read-only commands to inspect the current state and tell the user what you plan to do.
+- Ask the user for confirmation before hard-to-reverse actions such as deleting files, rebooting, or changing network/proxy settings.
+- When the user wants an interactive session themselves, let them know they can click **Terminal** in the device's `⋯` menu in the lobby or in the viewer window's title bar.
 "#;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -939,7 +1028,9 @@ pub enum SkillState {
 }
 
 fn skill_home() -> Result<PathBuf> {
-    std::env::var_os("USERPROFILE").map(PathBuf::from).ok_or_else(|| anyhow!("找不到用户文件夹"))
+    std::env::var_os("USERPROFILE")
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow!("{}", tr("找不到用户文件夹", "User home folder not found")))
 }
 
 fn skill_dirs(home: &Path) -> [(&'static str, PathBuf); 2] {
@@ -954,11 +1045,11 @@ fn install_skill_in(home: &Path, exe: &Path) -> Result<String> {
     let text = rendered_skill(exe);
     let mut done = Vec::new();
     for (dir, d) in skill_dirs(home) {
-        std::fs::create_dir_all(&d).map_err(|e| anyhow!("{}：{e}", d.display()))?;
-        std::fs::write(d.join("SKILL.md"), &text).map_err(|e| anyhow!("{}：{e}", d.display()))?;
+        std::fs::create_dir_all(&d).map_err(|e| anyhow!("{}{}{e}", d.display(), tr("：", ": ")))?;
+        std::fs::write(d.join("SKILL.md"), &text).map_err(|e| anyhow!("{}{}{e}", d.display(), tr("：", ": ")))?;
         done.push(format!("~\\{dir}\\skills"));
     }
-    Ok(done.join(" 和 "))
+    Ok(done.join(tr(" 和 ", " and ")))
 }
 
 /// Writes the skill for Claude Code (`~/.claude/skills`) and Codex (`~/.agents/skills`); where it went.
@@ -1014,7 +1105,7 @@ fn uninstall_skill_in(home: &Path) -> Result<()> {
         match std::fs::remove_file(d.join("SKILL.md")) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(anyhow!("{}：{e}", d.display())),
+            Err(e) => return Err(anyhow!("{}{}{e}", d.display(), tr("：", ": "))),
         }
         let _ = std::fs::remove_dir(&d);
     }
@@ -1053,7 +1144,7 @@ pub fn open_window(id: iroh::EndpointId, _name: &str) -> Result<()> {
     // A GUI-subsystem child does not receive ConPTY automatically; `cmd /c start /wait /b`
     // hosts the ConPTY and waits while `remote-control shell` attaches to it.
     let wt = std::process::Command::new("wt.exe")
-        .args(["-w", "new", "new-tab", "--title", "终端", "cmd.exe", "/d", "/c", "start", "remote control", "/wait", "/b"])
+        .args(["-w", "new", "new-tab", "--title", tr("终端", "Terminal"), "cmd.exe", "/d", "/c", "start", "remote control", "/wait", "/b"])
         .arg(&exe)
         .args(["shell", &id])
         .spawn();
@@ -1101,10 +1192,11 @@ fn ensure_console() {
 /// `remote-control shell`: PowerShell there, in this console window. A
 /// failure stays on screen until a key, since the window closes after.
 pub fn shell(device: &str) -> Result<i32> {
+    crate::i18n::init_from_key(&net::default_key_path());
     ensure_console();
     let r = shell_inner(device);
     if let Err(e) = &r {
-        eprintln!("\r\n{e:#}\r\n按回车关闭");
+        eprintln!("\r\n{e:#}\r\n{}", tr("按回车关闭", "Press Enter to close"));
         let _ = std::io::stdin().read_line(&mut String::new());
         std::process::exit(255);
     }
@@ -1118,8 +1210,12 @@ fn shell_inner(device: &str) -> Result<i32> {
         let safe_name = clean_title(&name);
         let raw = RawConsole::new()?;
         let (cols, rows) = raw.size();
-        print!("\x1b]0;{safe_name} · 终端\x07");
-        eprintln!("正在连接「{safe_name}」……\r");
+        print!("\x1b]0;{safe_name} · {}\x07", tr("终端", "Terminal"));
+        if is_en() {
+            eprintln!("Connecting to \"{safe_name}\"...\r");
+        } else {
+            eprintln!("正在连接「{safe_name}」……\r");
+        }
         let open = Open { proof: String::new(), what: What::Shell, cols, rows, text: String::new(), cwd: String::new() };
         let Session { ep, conn, mut send, mut recv } = connect(id, open).await?;
         let (tx, mut keys) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
@@ -1146,7 +1242,11 @@ fn shell_inner(device: &str) -> Result<i32> {
                     Ok(Some(_)) => {}
                     _ => {
                         drop(raw);
-                        bail!("和「{name}」的连接断开了");
+                        if is_en() {
+                            bail!("Connection to \"{name}\" was lost");
+                        } else {
+                            bail!("和「{name}」的连接断开了");
+                        }
                     }
                 }
             }
@@ -1183,7 +1283,7 @@ mod tests {
         assert_eq!(skill_state_in(&home, exe_a), SkillState::NotInstalled);
 
         let where_msg = install_skill_in(&home, exe_a).unwrap();
-        assert_eq!(where_msg, r"~\.claude\skills 和 ~\.agents\skills");
+        assert_eq!(where_msg, format!(r"~\.claude\skills{}~\.agents\skills", tr(" 和 ", " and ")));
         assert_eq!(skill_state_in(&home, exe_a), SkillState::Installed);
         assert_eq!(skill_state_in(&home, exe_b), SkillState::Outdated);
 

@@ -45,6 +45,7 @@ use windows::{
 use crate::{
     audio,
     gdi::{self, Canvas, coverage, rect, rgb},
+    i18n::{is_en, tr},
     keys, log,
     proto::AudioCfg,
     quality::{self, Res},
@@ -71,7 +72,14 @@ const FIRST_SHOW: Duration = Duration::from_millis(1500);
 const LINGER: Duration = Duration::from_millis(1200);
 const TIP_DELAY: Duration = Duration::from_millis(500);
 const SLIDE: f32 = 0.26;
-const RELEASED: &str = "键鼠已释放，点画面继续";
+
+fn released_note() -> &'static str {
+    tr("键鼠已释放，点画面继续", "Input released — click screen to resume")
+}
+
+fn disconnect_label() -> &'static str {
+    tr("断开", "Disconnect")
+}
 
 const TIMER_ANIMATE: usize = 1;
 const TIMER_WATCH: usize = 2;
@@ -173,13 +181,13 @@ struct Metrics {
     badge_h: i32,
     icon_w: i32,
     icon_h: i32,
-    end_w: i32,
+    min_end_w: i32,
     end_h: i32,
     sep_h: i32,
 }
 
-const IN_CAPTION: Metrics = Metrics { font: 12, badge_h: 24, icon_w: 30, icon_h: 26, end_w: 48, end_h: 22, sep_h: 14 };
-const IN_BAR: Metrics = Metrics { font: 13, badge_h: 28, icon_w: 30, icon_h: 30, end_w: 56, end_h: 26, sep_h: 20 };
+const IN_CAPTION: Metrics = Metrics { font: 12, badge_h: 24, icon_w: 30, icon_h: 26, min_end_w: 48, end_h: 22, sep_h: 14 };
+const IN_BAR: Metrics = Metrics { font: 13, badge_h: 28, icon_w: 30, icon_h: 30, min_end_w: 56, end_h: 26, sep_h: 20 };
 
 /// What the controls show right now.
 struct Look {
@@ -197,7 +205,7 @@ struct Look {
 
 fn look() -> Look {
     let i = INFO.lock().unwrap();
-    let badge = if i.badge.is_empty() { "正在连接…".to_string() } else { i.badge.clone() };
+    let badge = if i.badge.is_empty() { tr("正在连接…", "Connecting…").to_string() } else { i.badge.clone() };
     let input = window::input();
     Look {
         tone: i.tone,
@@ -409,22 +417,38 @@ fn tip(part: Part, look: &Look) -> Option<String> {
         Part::Badge | Part::Disconnect => return None,
         Part::Monitor => {
             let (current, count) = window::monitors();
-            format!("显示器 {}/{count}（Ctrl+Alt+Shift+→）", current + 1)
+            if is_en() {
+                format!("Display {}/{count} (Ctrl+Alt+Shift+→)", current + 1)
+            } else {
+                format!("显示器 {}/{count}（Ctrl+Alt+Shift+→）", current + 1)
+            }
         }
-        Part::Cad => "发送 Ctrl+Alt+Del（Ctrl+Alt+End）".into(),
-        Part::Quality => "画面：分辨率、帧率、码率".into(),
+        Part::Cad => tr("发送 Ctrl+Alt+Del（Ctrl+Alt+End）", "Send Ctrl+Alt+Del (Ctrl+Alt+End)").into(),
+        Part::Quality => tr("画面：分辨率、帧率、码率", "Display: resolution, frame rate, bitrate").into(),
         Part::Audio => {
-            let main = if look.audio_enabled { "传回本机：已开启" } else { "传回本机：已关闭" };
+            let main = if look.audio_enabled {
+                tr("传回本机：已开启", "Remote audio: on")
+            } else {
+                tr("传回本机：已关闭", "Remote audio: off")
+            };
             if look.audio_mute_host {
-                format!("{main} · 对方扬声器已静音")
+                if is_en() {
+                    format!("{main} · Host speakers muted")
+                } else {
+                    format!("{main} · 对方扬声器已静音")
+                }
             } else {
                 main.into()
             }
         }
-        Part::AudioMenu => "声音设置：传回音量、对方扬声器、音质、声道".into(),
-        Part::Terminal => "终端：在对方电脑上开 PowerShell".into(),
-        Part::Full if look.full => "退出全屏".into(),
-        Part::Full => "全屏".into(),
+        Part::AudioMenu => tr(
+            "声音设置：传回音量、对方扬声器、音质、声道",
+            "Audio settings: volume, host speakers, quality, channels",
+        )
+        .into(),
+        Part::Terminal => tr("终端：在对方电脑上开 PowerShell", "Terminal: open PowerShell on remote PC").into(),
+        Part::Full if look.full => tr("退出全屏", "Exit full screen").into(),
+        Part::Full => tr("全屏", "Full screen").into(),
     })
 }
 
@@ -448,7 +472,8 @@ struct Layout {
     right: i32,
 }
 
-fn layout(px: &dyn Fn(i32) -> i32, m: &Metrics, h: i32, x0: i32, badge_w: i32, note_w: i32, look: &Look) -> Layout {
+#[allow(clippy::too_many_arguments)]
+fn layout(px: &dyn Fn(i32) -> i32, m: &Metrics, h: i32, x0: i32, badge_w: i32, end_w: i32, note_w: i32, look: &Look) -> Layout {
     let span = |size: i32| ((h - px(size)) / 2, (h + px(size)) / 2);
     let (mut parts, mut seps) = (Vec::new(), Vec::new());
     let mut x = x0;
@@ -477,8 +502,8 @@ fn layout(px: &dyn Fn(i32) -> i32, m: &Metrics, h: i32, x0: i32, badge_w: i32, n
     seps.push(x);
     x += px(6);
     let (t, b) = span(m.end_h);
-    parts.push((Part::Disconnect, rect(x, t, x + px(m.end_w), b)));
-    x += px(m.end_w);
+    parts.push((Part::Disconnect, rect(x, t, x + end_w, b)));
+    x += end_w;
     let note = look.released.then(|| {
         let r = rect(x + px(10), 0, x + px(10) + note_w + 2, h);
         x = r.right;
@@ -544,7 +569,7 @@ fn paint_parts(c: &Canvas, lay: &Layout, dy: i32, h: i32, m: &Metrics, look: &Lo
                     _ => theme::BUTTON_HOVER,
                 };
                 c.round(&r, px(6), Some(rgb(fill)), None);
-                c.text(&r, "断开", p.font, rgb(DANGER), true);
+                c.text(&r, disconnect_label(), p.font, rgb(DANGER), true);
             }
             _ => {
                 let open = (*part == Part::Quality && p.menu) || (*part == Part::AudioMenu && p.audio_menu);
@@ -564,7 +589,7 @@ fn paint_parts(c: &Canvas, lay: &Layout, dy: i32, h: i32, m: &Metrics, look: &Lo
         c.fill(&rect(*s, cy - px(m.sep_h) / 2, *s + 1, cy + px(m.sep_h) / 2), rgb(EDGE));
     }
     if let Some(n) = lay.note {
-        c.text(&moved(&n, 0, dy), RELEASED, p.font, rgb(AMBER), false);
+        c.text(&moved(&n, 0, dy), released_note(), p.font, rgb(AMBER), false);
     }
 }
 
@@ -583,12 +608,13 @@ pub fn paint_caption(hwnd: HWND) {
     let name = window::name();
     let name_w = c.text_width(&name, bold);
     let badge_w = c.text_width(&look.badge, f);
-    let note_w = c.text_width(RELEASED, f);
+    let end_w = px(IN_CAPTION.min_end_w).max(c.text_width(disconnect_label(), f) + px(18));
+    let note_w = c.text_width(released_note(), f);
     let active = unsafe { GetForegroundWindow() } == hwnd;
     let left = px(12);
     let w = c.size.right;
     let cw = px(CAP_W);
-    let mut lay = layout(&px, &IN_CAPTION, h, 0, badge_w, note_w, &look);
+    let mut lay = layout(&px, &IN_CAPTION, h, 0, badge_w, end_w, note_w, &look);
     // Centred like the full-screen bar, the released note hanging off the
     // right; a narrow window moves them left of the caption buttons, never
     // overlapping the caption buttons (name truncates with ellipsis).
@@ -809,15 +835,31 @@ pub fn caption_mouse(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRE
     }
 }
 
-/// Measures with the controls' font: the badge, the released note, the tip
-/// (if one is due) and the numbers' widest key and value.
-fn measure(px: &dyn Fn(i32) -> i32, m: &Metrics, look: &Look, tip_text: Option<&str>) -> (i32, i32, i32, i32, i32) {
+struct Measured {
+    badge_w: i32,
+    end_w: i32,
+    note_w: i32,
+    tip_w: i32,
+    key_w: i32,
+    value_w: i32,
+}
+
+/// Measures with the controls' font: the badge, the disconnect button, the
+/// released note, the tip (if one is due) and the numbers' widest key and value.
+fn measure(px: &dyn Fn(i32) -> i32, m: &Metrics, look: &Look, tip_text: Option<&str>) -> Measured {
     let mut c = Canvas::offscreen(1, 1, rgb(FILL));
     let f = c.font(px(m.font), false);
     let tf = c.font(px(13), false);
     let key_w = look.rows.iter().map(|r| c.text_width(&r.0, tf)).max().unwrap_or(0);
     let value_w = look.rows.iter().map(|r| c.text_width(&r.1, tf)).max().unwrap_or(0);
-    (c.text_width(&look.badge, f), c.text_width(RELEASED, f), tip_text.map_or(0, |t| c.text_width(t, tf)), key_w, value_w)
+    Measured {
+        badge_w: c.text_width(&look.badge, f),
+        end_w: px(m.min_end_w).max(c.text_width(disconnect_label(), f) + px(18)),
+        note_w: c.text_width(released_note(), f),
+        tip_w: tip_text.map_or(0, |t| c.text_width(t, tf)),
+        key_w,
+        value_w,
+    }
 }
 
 fn due_tip(st: &State, look: &Look) -> Option<(Part, String)> {
@@ -867,29 +909,63 @@ fn mbps_text(kbps: u32) -> String {
 /// The menu's last line: what the host streams now.
 fn menu_footer() -> String {
     match quality::streaming() {
-        None => "等对方发来画面…".into(),
-        Some((_, None)) => "对方的软件较旧，更新后这些设置才生效".into(),
-        Some(((w, h), Some(s))) => format!(
-            "现在 {w}×{h} · {} 帧/秒 · 最高 {} Mbps{}",
-            s.fps,
-            mbps_text(s.max_kbps),
-            if s.yuv444 { " · 文字清晰" } else { "" }
-        ),
+        None => tr("等对方发来画面…", "Waiting for remote display…").into(),
+        Some((_, None)) => tr(
+            "对方的软件较旧，更新后这些设置才生效",
+            "Remote version is older; update it to apply these settings",
+        )
+        .into(),
+        Some(((w, h), Some(s))) => {
+            if is_en() {
+                format!(
+                    "Now {w}×{h} · {} fps · max {} Mbps{}",
+                    s.fps,
+                    mbps_text(s.max_kbps),
+                    if s.yuv444 { " · Sharp text" } else { "" }
+                )
+            } else {
+                format!(
+                    "现在 {w}×{h} · {} 帧/秒 · 最高 {} Mbps{}",
+                    s.fps,
+                    mbps_text(s.max_kbps),
+                    if s.yuv444 { " · 文字清晰" } else { "" }
+                )
+            }
+        }
     }
 }
 
 fn menu_layout(px: &dyn Fn(i32) -> i32) -> Menu {
+    let auto = tr("自动", "Auto");
     let mut rows: Vec<(&'static str, Vec<(Chip, String)>)> = vec![
-        ("分辨率", quality::RESOLUTIONS.iter().map(|(r, t)| (Chip::Res(*r), t.to_string())).collect()),
-        ("帧率", quality::FRAME_RATES.iter().map(|&v| (Chip::Fps(v), if v == 0 { "自动".into() } else { v.to_string() })).collect()),
         (
-            "码率",
-            quality::BITRATES.iter().map(|&v| (Chip::Mbps(v), if v == 0 { "自动".into() } else { format!("{v}M") })).collect(),
+            tr("分辨率", "Resolution"),
+            quality::RESOLUTIONS.iter().map(|&r| (Chip::Res(r), r.label().to_string())).collect(),
+        ),
+        (
+            tr("帧率", "Frame rate"),
+            quality::FRAME_RATES
+                .iter()
+                .map(|&v| (Chip::Fps(v), if v == 0 { auto.into() } else { v.to_string() }))
+                .collect(),
+        ),
+        (
+            tr("码率", "Bitrate"),
+            quality::BITRATES
+                .iter()
+                .map(|&v| (Chip::Mbps(v), if v == 0 { auto.into() } else { format!("{v}M") }))
+                .collect(),
         ),
     ];
     // Only when both computers can (YUV 4:4:4: HEVC on the graphics cards of both).
     if matches!(quality::streaming(), Some((_, Some(s))) if s.can444) {
-        rows.push(("文字", vec![(Chip::Sharp(false), "标准".into()), (Chip::Sharp(true), "清晰".into())]));
+        rows.push((
+            tr("文字", "Text"),
+            vec![
+                (Chip::Sharp(false), tr("标准", "Standard").into()),
+                (Chip::Sharp(true), tr("清晰", "Sharp").into()),
+            ],
+        ));
     }
     build_menu(px, None, rows, menu_footer())
 }
@@ -898,30 +974,48 @@ fn audio_menu_footer() -> String {
     let c = audio::config::choice();
     if !c.enabled {
         return if c.mute_host {
-            "未传回本机 · 对方已静音".into()
+            tr("未传回本机 · 对方已静音", "Remote audio off · Host muted").into()
         } else {
-            "未传回本机".into()
+            tr("未传回本机", "Remote audio off").into()
         };
     }
-    let ch = if c.channels == 1 { "单声道" } else { "立体声" };
+    let ch = if c.channels == 1 { tr("单声道", "Mono") } else { tr("立体声", "Stereo") };
     let rate_hz = audio::config::active_rate_hz();
     let rate_str = if rate_hz.is_multiple_of(1000) {
         format!("{} kHz", rate_hz / 1000)
     } else {
         format!("{:.1} kHz", rate_hz as f32 / 1000.0)
     };
-    let q = if c.lossless { "无损 PCM" } else { "Opus" };
-    let mute = if c.mute_host { " · 对方已静音" } else { "" };
+    let q = if c.lossless { tr("无损 PCM", "Lossless PCM") } else { "Opus" };
+    let mute = if c.mute_host { tr(" · 对方已静音", " · Host muted") } else { "" };
     format!("{q} · {ch} · {rate_str}{mute}")
 }
 
 fn audio_menu_layout(px: &dyn Fn(i32) -> i32) -> Menu {
     let rows = vec![
-        ("对方扬声器", vec![(Chip::AudioMuteHost(false), "正常出声".into()), (Chip::AudioMuteHost(true), "静音".into())]),
-        ("音质", vec![(Chip::AudioLossless(false), "标准".into()), (Chip::AudioLossless(true), "无损".into())]),
-        ("声道", vec![(Chip::AudioCh(2), "立体声".into()), (Chip::AudioCh(1), "单声道".into())]),
+        (
+            tr("对方扬声器", "Host speakers"),
+            vec![
+                (Chip::AudioMuteHost(false), tr("正常出声", "Unmuted").into()),
+                (Chip::AudioMuteHost(true), tr("静音", "Muted").into()),
+            ],
+        ),
+        (
+            tr("音质", "Quality"),
+            vec![
+                (Chip::AudioLossless(false), tr("标准", "Standard").into()),
+                (Chip::AudioLossless(true), tr("无损", "Lossless").into()),
+            ],
+        ),
+        (
+            tr("声道", "Channels"),
+            vec![
+                (Chip::AudioCh(2), tr("立体声", "Stereo").into()),
+                (Chip::AudioCh(1), tr("单声道", "Mono").into()),
+            ],
+        ),
     ];
-    build_menu(px, Some("传回音量"), rows, audio_menu_footer())
+    build_menu(px, Some(tr("传回音量", "Volume")), rows, audio_menu_footer())
 }
 
 fn build_menu(
@@ -1136,7 +1230,8 @@ fn clamp_rect(r: RECT, bounds: &RECT, pad: i32) -> RECT {
 fn draw_popups(hwnd: HWND, st: &mut State, look: &Look) {
     let px = gdi::scale(st.owner);
     let tip_due = due_tip(st, look);
-    let (_, _, tip_w, key_w, value_w) = measure(&px, &IN_CAPTION, look, tip_due.as_ref().map(|t| t.1.as_str()));
+    let m = measure(&px, &IN_CAPTION, look, tip_due.as_ref().map(|t| t.1.as_str()));
+    let (tip_w, key_w, value_w) = (m.tip_w, m.key_w, m.value_w);
     let owner = st.owner;
     let work = work_area(owner);
     let screen = |r: &RECT| {
@@ -1219,11 +1314,12 @@ fn draw_bar(hwnd: HWND, st: &mut State, look: &Look) {
     let px = gdi::scale(st.owner);
     let pf = |v: f32| v * px(96) as f32 / 96.0;
     let tip_due = due_tip(st, look);
-    let (badge_w, note_w, tip_w, key_w, value_w) = measure(&px, &IN_BAR, look, tip_due.as_ref().map(|t| t.1.as_str()));
+    let m = measure(&px, &IN_BAR, look, tip_due.as_ref().map(|t| t.1.as_str()));
+    let (badge_w, end_w, note_w, tip_w, key_w, value_w) = (m.badge_w, m.end_w, m.note_w, m.tip_w, m.key_w, m.value_w);
     st.tip_shown = tip_due.is_some();
 
     let h = px(BAR_H);
-    let mut lay = layout(&px, &IN_BAR, h, px(6), badge_w, note_w, look);
+    let mut lay = layout(&px, &IN_BAR, h, px(6), badge_w, end_w, note_w, look);
     let bar_w = lay.right + if lay.note.is_some() { px(12) } else { px(6) };
     let menu = if st.menu {
         Some(menu_layout(&px))

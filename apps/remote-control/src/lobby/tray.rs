@@ -142,8 +142,14 @@ pub fn hide() {
             let v: Vec<u16> = s.encode_utf16().take(dst.len() - 1).collect();
             dst[..v.len()].copy_from_slice(&v);
         };
-        copy(&mut nid.szInfoTitle, "Remote Control 还在运行");
-        copy(&mut nid.szInfo, "点这里的图标打开窗口，右键可以退出");
+        copy(
+            &mut nid.szInfoTitle,
+            crate::i18n::tr("Remote Control 还在运行", "Remote Control is still running"),
+        );
+        copy(
+            &mut nid.szInfo,
+            crate::i18n::tr("点这里的图标打开窗口，右键可以退出", "Click this icon to open the window, or right-click to quit"),
+        );
         unsafe {
             let _ = Shell_NotifyIconW(NIM_MODIFY, &nid);
         }
@@ -208,9 +214,11 @@ fn icon_data(hwnd: HWND) -> NOTIFYICONDATAW {
 fn menu(hwnd: HWND) {
     unsafe {
         let Ok(m) = CreatePopupMenu() else { return };
-        let _ = AppendMenuW(m, MF_STRING, CMD_OPEN, w!("打开"));
+        let open_label = HSTRING::from(crate::i18n::tr("打开", "Open"));
+        let quit_label = HSTRING::from(crate::i18n::tr("退出", "Quit"));
+        let _ = AppendMenuW(m, MF_STRING, CMD_OPEN, &open_label);
         let _ = AppendMenuW(m, MF_SEPARATOR, 0, None);
-        let _ = AppendMenuW(m, MF_STRING, CMD_QUIT, w!("退出"));
+        let _ = AppendMenuW(m, MF_STRING, CMD_QUIT, &quit_label);
         let mut p = POINT::default();
         let _ = GetCursorPos(&mut p);
         // Without this the menu stays open when clicking elsewhere.
