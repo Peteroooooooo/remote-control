@@ -191,6 +191,10 @@ fn leftover_helpers(exes: &[PathBuf], keep: Option<u32>) -> Vec<u32> {
     found
 }
 
+pub fn kill_helpers_for(exe: &Path) {
+    kill_leftover_helpers(&[exe.to_path_buf()], None);
+}
+
 fn kill_leftover_helpers(exes: &[PathBuf], keep: Option<u32>) {
     for pid in leftover_helpers(exes, keep) {
         unsafe {

@@ -27,7 +27,11 @@ rc-ident = { path = "../../crates/rc-ident" }
 # Claiming the own relay and asking it for a code for another computer.
 rc-relay = { path = "../rc-relay", default-features = false }
 rc-stream = { path = "../../crates/rc-stream" }
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
 rusty-opus = "1.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11"
 tokio = { version = "1", features = ["full"] }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 windows-service = "0.8"

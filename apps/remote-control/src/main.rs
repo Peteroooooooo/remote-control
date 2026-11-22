@@ -56,6 +56,7 @@ mod theme;
 mod toolbar;
 mod torgb;
 mod trace;
+mod update;
 mod video_rx;
 mod video_tx;
 mod view;
@@ -76,7 +77,7 @@ macro_rules! log {
 }
 
 #[derive(Parser)]
-#[command(about = "remote control: remote desktop for Windows")]
+#[command(version = update::APP_VERSION, about = "remote control: remote desktop for Windows")]
 struct Cli {
     /// Without a command: the lobby.
     #[command(subcommand)]
@@ -152,6 +153,10 @@ enum Cmd {
     },
     /// Show whether the service is installed and running, and its device id.
     ServiceStatus,
+    /// Check for a newer release and optionally download and install it.
+    Update(update::UpdateArgs),
+    #[command(hide = true)]
+    ApplyUpdate(update::ApplyUpdateArgs),
     /// Started by the service manager.
     #[command(hide = true)]
     Service {
@@ -182,7 +187,7 @@ fn needs_parent_console() -> bool {
     };
     let is_gui_or_bg = matches!(
         first.to_str(),
-        Some("lobby" | "service" | "helper" | "capture-agent" | "clip-files" | "audio-agent")
+        Some("lobby" | "service" | "helper" | "capture-agent" | "clip-files" | "audio-agent" | "apply-update")
     );
     if !is_gui_or_bg {
         return true;
@@ -239,7 +244,12 @@ fn main() -> Result<()> {
         .init();
     stats::now_us();
     setup_process();
-    match Cli::parse().cmd.unwrap_or(Cmd::Lobby(Default::default())) {
+    if std::env::args_os().nth(1).and_then(|s| s.into_string().ok()).as_deref() != Some("apply-update") {
+        update::cleanup_stale_files();
+    }
+    let parsed = Cli::parse();
+    let cmd = parsed.cmd.unwrap_or(Cmd::Lobby(Default::default()));
+    match cmd {
         Cmd::Lobby(a) => lobby::run(a),
         Cmd::Id { key } => {
             let k = net::load_key(&key.unwrap_or_else(net::default_key_path))?;
@@ -275,6 +285,8 @@ fn main() -> Result<()> {
             install::uninstall(from_lobby.as_deref(), lobby_pid)
         }
         Cmd::ServiceStatus => install::status(),
+        Cmd::Update(a) => update::run_cli(a),
+        Cmd::ApplyUpdate(a) => update::apply_update(a),
         Cmd::Service { key } => service::run(key),
         Cmd::Helper(mut a) => {
             service::set_key(a.key.clone());

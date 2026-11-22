@@ -3294,7 +3294,7 @@ dependencies = [
 
 [[package]]
 name = "nettest"
-version = "0.0.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -4486,7 +4486,7 @@ checksum = "20675572f6f24e9e76ef639bc5552774ed45f1c30e2951e1e99c59888861c539"
 
 [[package]]
 name = "rc-ident"
-version = "0.0.1"
+version = "0.3.0"
 dependencies = [
  "blake3",
  "bs58",
@@ -4495,7 +4495,7 @@ dependencies = [
 
 [[package]]
 name = "rc-relay"
-version = "0.0.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "blake3",
@@ -4525,7 +4525,7 @@ dependencies = [
 
 [[package]]
 name = "rc-stream"
-version = "0.0.1"
+version = "0.3.0"
 dependencies = [
  "reed-solomon-simd",
 ]
@@ -4635,7 +4635,7 @@ dependencies = [
 
 [[package]]
 name = "remote-control"
-version = "0.0.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -4651,7 +4651,11 @@ dependencies = [
  "rc-ident",
  "rc-relay",
  "rc-stream",
+ "reqwest",
  "rusty-opus",
+ "serde",
+ "serde_json",
+ "sha2",
  "tokio",
  "tracing-subscriber",
  "wgpu",

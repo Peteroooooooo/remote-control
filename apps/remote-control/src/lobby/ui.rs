@@ -312,6 +312,109 @@ impl RelayProbe {
     }
 }
 
+#[derive(Clone, Default)]
+enum UpdatePhase {
+    #[default]
+    Idle,
+    Checking,
+    UpToDate,
+    Available(crate::update::Manifest),
+    Downloading {
+        version: String,
+        done: u64,
+        total: Option<u64>,
+    },
+    ReadyToApply(std::path::PathBuf),
+    Error(String),
+}
+
+#[derive(Clone, Default)]
+struct SelfUpdate {
+    state: Arc<Mutex<UpdatePhase>>,
+}
+
+impl SelfUpdate {
+    fn snapshot(&self) -> UpdatePhase {
+        self.state.lock().unwrap().clone()
+    }
+
+    fn take_ready(&self) -> Option<std::path::PathBuf> {
+        let mut s = self.state.lock().unwrap();
+        if let UpdatePhase::ReadyToApply(path) = &*s {
+            let out = path.clone();
+            *s = UpdatePhase::Idle;
+            Some(out)
+        } else {
+            None
+        }
+    }
+
+    fn fail(&self, msg: String) {
+        *self.state.lock().unwrap() = UpdatePhase::Error(msg);
+    }
+
+    fn start_check(&self, ctx: &egui::Context) {
+        {
+            let mut s = self.state.lock().unwrap();
+            if matches!(*s, UpdatePhase::Checking | UpdatePhase::Downloading { .. } | UpdatePhase::ReadyToApply(_)) {
+                return;
+            }
+            *s = UpdatePhase::Checking;
+        }
+        ctx.request_repaint();
+        let state = self.state.clone();
+        let ctx = ctx.clone();
+        let _ = std::thread::Builder::new().name("update-check".into()).spawn(move || {
+            let next = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+                Ok(rt) => match rt.block_on(crate::update::check()) {
+                    Ok(crate::update::CheckResult::UpToDate { .. }) => UpdatePhase::UpToDate,
+                    Ok(crate::update::CheckResult::Available(m)) => UpdatePhase::Available(m),
+                    Err(e) => UpdatePhase::Error(format!("{e:#}")),
+                },
+                Err(e) => UpdatePhase::Error(format!("{e:#}")),
+            };
+            *state.lock().unwrap() = next;
+            ctx.request_repaint();
+        });
+    }
+
+    fn start_download(&self, ctx: &egui::Context, manifest: crate::update::Manifest) {
+        let version = manifest.version.trim().trim_start_matches('v').to_string();
+        {
+            let mut s = self.state.lock().unwrap();
+            if matches!(*s, UpdatePhase::Downloading { .. } | UpdatePhase::ReadyToApply(_)) {
+                return;
+            }
+            *s = UpdatePhase::Downloading { version: version.clone(), done: 0, total: None };
+        }
+        ctx.request_repaint();
+        let state = self.state.clone();
+        let ctx = ctx.clone();
+        let _ = std::thread::Builder::new().name("update-dl".into()).spawn(move || {
+            let mut last_repaint = Instant::now();
+            let next = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+                Ok(rt) => match rt.block_on(crate::update::download_and_stage(&manifest, |done, total| {
+                    *state.lock().unwrap() = UpdatePhase::Downloading {
+                        version: version.clone(),
+                        done,
+                        total,
+                    };
+                    if last_repaint.elapsed() >= Duration::from_millis(80) || Some(done) == total {
+                        last_repaint = Instant::now();
+                        ctx.request_repaint();
+                    }
+                })) {
+                    Ok(path) => UpdatePhase::ReadyToApply(path),
+                    Err(e) => UpdatePhase::Error(format!("{e:#}")),
+                },
+                Err(e) => UpdatePhase::Error(format!("{e:#}")),
+            };
+            *state.lock().unwrap() = next;
+            ctx.request_repaint();
+        });
+    }
+}
+
 pub struct App {
     b: Backend,
     hwnd: Option<isize>,
@@ -344,6 +447,7 @@ pub struct App {
     highlight_settings: Option<(SettingsTarget, Instant)>,
     focus_name: bool,
     skill_state: crate::term::SkillState,
+    self_update: SelfUpdate,
 }
 
 /// `hidden`: started at sign-in, with only the icon in the tray.
@@ -410,6 +514,7 @@ pub fn run(b: Backend, hidden: bool) -> anyhow::Result<()> {
                 highlight_settings: None,
                 focus_name: false,
                 skill_state: crate::term::skill_state(),
+                self_update: SelfUpdate::default(),
             }))
         }),
     )
@@ -1153,6 +1258,22 @@ impl eframe::App for App {
         }
         let snap = self.b.snap();
         self.take_notices(&snap);
+        if let Some(stage) = self.self_update.take_ready() {
+            let active = !self.b.sessions().is_empty() || snap.hosting.is_some() || snap.asking.is_some();
+            if active {
+                let msg = tr("当前有远控连接，请先断开后再更新", "Disconnect active remote sessions before updating");
+                self.self_update.fail(msg.into());
+                self.toast(Tone::Warn, msg);
+            } else {
+                let svc = self.b.service_installed() && !self.b.service_other();
+                self.b.prepare_for_self_update();
+                if let Err(e) = crate::update::launch_apply_and_exit(&stage, svc, true) {
+                    let msg = format!("{e:#}");
+                    self.self_update.fail(msg.clone());
+                    self.toast(Tone::Err, msg);
+                }
+            }
+        }
         if self.confirm.is_none() {
             self.paste_anywhere(&ctx);
         }
@@ -2383,6 +2504,97 @@ impl App {
             }
             self.skill_state = crate::term::skill_state();
         }
+
+        ui.add_space(12.0);
+        let phase = self.self_update.snapshot();
+        let active_session = !self.b.sessions().is_empty() || snap.hosting.is_some() || snap.asking.is_some();
+        let title = format!("Remote Control v{}", crate::update::APP_VERSION);
+        let desc = match &phase {
+            UpdatePhase::Idle => tr("手动检查新版本，平时不会主动打扰", "Check for updates manually; never prompts in background").to_string(),
+            UpdatePhase::Checking => tr("正在检查更新…", "Checking for updates…").to_string(),
+            UpdatePhase::UpToDate => tr("已是最新版本", "You are on the latest version").to_string(),
+            UpdatePhase::Available(m) => {
+                let next = m.version.trim().trim_start_matches('v');
+                let note = m.notes.lines().next().map(str::trim).unwrap_or("");
+                if is_en() {
+                    if note.is_empty() {
+                        format!("New version v{next} available")
+                    } else {
+                        format!("New version v{next} available · {note}")
+                    }
+                } else if note.is_empty() {
+                    format!("发现新版本 v{next}")
+                } else {
+                    format!("发现新版本 v{next} · {note}")
+                }
+            }
+            UpdatePhase::Downloading { version, done, total } => match total.filter(|&t| t > 0) {
+                Some(t) => {
+                    let pct = done.saturating_mul(100) / t;
+                    if is_en() {
+                        format!("Downloading v{version} · {pct}% ({:.1} / {:.1} MB)", *done as f64 / 1e6, t as f64 / 1e6)
+                    } else {
+                        format!("正在下载 v{version} · {pct}%（{:.1} / {:.1} MB）", *done as f64 / 1e6, t as f64 / 1e6)
+                    }
+                }
+                None => {
+                    if is_en() {
+                        format!("Downloading v{version} ({:.1} MB)…", *done as f64 / 1e6)
+                    } else {
+                        format!("正在下载 v{version}（{:.1} MB）…", *done as f64 / 1e6)
+                    }
+                }
+            },
+            UpdatePhase::ReadyToApply(_) => tr("正在应用更新并重启…", "Applying update and restarting…").to_string(),
+            UpdatePhase::Error(e) => {
+                if is_en() {
+                    format!("Update check failed: {e}")
+                } else {
+                    format!("更新失败：{e}")
+                }
+            }
+        };
+        section_head(ui, tr("关于", "About"), None);
+        group(ui, |ui| {
+            Item::new(Lead::Icon(ic::INFO), &title).desc(&desc).first(true).show(ui, |ui| match &phase {
+                UpdatePhase::Idle => {
+                    if Btn::new(tr("检查更新", "Check for Updates")).show(ui).clicked() {
+                        self.self_update.start_check(ui.ctx());
+                    }
+                }
+                UpdatePhase::Checking => {
+                    Btn::new(tr("检查中…", "Checking…")).enabled(false).show(ui);
+                }
+                UpdatePhase::UpToDate => {
+                    if Btn::new(tr("再次检查", "Check Again")).show(ui).clicked() {
+                        self.self_update.start_check(ui.ctx());
+                    }
+                }
+                UpdatePhase::Available(m) => {
+                    if Btn::new(tr("重新检查", "Recheck")).show(ui).clicked() {
+                        self.self_update.start_check(ui.ctx());
+                    }
+                    if Btn::new(tr("立即更新", "Update Now")).look(Look::Primary).show(ui).clicked() {
+                        if active_session {
+                            self.toast(
+                                Tone::Warn,
+                                tr("当前有远控连接，请先断开后再更新", "Disconnect active remote sessions before updating"),
+                            );
+                        } else {
+                            self.self_update.start_download(ui.ctx(), m.clone());
+                        }
+                    }
+                }
+                UpdatePhase::Downloading { .. } | UpdatePhase::ReadyToApply(_) => {
+                    Btn::new(tr("更新中…", "Updating…")).enabled(false).show(ui);
+                }
+                UpdatePhase::Error(_) => {
+                    if Btn::new(tr("重试", "Retry")).show(ui).clicked() {
+                        self.self_update.start_check(ui.ctx());
+                    }
+                }
+            });
+        });
     }
 
     /// 设置 → 自建中转: the relays this computer owns, tried top to bottom.

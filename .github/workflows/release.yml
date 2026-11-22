@@ -19,9 +19,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Run unit tests
-        run: cargo test --locked -p rc-ident -p rc-stream
+        run: cargo test --locked -p rc-ident -p rc-stream -p remote-control update::tests
 
       - name: Build remote-control.exe
+        env:
+          RC_BUILD_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}
         run: cargo build --release --locked -p remote-control
 
       - uses: actions/upload-artifact@v4
@@ -30,9 +32,41 @@ jobs:
           path: target/release/remote-control.exe
           if-no-files-found: error
 
+  publish:
+    needs: windows
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: remote-control-windows-x86_64
+          path: dist
+
+      - name: Generate and sign latest.json
+        env:
+          TAG: ${{ github.ref_name }}
+          EXE_PATH: dist/remote-control.exe
+          OUT_MANIFEST: dist/latest.json
+          GITHUB_REPO: ${{ github.repository }}
+          CNB_REPO: peteroooooooo/remote-control
+          UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
+        run: node .github/scripts/publish-release.mjs --manifest
+
       - name: Publish GitHub Release
-        if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: target/release/remote-control.exe
+          files: |
+            dist/remote-control.exe
+            dist/latest.json
           generate_release_notes: true
+
+      - name: Sync release to CNB
+        env:
+          TAG: ${{ github.ref_name }}
+          EXE_PATH: dist/remote-control.exe
+          OUT_MANIFEST: dist/latest.json
+          CNB_REPO: peteroooooooo/remote-control
+          CNB_TOKEN: ${{ secrets.CNB_TOKEN }}
+        run: node .github/scripts/publish-release.mjs --sync-cnb

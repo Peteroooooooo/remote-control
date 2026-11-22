@@ -787,6 +787,12 @@ impl Backend {
         std::process::exit(0);
     }
 
+    pub fn prepare_for_self_update(&self) {
+        self.flush_undoables();
+        self.goodbye(net::CLOSE_STOPPED);
+        self.sh.stop_local();
+    }
+
     /// The window closes: sessions hosted here end with `code` (the
     /// service's go on). The service forgets the temporary devices now
     /// instead of when the snapshots stop coming.
