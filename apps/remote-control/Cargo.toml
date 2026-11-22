@@ -8,9 +8,10 @@ publish.workspace = true
 anyhow = "1.0.104"
 bytes = "1.12.1"
 clap = { version = "4.6.7", features = ["derive"] }
-# The lobby. wgpu (DX12 flip model) avoids WGL single-frame flashes on Windows; 0.36+ needs Rust 1.95.
-eframe = { version = "0.35", default-features = false, features = ["wgpu_no_default_features", "accesskit", "default_fonts"] }
-wgpu = { version = "29", default-features = false, features = ["std", "parking_lot", "dx12", "wgsl"] }
+# The lobby: egui + winit + our own D3D11 renderer (`DXGI_SWAP_EFFECT_SEQUENTIAL`)
+# so DWM synchronizes window resize frames atomically with zero stretch/gap; 0.36+ needs Rust 1.95.
+egui = { version = "0.35", default-features = false, features = ["default_fonts"] }
+egui-winit = { version = "0.35", default-features = false, features = ["clipboard", "links", "accesskit"] }
 getrandom = "0.4"
 # unstable-custom-transports: only for `path_selector` (see `net::Prefer`).
 iroh = { version = "1.4.1", features = ["unstable-custom-transports"] }

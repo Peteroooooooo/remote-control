@@ -14,13 +14,12 @@ use std::{
     time::{Duration, Instant},
 };
 
-use eframe::egui::{
+use egui::{
     self, Align, Align2, Color32, CornerRadius, FontData, FontFamily, FontId, Frame, Galley, Id, Layout, Margin,
     Order, Pos2, Rect, RectAlign, RichText, Sense, Shadow, Stroke, StrokeKind, TextEdit, UiBuilder, Vec2, WidgetInfo,
     WidgetType, emath::easing, pos2, text::{LayoutJob, TextFormat}, vec2,
 };
 use iroh::EndpointId;
-use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use rc_ident::conn_code::ConnCode;
 use windows::Win32::{
     Foundation::HWND,
@@ -29,7 +28,10 @@ use windows::Win32::{
     },
 };
 
-use super::backend::{Ask, Backend, Dev, SessionInfo, SessionState, Snap, Status, Tone, Undoable};
+use super::{
+    backend::{Ask, Backend, Dev, SessionInfo, SessionState, Snap, Status, Tone, Undoable},
+    host,
+};
 use crate::{
     i18n::{self, LangPref, is_en, tr},
     meet,
@@ -418,7 +420,6 @@ impl SelfUpdate {
 pub struct App {
     b: Backend,
     hwnd: Option<isize>,
-    start_hidden_step: u8,
     page: Page,
     paste: String,
     copied: Option<Instant>,
@@ -452,44 +453,20 @@ pub struct App {
 
 /// `hidden`: started at sign-in, with only the icon in the tray.
 pub fn run(b: Backend, hidden: bool) -> anyhow::Result<()> {
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("Remote Control")
-            .with_inner_size([920.0, 600.0])
-            .with_min_inner_size([720.0, 460.0])
-            // An empty icon: eframe would otherwise put its own (or one picture
-            // rescaled for every size) on the window on the first frame, over
-            // the exe's drawn sizes that `theme::set_icon` gives it.
-            .with_icon(egui::IconData::default())
-            .with_visible(!hidden),
-        ..Default::default()
-    };
-    eframe::run_native(
-        "remote-control",
-        options,
-        Box::new(move |cc| {
-            setup(&cc.egui_ctx);
-            // eframe keeps the window hidden until the first frame is drawn,
-            // so the frame gets its colours before anyone sees it.
-            let mut raw_hwnd = None;
-            if let Ok(h) = cc.window_handle()
-                && let RawWindowHandle::Win32(w) = h.as_raw()
-            {
-                raw_hwnd = Some(w.hwnd.get());
-                let hwnd = HWND(w.hwnd.get() as *mut _);
-                theme::frame(hwnd, theme::CHROME);
-                theme::set_icon(hwnd);
-                super::tray::set_window(hwnd);
-                if hidden {
-                    super::tray::start_hidden(hwnd);
-                }
-            }
-            let ctx = cc.egui_ctx.clone();
-            b.on_change(move || ctx.request_repaint());
-            Ok(Box::new(App {
+    host::run(
+        host::Config {
+            title: "Remote Control",
+            inner_size: [920.0, 600.0],
+            min_inner_size: [720.0, 460.0],
+            hidden,
+        },
+        move |ctx, hwnd| {
+            setup(ctx);
+            let repaint_ctx = ctx.clone();
+            b.on_change(move || repaint_ctx.request_repaint());
+            App {
                 b,
-                hwnd: raw_hwnd,
-                start_hidden_step: if hidden { 1 } else { 0 },
+                hwnd: Some(hwnd.0 as isize),
                 page: Page::Devices,
                 paste: String::new(),
                 copied: None,
@@ -515,8 +492,8 @@ pub fn run(b: Backend, hidden: bool) -> anyhow::Result<()> {
                 focus_name: false,
                 skill_state: crate::term::skill_state(),
                 self_update: SelfUpdate::default(),
-            }))
-        }),
+            }
+        },
     )
     .map_err(|e| anyhow::anyhow!("lobby window: {e}"))
 }
@@ -1220,10 +1197,14 @@ fn short_host(urls: &str) -> String {
     }
 }
 
-impl eframe::App for App {
+impl host::LobbyApp for App {
     /// What shows around the content area's round corner.
-    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+    fn clear_color(&self) -> [f32; 4] {
         PANE.to_normalized_gamma_f32()
+    }
+
+    fn on_close(&mut self, _ctx: &egui::Context) {
+        self.hide_to_tray();
     }
 
     fn on_exit(&mut self) {
@@ -1231,31 +1212,8 @@ impl eframe::App for App {
         self.b.flush_undoables();
     }
 
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
-        match self.start_hidden_step {
-            1 => {
-                if super::tray::is_start_hidden() {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-                    ctx.request_repaint();
-                    self.start_hidden_step = 2;
-                } else {
-                    self.start_hidden_step = 0;
-                }
-            }
-            2 => {
-                self.start_hidden_step = 0;
-                if super::tray::is_start_hidden() {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-                }
-                super::tray::finish_start_hidden();
-            }
-            _ => {}
-        }
-        if ctx.input(|i| i.viewport().close_requested()) {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            self.hide_to_tray();
-        }
         let snap = self.b.snap();
         self.take_notices(&snap);
         if let Some(stage) = self.self_update.take_ready() {

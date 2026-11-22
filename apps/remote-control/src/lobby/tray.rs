@@ -10,7 +10,6 @@ use std::sync::{
 use windows::{
     Win32::{
         Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM},
-        Graphics::Dwm::{DWMWA_CLOAK, DwmSetWindowAttribute},
         System::LibraryLoader::GetModuleHandleW,
         UI::{
             Shell::{
@@ -28,7 +27,7 @@ use windows::{
             },
         },
     },
-    core::{BOOL, HSTRING, PCWSTR, w},
+    core::{HSTRING, PCWSTR, w},
 };
 
 const CLASS: PCWSTR = w!("remote-control-tray");
@@ -63,56 +62,17 @@ fn window() -> Option<HWND> {
     (h != 0).then_some(HWND(h as *mut _))
 }
 
-/// Started in the tray: eframe shows the window once it has drawn the first
-/// frame anyway. Until then it is cloaked (drawn, never seen), then hidden
-/// on the UI thread once the first frame completes.
-static START_HIDDEN: AtomicBool = AtomicBool::new(false);
+/// Set when `show()` is requested (including if clicked before the window handle
+/// is registered during startup).
 static WANT_VISIBLE: AtomicBool = AtomicBool::new(false);
 
-fn cloak(h: HWND, on: bool) {
-    let v: BOOL = on.into();
-    let _ = unsafe { DwmSetWindowAttribute(h, DWMWA_CLOAK, &v as *const BOOL as *const _, size_of::<BOOL>() as u32) };
-}
-
-/// The window starts in the tray: call it before the window is first shown.
-pub fn start_hidden(hwnd: HWND) {
-    WANT_VISIBLE.store(false, Ordering::SeqCst);
-    cloak(hwnd, true);
-    START_HIDDEN.store(true, Ordering::SeqCst);
-}
-
-pub fn is_start_hidden() -> bool {
-    START_HIDDEN.load(Ordering::SeqCst)
-}
-
-/// Called on the UI thread after the first frame: hides the cloaked startup
-/// window and uncloaks it unless `show()` was already requested.
-pub fn finish_start_hidden() {
-    if START_HIDDEN.swap(false, Ordering::SeqCst)
-        && !WANT_VISIBLE.load(Ordering::SeqCst)
-        && let Some(h) = window()
-    {
-        unsafe {
-            let _ = ShowWindow(h, SW_HIDE);
-        }
-        cloak(h, false);
-        if WANT_VISIBLE.load(Ordering::SeqCst) {
-            unsafe {
-                let _ = ShowWindow(h, if IsIconic(h).as_bool() { SW_RESTORE } else { SW_SHOW });
-                let _ = SetForegroundWindow(h);
-            }
-        }
-    }
+pub fn want_visible() -> bool {
+    WANT_VISIBLE.load(Ordering::SeqCst)
 }
 
 /// Shows the lobby window in front, and tells the backend.
 pub fn show() {
     WANT_VISIBLE.store(true, Ordering::SeqCst);
-    if START_HIDDEN.swap(false, Ordering::SeqCst)
-        && let Some(h) = window()
-    {
-        cloak(h, false);
-    }
     if let Some(h) = window() {
         unsafe {
             let _ = ShowWindow(h, if IsIconic(h).as_bool() { SW_RESTORE } else { SW_SHOW });

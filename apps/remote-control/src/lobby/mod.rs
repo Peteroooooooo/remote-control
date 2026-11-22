@@ -3,6 +3,7 @@
 //! notification area: closing the window hides it, 退出 there quits.
 
 mod backend;
+mod host;
 mod tray;
 mod ui;
 
