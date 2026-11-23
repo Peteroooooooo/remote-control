@@ -109,4 +109,4 @@ volumes:
 
 ---
 
-Apache-2.0 许可证，见 [LICENSE](LICENSE)。社区交流：[LINUX DO](https://linux.do)。
+Apache-2.0 许可证，见 [LICENSE](LICENSE)。
