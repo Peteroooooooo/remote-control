@@ -75,6 +75,8 @@
 
 在主控端打开 **「设置 → AI 集成 → 配置 AI Skills → 安装」**，即可让 Claude Code / Codex 自动调用 CLI 跨设备执行命令与传输文件（「我的电脑」免确认，「信任设备」首次弹窗确认，已装后台服务时以管理员权限运行）。
 
+下面的 `remote-control` 指程序本身。它不会自动加入 PATH，在命令行里请写 exe 的完整路径（PowerShell 中路径带空格时写成 `& "D:\路径\remote-control.exe" devices`），或先进入 exe 所在文件夹再用 `.\remote-control.exe`。
+
 ```powershell
 remote-control devices                          # 查看在线设备
 remote-control shell laptop                     # 进入远程交互式 PowerShell

@@ -75,6 +75,8 @@ Enable via **Settings → Background Service → Install** (requires administrat
 
 Install via **Settings → AI Integration → AI Skills → Install** on the controller PC so Claude Code / Codex can run commands and transfer files across devices (**My Devices** run without prompts, **Trusted Devices** prompt once, and commands run elevated when the target has the background service installed).
 
+Below, `remote-control` means the program itself. It is not added to PATH, so on the command line give the exe's full path (in PowerShell, a path with spaces is written `& "D:\path\remote-control.exe" devices`), or go to its folder and use `.\remote-control.exe`.
+
 ```powershell
 remote-control devices                          # List online devices
 remote-control shell laptop                     # Interactive remote PowerShell
