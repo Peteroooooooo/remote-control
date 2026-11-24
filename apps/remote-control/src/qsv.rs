@@ -12,7 +12,7 @@ use std::{
     ffi::{CStr, c_void},
     mem::size_of,
     path::PathBuf,
-    sync::OnceLock,
+    sync::{Mutex, OnceLock},
     time::{Duration, Instant},
 };
 
@@ -493,6 +493,21 @@ unsafe impl Sync for VplApi {}
 
 static VPL: OnceLock<Option<VplApi>> = OnceLock::new();
 
+/// A configured oneVPL loader, by codec and adapter (`None` = any adapter).
+/// The first session from a loader takes 200-250 ms (the dispatcher finds and
+/// loads the runtime; Arc, 2026-11-24), later ones from the same loader are
+/// quick, so loaders stay for the life of the process: every new picture size
+/// or frame rate builds a new encoder.
+struct CachedLoader {
+    codec_id: u32,
+    adapter: Option<u32>,
+    loader: MfxLoader,
+}
+
+unsafe impl Send for CachedLoader {}
+
+static LOADERS: Mutex<Vec<CachedLoader>> = Mutex::new(Vec::new());
+
 fn vpl_api() -> Option<&'static VplApi> {
     VPL.get_or_init(load_vpl).as_ref()
 }
@@ -828,9 +843,19 @@ unsafe extern "C" fn free_frames(pthis: MfxHdl, resp: *mut MfxFrameAllocResponse
 /// needs to change across `MFXVideoENCODE_Reset` calls.
 const BRC_MULT: u16 = 4;
 
+/// Rate buffer, in frames at the starting bitrate. With one frame the encoder
+/// spends a few percent of each frame's budget and never sharpens a still
+/// picture past its key frame's quality: Arc HEVC, 2880x1920 text, 33 Mbps at
+/// 120 fps (2026-11-24): 30 dB for good, so a picture stays blocky after every
+/// key frame (connecting, another resolution) until its parts are redrawn.
+/// Four frames: 39 dB within 1.3 s, scrolling 34 dB to 39, key frames the
+/// same size, and the frames right after a bitrate cut smaller (at most 1.9
+/// times their budget instead of 6), with no encoder errors on changing the
+/// bitrate every frame.
+const VBV_FRAMES: f64 = 4.0;
+
 pub struct QsvEncoder {
     api: &'static VplApi,
-    loader: MfxLoader,
     session: MfxSession,
     _alloc_state: Box<D3D11Allocator>,
     _alloc_table: Box<MfxFrameAllocator>,
@@ -910,7 +935,20 @@ impl QsvEncoder {
             Codec::Hevc => MFX_CODEC_HEVC,
         };
         unsafe {
-            let init_session = |with_adapter_idx: bool| -> Result<(MfxLoader, MfxSession)> {
+            let init_session = |with_adapter_idx: bool| -> Result<MfxSession> {
+                let adapter = with_adapter_idx.then_some(adapter_idx);
+                let mut loaders = LOADERS.lock().unwrap();
+                if let Some(i) = loaders.iter().position(|c| c.codec_id == codec_id && c.adapter == adapter) {
+                    let kept = loaders[i].loader;
+                    let mut session: MfxSession = std::ptr::null_mut();
+                    let sts = (api.mfx_create_session)(kept, 0, &mut session);
+                    if sts >= MFX_ERR_NONE && !session.is_null() {
+                        return Ok(session);
+                    }
+                    crate::log!("MFXCreateSession from the kept loader failed: {sts}; loading again");
+                    (api.mfx_unload)(kept);
+                    loaders.remove(i);
+                }
                 let loader = (api.mfx_load)();
                 if loader.is_null() {
                     bail!("MFXLoad returned null");
@@ -942,15 +980,19 @@ impl QsvEncoder {
                     Ok(session)
                 };
                 match setup() {
-                    Ok(session) => Ok((loader, session)),
+                    Ok(session) => {
+                        loaders.push(CachedLoader { codec_id, adapter, loader });
+                        Ok(session)
+                    }
                     Err(e) => {
                         (api.mfx_unload)(loader);
                         Err(e)
                     }
                 }
             };
-            let (loader, session) = match init_session(true) {
-                Ok(pair) => pair,
+            let t_start = Instant::now();
+            let session = match init_session(true) {
+                Ok(session) => session,
                 Err(e) => {
                     crate::log!(
                         "oneVPL DXGIAdapterIndex={adapter_idx} filter unavailable ({e:#}); falling back to default adapter"
@@ -978,19 +1020,17 @@ impl QsvEncoder {
             let sts = (api.set_handle)(session, MFX_HANDLE_D3D11_DEVICE, device.as_raw());
             if sts < MFX_ERR_NONE {
                 (api.mfx_close)(session);
-                (api.mfx_unload)(loader);
                 bail!("MFXVideoCORE_SetHandle(D3D11) failed: {sts}");
             }
             let sts = (api.set_frame_allocator)(session, &mut *alloc_table);
             if sts < MFX_ERR_NONE {
                 (api.mfx_close)(session);
-                (api.mfx_unload)(loader);
                 bail!("MFXVideoCORE_SetFrameAllocator failed: {sts}");
             }
 
             let aligned_w = (width + 15) & !15;
             let aligned_h = (height + 15) & !15;
-            let vbv_frames = opts.vbv_frames.unwrap_or(1.0);
+            let vbv_frames = opts.vbv_frames.unwrap_or(VBV_FRAMES);
             let target_usage = match opts.speed {
                 None => {
                     if fps <= 60 {
@@ -1101,7 +1141,6 @@ impl QsvEncoder {
             }
             if sts < MFX_ERR_NONE {
                 (api.mfx_close)(session);
-                (api.mfx_unload)(loader);
                 bail!("MFXVideoENCODE_Init failed: {sts}");
             }
             // Populate `params` (and attached ext buffers) with the exact active
@@ -1111,7 +1150,10 @@ impl QsvEncoder {
 
             let lp = if params.mfx.low_power == MFX_CODINGOPTION_ON { "VDENC" } else { "VME" };
             let name = format!("Intel QSV {} ({lp}, oneVPL)", opts.codec.name());
-            crate::log!("encoder {name}: {width}x{height} (aligned {aligned_w}x{aligned_h}) @ {fps} fps, TU={target_usage}, init status={sts}");
+            crate::log!(
+                "encoder {name}: {width}x{height} (aligned {aligned_w}x{aligned_h}) @ {fps} fps, TU={target_usage}, init status={sts}, ready in {} ms",
+                t_start.elapsed().as_millis()
+            );
 
             let init_max_kbps = params.mfx.max_kbps.max(params.mfx.target_kbps).max(1);
             let actual_bitrate = if !opts.qp_control && params.mfx.target_kbps > 0 {
@@ -1121,7 +1163,6 @@ impl QsvEncoder {
             };
             Ok(QsvEncoder {
                 api,
-                loader,
                 session,
                 _alloc_state: alloc_state,
                 _alloc_table: alloc_table,
@@ -1349,7 +1390,6 @@ impl Drop for QsvEncoder {
         unsafe {
             let _ = (self.api.encode_close)(self.session);
             let _ = (self.api.mfx_close)(self.session);
-            (self.api.mfx_unload)(self.loader);
         }
     }
 }

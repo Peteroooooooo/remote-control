@@ -12,7 +12,7 @@ use std::{
 
 use reed_solomon_simd::ReedSolomonEncoder;
 
-use crate::wire::{Report, SHARD_HDR, ShardHeader};
+use crate::wire::{Report, SHARD_HDR, ShardHeader, T_SHARD_RESENT};
 
 /// Upper bound on data shards per frame (about 45 MB at 1400-byte datagrams).
 const MAX_DATA_SHARDS: usize = 32_768;
@@ -126,6 +126,8 @@ pub struct Completed {
     pub data: Vec<u8>,
     /// Parity shards were needed.
     pub recovered: bool,
+    /// Shards sent again were needed.
+    pub resent: bool,
 }
 
 struct Partial {
@@ -134,9 +136,13 @@ struct Partial {
     frame_len: u32,
     shard_len: usize,
     shards: Vec<Option<Vec<u8>>>,
+    /// Shards here, sent first or again.
     seen: Vec<bool>,
+    /// Shards that came the first time they were sent: what the loss report counts.
+    first: Vec<bool>,
     received: u16,
     data_received: u16,
+    resent_used: bool,
     /// When the latest shard of this frame came in.
     last_at: Instant,
     /// `Some(recovered)` once the frame has been handed out.
@@ -185,11 +191,17 @@ impl Assembler {
         Assembler { frames: HashMap::new(), retired: HashSet::new(), newest_retired: 0, linger, pending: Report::default() }
     }
 
+    /// See `new`.
+    pub fn set_linger(&mut self, linger: Duration) {
+        self.linger = linger;
+    }
+
     pub fn push(&mut self, datagram: &[u8], now: Instant) -> Option<Completed> {
         let (h, body) = ShardHeader::parse(datagram)?;
         if self.retired.contains(&h.frame) {
             return None;
         }
+        let resent = datagram[0] == T_SHARD_RESENT;
         let total = h.data as usize + h.parity as usize;
         let p = self.frames.entry(h.frame).or_insert_with(|| Partial {
             data: h.data,
@@ -198,13 +210,21 @@ impl Assembler {
             shard_len: body.len(),
             shards: vec![None; total],
             seen: vec![false; total],
+            first: vec![false; total],
             received: 0,
             data_received: 0,
+            resent_used: false,
             last_at: now,
             done: None,
         });
         let i = h.index as usize;
-        if p.data != h.data || p.parity != h.parity || p.shard_len != body.len() || p.seen[i] {
+        if p.data != h.data || p.parity != h.parity || p.shard_len != body.len() {
+            return None;
+        }
+        if !resent {
+            p.first[i] = true;
+        }
+        if p.seen[i] {
             return None;
         }
         p.seen[i] = true;
@@ -216,6 +236,7 @@ impl Assembler {
         if p.done.is_some() {
             return None;
         }
+        p.resent_used |= resent;
         p.shards[i] = Some(body.to_vec());
         let (data, recovered) = if p.data_received == p.data {
             (p.assemble(), false)
@@ -225,7 +246,29 @@ impl Assembler {
             return None;
         };
         p.done = Some(recovered);
-        Some(Completed { frame: h.frame, data, recovered })
+        Some(Completed { frame: h.frame, data, recovered, resent: p.resent_used })
+    }
+
+    /// The shards of `frame` to ask for again: as many of the missing ones
+    /// as it still needs (data shards first) and one more, in case one of
+    /// them is lost too. Empty when nothing of it came: then all its data
+    /// shards. `None` when it is complete or already given up.
+    pub fn wanted(&self, frame: u32) -> Option<Vec<u16>> {
+        if self.retired.contains(&frame) {
+            return None;
+        }
+        let Some(p) = self.frames.get(&frame) else { return Some(Vec::new()) };
+        if p.done.is_some() {
+            return None;
+        }
+        let need = (p.data.saturating_sub(p.received)).max(1) as usize + 1;
+        Some(
+            (0..p.seen.len())
+                .filter(|&i| !p.seen[i])
+                .take(need.min(crate::wire::RESEND_MAX))
+                .map(|i| i as u16)
+                .collect(),
+        )
     }
 
     /// Moves frames with no shard for more than `linger` into the report.
@@ -237,8 +280,13 @@ impl Assembler {
             let p = self.frames.remove(&f).expect("listed above");
             let r = &mut self.pending;
             r.shards_expected += p.data as u32 + p.parity as u32;
-            r.shards_received += p.received as u32;
+            r.shards_received += p.first.iter().filter(|&&s| s).count() as u32;
+            let run = p.first.split(|&s| s).map(<[bool]>::len).max().unwrap_or(0);
+            r.max_run = r.max_run.max(run.min(u8::MAX as usize) as u8);
+            // A frame saved by shards sent again was more than parity could
+            // repair: the sender should hear of it like of a lost one.
             match p.done {
+                Some(_) if p.resent_used => r.frames_failed += 1,
                 Some(false) => r.frames_ok += 1,
                 Some(true) => r.frames_recovered += 1,
                 None => r.frames_failed += 1,
@@ -316,6 +364,7 @@ mod tests {
         assert_eq!((r.frames_ok, r.frames_recovered, r.frames_failed), (0, 1, 0));
         assert_eq!(r.shards_expected as usize, pkts.len());
         assert_eq!(r.shards_received as usize, pkts.len() - lose);
+        assert_eq!(r.max_run as usize, lose, "the first `lose` shards in a row");
     }
 
     #[test]
@@ -349,11 +398,37 @@ mod tests {
             assert!(a.push(p, t0).is_none());
         }
         a.expire(t0 + Duration::from_millis(200));
-        assert_eq!(a.take_report().frames_failed, 1);
+        let r = a.take_report();
+        assert_eq!((r.frames_failed, r.max_run as u16), (1, h.parity + 1));
         // Shards arriving after the frame was reported are ignored.
         assert!(a.push(&pkts[0], t0 + Duration::from_millis(300)).is_none());
         a.expire(t0 + Duration::from_millis(500));
         assert_eq!(a.take_report(), Report::default());
+    }
+
+    #[test]
+    fn shards_sent_again_complete_a_frame_but_not_the_loss_count() {
+        let data = frame_bytes(10_000);
+        let pkts = encode_frame(9, &data, 1400, 20, 2);
+        let (h, _) = ShardHeader::parse(&pkts[0]).unwrap();
+        let lost = h.parity as usize + 2;
+        let mut a = Assembler::new(Duration::from_millis(100));
+        let t0 = Instant::now();
+        assert_eq!(a.wanted(9), Some(vec![]), "nothing came: all of it");
+        for p in &pkts[lost..] {
+            assert!(a.push(p, t0).is_none());
+        }
+        // Two shards short: the first three missing ones.
+        assert_eq!(a.wanted(9), Some(vec![0, 1, 2]));
+        assert!(a.push(&crate::wire::resent_shard(&pkts[0]), t0).is_none());
+        let c = a.push(&crate::wire::resent_shard(&pkts[2]), t0).expect("complete");
+        assert_eq!((c.data, c.resent), (data, true));
+        assert_eq!(a.wanted(9), None);
+        a.expire(t0 + Duration::from_millis(200));
+        let r = a.take_report();
+        assert_eq!(r.shards_received as usize, pkts.len() - lost, "resent shards are not first arrivals");
+        assert_eq!((r.frames_failed, r.max_run as usize), (1, lost));
+        assert_eq!(a.wanted(9), None, "given up");
     }
 
     #[test]

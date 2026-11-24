@@ -93,7 +93,7 @@ pub struct ViewArgs {
     /// `move X Y` and `click X Y` (fractions of the picture), `keys SCAN...`
     /// (hex scan codes, pressed in order, released in reverse), `sas`,
     /// `monitor next|prev|N` (N from 1, may be out of range), `probe` (as --probe, now),
-    /// `shot FILE.bmp` (save the picture shown now, half size), `picture res|fps|mbps V`
+    /// `shot FILE.bmp` (save the picture shown now, half size), `picture res|fps|mbps|sharp|route V`
     /// (as the Display menu, see `picture_line`), `full` (full screen on or off).
     #[arg(long)]
     script: Option<PathBuf>,
@@ -129,6 +129,8 @@ struct RenderSecond {
 struct Shared {
     ctrl: mpsc::UnboundedSender<Msg>,
     active_conn: Mutex<Connection>,
+    /// Its endpoint (another one after a 线路 change).
+    active_ep: Mutex<Endpoint>,
     reconnecting: AtomicBool,
     quit: AtomicBool,
     render: Mutex<RenderSecond>,
@@ -260,6 +262,53 @@ pub fn run(a: ViewArgs) -> Result<()> {
     r
 }
 
+/// How this window reaches the host, on either 线路.
+struct Link {
+    id: EndpointId,
+    secret: SecretKey,
+    relays: net::Relays,
+    addrs: Vec<SocketAddr>,
+    via: Vec<RelayUrl>,
+}
+
+impl Link {
+    fn new(a: &ViewArgs, secret: SecretKey, proof: String) -> Link {
+        let mut via = a.via.clone();
+        if via.is_empty() {
+            via = a.relay.clone();
+            if !a.no_public && a.relay.is_empty() {
+                via.extend(net::public_relays());
+            }
+        }
+        let relays = net::Relays { own: a.relay.clone(), public: !a.no_public, theirs: a.via.clone(), token: Some(proof) };
+        Link { id: a.id, secret, relays, addrs: a.addr.clone(), via }
+    }
+
+    /// The self-hosted relays to the host: what 只走中转 goes through (a
+    /// public relay carries no session, see `net::choose`).
+    fn own(&self) -> Vec<RelayUrl> {
+        self.via.iter().filter(|u| net::public_index(u).is_none()).cloned().collect()
+    }
+
+    /// A new endpoint and the host's address. An endpoint with IP transports
+    /// always finds the direct paths and one without never does, so another
+    /// 线路 is another endpoint.
+    async fn open(&self, relay_only: bool) -> Result<(Endpoint, EndpointAddr)> {
+        let own = self.own();
+        let (relays, ips, via) = match (relay_only, own.is_empty()) {
+            (false, _) => (self.relays.clone(), &self.addrs[..], self.via.clone()),
+            // --relay-only without a self-hosted relay (tests): the relays it has.
+            (true, true) => (self.relays.clone(), &[][..], self.via.clone()),
+            (true, false) => (net::Relays { public: false, theirs: own.clone(), ..self.relays.clone() }, &[][..], own),
+        };
+        let ep = net::endpoint(self.secret.clone(), &relays, !relay_only).await?;
+        Ok((ep, net::dial_addr(self.id, ips, &via)))
+    }
+}
+
+/// How long 只走中转 tries the relay before it goes 自动 again.
+const RELAY_TRY: Duration = Duration::from_secs(10);
+
 fn run_inner(a: &ViewArgs) -> Result<()> {
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     let t_start = Instant::now();
@@ -274,23 +323,28 @@ fn run_inner(a: &ViewArgs) -> Result<()> {
     });
     let (secret, proof) = session_key(a)?;
     crate::cc::set_pacing_gain(a.floor_pacing);
-    let relays = net::Relays { own: a.relay.clone(), public: !a.no_public, theirs: a.via.clone(), token: Some(proof.clone()) };
-    let ep = rt.block_on(net::endpoint(secret, &relays, !a.relay_only))?;
-    let ips: &[SocketAddr] = if a.relay_only { &[] } else { &a.addr };
-    let mut via = a.via.clone();
-    if via.is_empty() {
-        via = a.relay.clone();
-        if !a.no_public && a.relay.is_empty() {
-            via.extend(net::public_relays());
-        }
+    let link = Arc::new(Link::new(a, secret, proof.clone()));
+    let mut relay_only = a.relay_only || (!link.own().is_empty() && crate::quality::saved(&a.id.to_string()).relay_only);
+    let (mut ep, mut target) = rt.block_on(link.open(relay_only))?;
+    let dial = |ep: &Endpoint, target: &EndpointAddr, limit: Duration| {
+        let (ep, target) = (ep.clone(), target.clone());
+        async move { tokio::time::timeout(limit, ep.connect(target, crate::proto::ALPN)).await }
+    };
+    let mut first = rt.block_on(dial(&ep, &target, if relay_only && !a.relay_only { RELAY_TRY } else { Duration::from_secs(15) }));
+    if relay_only && !a.relay_only && !matches!(first, Ok(Ok(_))) {
+        log!("no connection through the relay in {} s: 自动 instead", RELAY_TRY.as_secs());
+        rt.block_on(async {
+            let _ = tokio::time::timeout(Duration::from_millis(1500), ep.close()).await;
+        });
+        relay_only = false;
+        (ep, target) = rt.block_on(link.open(false))?;
+        first = rt.block_on(dial(&ep, &target, Duration::from_secs(15)));
     }
-    let target = net::dial_addr(a.id, ips, &via);
-    let dial = async { tokio::time::timeout(Duration::from_secs(15), ep.connect(target.clone(), crate::proto::ALPN)).await };
     let no_answer = tr(
         "连不上对方：没有回应（对方没开机、没联网、睡着了，或者找不到通路）",
         "Cannot connect: no response (remote PC is off, offline, asleep, or unreachable)",
     );
-    let connected = match rt.block_on(dial) {
+    let connected = match first {
         Ok(Ok(conn)) => Ok(conn),
         // The handshake gave up: quinn's idle timeout.
         Ok(Err(e)) if format!("{e:#}").contains("timed out") => Err(anyhow!(no_answer)),
@@ -306,12 +360,31 @@ fn run_inner(a: &ViewArgs) -> Result<()> {
             }
             Err(_) => 0,
         };
-        run_connected(&rt, a, &ep, &target, &conn, t_start, caps, proof)
+        run_connected(&rt, a, Route { link, ep: ep.clone(), target, relay_only }, &conn, t_start, caps, proof)
     });
     rt.block_on(async {
         let _ = tokio::time::timeout(Duration::from_secs(2), ep.close()).await;
     });
     r
+}
+
+/// The connection's endpoint and 线路, replaced when 线路 changes.
+struct Route {
+    link: Arc<Link>,
+    ep: Endpoint,
+    target: EndpointAddr,
+    relay_only: bool,
+}
+
+impl Route {
+    /// Over to `relay_only`: the old endpoint goes first, so the relays never
+    /// see this session key twice.
+    async fn switch(&mut self, relay_only: bool) -> Result<()> {
+        let _ = tokio::time::timeout(Duration::from_millis(1500), self.ep.close()).await;
+        let (ep, target) = self.link.open(relay_only).await?;
+        (self.ep, self.target, self.relay_only) = (ep, target, relay_only);
+        Ok(())
+    }
 }
 
 fn is_handoff_close(conn: &Connection) -> bool {
@@ -370,6 +443,7 @@ fn spawn_ctrl_read(
                             if s.yuv444 { "4:4:4" } else if s.can444 { "4:2:0 (4:4:4 on offer)" } else { "4:2:0" }
                         );
                     }
+                    crate::video_rx::HOST_RESENDS.store(streaming.is_some_and(|s| s.resends), Ordering::Relaxed);
                     crate::quality::set_streaming((width as u32, height as u32), streaming);
                     let _ = info_tx.send((width as u32, height as u32, encoder));
                 }
@@ -443,8 +517,7 @@ fn spawn_watchdog(rt: &tokio::runtime::Handle, sh: Arc<Shared>, conn: Connection
 fn run_connected(
     rt: &tokio::runtime::Runtime,
     a: &ViewArgs,
-    ep: &Endpoint,
-    target: &EndpointAddr,
+    mut route: Route,
     initial_conn: &Connection,
     t_start: Instant,
     caps: u8,
@@ -545,6 +618,7 @@ fn run_connected(
     let sh = Arc::new(Shared {
         ctrl: ctrl_tx.clone(),
         active_conn: Mutex::new(conn.clone()),
+        active_ep: Mutex::new(route.ep.clone()),
         reconnecting: AtomicBool::new(false),
         quit: AtomicBool::new(false),
         render: Mutex::default(),
@@ -563,7 +637,13 @@ fn run_connected(
         current_monitor: AtomicI32::new(-1),
         restore_monitor: AtomicI32::new(-1),
     });
-    let (_, init_quality) = crate::quality::start(&a.id.to_string(), a.fps, a.mbps);
+    let id = a.id.to_string();
+    let (_, init_quality) = crate::quality::start(&id, a.fps, a.mbps);
+    crate::quality::line_used(route.relay_only, !a.relay_only);
+    let (line_tx, mut line_rx) = mpsc::unbounded_channel::<bool>();
+    if !route.link.own().is_empty() {
+        crate::quality::connect_line(line_tx);
+    }
     let init_screen = crate::quality::screen();
     crate::quality::connect(ctrl_tx.clone());
     let _init_audio = crate::audio::config::start(&a.id.to_string());
@@ -714,7 +794,7 @@ fn run_connected(
                         return Err(anyhow!("{}", close_text(net::CLOSE_HANDOFF)));
                     }
                     tokio::time::sleep(Duration::from_secs(1).min(dl - now)).await;
-                    match tokio::time::timeout(Duration::from_secs(5), ep.connect(target.clone(), crate::proto::ALPN)).await {
+                    match tokio::time::timeout(Duration::from_secs(5), route.ep.connect(route.target.clone(), crate::proto::ALPN)).await {
                         Ok(Ok(c)) => return Ok(c),
                         Ok(Err(e)) => log!("initial handoff reconnect dial failed: {e:#}"),
                         Err(_) => log!("initial handoff reconnect dial timed out"),
@@ -765,11 +845,9 @@ fn run_connected(
         });
     }
     {
-        let (sh, wstate, ep, target, proof, ctrl_tx, writer_tx, frames, counters, audio_tx, audio_reset) = (
+        let (sh, wstate, proof, ctrl_tx, writer_tx, frames, counters, audio_tx, audio_reset) = (
             sh.clone(),
             wstate.clone(),
-            ep.clone(),
-            target.clone(),
             proof.clone(),
             ctrl_tx.clone(),
             writer_tx.clone(),
@@ -784,44 +862,86 @@ fn run_connected(
         rt.spawn(async move {
             let mut watchdog_handle = spawn_watchdog(&rt_handle, sh.clone(), conn.clone());
             loop {
-                let reason = conn.closed().await;
-                let silent = sh.silent.load(Ordering::SeqCst);
-                let handoff = !silent
-                    && !sh.quit.load(Ordering::Relaxed)
-                    && !wstate.closed.load(Ordering::Relaxed)
-                    && matches!(
-                        &reason,
-                        ConnectionError::ApplicationClosed(c) if c.error_code.into_inner() == u64::from(net::CLOSE_HANDOFF)
-                    );
-                if !handoff {
-                    let why = if silent { Some(silent_text()) } else { why_closed(&reason) };
-                    let Some(why) = why else { return };
-                    let since = sh.last_picture.lock().unwrap().map_or(f64::NAN, |t| t.elapsed().as_secs_f64());
-                    log!("connection closed: {reason} ({why}); last picture {since:.2} s before");
-                    status(&format!("closed\t{why}"));
-                    crate::toolbar::closed(why);
-                    tokio::time::sleep(CLOSED_NOTICE).await;
-                    window::close();
-                    return;
+                let switch_to = tokio::select! {
+                    reason = conn.closed() => Err(reason),
+                    Some(want) = line_rx.recv() => Ok(want),
+                };
+                let prev_monitor = sh.current_monitor.load(Ordering::SeqCst);
+                let handoff_wait = switch_to.is_err();
+                match switch_to {
+                    Ok(want) if want == route.relay_only => continue,
+                    Ok(want) => {
+                        log!("route: {}; connecting again", if want { "relay only" } else { "auto" });
+                        sh.reconnecting.store(true, Ordering::SeqCst);
+                        status("connecting");
+                        crate::toolbar::update(
+                            crate::toolbar::Tone::Fair,
+                            tr("正在切换线路…", "Switching route…").into(),
+                            vec![],
+                            true,
+                        );
+                        let _ = writer_tx.send(None);
+                        read_handle.abort();
+                        video_handle.abort();
+                        uni_handle.abort();
+                        watchdog_handle.abort();
+                        conn.close(0u32.into(), b"route");
+                        if let Err(e) = route.switch(want).await {
+                            log!("route: {e:#}; back to the one before");
+                            let back = !want;
+                            if let Err(e) = route.switch(back).await {
+                                log!("route: {e:#}");
+                                status(&format!("closed\t{}", tr("连接已断开", "Disconnected")));
+                                crate::toolbar::closed(tr("连接已断开", "Disconnected"));
+                                tokio::time::sleep(CLOSED_NOTICE).await;
+                                window::close();
+                                return;
+                            }
+                            crate::quality::line_used(back, true);
+                        }
+                        *sh.active_ep.lock().unwrap() = route.ep.clone();
+                    }
+                    Err(reason) => {
+                        let silent = sh.silent.load(Ordering::SeqCst);
+                        let handoff = !silent
+                            && !sh.quit.load(Ordering::Relaxed)
+                            && !wstate.closed.load(Ordering::Relaxed)
+                            && matches!(
+                                &reason,
+                                ConnectionError::ApplicationClosed(c) if c.error_code.into_inner() == u64::from(net::CLOSE_HANDOFF)
+                            );
+                        if !handoff {
+                            let why = if silent { Some(silent_text()) } else { why_closed(&reason) };
+                            let Some(why) = why else { return };
+                            let since = sh.last_picture.lock().unwrap().map_or(f64::NAN, |t| t.elapsed().as_secs_f64());
+                            log!("connection closed: {reason} ({why}); last picture {since:.2} s before");
+                            status(&format!("closed\t{why}"));
+                            crate::toolbar::closed(why);
+                            tokio::time::sleep(CLOSED_NOTICE).await;
+                            window::close();
+                            return;
+                        }
+
+                        log!("host is handing off (CLOSE_HANDOFF); reconnecting...");
+                        sh.reconnecting.store(true, Ordering::SeqCst);
+                        status("connecting");
+                        crate::toolbar::update(
+                            crate::toolbar::Tone::Fair,
+                            tr("对方正在切换后台服务，正在重连…", "Remote PC switching to service, reconnecting…").into(),
+                            vec![],
+                            true,
+                        );
+                        let _ = writer_tx.send(None);
+                        read_handle.abort();
+                        video_handle.abort();
+                        uni_handle.abort();
+                        watchdog_handle.abort();
+                    }
                 }
 
-                log!("host is handing off (CLOSE_HANDOFF); reconnecting...");
-                let prev_monitor = sh.current_monitor.load(Ordering::SeqCst);
-                sh.reconnecting.store(true, Ordering::SeqCst);
-                status("connecting");
-                crate::toolbar::update(
-                    crate::toolbar::Tone::Fair,
-                    tr("对方正在切换后台服务，正在重连…", "Remote PC switching to service, reconnecting…").into(),
-                    vec![],
-                    true,
-                );
-                let _ = writer_tx.send(None);
-                read_handle.abort();
-                video_handle.abort();
-                uni_handle.abort();
-                watchdog_handle.abort();
-
-                let deadline = Instant::now() + Duration::from_secs(45);
+                let started = Instant::now();
+                let deadline = started + Duration::from_secs(45);
+                let mut tries = 0u32;
                 let mut terminal_code: Option<u32> = None;
                 let mut reconnected: Option<(Connection, SendStream, AbortHandle, AbortHandle, AbortHandle)> = None;
                 loop {
@@ -832,12 +952,32 @@ fn run_connected(
                     if now >= deadline {
                         break;
                     }
-                    tokio::time::sleep(Duration::from_secs(1).min(deadline - now)).await;
+                    if route.relay_only && started.elapsed() >= RELAY_TRY {
+                        log!("no connection through the relay in {} s: 自动 instead", RELAY_TRY.as_secs());
+                        crate::toolbar::update(
+                            crate::toolbar::Tone::Fair,
+                            tr("中转连不上，改回自动…", "Relay unreachable, back to Auto…").into(),
+                            vec![],
+                            true,
+                        );
+                        if let Err(e) = route.switch(false).await {
+                            log!("route: {e:#}");
+                            break;
+                        }
+                        *sh.active_ep.lock().unwrap() = route.ep.clone();
+                        crate::quality::line_used(false, true);
+                    }
+                    // The first try at once after a 线路 change; the host
+                    // handing off needs a moment first.
+                    if tries > 0 || handoff_wait {
+                        tokio::time::sleep(Duration::from_secs(1).min(deadline - now)).await;
+                    }
+                    tries += 1;
                     if sh.quit.load(Ordering::Relaxed) || wstate.closed.load(Ordering::Relaxed) {
                         return;
                     }
 
-                    let new_conn = match tokio::time::timeout(Duration::from_secs(5), ep.connect(target.clone(), crate::proto::ALPN)).await {
+                    let new_conn = match tokio::time::timeout(Duration::from_secs(5), route.ep.connect(route.target.clone(), crate::proto::ALPN)).await {
                         Ok(Ok(c)) => c,
                         Ok(Err(e)) => {
                             log!("reconnect dial failed: {e:#}");
@@ -994,7 +1134,12 @@ fn run_connected(
                 sh.silent.store(false, Ordering::SeqCst);
                 sh.reconnecting.store(false, Ordering::SeqCst);
                 status("connected");
-                crate::toolbar::update(crate::toolbar::Tone::Good, tr("已重连", "Reconnected").into(), vec![], false);
+                let done = match (handoff_wait, route.relay_only) {
+                    (true, _) => tr("已重连", "Reconnected"),
+                    (false, true) => tr("已切到只走中转", "Now relay only"),
+                    (false, false) => tr("已切到自动线路", "Now on Auto route"),
+                };
+                crate::toolbar::update(crate::toolbar::Tone::Good, done.into(), vec![], false);
                 let new_watchdog = spawn_watchdog(&rt_handle, sh.clone(), new_conn.clone());
 
                 conn = new_conn;
@@ -1017,9 +1162,11 @@ fn run_connected(
     let _ = render.join();
     let _ = audio_player.join();
     let final_conn = sh.active_conn.lock().unwrap().clone();
+    let final_ep = sh.active_ep.lock().unwrap().clone();
     rt.block_on(async {
         tokio::time::sleep(Duration::from_millis(100)).await;
         final_conn.close(0u32.into(), b"bye");
+        let _ = tokio::time::timeout(Duration::from_secs(2), final_ep.close()).await;
     });
     Ok(())
 }
@@ -1199,6 +1346,10 @@ fn render_loop(sh: &Shared, frames: Arc<FrameQueue>, hwnd: HWND) -> Result<()> {
             pending_present = true;
         }
         was_minimized = minimized;
+        if minimized {
+            // Time spent minimized is no gap in the picture.
+            last_shown = None;
+        }
 
         let mut newest = None;
         if !batch.is_empty() {
@@ -1330,7 +1481,7 @@ fn render_loop(sh: &Shared, frames: Arc<FrameQueue>, hwnd: HWND) -> Result<()> {
     Ok(())
 }
 
-const CSV_HEADER: &str = "t_s,fps,mbps,rate_mbps,path,path_rtt_ms,frame_rtt_p50_ms,frame_rtt_p95_ms,host_p50_ms,host_p95_ms,encode_p50_ms,decode_p50_ms,local_p50_ms,local_p95_ms,total_est_ms,input_p50_ms,input_p95_ms,skipped_pct,shrunk_pct,size_p50_pct,size_max_pct,key_requests,lost,decode_errors,recovered,failed,sim_dropped,fec_pct,max_gap_ms";
+const CSV_HEADER: &str = "t_s,fps,mbps,rate_mbps,path,path_rtt_ms,frame_rtt_p50_ms,frame_rtt_p95_ms,host_p50_ms,host_p95_ms,encode_p50_ms,decode_p50_ms,local_p50_ms,local_p95_ms,total_est_ms,input_p50_ms,input_p95_ms,skipped_pct,shrunk_pct,size_p50_pct,size_max_pct,key_requests,lost,decode_errors,recovered,failed,sim_dropped,fec_pct,max_gap_ms,resend_asked,resend_saved";
 
 #[allow(clippy::too_many_arguments)]
 async fn stats_loop(
@@ -1438,7 +1589,7 @@ async fn stats_loop(
         }
         let my_window = net::path_congestion(&conn).map_or(0, |c| c.0 / 1000);
         println!(
-            "{t:>4}s {:>3} fps {mbps:>5.1}/{rate_mbps:>4.1} Mbps {} {path_rtt:>5.1} ms | host {host_ms:>5.1} (enc {:>4.1}) net {net_ms:>5.1} local {local_ms:>5.1} = {total:>5.1} ms | decode {decode_ms:>4.1} ms | input {in50:>5.1}/{in95:>5.1} ms | skip {skipped:>4.1}% shrunk {shrunk:>4.1}% | size {:>3}/{:>4}% | lost {} keyreq {} | fec {} rec {} fail {} gap {:.0} ms | own window {my_window} KB",
+            "{t:>4}s {:>3} fps {mbps:>5.1}/{rate_mbps:>4.1} Mbps {} {path_rtt:>5.1} ms | host {host_ms:>5.1} (enc {:>4.1}) net {net_ms:>5.1} local {local_ms:>5.1} = {total:>5.1} ms | decode {decode_ms:>4.1} ms | input {in50:>5.1}/{in95:>5.1} ms | skip {skipped:>4.1}% shrunk {shrunk:>4.1}% | size {:>3}/{:>4}% | lost {} keyreq {} resent {}/{} | fec {} rec {} fail {} gap {:.0} ms | own window {my_window} KB",
             r.presented,
             path.label(),
             ms(host.encode_p50_us),
@@ -1446,6 +1597,8 @@ async fn stats_loop(
             host.size_max_pct,
             k.lost,
             k.key_requests,
+            k.resend_saved,
+            k.resend_asked,
             k.fec_pct,
             k.recovered,
             k.failed,
@@ -1454,7 +1607,7 @@ async fn stats_loop(
         if let Some(f) = file.as_mut() {
             writeln!(
                 f,
-                "{t},{},{mbps:.2},{rate_mbps:.2},{},{path_rtt:.2},{frame_rtt:.2},{:.2},{host_ms:.2},{:.2},{:.2},{decode_ms:.2},{local_ms:.2},{:.2},{total:.2},{in50:.2},{in95:.2},{skipped:.1},{shrunk:.1},{},{},{},{},{},{},{},{},{},{:.1}",
+                "{t},{},{mbps:.2},{rate_mbps:.2},{},{path_rtt:.2},{frame_rtt:.2},{:.2},{host_ms:.2},{:.2},{:.2},{decode_ms:.2},{local_ms:.2},{:.2},{total:.2},{in50:.2},{in95:.2},{skipped:.1},{shrunk:.1},{},{},{},{},{},{},{},{},{},{:.1},{},{}",
                 r.presented,
                 path.label(),
                 ms(host.frame_rtt_p95_us),
@@ -1471,6 +1624,8 @@ async fn stats_loop(
                 k.sim_dropped,
                 k.fec_pct,
                 r.max_gap_ms,
+                k.resend_asked,
+                k.resend_saved,
             )?;
         }
         if t == 1 {
@@ -1553,6 +1708,9 @@ fn picture_line(f: &[&str]) -> bool {
         (Some("mbps"), _, Some(n)) => quality::choose(|c| c.mbps = n),
         (Some("sharp"), _, _) if matches!(f.get(1).copied(), Some("on" | "off")) => {
             quality::choose(|c| c.sharp = f[1] == "on")
+        }
+        (Some("route"), _, _) if matches!(f.get(1).copied(), Some("auto" | "relay")) => {
+            quality::choose(|c| c.relay_only = f[1] == "relay")
         }
         _ => return false,
     }

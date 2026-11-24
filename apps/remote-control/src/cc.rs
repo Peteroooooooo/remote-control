@@ -23,6 +23,17 @@
 //! test laptop session since P1-1; on loopback it stayed at the floor). A
 //! window that size lets a WiFi stall fill the radio's queues instead of
 //! our own short send queue, which is what skips stale frames.
+//!
+//! The floor itself is held to what the path has shown it carries. On a
+//! phone hotspot (2026-11-23) the chosen rate climbed to 42.4 Mbps on a still
+//! screen while the link carried 2-7 Mbps; its floor of 600-700 KB filled the
+//! carrier's queue instead of ours (round trips of 0.3-0.9 s, and 16 s on a
+//! path whose first round trip, 920 ms, was measured inside such a queue),
+//! and a relay path opened mid-session got 1.8 MB at an estimate of 0.2 Mbps.
+//! So the floor's rate stays under `OVER_ESTIMATE` times the best bandwidth
+//! estimate the path has shown, lowered by an eighth at every loss (a still
+//! screen makes BBR forget its estimate but loses nothing), and its round
+//! trip under `MAX_FLOOR_RTT`.
 
 use std::{
     any::Any,
@@ -50,6 +61,10 @@ const MAX_SEND_QUANTUM: u64 = 64 * 1024;
 /// still screen its acks queued behind a crawling BBR, frames timed out on
 /// the host and the video rate was cut to a fifth (test laptop 2026-11-06).
 const MIN_RATE: u64 = 250_000;
+/// The floor's rate over the path's bandwidth estimate: BBR's own probing gain.
+const OVER_ESTIMATE: f64 = 1.25;
+/// Longest minimum round trip the floor is sized for.
+const MAX_FLOOR_RTT: Duration = Duration::from_millis(200);
 
 /// Bytes per second the video sender currently wants to send (0 before it
 /// starts). One process streams to one viewer at a time, so one value is enough.
@@ -82,7 +97,7 @@ pub struct Factory {
 
 impl ControllerFactory for Factory {
     fn build(self: Arc<Self>, now: Instant, current_mtu: u16) -> Box<dyn Controller> {
-        Box::new(Floored { inner: self.inner.clone().build(now, current_mtu), min_rtt: None })
+        Box::new(Floored { inner: self.inner.clone().build(now, current_mtu), min_rtt: None, best_bits: 0 })
     }
 }
 
@@ -90,24 +105,36 @@ impl ControllerFactory for Factory {
 struct Floored {
     inner: Box<dyn Controller>,
     min_rtt: Option<Duration>,
+    /// Highest bandwidth estimate (bits/s) seen, lowered at every loss.
+    best_bits: u64,
 }
 
 impl Floored {
+    fn estimate(&self) -> u64 {
+        self.inner.metrics().bandwidth_estimate.unwrap_or(0)
+    }
+
     /// (window bytes, pacing bytes/s) the chosen video rate needs.
     fn floor(&self) -> (u64, u64) {
         let pct = PACING_PCT.load(Ordering::Relaxed);
         if pct == 0 {
             return (0, 0);
         }
-        let rate = FLOOR.load(Ordering::Relaxed).max(MIN_RATE);
-        let t = self.min_rtt.unwrap_or(FIRST_RTT) + SLACK;
-        let pacing = (rate as u128 * pct as u128 / 100) as u64;
+        let chosen = FLOOR.load(Ordering::Relaxed).max(MIN_RATE);
+        let pacing = (chosen as u128 * pct as u128 / 100) as u64;
+        let shown = (self.best_bits.max(self.estimate()) as f64 / 8.0 * OVER_ESTIMATE) as u64;
+        let rate = chosen.min(shown.max(MIN_RATE));
+        let t = self.min_rtt.unwrap_or(FIRST_RTT).min(MAX_FLOOR_RTT) + SLACK;
         ((rate as f64 * t.as_secs_f64()) as u64, pacing)
     }
 
     /// Most of BBR's own window that is kept: its bandwidth estimate for
     /// twice the minimum round trip (BBR's normal window), or for the minimum
-    /// round trip plus `SLACK` (as the floor), whichever is longer.
+    /// round trip plus `SLACK` (as the floor), whichever is longer. Not tied
+    /// to the chosen rate: on a phone hotspot (2026-11-24) the round trip
+    /// under load was 50-400 ms against a minimum of 24 ms, and a window of
+    /// the chosen rate for the minimum plus `SLACK` (26 KB) let through 0.7
+    /// Mbps, which looked like a slow link and cut the rate to the minimum.
     fn ceiling(&self) -> u64 {
         let Some(bits) = self.inner.metrics().bandwidth_estimate else { return u64::MAX };
         let rtt = self.min_rtt.unwrap_or(FIRST_RTT);
@@ -135,7 +162,8 @@ impl Controller for Floored {
 
     fn on_ack(&mut self, now: Instant, sent: Instant, bytes: u64, pn: u64, app_limited: bool, rtt: &RttEstimator) {
         self.min_rtt = Some(rtt.min());
-        self.inner.on_ack(now, sent, bytes, pn, app_limited, rtt)
+        self.inner.on_ack(now, sent, bytes, pn, app_limited, rtt);
+        self.best_bits = self.best_bits.max(self.estimate());
     }
 
     fn on_end_acks(&mut self, now: Instant, in_flight: u64, app_limited: bool, largest: Option<u64>) {
@@ -151,7 +179,8 @@ impl Controller for Floored {
         lost_bytes: u64,
         largest_lost_pn: u64,
     ) {
-        self.inner.on_congestion_event(now, sent, persistent, is_ecn, lost_bytes, largest_lost_pn)
+        self.inner.on_congestion_event(now, sent, persistent, is_ecn, lost_bytes, largest_lost_pn);
+        self.best_bits = self.estimate().max(self.best_bits / 8 * 7);
     }
 
     fn on_packet_lost(&mut self, lost_bytes: u16, pn: u64, now: Instant) {
@@ -189,7 +218,7 @@ impl Controller for Floored {
     }
 
     fn clone_box(&self) -> Box<dyn Controller> {
-        Box::new(Floored { inner: self.inner.clone_box(), min_rtt: self.min_rtt })
+        Box::new(Floored { inner: self.inner.clone_box(), min_rtt: self.min_rtt, best_bits: self.best_bits })
     }
 
     fn initial_window(&self) -> u64 {
@@ -214,12 +243,12 @@ mod tests {
         let own = c.window();
         set_pacing_gain(4.0);
         set_floor(20e6, 25);
-        // 20 Mbps + 25% FEC = 3.125 MB/s; (100 ms first guess + 80 ms) of it.
-        assert_eq!(c.window(), 562_500);
+        // No estimate yet: the window floor is the minimum, 250 KB/s for
+        // (100 ms first guess + 80 ms); pacing still follows the chosen rate.
+        assert_eq!(c.window(), own.max(45_000));
         let m = c.metrics();
-        assert_eq!(m.congestion_window, 562_500);
+        assert_eq!(m.congestion_window, own.max(45_000));
         assert!(m.pacing_rate.is_none_or(|r| r >= 4 * 3_125_000));
-        // Below 2 Mbps the minimum applies: 250 KB/s for 180 ms.
         set_floor(1e6, 0);
         assert_eq!(c.window(), own.max(45_000));
         clear_floor();
@@ -265,6 +294,7 @@ mod tests {
         let wild = |window, bits, rtt_ms| Floored {
             inner: Box::new(Runaway { window, bits }),
             min_rtt: Some(Duration::from_millis(rtt_ms)),
+            best_bits: 0,
         };
         clear_floor();
         // 44 MB at a 42 Mbps estimate and 10 ms: 5.25 MB/s for 90 ms.
@@ -275,9 +305,25 @@ mod tests {
         assert_eq!(wild(44_000_000, 8_000_000, 200).window(), 400_000);
         // A window below the cap is BBR's own.
         assert_eq!(wild(300_000, 42_000_000, 10).window(), 300_000);
-        // The floor still wins over a low estimate.
+        // 20 Mbps + 25% FEC = 3.125 MB/s: a collapsed window is lifted to it
+        // for 10 ms + 80 ms...
         set_floor(20e6, 25);
-        assert_eq!(wild(44_000_000, 1_000_000, 10).window(), 281_250);
+        assert_eq!(wild(5_000, 40_000_000, 10).window(), 281_250);
+        // ...but only up to 1.25 times what the path has shown it carries: 1 MB/s.
+        assert_eq!(wild(44_000_000, 8_000_000, 10).window(), 112_500);
+        // An estimate forgotten on a still screen still counts; every loss
+        // lowers it by an eighth, down to what BBR sees now.
+        let mut c = Floored { best_bits: 40_000_000, ..wild(5_000, 1_000_000, 10) };
+        assert_eq!(c.window(), 281_250);
+        let now = Instant::now();
+        c.on_congestion_event(now, now, false, false, 1200, 1);
+        assert_eq!(c.window(), 281_250, "one loss on a still screen");
+        for _ in 0..40 {
+            c.on_congestion_event(now, now, false, false, 1200, 1);
+        }
+        assert_eq!(c.window(), 22_500, "the minimum, 250 KB/s for 90 ms");
+        // A minimum round trip measured inside a standing queue counts as 200 ms.
+        assert_eq!(wild(5_000, 40_000_000, 920).window(), 875_000);
         clear_floor();
     }
 }

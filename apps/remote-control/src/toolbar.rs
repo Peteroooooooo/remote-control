@@ -135,6 +135,7 @@ enum Chip {
     Fps(u8),
     Mbps(u16),
     Sharp(bool),
+    RelayOnly(bool),
     AudioLossless(bool),
     AudioCh(u8),
     AudioMuteHost(bool),
@@ -147,6 +148,7 @@ impl Chip {
             Chip::Fps(f) => q.fps == f,
             Chip::Mbps(m) => q.mbps == m,
             Chip::Sharp(s) => q.sharp == s,
+            Chip::RelayOnly(r) => q.relay_only == r,
             Chip::AudioLossless(l) => a.lossless == l,
             Chip::AudioCh(ch) => a.channels == ch,
             Chip::AudioMuteHost(m) => a.mute_host == m,
@@ -159,6 +161,7 @@ impl Chip {
             Chip::Fps(f) => quality::choose(|c| c.fps = f),
             Chip::Mbps(m) => quality::choose(|c| c.mbps = m),
             Chip::Sharp(s) => quality::choose(|c| c.sharp = s),
+            Chip::RelayOnly(r) => quality::choose(|c| c.relay_only = r),
             Chip::AudioLossless(l) => audio::config::choose(|c| c.lossless = l),
             Chip::AudioCh(ch) => audio::config::choose(|c| c.channels = ch),
             Chip::AudioMuteHost(m) => audio::config::choose(|c| c.mute_host = m),
@@ -975,6 +978,13 @@ fn menu_layout(px: &dyn Fn(i32) -> i32) -> Menu {
                 (Chip::Sharp(false), tr("标准", "Standard").into()),
                 (Chip::Sharp(true), tr("清晰", "Sharp").into()),
             ],
+        ));
+    }
+    // Only with a self-hosted relay to go through.
+    if quality::line_offered() {
+        rows.push((
+            tr("线路", "Route"),
+            vec![(Chip::RelayOnly(false), auto.into()), (Chip::RelayOnly(true), tr("只走中转", "Relay only").into())],
         ));
     }
     build_menu(px, None, rows, menu_footer())

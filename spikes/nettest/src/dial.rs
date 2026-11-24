@@ -486,7 +486,7 @@ fn spawn_controller(conn: Connection, st: Shared<State>, adaptive: bool) {
                 s.rc.on_frame_failed();
             }
             if k != last_path {
-                s.rc.reset_base();
+                s.rc.new_path();
                 last_path = k;
             }
             if adaptive {

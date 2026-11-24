@@ -238,7 +238,8 @@ impl MaybeTlsStreamBuilder {
 ///   family while only the other family has resolved, and starts immediately
 ///   once the preferred family resolves;
 /// - each later attempt starts [`CONNECTION_ATTEMPT_DELAY`] after the previous
-///   one, or as soon as the last in-flight attempt fails, whichever comes first;
+///   one, or as soon as the last in-flight attempt fails, whichever comes first,
+///   except the other family's first address, which starts at once;
 /// - every attempt is itself capped at [`DIAL_ENDPOINT_TIMEOUT`].
 ///
 /// The first connection to succeed is returned; the rest are dropped, which
@@ -263,6 +264,8 @@ async fn dial_happy_eyeballs(
     let mut dials = FuturesUnordered::new();
     // Whether the first connection attempt has been started yet.
     let mut started = false;
+    // Whether an address of each family has been dialed, by `is_ipv6()`.
+    let mut tried = [false; 2];
     // Last error that occurred, returned if no connection attempt succeeded.
     let mut last_err: Option<DialError> = None;
     // Timer after which to start the next connection attempt, or `None` for immediately.
@@ -296,9 +299,18 @@ async fn dial_happy_eyeballs(
                 .instrument(info_span!("connect", %addr)),
             );
             started = true;
-            next_dial_delayed_until
-                .as_mut()
-                .set_future(time::sleep(CONNECTION_ATTEMPT_DELAY));
+            tried[usize::from(ip.is_ipv6())] = true;
+            if queue.iter().any(|a| !tried[usize::from(a.is_ipv6())]) {
+                // The other family starts at once: whichever connects first
+                // is kept. A family that works but takes a much longer way
+                // (IPv4 at 200 ms with loss beside IPv6 at 50 ms, the same
+                // relay) would otherwise win just by starting first.
+                next_dial_delayed_until.as_mut().set_none();
+            } else {
+                next_dial_delayed_until
+                    .as_mut()
+                    .set_future(time::sleep(CONNECTION_ATTEMPT_DELAY));
+            }
         }
 
         // All three arms are guarded, but it is guaranteed that at least one arm
@@ -331,6 +343,8 @@ async fn dial_happy_eyeballs(
                             } else if next_dial_delayed_until.is_none() {
                                 next_dial_delayed_until.as_mut().set_future(time::sleep(RESOLUTION_DELAY));
                             }
+                        } else if !tried[usize::from(ip.is_ipv6())] {
+                            next_dial_delayed_until.as_mut().set_none();
                         }
                     }
                     Some(Err(err)) => {
@@ -424,6 +438,22 @@ mod tests {
             .await
             .expect("falls back to IPv4");
         assert!(stream.peer_addr().unwrap().is_ipv4());
+    }
+
+    /// Tests that the other family does not wait for the preferred one: a
+    /// preferred IPv4 address that never answers does not hold IPv6 back.
+    #[tokio::test]
+    async fn other_family_races_from_the_start() {
+        let listener = TcpListener::bind((Ipv6Addr::LOCALHOST, 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let resolver = static_resolver(vec![dead_v4(1)], vec![Ipv6Addr::LOCALHOST]);
+
+        let t = std::time::Instant::now();
+        let stream = dial_happy_eyeballs(&resolver, &relay_url(port), false)
+            .await
+            .expect("IPv6 connects");
+        assert!(stream.peer_addr().unwrap().is_ipv6());
+        assert!(t.elapsed() < CONNECTION_ATTEMPT_DELAY, "took {:?}", t.elapsed());
     }
 
     #[tokio::test]

@@ -188,6 +188,112 @@ fn stream_bps(q: &Quality, cfg: &PipeConfig, w: u32, h: u32, fps: u32) -> u32 {
     chosen.min(cfg.max_bps.unwrap_or(u32::MAX)).max(1_000_000)
 }
 
+/// A picture needs this share of `auto_bps` to look sharp enough: about 10
+/// Mbps for 1440p at 60 frames, 5.6 for 1080p, 2.5 for 720p.
+const NEED_SHARE: f64 = 0.28;
+/// The rate below a picture's need this long makes the picture smaller...
+const SHRINK_AFTER: Duration = Duration::from_secs(3);
+/// ...and this much over the larger picture's need, this long, makes it
+/// larger again, but not sooner than `GROW_GAP` after the last change: each
+/// change starts a new encoder and a key frame.
+const GROW_MARGIN: f64 = 1.3;
+const GROW_AFTER: Duration = Duration::from_secs(10);
+const GROW_GAP: Duration = Duration::from_secs(15);
+
+/// Lowest frame rate a slow link drops to when frame rate is 自动.
+const AUTO_FPS_FLOOR: u32 = 30;
+
+/// A slow link streams a smaller or slower picture than the one chosen, only
+/// changing the items the viewer left on 自动. At 3-5 Mbps (a phone hotspot's
+/// upload, 2026-11-24) a 1440p picture turns to blocks as soon as it moves and
+/// its frames overshoot their budget; 1080p or 720p at the same rate is
+/// sharper, and if even 720p is starved, 30 fps gives each frame twice the bits.
+#[derive(Default)]
+struct AutoSize {
+    /// The picture the steps start from; a new choice starts at it.
+    chosen: Option<(Quality, (u32, u32), u32)>,
+    /// 0 = the chosen picture, then smaller resolutions (if 自动), then 30 fps (if 自动).
+    level: usize,
+    /// The step the rate points to, and since when.
+    pending: Option<(usize, Instant)>,
+    changed: Option<Instant>,
+}
+
+impl AutoSize {
+    /// The pictures to stream at, best first, for `q`, `full` size and `full_fps`.
+    fn steps(q: Quality, full: (u32, u32), full_fps: u32) -> Vec<((u32, u32), u32)> {
+        let mut sizes = vec![full];
+        if q.fit_w > 0 && q.fit_h > 0 {
+            for short in [1080, 720] {
+                let p = picture_size(full.0, full.1, &Quality { short, ..Quality::default() }, 0);
+                let last = sizes[sizes.len() - 1];
+                if (p.0 as u64 * p.1 as u64) * 10 < (last.0 as u64 * last.1 as u64) * 8 {
+                    sizes.push(p);
+                }
+            }
+        }
+        let smallest = sizes[sizes.len() - 1];
+        let mut steps: Vec<((u32, u32), u32)> = sizes.into_iter().map(|s| (s, full_fps)).collect();
+        if q.auto_fps && full_fps > AUTO_FPS_FLOOR {
+            steps.push((smallest, AUTO_FPS_FLOOR));
+        }
+        steps
+    }
+
+    /// The size and frame rate to stream now, for the viewer's `q` and full choice.
+    fn pick(&mut self, q: Quality, full: (u32, u32), full_fps: u32) -> ((u32, u32), u32) {
+        if self.chosen != Some((q, full, full_fps)) {
+            *self = AutoSize { chosen: Some((q, full, full_fps)), ..AutoSize::default() };
+        }
+        let steps = Self::steps(q, full, full_fps);
+        self.level = self.level.min(steps.len() - 1);
+        steps[self.level]
+    }
+
+    /// Whether the rate now asks for another picture (then `pick` gives it).
+    /// Only a link that holds the rate under `max_bps` counts: a highest
+    /// bitrate the viewer chose keeps its picture.
+    fn step(&mut self, rate: f64, max_bps: f64, now: Instant) -> bool {
+        let Some((q, full, full_fps)) = self.chosen else { return false };
+        let steps = Self::steps(q, full, full_fps);
+        let need = |i: usize| auto_bps(steps[i].0.0, steps[i].0.1, steps[i].1) as f64 * NEED_SHARE;
+        let free = rate >= 0.9 * max_bps;
+        let want = if self.level + 1 < steps.len() && rate < need(self.level) && !free {
+            Some((self.level + 1, SHRINK_AFTER))
+        } else if self.level > 0 && (free || rate >= GROW_MARGIN * need(self.level - 1)) {
+            Some((self.level - 1, GROW_AFTER))
+        } else {
+            None
+        };
+        let Some((level, after)) = want else {
+            self.pending = None;
+            return false;
+        };
+        let since = match self.pending {
+            Some((l, t)) if l == level => t,
+            _ => self.pending.insert((level, now)).1,
+        };
+        let soon = level < self.level && self.changed.is_some_and(|t| now.duration_since(t) < GROW_GAP);
+        if now.duration_since(since) < after || soon {
+            return false;
+        }
+        log!(
+            "rate {:.1} Mbps: streaming {}x{}@{} instead of {}x{}@{}",
+            rate / 1e6,
+            steps[level].0.0,
+            steps[level].0.1,
+            steps[level].1,
+            steps[self.level].0.0,
+            steps[self.level].0.1,
+            steps[self.level].1,
+        );
+        self.level = level;
+        self.pending = None;
+        self.changed = Some(now);
+        true
+    }
+}
+
 pub fn nv12_texture(gpu: &Gpu, w: u32, h: u32) -> Result<ID3D11Texture2D> {
     yuv_texture(gpu, w, h, false)
 }
@@ -291,8 +397,9 @@ pub fn run(cfg: PipeConfig, tx: Arc<VideoTx>, sh: Arc<PipeShared>, info: Unbound
     // What this machine's encoder does on a bitrate change; kept when the
     // encoder is rebuilt after a desktop switch.
     let mut quirks = RateQuirks::default();
+    let mut auto = AutoSize::default();
     while !sh.stop.load(Ordering::Relaxed) {
-        match run_once(cfg, &tx, &sh, &info, &mut quirks) {
+        match run_once(cfg, &tx, &sh, &info, &mut quirks, &mut auto) {
             Ok(()) => last_err.clear(),
             Err(e) => {
                 let s = format!("{e:#}");
@@ -475,6 +582,7 @@ fn run_once(
     sh: &PipeShared,
     info: &UnboundedSender<Msg>,
     quirks: &mut RateQuirks,
+    auto: &mut AutoSize,
 ) -> Result<()> {
     // Service mode: capture the desktop that is shown now (see desktop.rs).
     let desktop = crate::desktop::follow()?;
@@ -489,15 +597,19 @@ fn run_once(
         sh.quality_changed.store(false, Ordering::Release);
         *g
     };
-    let (w, h) = picture_size(cw, ch, &quality, cfg.max_width);
+    let full = picture_size(cw, ch, &quality, cfg.max_width);
     let refresh = crate::monitors::refresh_hz(&sh.monitors);
-    let fps = stream_fps(&quality, &cfg, refresh);
-    let max_bps = stream_bps(&quality, &cfg, w, h, fps);
+    let full_fps = stream_fps(&quality, &cfg, refresh);
+    let max_bps = stream_bps(&quality, &cfg, full.0, full.1, full_fps);
+    let ((w, h), fps) = auto.pick(quality, full, full_fps);
     tx.configure(fps, max_bps as f64);
     // The shader that makes the 4:4:4 picture does not turn it.
     let mut can444 = cfg.viewer444 && !quirks.no_hevc && !quirks.no_444 && cap.rotation == 0 && can_encode_444(&gpu);
     let yuv444 = can444 && quality.yuv444;
-    let mut enc = match new_encoder(&gpu, w, h, fps, &cfg, quirks, max_bps, yuv444) {
+    // Mid-session (another picture) at the rate the link carries, not the
+    // highest: the encoder's first frame is a key frame.
+    let start_bps = (tx.bitrate() as u32).clamp(1_000_000, max_bps);
+    let mut enc = match new_encoder(&gpu, w, h, fps, &cfg, quirks, start_bps, yuv444) {
         Err(e) if yuv444 => {
             log!("4:4:4 encoder: {e:#}; 4:2:0 from now on");
             quirks.no_444 = true;
@@ -580,7 +692,7 @@ fn run_once(
         width: w as u16,
         height: h as u16,
         encoder: enc.name.clone(),
-        streaming: Some(Streaming { fps: fps.min(255) as u8, max_kbps: max_bps / 1000, can444, yuv444 }),
+        streaming: Some(Streaming { fps: fps.min(255) as u8, max_kbps: max_bps / 1000, can444, yuv444, resends: true }),
     };
     let _ = info.send(info_msg(&enc, can444));
     if let Some(name) = desktop {
@@ -617,6 +729,9 @@ fn run_once(
     while !sh.stop.load(Ordering::Relaxed) {
         if sh.quality_changed.load(Ordering::Acquire) {
             log!("the viewer chose another picture");
+            return Ok(());
+        }
+        if frames > 0 && auto.step(tx.bitrate(), max_bps as f64, Instant::now()) {
             return Ok(());
         }
         // Service mode: do not count on the duplication to report a desktop
@@ -877,6 +992,114 @@ mod tests {
     use std::time::{Duration, Instant};
 
     #[test]
+    fn a_slow_link_streams_a_smaller_picture() {
+        use crate::proto::Quality;
+        let q = Quality { fit_w: 2560, fit_h: 1440, short: 0, fps: 60, kbps: 0, yuv444: false, auto_fps: true };
+        let full = super::picture_size(2880, 1920, &q, 0);
+        assert_eq!(full, (2160, 1440));
+        assert_eq!(
+            super::AutoSize::steps(q, full, 60),
+            vec![((2160, 1440), 60), ((1620, 1080), 60), ((1080, 720), 60), ((1080, 720), 30)]
+        );
+        let max = super::auto_bps(2160, 1440, 60) as f64;
+        let mut a = super::AutoSize::default();
+        assert_eq!(a.pick(q, full, 60), (full, 60));
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let mbps = 1e6;
+        // 1440p@60 needs about 8.4 Mbps: 3 s under it gives 1080p@60.
+        assert!(!a.step(6.0 * mbps, max, at(0)));
+        assert!(!a.step(6.0 * mbps, max, at(2_900)));
+        assert!(a.step(6.0 * mbps, max, at(3_000)));
+        assert_eq!(a.pick(q, full, 60), ((1620, 1080), 60));
+        // 1080p@60 needs about 4.7: a dip that recovers within 3 s changes nothing.
+        assert!(!a.step(3.0 * mbps, max, at(4_000)));
+        assert!(!a.step(6.0 * mbps, max, at(6_000)));
+        assert!(!a.step(3.0 * mbps, max, at(7_000)));
+        assert!(a.step(3.0 * mbps, max, at(10_000)));
+        assert_eq!(a.pick(q, full, 60), ((1080, 720), 60));
+        // 720p@60 needs 2.1 Mbps: still lower drops the frame rate to 30 fps.
+        assert!(!a.step(1.5 * mbps, max, at(11_000)));
+        assert!(!a.step(1.5 * mbps, max, at(13_900)));
+        assert!(a.step(1.5 * mbps, max, at(14_000)));
+        assert_eq!(a.pick(q, full, 60), ((1080, 720), 30));
+        // Recovery reverses the order: 30->60 fps first (needs 1.3 * 2.1 = 2.73 Mbps),
+        // respecting GROW_AFTER (10 s) and GROW_GAP (15 s since last change at 14 s).
+        assert!(!a.step(3.0 * mbps, max, at(15_000)));
+        assert!(!a.step(3.0 * mbps, max, at(25_000)), "11 s after last change < 15 s GROW_GAP");
+        assert!(!a.step(3.0 * mbps, max, at(28_900)), "14.9 s after last change");
+        assert!(a.step(3.0 * mbps, max, at(29_000)));
+        assert_eq!(a.pick(q, full, 60), ((1080, 720), 60));
+        // Then 720p->1080p (needs 1.3 * 4.725 = 6.14 Mbps).
+        assert!(!a.step(6.5 * mbps, max, at(30_000)));
+        assert!(!a.step(6.5 * mbps, max, at(40_000)), "10 s at rate, but 11 s since change < 15 s");
+        assert!(a.step(6.5 * mbps, max, at(44_000)));
+        assert_eq!(a.pick(q, full, 60), ((1620, 1080), 60));
+        // Then 1080p->full (at max = free link, respecting GROW_AFTER and GROW_GAP).
+        assert!(!a.step(max, max, at(50_000)));
+        assert!(!a.step(max, max, at(59_000)), "9 s at rate");
+        assert!(a.step(max, max, at(60_000)));
+        assert_eq!(a.pick(q, full, 60), (full, 60));
+        // A highest bitrate the viewer chose below the need (rate == max) keeps the picture...
+        let low = 5.0 * mbps;
+        assert!(!a.step(low, low, at(70_000)));
+        assert!(!a.step(low, low, at(80_000)));
+        assert_eq!(a.pick(q, full, 60), (full, 60));
+        // ...and another choice starts at the chosen picture again.
+        assert!(a.step(1.0 * mbps, max, at(81_000)) || a.step(1.0 * mbps, max, at(84_000)));
+        let q720 = Quality { short: 720, fit_w: 0, fit_h: 0, ..q };
+        let small = super::picture_size(2880, 1920, &q720, 0);
+        assert_eq!(a.pick(q720, small, 60), (small, 60));
+        assert_eq!(super::AutoSize::steps(q720, small, 60), vec![(small, 60), (small, 30)], "fixed 720p only steps fps");
+        assert_eq!(super::AutoSize::steps(q720, small, 30), vec![(small, 30)], "never below 30 fps");
+    }
+
+    #[test]
+    fn auto_degrade_respects_fixed_choices() {
+        use crate::proto::Quality;
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let mbps = 1e6;
+
+        // Fixed resolution (short: 1440, fit 0) + auto fps: only fps drops to 30, never size.
+        let q_fixed_res = Quality { fit_w: 0, fit_h: 0, short: 1440, fps: 60, kbps: 0, yuv444: false, auto_fps: true };
+        let full = super::picture_size(2880, 1920, &q_fixed_res, 0);
+        assert_eq!(full, (2160, 1440));
+        let max = super::auto_bps(full.0, full.1, 60) as f64;
+        let mut a = super::AutoSize::default();
+        assert_eq!(a.pick(q_fixed_res, full, 60), (full, 60));
+        assert!(!a.step(2.0 * mbps, max, at(0)));
+        assert!(a.step(2.0 * mbps, max, at(3_000)));
+        assert_eq!(a.pick(q_fixed_res, full, 60), (full, 30));
+        // Stays at full@30 even at 1 Mbps.
+        assert!(!a.step(1.0 * mbps, max, at(4_000)));
+        assert!(!a.step(1.0 * mbps, max, at(10_000)));
+        assert_eq!(a.pick(q_fixed_res, full, 60), (full, 30));
+
+        // Fixed resolution + fixed fps: nothing ever changes.
+        let q_fixed_both = Quality { auto_fps: false, ..q_fixed_res };
+        let mut a = super::AutoSize::default();
+        assert_eq!(a.pick(q_fixed_both, full, 60), (full, 60));
+        assert!(!a.step(1.0 * mbps, max, at(0)));
+        assert!(!a.step(1.0 * mbps, max, at(10_000)));
+        assert_eq!(a.pick(q_fixed_both, full, 60), (full, 60));
+
+        // Auto resolution + fixed fps: only the size changes, fps never drops.
+        let q_auto_res = Quality { fit_w: 2560, fit_h: 1440, short: 0, fps: 60, kbps: 0, yuv444: false, auto_fps: false };
+        let mut a = super::AutoSize::default();
+        assert_eq!(a.pick(q_auto_res, full, 60), (full, 60));
+        assert!(!a.step(1.0 * mbps, max, at(0)));
+        assert!(a.step(1.0 * mbps, max, at(3_000)));
+        assert_eq!(a.pick(q_auto_res, full, 60), ((1620, 1080), 60));
+        assert!(!a.step(1.0 * mbps, max, at(3_100)));
+        assert!(a.step(1.0 * mbps, max, at(6_100)));
+        assert_eq!(a.pick(q_auto_res, full, 60), ((1080, 720), 60));
+        assert!(!a.step(1.0 * mbps, max, at(6_200)));
+        assert!(!a.step(1.0 * mbps, max, at(20_000)));
+        assert_eq!(a.pick(q_auto_res, full, 60), ((1080, 720), 60));
+    }
+
+    #[test]
     fn encode_size_is_even_and_scaled() {
         assert_eq!(super::encode_size(2880, 1920, 0), (2880, 1920));
         assert_eq!(super::encode_size(1365, 767, 0), (1364, 766));
@@ -886,7 +1109,7 @@ mod tests {
     #[test]
     fn picture_size_follows_the_viewers_choice() {
         use crate::proto::Quality;
-        let q = |fit_w, fit_h, short| Quality { fit_w, fit_h, short, fps: 60, kbps: 0, yuv444: false };
+        let q = |fit_w, fit_h, short| Quality { fit_w, fit_h, short, fps: 60, kbps: 0, yuv444: false, auto_fps: false };
         let size = super::picture_size;
         assert_eq!(size(3840, 2160, &q(2560, 1440, 0), 0), (2560, 1440), "自动 fits the viewer's screen");
         assert_eq!(size(1920, 1080, &q(2560, 1440, 0), 0), (1920, 1080), "never larger than the display");

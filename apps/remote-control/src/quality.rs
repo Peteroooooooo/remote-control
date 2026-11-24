@@ -1,10 +1,12 @@
-//! The viewer's 画面 menu: resolution, frame rate, highest bitrate and
-//! 文字清晰 (YUV 4:4:4, offered when both ends can), kept per device in
+//! The viewer's 画面 menu: resolution, frame rate, highest bitrate,
+//! 文字清晰 (YUV 4:4:4, offered when both ends can) and 线路 (only through a
+//! self-hosted relay, offered when there is one), kept per device in
 //! `%APPDATA%\remote-control\quality.txt`, one line per device
-//! (`<id>\t<resolution>\t<fps>\t<mbps>\t<sharp 0|1>`, 0 for 自动); a device
-//! without a line gets the defaults (自动 everywhere, off). A choice goes to
-//! the host at once (`Msg::Quality`); the host answers with what it streams
-//! now (`Msg::Info`'s `Streaming`), which the menu shows.
+//! (`<id>\t<resolution>\t<fps>\t<mbps>\t<sharp 0|1>\t<relay only 0|1>`, 0 for
+//! 自动); a device without a line gets the defaults (自动 everywhere, off). A
+//! picture choice goes to the host at once (`Msg::Quality`); the host answers
+//! with what it streams now (`Msg::Info`'s `Streaming`), which the menu shows.
+//! A 线路 choice makes the session window connect again (see `view`).
 //!
 //! 自动 resolution fits the screen the session window is on: the host never
 //! sends more pixels than this screen can show, nor more than it has. 自动
@@ -50,11 +52,13 @@ pub struct Choice {
     pub mbps: u16,
     /// 文字清晰: 4:4:4 if both ends can.
     pub sharp: bool,
+    /// 线路 只走中转: no direct path, only self-hosted relays.
+    pub relay_only: bool,
 }
 
 impl Default for Choice {
     fn default() -> Self {
-        Choice { res: Res::Auto, fps: 0, mbps: 0, sharp: false }
+        Choice { res: Res::Auto, fps: 0, mbps: 0, sharp: false, relay_only: false }
     }
 }
 
@@ -95,6 +99,9 @@ struct State {
     save: bool,
     screen: Screen,
     ctrl: Option<UnboundedSender<Msg>>,
+    /// Where a 线路 choice goes (the session window's connection), and
+    /// whether the menu offers it (a self-hosted relay to go through).
+    line: Option<UnboundedSender<bool>>,
     /// What the host streams now: picture size and the rest. None from a
     /// host that does not know the menu (it keeps its own settings).
     streaming: Option<((u32, u32), Option<Streaming>)>,
@@ -119,7 +126,15 @@ impl Choice {
             Res::Short(s) => s,
             _ => 0,
         };
-        Quality { fit_w, fit_h, short, fps: self.fps_on(screen), kbps: self.mbps as u32 * 1000, yuv444: self.sharp }
+        Quality {
+            fit_w,
+            fit_h,
+            short,
+            fps: self.fps_on(screen),
+            kbps: self.mbps as u32 * 1000,
+            yuv444: self.sharp,
+            auto_fps: self.fps == 0,
+        }
     }
 
     fn line(&self, device: &str) -> String {
@@ -128,14 +143,15 @@ impl Choice {
             Res::Native => "native".to_string(),
             Res::Short(s) => s.to_string(),
         };
-        format!("{device}\t{res}\t{}\t{}\t{}", self.fps, self.mbps, self.sharp as u8)
+        format!("{device}\t{res}\t{}\t{}\t{}\t{}", self.fps, self.mbps, self.sharp as u8, self.relay_only as u8)
     }
 
     fn parse(line: &str) -> Option<(&str, Choice)> {
         let f: Vec<&str> = line.trim_end().split('\t').collect();
-        let (device, res, fps, mbps, sharp) = match f[..] {
-            [d, r, f, m] => (d, r, f, m, "0"),
-            [d, r, f, m, s] => (d, r, f, m, s),
+        let (device, res, fps, mbps, sharp, relay_only) = match f[..] {
+            [d, r, f, m] => (d, r, f, m, "0", "0"),
+            [d, r, f, m, s] => (d, r, f, m, s, "0"),
+            [d, r, f, m, s, o] => (d, r, f, m, s, o),
             _ => return None,
         };
         let res = match res {
@@ -143,12 +159,15 @@ impl Choice {
             "native" => Res::Native,
             s => Res::Short(s.parse().ok().filter(|&v| v >= 240)?),
         };
-        let sharp = match sharp {
-            "0" => false,
-            "1" => true,
-            _ => return None,
+        let flag = |s: &str| match s {
+            "0" => Some(false),
+            "1" => Some(true),
+            _ => None,
         };
-        Some((device, Choice { res, fps: fps.parse().ok()?, mbps: mbps.parse().ok()?, sharp }))
+        Some((
+            device,
+            Choice { res, fps: fps.parse().ok()?, mbps: mbps.parse().ok()?, sharp: flag(sharp)?, relay_only: flag(relay_only)? },
+        ))
     }
 }
 
@@ -193,6 +212,11 @@ fn screen_of(m: HMONITOR) -> Screen {
     Screen { size, hz: if ok { dm.dmDisplayFrequency.min(1000) as u16 } else { 0 } }
 }
 
+/// The saved choice for `device` (before connecting: its 线路).
+pub fn saved(device: &str) -> Choice {
+    load(device).unwrap_or_default()
+}
+
 /// The session with `device` starts: its saved choice, or the command
 /// line's frame rate and bitrate (not saved). Before the window exists the
 /// screen is the one under the pointer. Returns what to ask for in the hello.
@@ -209,7 +233,8 @@ pub fn start(device: &str, fps: Option<u8>, mbps: Option<f64>) -> (Choice, Quali
     let _ = unsafe { GetCursorPos(&mut p) };
     let screen = screen_of(unsafe { MonitorFromPoint(p, MONITOR_DEFAULTTONEAREST) });
     log!("picture: {choice:?} on a {}x{} screen at {} Hz", screen.size.0, screen.size.1, screen.hz);
-    *STATE.lock().unwrap() = Some(State { device: device.to_string(), choice, save, screen, ctrl: None, streaming: None });
+    *STATE.lock().unwrap() =
+        Some(State { device: device.to_string(), choice, save, screen, ctrl: None, line: None, streaming: None });
     (choice, choice.quality(screen))
 }
 
@@ -218,6 +243,17 @@ pub fn connect(ctrl: UnboundedSender<Msg>) {
     if let Some(s) = STATE.lock().unwrap().as_mut() {
         s.ctrl = Some(ctrl);
     }
+}
+
+/// The menu offers 线路; its choices go to `line`.
+pub fn connect_line(line: UnboundedSender<bool>) {
+    if let Some(s) = STATE.lock().unwrap().as_mut() {
+        s.line = Some(line);
+    }
+}
+
+pub fn line_offered() -> bool {
+    STATE.lock().unwrap().as_ref().is_some_and(|s| s.line.is_some())
 }
 
 pub fn choice() -> Choice {
@@ -229,7 +265,8 @@ pub fn screen() -> Screen {
     STATE.lock().unwrap().as_ref().map_or(Screen { size: (0, 0), hz: 0 }, |s| s.screen)
 }
 
-/// The menu changed the choice: keep it and tell the host.
+/// The menu changed the choice: keep it and tell the host, or for 线路 the
+/// connection.
 pub fn choose(f: impl FnOnce(&mut Choice)) {
     let mut g = STATE.lock().unwrap();
     let Some(s) = g.as_mut() else { return };
@@ -244,7 +281,33 @@ pub fn choose(f: impl FnOnce(&mut Choice)) {
     {
         log!("picture choice not saved: {e}");
     }
-    send(s);
+    if s.choice.relay_only != before.relay_only {
+        if let Some(l) = &s.line {
+            let _ = l.send(s.choice.relay_only);
+        }
+    } else {
+        send(s);
+    }
+}
+
+/// The 线路 the connection uses, when not the one chosen: the relay did not
+/// answer (saved, so the menu and the next session show what is in use), or
+/// the command line's (`save` false, for tests).
+pub fn line_used(relay_only: bool, save: bool) {
+    let mut g = STATE.lock().unwrap();
+    let Some(s) = g.as_mut() else { return };
+    if s.choice.relay_only == relay_only {
+        return;
+    }
+    s.choice.relay_only = relay_only;
+    if save
+        && s.save
+        && let Err(e) = store(&s.device, &s.choice)
+    {
+        log!("picture choice not saved: {e}");
+    }
+    drop(g);
+    crate::toolbar::refresh();
 }
 
 fn send(s: &State) {
@@ -307,29 +370,32 @@ mod tests {
     fn lines_round_trip() {
         for c in [
             Choice::default(),
-            Choice { res: Res::Native, fps: 144, mbps: 80, sharp: true },
-            Choice { res: Res::Short(1080), fps: 30, mbps: 5, sharp: false },
+            Choice { res: Res::Native, fps: 144, mbps: 80, sharp: true, relay_only: false },
+            Choice { res: Res::Short(1080), fps: 30, mbps: 5, sharp: false, relay_only: true },
         ] {
             let line = c.line("abc");
             assert_eq!(Choice::parse(&line), Some(("abc", c)), "{line}");
         }
         assert_eq!(Choice::parse("abc\t100\t60\t0"), None, "no such resolution");
         assert_eq!(Choice::parse("abc\tauto\t60"), None);
-        let auto = Choice { res: Res::Auto, fps: 0, mbps: 0, sharp: false };
+        let auto = Choice::default();
         assert_eq!(Choice::parse("abc\tauto\t0\t0"), Some(("abc", auto)));
-        let before_sharp = Choice { res: Res::Short(720), fps: 30, mbps: 5, sharp: false };
+        let before_sharp = Choice { res: Res::Short(720), fps: 30, mbps: 5, ..auto };
         assert_eq!(Choice::parse("abc\t720\t30\t5"), Some(("abc", before_sharp)));
+        let before_line = Choice { sharp: true, ..before_sharp };
+        assert_eq!(Choice::parse("abc\t720\t30\t5\t1"), Some(("abc", before_line)));
+        assert_eq!(Choice::parse("abc\t720\t30\t5\t1\t2"), None);
     }
 
     #[test]
     fn what_the_host_is_asked_for() {
         let screen = Screen { size: (2560, 1440), hz: 165 };
         let q = Choice::default().quality(screen);
-        assert_eq!((q.fit_w, q.fit_h, q.short, q.fps, q.kbps, q.yuv444), (2560, 1440, 0, 144, 0, false));
-        let q = Choice { res: Res::Short(720), fps: 30, mbps: 10, sharp: true }.quality(screen);
-        assert_eq!((q.fit_w, q.fit_h, q.short, q.fps, q.kbps, q.yuv444), (0, 0, 720, 30, 10_000, true));
-        let q = Choice { res: Res::Native, fps: 120, mbps: 0, sharp: false }.quality(screen);
-        assert_eq!((q.fit_w, q.fit_h, q.short), (0, 0, 0));
+        assert_eq!((q.fit_w, q.fit_h, q.short, q.fps, q.kbps, q.yuv444, q.auto_fps), (2560, 1440, 0, 144, 0, false, true));
+        let q = Choice { res: Res::Short(720), fps: 30, mbps: 10, sharp: true, relay_only: false }.quality(screen);
+        assert_eq!((q.fit_w, q.fit_h, q.short, q.fps, q.kbps, q.yuv444, q.auto_fps), (0, 0, 720, 30, 10_000, true, false));
+        let q = Choice { res: Res::Native, fps: 120, ..Choice::default() }.quality(screen);
+        assert_eq!((q.fit_w, q.fit_h, q.short, q.auto_fps), (0, 0, 0, false));
     }
 
     #[test]

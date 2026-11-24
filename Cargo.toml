@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["apps/remote-control", "apps/rc-relay", "crates/rc-ident", "crates/rc-stream", "spikes/nettest"]
+members = ["apps/remote-control", "apps/rc-relay", "crates/rc-ident", "crates/rc-stream", "spikes/nettest", "spikes/netshape"]
 exclude = ["vendor/iroh-relay", "vendor/iroh"]
 
 [workspace.package]

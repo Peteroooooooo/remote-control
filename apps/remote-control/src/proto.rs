@@ -51,16 +51,35 @@ pub struct Quality {
     pub kbps: u32,
     /// YUV 4:4:4 if both ends can (sharp coloured text).
     pub yuv444: bool,
+    /// The frame rate is 自动: the host may lower it on a slow link.
+    pub auto_fps: bool,
 }
 
 impl Quality {
     fn write(&self, w: &mut W) {
-        w.u16(self.fit_w).u16(self.fit_h).u16(self.short).u8(self.fps).u32(self.kbps).u8(self.yuv444 as u8);
+        w.u16(self.fit_w)
+            .u16(self.fit_h)
+            .u16(self.short)
+            .u8(self.fps)
+            .u32(self.kbps)
+            .u8(self.yuv444 as u8)
+            .u8(self.auto_fps as u8);
     }
 
     fn read(r: &mut R) -> Result<Quality> {
-        let mut q = Quality { fit_w: r.u16()?, fit_h: r.u16()?, short: r.u16()?, fps: r.u8()?, kbps: r.u32()?, yuv444: false };
+        let mut q = Quality {
+            fit_w: r.u16()?,
+            fit_h: r.u16()?,
+            short: r.u16()?,
+            fps: r.u8()?,
+            kbps: r.u32()?,
+            yuv444: false,
+            auto_fps: false,
+        };
         q.yuv444 = r.u8()? != 0;
+        if let Ok(b) = r.u8() {
+            q.auto_fps = b != 0;
+        }
         Ok(q)
     }
 }
@@ -74,6 +93,8 @@ pub struct Streaming {
     /// Both ends can do 4:4:4 (the menu offers it).
     pub can444: bool,
     pub yuv444: bool,
+    /// The host sends video shards again when asked (`rc_stream::wire::Resend`).
+    pub resends: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -442,7 +463,7 @@ impl Msg {
                 w.u16(*width).u16(*height).u8(name.len() as u8);
                 w.0.extend_from_slice(name);
                 if let Some(s) = streaming {
-                    w.u8(STREAMING_MARK).u8(s.fps).u32(s.max_kbps).u8(s.can444 as u8 | (s.yuv444 as u8) << 1);
+                    w.u8(STREAMING_MARK).u8(s.fps).u32(s.max_kbps).u8(s.can444 as u8 | (s.yuv444 as u8) << 1 | (s.resends as u8) << 2);
                 }
             }
             Msg::Desktop { name } => {
@@ -537,7 +558,7 @@ impl Msg {
                 let streaming = if r.0.first() == Some(&STREAMING_MARK) {
                     r.u8()?;
                     let (fps, max_kbps, f) = (r.u8()?, r.u32()?, r.u8()?);
-                    Some(Streaming { fps, max_kbps, can444: f & 1 != 0, yuv444: f & 2 != 0 })
+                    Some(Streaming { fps, max_kbps, can444: f & 1 != 0, yuv444: f & 2 != 0, resends: f & 4 != 0 })
                 } else {
                     None
                 };
@@ -655,9 +676,9 @@ mod tests {
                 fps: 144,
                 caps: CAN_HEVC | CAN_HEVC444,
                 proof: "rcd1x".into(),
-                quality: Some(Quality { fit_w: 2560, fit_h: 1600, short: 0, fps: 144, kbps: 0, yuv444: true }),
+                quality: Some(Quality { fit_w: 2560, fit_h: 1600, short: 0, fps: 144, kbps: 0, yuv444: true, auto_fps: true }),
             },
-            Msg::Quality(Quality { fit_w: 0, fit_h: 0, short: 1080, fps: 30, kbps: 5_000, yuv444: false }),
+            Msg::Quality(Quality { fit_w: 0, fit_h: 0, short: 1080, fps: 30, kbps: 5_000, yuv444: false, auto_fps: false }),
             Msg::Waiting,
             Msg::Paused { on: true },
             Msg::Paused { on: false },
@@ -670,8 +691,8 @@ mod tests {
             Msg::Ping { t_us: 1 << 40 },
             Msg::Pong { t_us: 7 },
             Msg::Info { width: 2880, height: 1920, encoder: "Intel® H.264".into(), streaming: None },
-            Msg::Info { width: 2560, height: 1440, encoder: "NVIDIA".into(), streaming: Some(Streaming { fps: 120, max_kbps: 50_000, can444: true, yuv444: false }) },
-            Msg::Info { width: 1920, height: 1080, encoder: "NVIDIA".into(), streaming: Some(Streaming { fps: 60, max_kbps: 20_000, can444: true, yuv444: true }) },
+            Msg::Info { width: 2560, height: 1440, encoder: "NVIDIA".into(), streaming: Some(Streaming { fps: 120, max_kbps: 50_000, can444: true, yuv444: false, resends: false }) },
+            Msg::Info { width: 1920, height: 1080, encoder: "NVIDIA".into(), streaming: Some(Streaming { fps: 60, max_kbps: 20_000, can444: true, yuv444: true, resends: true }) },
             Msg::Stats(HostStats { fps: 60, kbps: 19_000, path: 1, host_p95_us: 9_000, rate_kbps: 20_000, size_max_pct: 340, ..Default::default() }),
             Msg::Probe { x: 100, y: 200 },
             Msg::ProbeReply { x: 101, y: 199 },
@@ -743,6 +764,13 @@ mod tests {
             Msg::decode(&w.0[4..]).unwrap(),
             Msg::Info { width: 1920, height: 1080, encoder: "NVIDIA".into(), streaming: None }
         );
+        // A Quality without the auto_fps byte (from an older peer) parses with auto_fps = false.
+        let q = Quality { fit_w: 2560, fit_h: 1440, short: 0, fps: 60, kbps: 0, yuv444: true, auto_fps: false };
+        let e = Msg::Quality(q).encode();
+        assert_eq!(Msg::decode(&e[4..e.len() - 1]).unwrap(), Msg::Quality(q));
+        let h = Msg::Hello { max_kbps: 20_000, fps: 60, caps: CAN_HEVC, proof: "rcd1".into(), quality: Some(q) };
+        let eh = h.encode();
+        assert_eq!(Msg::decode(&eh[4..eh.len() - 1]).unwrap(), h);
     }
 
     #[test]

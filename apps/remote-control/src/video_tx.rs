@@ -3,7 +3,7 @@
 //! Same logic as the phase-0 nettest sender, fed by a real encoder.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
@@ -18,7 +18,8 @@ use rc_stream::{
     fec::{FrameEncoder, parity_count},
     pacer,
     rate::{RateConfig, RateController},
-    wire::{Ack, Report, SHARD_HDR, T_ACK, T_REPORT},
+    rate::PROBE_ABORT_MS,
+    wire::{self, Ack, ProbeResult, Report, Resend, SHARD_HDR, ShardHeader, T_ACK, T_PROBE_RESULT, T_REPORT, T_RESEND, probe_datagram},
 };
 use tokio::sync::mpsc;
 
@@ -34,12 +35,21 @@ use crate::{
 /// relay at 0.7-2 s round trip failed and its late ack was not counted as
 /// delivered, so the rate could only fall.
 const FRAME_TIMEOUT: Duration = Duration::from_millis(500);
+/// But never more than this: a round trip that our own queue drove to 16 s
+/// (phone hotspot, 2026-11-23) had frames wait 32 s before they failed.
+const MAX_FRAME_TIMEOUT: Duration = Duration::from_secs(3);
 pub const REPORT_EVERY: Duration = Duration::from_millis(100);
 const PACE_GAP: Duration = Duration::from_millis(1);
 const PACE_SHARE: f64 = 0.5;
 const PACE_MAX: Duration = Duration::from_millis(5);
-const MIN_PARITY: u16 = 2;
+
 const MAX_DATAGRAM: usize = 1400;
+/// How long a probe (see `rc_stream::rate`) sends padding, and how often it
+/// tops it up. Frames skipped until `PROBE_QUIET` after it are its doing,
+/// not the link's: the padding fills the link on purpose.
+const PROBE_TIME: Duration = Duration::from_millis(200);
+const PROBE_STEP: Duration = Duration::from_millis(5);
+const PROBE_QUIET: Duration = Duration::from_millis(300);
 
 pub enum Plan {
     Skip,
@@ -73,6 +83,47 @@ struct Second {
     queued_max: usize,
     /// Frames over three times the size asked for: (bytes, budget, key).
     big: Vec<(usize, usize, bool)>,
+    /// Resend requests answered, and shards sent again for them.
+    resend_requests: u64,
+    resent_shards: u64,
+}
+
+/// Datagrams of the frames sent lately, for resend requests: no older than
+/// `RESEND_KEEP` and no more than `RESEND_KEEP_BYTES` in all.
+#[derive(Default)]
+struct Sent {
+    frames: VecDeque<(u32, Instant, Vec<Bytes>)>,
+    bytes: usize,
+}
+
+const RESEND_KEEP: Duration = Duration::from_secs(2);
+const RESEND_KEEP_BYTES: usize = 16 << 20;
+
+impl Sent {
+    fn add(&mut self, frame: u32, now: Instant, packets: Vec<Bytes>) {
+        self.bytes += packets.iter().map(Bytes::len).sum::<usize>();
+        self.frames.push_back((frame, now, packets));
+        while let Some((_, at, p)) = self.frames.front()
+            && (now.duration_since(*at) > RESEND_KEEP || self.bytes > RESEND_KEEP_BYTES)
+        {
+            self.bytes -= p.iter().map(Bytes::len).sum::<usize>();
+            self.frames.pop_front();
+        }
+    }
+
+    /// The datagrams `r` asks for, marked as sent again.
+    fn wanted(&self, r: &Resend) -> Vec<Bytes> {
+        let Some((_, _, packets)) = self.frames.iter().rev().find(|(f, _, _)| *f == r.frame) else {
+            return Vec::new();
+        };
+        let pick = |p: &Bytes| Bytes::from(wire::resent_shard(p));
+        if r.shards.is_empty() {
+            let data = packets.first().and_then(|p| ShardHeader::parse(p)).map_or(0, |(h, _)| h.data as usize);
+            packets.iter().take(data).map(pick).collect()
+        } else {
+            r.shards.iter().filter_map(|&i| packets.get(i as usize)).map(pick).collect()
+        }
+    }
 }
 
 struct State {
@@ -84,11 +135,28 @@ struct State {
     /// budget (a key frame, the first frame after a still screen): frames
     /// skipped or shrunk meanwhile say nothing about the link.
     own_backlog_until: Option<Instant>,
+    /// Recent frames' size over the size the rate gives them; a skipped frame
+    /// is offered at that share. Frames are 35-60% of it on a desktop (phone
+    /// hotspot 2026-11-24), and a skipped frame offered at the full size made
+    /// the link look half as fast as it was.
+    typical: f64,
     /// Most recent keyframe number sent, used to avoid endlessly re-requesting
     /// a keyframe on a still screen if reverse ACKs are lost.
     last_key_frame: Option<u32>,
     /// Last time a timed-out tail frame triggered an automatic keyframe.
     last_timeout_rekey: Option<Instant>,
+    /// Frame datagram bytes handed to the pacer so far, and the rate they
+    /// went at lately (bits/s, over a few updates).
+    wire_sent: u64,
+    wire_seen: u64,
+    wire_bps: f64,
+    /// The probe running: its rate, until when the transport's floor
+    /// follows it.
+    probe_floor: Option<(f64, Instant)>,
+    /// The last probe sent: its number, the rate that went out while it
+    /// ran (frames and padding, bits/s) and whether our own queue held some
+    /// padding back.
+    probe_sent: Option<(u16, f64, bool)>,
 }
 
 /// A frame queued for the pacer task.
@@ -108,6 +176,7 @@ pub struct VideoTx {
     /// Reusable Reed-Solomon encoder; kept outside `st` so feedback/control
     /// tasks never block behind FEC encoding.
     encoder: Mutex<FrameEncoder>,
+    sent: Mutex<Sent>,
     /// Frames per second the encoder runs at now (see `configure`).
     fps: Arc<AtomicU32>,
     pacer: mpsc::UnboundedSender<PaceFrame>,
@@ -125,6 +194,10 @@ pub struct VideoTx {
 
 /// Lowest bitrate the rate controller goes down to (when the highest allows).
 const MIN_BPS: f64 = 1.5e6;
+/// Least share of the rate's frame size a skipped frame is offered at: after
+/// a still screen `typical` is tiny, and the frames skipped when motion
+/// starts must still show that the link falls short.
+const MIN_TYPICAL: f64 = 0.5;
 
 impl VideoTx {
     /// Starts the pacing, feedback and rate-control tasks on the current runtime.
@@ -141,10 +214,17 @@ impl VideoTx {
                 frame: 0,
                 sec: Second::default(),
                 own_backlog_until: None,
+                typical: 1.0,
                 last_key_frame: None,
                 last_timeout_rekey: None,
+                wire_sent: 0,
+                wire_seen: 0,
+                wire_bps: 0.0,
+                probe_floor: None,
+                probe_sent: None,
             }),
             encoder: Mutex::new(FrameEncoder::new()),
+            sent: Mutex::new(Sent::default()),
             fps: fps.clone(),
             pacer: ptx,
             pacer_bytes: pacer_bytes.clone(),
@@ -181,6 +261,11 @@ impl VideoTx {
         }
     }
 
+    /// The rate controller's bitrate now, bits/s.
+    pub fn bitrate(&self) -> f64 {
+        self.st.lock().unwrap().rc.bitrate()
+    }
+
     /// Call when a new screen image is ready, before encoding it.
     /// `encoder_bps`: the bitrate the encoder runs at now; frame sizes are
     /// measured against it, since an encoder that changes its rate only
@@ -192,7 +277,7 @@ impl VideoTx {
         let chosen = s.rc.bitrate();
         let bits = encoder_bps as f64;
         let normal = ((bits / 8.0 / self.fps.load(Ordering::Relaxed) as f64) as usize).max(1);
-        let wire_normal = wire_frame_bytes(normal, s.rc.fec_pct(), max_datagram, MIN_PARITY);
+        let wire_normal = wire_frame_bytes(normal, s.rc.fec_pct(), max_datagram, s.rc.min_parity());
         let queued = SEND_BUFFER.saturating_sub(self.conn.datagram_send_buffer_space())
             + self.pacer_bytes.load(Ordering::Relaxed);
         s.sec.queued_max = s.sec.queued_max.max(queued);
@@ -203,7 +288,8 @@ impl VideoTx {
                 s.sec.skipped += 1;
                 if link_signal {
                     s.rc.on_backlog();
-                    s.rc.on_frame_offered(normal as u64);
+                    let typical = (normal as f64 * s.typical.clamp(MIN_TYPICAL, 1.5)) as u64;
+                    s.rc.on_frame_offered(typical);
                 }
                 Plan::Skip
             }
@@ -227,18 +313,20 @@ impl VideoTx {
             return 0;
         }
         let max = self.conn.max_datagram_size().unwrap_or(1200).min(MAX_DATAGRAM);
-        let (f, fec_pct, rate_bps) = {
+        let (f, fec_pct, min_parity, rate_bps) = {
             let mut s = self.st.lock().unwrap();
             let f = s.frame;
             s.frame = s.frame.wrapping_add(1);
             s.rc.on_frame_offered(if shrunk { normal } else { payload.len() } as u64);
+            let is_key = crate::proto::FrameHeader::parse(payload).is_some_and(|(h, _)| h.key);
             if payload.len() > 2 * budget {
                 // Time the extra bytes need at the chosen rate.
                 let extra = (payload.len() - budget) as f64 * 8.0 / s.rc.bitrate().max(1.0);
                 let until = Instant::now() + Duration::from_secs_f64(extra);
                 s.own_backlog_until = Some(s.own_backlog_until.map_or(until, |t| t.max(until)));
+            } else if !shrunk && !is_key {
+                s.typical = 0.9 * s.typical + 0.1 * payload.len() as f64 / normal.max(1) as f64;
             }
-            let is_key = crate::proto::FrameHeader::parse(payload).is_some_and(|(h, _)| h.key);
             if is_key {
                 s.last_key_frame = Some(f);
             }
@@ -251,10 +339,13 @@ impl VideoTx {
             if payload.len() > 3 * budget {
                 s.sec.big.push((payload.len(), budget, is_key));
             }
-            (f, s.rc.fec_pct(), s.rc.bitrate())
+            (f, s.rc.fec_pct(), s.rc.min_parity(), s.rc.bitrate())
         };
-        let packets = self.encoder.lock().unwrap().encode_frame(f, payload, max, fec_pct, MIN_PARITY);
-        let bytes: usize = packets.iter().map(Vec::len).sum();
+        let packets: Vec<Bytes> =
+            self.encoder.lock().unwrap().encode_frame(f, payload, max, fec_pct, min_parity).into_iter().map(Bytes::from).collect();
+        let bytes: usize = packets.iter().map(Bytes::len).sum();
+        self.sent.lock().unwrap().add(f, Instant::now(), packets.clone());
+        self.st.lock().unwrap().wire_sent += bytes as u64;
         let link_bps = net::path_congestion(&self.conn)
             .and_then(|(_, bw, _, _)| bw)
             .filter(|&bw| bw > 0)
@@ -265,7 +356,7 @@ impl VideoTx {
         if self
             .pacer
             .send(PaceFrame {
-                packets: packets.into_iter().map(Bytes::from).collect(),
+                packets,
                 bytes,
                 link_bps,
                 fast_lan,
@@ -280,9 +371,9 @@ impl VideoTx {
     /// Counters for the last second; resets them. Also writes one line to the
     /// host's log, for diagnosing the sending side.
     pub fn take_stats(&self) -> HostStats {
-        let (sec, rate) = {
+        let (sec, rate, link) = {
             let mut s = self.st.lock().unwrap();
-            (std::mem::take(&mut s.sec), s.rc.bitrate())
+            (std::mem::take(&mut s.sec), s.rc.bitrate(), s.rc.link())
         };
         let (cwnd, bw, lost, events) = net::path_congestion(&self.conn).unwrap_or_default();
         let big: Vec<String> = sec
@@ -291,14 +382,20 @@ impl VideoTx {
             .map(|(b, budget, key)| format!("{}{}/{} KB", if *key { "key " } else { "" }, b / 1000, budget / 1000))
             .collect();
         crate::log!(
-            "tx {} sent {} skipped {} shrunk, rate {:.1} Mbps, queue max {} KB, window {} KB, BBR estimate {:.1} Mbps, lost pkts {lost}, cc events {events}{}",
+            "tx {} sent {} skipped {} shrunk, rate {:.1} Mbps, link {}, queue max {} KB, window {} KB, BBR estimate {:.1} Mbps, lost pkts {lost}, cc events {events}{}{}",
             sec.sent,
             sec.skipped,
             sec.shrunk,
             rate / 1e6,
+            link.map_or("?".to_string(), |l| format!("{:.1}", l / 1e6)),
             sec.queued_max / 1000,
             cwnd / 1000,
             bw.unwrap_or(0) as f64 / 1e6,
+            if sec.resend_requests == 0 {
+                String::new()
+            } else {
+                format!(", {} shards sent again for {} requests", sec.resent_shards, sec.resend_requests)
+            },
             if big.is_empty() { String::new() } else { format!(", big frames: {}", big.join(", ")) },
         );
         let (path, _, rtt) = net::selected_path(&self.conn);
@@ -329,9 +426,14 @@ impl VideoTx {
                 Some(&T_ACK) => {
                     let Some(ack) = Ack::parse(&d) else { continue };
                     if let Some((sent_at, bytes)) = s.in_flight.remove(&ack.frame) {
-                        let ms = sent_at.elapsed().as_secs_f64() * 1000.0;
-                        s.sec.frame_rtt.push(ms);
-                        s.rc.on_frame_acked(ms, bytes);
+                        if ack.resent {
+                            // Its delay is the resend's round trip, not the path's.
+                            s.rc.on_frame_acked_late(bytes.min(u32::MAX as u64) as u32);
+                        } else {
+                            let ms = sent_at.elapsed().as_secs_f64() * 1000.0;
+                            s.sec.frame_rtt.push(ms);
+                            s.rc.on_frame_acked(ms, bytes);
+                        }
                     }
                     // Redundant ACK bitmap for the preceding 32 frames: credit
                     // delivered bytes and prevent false timeouts without
@@ -351,6 +453,36 @@ impl VideoTx {
                         s.rc.on_report(&r);
                     }
                 }
+                Some(&T_RESEND) => {
+                    let Some(r) = Resend::parse(&d) else { continue };
+                    let again = self.sent.lock().unwrap().wanted(&r);
+                    s.sec.resend_requests += 1;
+                    s.sec.resent_shards += again.len() as u64;
+                    for p in again {
+                        s.wire_sent += p.len() as u64;
+                        if self.conn.send_datagram(p).is_err() {
+                            break;
+                        }
+                    }
+                }
+                Some(&T_PROBE_RESULT) => {
+                    if let Some(r) = ProbeResult::parse(&d)
+                        && let Some((id, sent, held)) = s.probe_sent
+                        && id == r.id
+                    {
+                        s.probe_sent = None;
+                        // Both in wire bytes; the rate controller counts frame bytes.
+                        let wire = 1.0 + s.rc.fec_pct() as f64 / 100.0;
+                        let got = r.bps();
+                        crate::log!(
+                            "probe {id}: {:.1} Mbps sent, {:.1} got through{}",
+                            sent / 1e6,
+                            got / 1e6,
+                            if held { " (padding held back by our own queue)" } else { "" }
+                        );
+                        s.rc.on_probe(Instant::now(), id, sent / wire, got / wire, held);
+                    }
+                }
                 _ => {}
             }
         }
@@ -360,11 +492,11 @@ impl VideoTx {
     /// to the congestion controller as its floor.
     async fn control(self: Arc<Self>) {
         let mut tick = tokio::time::interval(REPORT_EVERY);
-        let mut last_path = net::PathKind::None;
+        let mut last_path = (net::PathKind::None, String::new());
         while self.conn.close_reason().is_none() {
             tick.tick().await;
-            let (k, _, rtt) = net::selected_path(&self.conn);
-            let timeout = FRAME_TIMEOUT.max(Duration::from_secs_f64(rtt.max(0.0) * 2.0 / 1000.0));
+            let (k, addr, rtt) = net::selected_path(&self.conn);
+            let timeout = Duration::from_secs_f64(rtt.max(0.0) * 2.0 / 1000.0).clamp(FRAME_TIMEOUT, MAX_FRAME_TIMEOUT);
             let now = Instant::now();
             let mut s = self.st.lock().unwrap();
             let before = s.in_flight.len();
@@ -388,14 +520,102 @@ impl VideoTx {
                 s.last_timeout_rekey = Some(now);
                 self.want_key.store(true, Ordering::Relaxed);
             }
-            if k != last_path {
-                s.rc.reset_base();
-                last_path = k;
+            // Another address is another network as often as not (a laptop
+            // leaving a phone hotspot for WiFi stays "direct").
+            if (k, &addr) != (last_path.0, &last_path.1) {
+                s.rc.new_path();
+                last_path = (k, addr);
             }
             let rate = s.rc.update(now);
-            cc::set_floor(rate, s.rc.fec_pct());
+            let fec = s.rc.fec_pct();
+            let wire = (s.wire_sent - s.wire_seen) as f64 * 8.0 / REPORT_EVERY.as_secs_f64();
+            s.wire_seen = s.wire_sent;
+            s.wire_bps = 0.5 * s.wire_bps + 0.5 * wire;
+            if !self.paused.load(Ordering::Relaxed)
+                && let Some(p) = s.rc.probe(now)
+            {
+                // Padding tops the frames up to the probe's rate (in wire
+                // bytes), and is at least a quarter of it.
+                let k = 1.0 + fec as f64 / 100.0;
+                let pad = (p.bps * k - s.wire_bps).max(0.25 * p.bps * k);
+                let max = self.conn.max_datagram_size().unwrap_or(1200).min(MAX_DATAGRAM);
+                let normal = (rate / 8.0 / self.fps.load(Ordering::Relaxed).max(1) as f64) as usize;
+                // Under one frame queued, a frame is never skipped behind the
+                // padding (`WHOLE_FRAMES`). The padding sent per `PROBE_STEP`
+                // is at most this, so with half a frame a probe could not go
+                // past about 0.8 times the rate at 120 fps, and a rate read
+                // low on a LAN (3.8 Mbps on one carrying 40, 2026-11-24)
+                // never climbed back.
+                let max_queue = (wire_frame_bytes(normal, fec, max, s.rc.min_parity()) * 9 / 10).max(2 * max);
+                s.probe_floor = Some((p.bps, now + PROBE_TIME + REPORT_EVERY));
+                let quiet = now + PROBE_TIME + PROBE_QUIET;
+                s.own_backlog_until = Some(s.own_backlog_until.map_or(quiet, |t| t.max(quiet)));
+                s.probe_sent = None;
+                tokio::spawn(self.clone().send_probe(p.id, pad, max, max_queue));
+            }
+            let floor = match s.probe_floor {
+                Some((bps, until)) if now < until => rate.max(bps),
+                _ => rate,
+            };
+            cc::set_floor(floor, fec);
         }
         cc::clear_floor();
+    }
+
+    /// Sends probe `id`'s padding: `pad_bps` of `len`-byte datagrams for
+    /// `PROBE_TIME`, while under `max_queue` bytes wait to be sent (so frames
+    /// are not skipped behind it). Stops early once the round trip has grown
+    /// by `PROBE_ABORT_MS`: the link is full, and more padding only queues.
+    async fn send_probe(self: Arc<Self>, id: u16, pad_bps: f64, len: usize, max_queue: usize) {
+        let rtt = || net::selected_path(&self.conn).2;
+        let rtt0 = rtt();
+        let wire0 = self.st.lock().unwrap().wire_sent;
+        let start = Instant::now();
+        let (mut sent, mut held) = (0usize, false);
+        // Wire bytes so far (frames and padding), and when: just after the
+        // first padding datagram and after the latest. The viewer counts what
+        // arrives between its first and last padding datagram, so a frame
+        // handed over after the last one (it arrives after it) must not count
+        // as sent: a key frame there read a LAN carrying 40 Mbps at 3.8
+        // (2026-11-24).
+        let wire_now = |sent: usize| self.st.lock().unwrap().wire_sent + sent as u64;
+        let mut first: Option<(Instant, u64)> = None;
+        let mut last: Option<(Instant, u64)> = None;
+        let mut tick = tokio::time::interval(PROBE_STEP);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let datagram = Bytes::from(probe_datagram(id, len));
+        loop {
+            tick.tick().await;
+            let elapsed = start.elapsed();
+            if elapsed >= PROBE_TIME || rtt() - rtt0 > PROBE_ABORT_MS || self.conn.close_reason().is_some() {
+                break;
+            }
+            let due = (pad_bps / 8.0 * elapsed.as_secs_f64()) as usize;
+            let before = sent;
+            while sent < due {
+                let queued =
+                    SEND_BUFFER.saturating_sub(self.conn.datagram_send_buffer_space()) + self.pacer_bytes.load(Ordering::Relaxed);
+                if queued > max_queue {
+                    held = true;
+                    break;
+                }
+                if self.conn.send_datagram(datagram.clone()).is_err() {
+                    return;
+                }
+                sent += len;
+                if first.is_none() {
+                    first = Some((Instant::now(), wire_now(sent)));
+                }
+            }
+            if sent > before {
+                last = Some((Instant::now(), wire_now(sent)));
+            }
+        }
+        let bps = match (first, last) {
+            (Some((t0, b0)), Some((t1, b1))) if t1 > t0 => (b1 - b0) as f64 * 8.0 / (t1 - t0).as_secs_f64(),
+            _ => (wire_now(sent) - wire0) as f64 * 8.0 / start.elapsed().as_secs_f64().max(1e-3),
+        };
+        self.st.lock().unwrap().probe_sent = Some((id, bps, held));
     }
 }
 
@@ -504,6 +724,7 @@ async fn pace(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rc_stream::rate::MIN_PARITY;
 
     #[test]
     fn pace_spread_is_fast_on_lan_and_smooth_on_wifi_and_wan() {

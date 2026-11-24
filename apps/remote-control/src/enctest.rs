@@ -87,6 +87,9 @@ pub struct EncTestArgs {
     /// frame and put back right after it.
     #[arg(long = "key-set", value_parser = parse_setting)]
     key_settings: Vec<(&'static str, GUID, u64)>,
+    /// With --keys: the bitrate (Mbps) for each forced key frame only.
+    #[arg(long)]
+    key_mbps: Option<f64>,
     /// With --keys: one line per frame.
     #[arg(long)]
     dump: bool,
@@ -590,6 +593,9 @@ fn run_keys(
         let forced = a.key_every > 0 && i > 0 && phase == 0;
         if forced {
             enc.request_key();
+            if let Some(m) = a.key_mbps {
+                enc.set_bitrate((m * 1e6) as u32);
+            }
             if let Some(c) = enc.codec_api() {
                 for (_, k, v) in &a.key_settings {
                     set_failed += mf::set_u32(c, k, *v as u32).is_err() as u32;
@@ -602,6 +608,9 @@ fn run_keys(
         pending.push_back((i, y));
         i += 1;
         let out = enc.encode(nv12, Duration::from_millis(200), None)?;
+        if forced && a.key_mbps.is_some() {
+            enc.set_bitrate((a.mbps * 1e6) as u32);
+        }
         if forced
             && let Some(c) = enc.codec_api()
         {

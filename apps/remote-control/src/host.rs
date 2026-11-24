@@ -168,7 +168,7 @@ pub struct Hello {
 impl Hello {
     /// What the viewer wants the picture to be.
     fn quality(&self) -> Quality {
-        self.quality.unwrap_or(Quality { fit_w: 0, fit_h: 0, short: 0, fps: self.fps, kbps: self.max_kbps, yuv444: false })
+        self.quality.unwrap_or(Quality { fit_w: 0, fit_h: 0, short: 0, fps: self.fps, kbps: self.max_kbps, yuv444: false, auto_fps: false })
     }
 }
 

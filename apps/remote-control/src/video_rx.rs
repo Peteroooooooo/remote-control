@@ -1,18 +1,22 @@
 //! Viewer side of the video stream: rebuilds frames from shards, acks them at
 //! once (the host's rate control needs that), and hands them to the decoder in
-//! order. H.264 delta frames depend on the frame before, so a lost frame means
-//! waiting for a key frame, which is requested right away.
+//! order. H.264 delta frames depend on the frame before, so a frame missing
+//! shards is asked for again at once; if they do not come back in time, a key
+//! frame is requested.
 
 use std::{
-    collections::BTreeMap,
-    sync::{Arc, Mutex},
+    collections::{BTreeMap, HashSet},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
 use iroh::endpoint::Connection;
 use rc_stream::{
     fec::Assembler,
-    wire::{Ack, ShardHeader, T_AUDIO, T_SHARD},
+    wire::{self, Ack, ProbeResult, Resend, ShardHeader, T_AUDIO, T_PROBE},
 };
 use tokio::sync::mpsc;
 
@@ -21,12 +25,23 @@ use crate::{
     video_tx::REPORT_EVERY,
 };
 
+/// The host sends shards again when asked (from its `Info`; an older one does not).
+pub static HOST_RESENDS: AtomicBool = AtomicBool::new(false);
+
 /// How long the FEC assembler keeps a frame open after its latest shard.
 const FRAME_LINGER: Duration = Duration::from_millis(150);
 /// A later frame is complete but this one is not: give it this long. The host
 /// sends frames one after another, so only the network can reorder them, by
 /// a few milliseconds at most; every millisecond more is frozen picture.
 const GAP_WAIT: Duration = Duration::from_millis(12);
+/// A shard of a later frame came this long ago and this one is still
+/// missing shards: ask for them again.
+const RESEND_AFTER: Duration = Duration::from_millis(3);
+/// The newest frame is missing shards and none came for this long: ask for
+/// them again.
+const TAIL_WAIT: Duration = Duration::from_millis(50);
+/// What shards sent again may take beyond one and a half round trips.
+const RESEND_SLACK: Duration = Duration::from_millis(25);
 /// No shard of an incomplete frame for this long, and nothing came after it.
 /// Counted from the latest shard, so a large frame on a slow link may take
 /// as long as it needs.
@@ -40,6 +55,8 @@ const KEY_REQUEST_GAP: Duration = Duration::from_millis(300);
 /// millisecond of frozen picture after a loss (the report interval, 100 ms,
 /// made the freeze about 50 ms longer on average).
 const CHECK_EVERY: Duration = Duration::from_millis(4);
+/// A probe is over once none of its datagrams arrived for this long.
+const PROBE_DONE: Duration = Duration::from_millis(50);
 
 pub struct Delivered {
     pub header: FrameHeader,
@@ -70,7 +87,21 @@ pub struct Reorder {
     pub lost: u64,
     /// The path's round trip (see `KEY_REQUEST_GAP`).
     pub rtt: Duration,
+    /// Missing shards are asked for again (see `HOST_RESENDS`).
+    pub resend: bool,
+    /// Frames still missing shards when a later frame's shard came, and when.
+    behind: BTreeMap<u32, Instant>,
+    /// Frames asked for again.
+    asked: HashSet<u32>,
+    newest: Option<u32>,
+    /// Frames asked for again so far, and of those completed in time.
+    pub resend_asked: u64,
+    pub resend_saved: u64,
 }
+
+/// More frames than this missing at once (an outage, not a loss): a key
+/// frame costs less than sending them all again.
+const BEHIND_MAX: u32 = 8;
 
 impl Reorder {
     /// A shard of `frame` arrived.
@@ -80,11 +111,67 @@ impl Reorder {
             return;
         }
         self.incomplete.insert(frame, now);
+        if let Some(n) = self.next
+            && self.newest.is_none_or(|m| frame > m)
+            && frame - n <= BEHIND_MAX
+        {
+            for f in n..frame {
+                if !self.pending.contains_key(&f) {
+                    self.behind.entry(f).or_insert(now);
+                }
+            }
+        }
+        if self.newest.is_none_or(|m| frame > m) {
+            self.newest = Some(frame);
+        }
+    }
+
+    /// Frames to ask the host for again now.
+    pub fn resends(&mut self, now: Instant) -> Vec<u32> {
+        if !self.resend || self.need_key {
+            self.behind.clear();
+            return Vec::new();
+        }
+        if let Some(n) = self.next {
+            self.behind.retain(|f, _| *f >= n);
+            self.asked.retain(|f| *f >= n);
+        }
+        let mut out: Vec<u32> = self
+            .behind
+            .iter()
+            .filter(|&(f, t)| now.duration_since(*t) >= RESEND_AFTER && !self.asked.contains(f))
+            .map(|(f, _)| *f)
+            .collect();
+        if let Some((&f, &t)) = self.incomplete.last_key_value()
+            && self.newest == Some(f)
+            && now.duration_since(t) >= TAIL_WAIT
+            && !self.asked.contains(&f)
+        {
+            out.push(f);
+        }
+        self.asked.extend(&out);
+        self.resend_asked += out.len() as u64;
+        out
+    }
+
+    /// How long the missing frame `f` may keep the picture still before a key
+    /// frame is asked for: after a gap, and with nothing coming after it.
+    fn waits(&self, f: u32) -> (Duration, Duration) {
+        if self.asked.contains(&f) {
+            let back = self.rtt.mul_f64(1.5) + RESEND_SLACK;
+            (GAP_WAIT.max(RESEND_AFTER + back), STUCK_WAIT.max(TAIL_WAIT + back))
+        } else {
+            (GAP_WAIT, STUCK_WAIT)
+        }
     }
 
     /// A frame could be rebuilt. Returns the frames that can be decoded now, in order.
     pub fn push(&mut self, frame: u32, d: Delivered, now: Instant) -> Vec<Delivered> {
         self.incomplete.remove(&frame);
+        self.behind.remove(&frame);
+        if self.asked.remove(&frame) {
+            self.resend_saved += 1;
+        }
         let mut out = Vec::new();
         let behind = self.next.is_some_and(|n| frame < n);
         if d.header.key && !behind {
@@ -137,8 +224,11 @@ impl Reorder {
         if let Some(n) = self.next {
             self.incomplete.retain(|f, _| *f >= n);
         }
-        let gap = self.gap_since.is_some_and(|t| now.duration_since(t) > GAP_WAIT);
-        let stuck = self.incomplete.values().any(|t| now.duration_since(*t) > STUCK_WAIT);
+        let gap = self.gap_since.is_some_and(|t| {
+            let missing = self.next.map_or(GAP_WAIT, |n| self.waits(n).0);
+            now.duration_since(t) > missing
+        });
+        let stuck = self.incomplete.iter().any(|(f, t)| now.duration_since(*t) > self.waits(*f).1);
         if (gap || stuck) && !self.need_key {
             self.need_key = true;
             self.lost += 1;
@@ -147,6 +237,8 @@ impl Reorder {
         if gap || stuck {
             self.pending.clear();
             self.incomplete.clear();
+            self.behind.clear();
+            self.asked.clear();
             self.gap_since = None;
         }
         let no_start = self.next.is_none() && self.first_seen.is_some_and(|t| now.duration_since(t) > STUCK_WAIT);
@@ -172,6 +264,9 @@ pub struct RxCounters {
     pub failed: u64,
     /// Datagrams dropped by `--sim-loss`.
     pub sim_dropped: u64,
+    /// Frames asked for again, and of those completed in time.
+    pub resend_asked: u64,
+    pub resend_saved: u64,
     /// Parity shards per 100 data shards of the largest frame.
     pub fec_pct: u32,
     largest: u16,
@@ -252,23 +347,44 @@ pub async fn run(
     let mut recent_acked = std::collections::VecDeque::<u32>::with_capacity(64);
     let mut prev_key_requests = 0u64;
     let mut prev_lost = 0u64;
+    let mut prev_resends = (0u64, 0u64);
+    // Datagram bytes received so far, and the probe arriving: its number,
+    // first and last datagram's arrival and the count at each.
+    let mut total = 0u64;
+    let mut probe: Option<(u16, Instant, u64, Instant, u64)> = None;
     loop {
         tokio::select! {
             d = conn.read_datagram() => {
                 let Ok(d) = d else { return };
                 if d.first() == Some(&T_AUDIO) {
+                    total += d.len() as u64;
                     if let Some(a) = &audio {
                         let _ = a.send(d);
                     }
                     continue;
                 }
-                if d.first() != Some(&T_SHARD) {
+                if d.first() == Some(&T_PROBE) && d.len() >= 3 {
+                    total += d.len() as u64;
+                    let (id, now) = (u16::from_be_bytes([d[1], d[2]]), Instant::now());
+                    match probe.as_mut() {
+                        Some(p) if p.0 == id => (p.3, p.4) = (now, total),
+                        _ => {
+                            if let Some(p) = probe.take() {
+                                send_probe_result(&conn, p);
+                            }
+                            probe = Some((id, now, total, now, total));
+                        }
+                    }
+                    continue;
+                }
+                if !wire::is_shard(&d) {
                     continue;
                 }
                 if sim.as_mut().is_some_and(|s| s.drop_next()) {
                     counters.lock().unwrap().sim_dropped += 1;
                     continue;
                 }
+                total += d.len() as u64;
                 let now = Instant::now();
                 if let Some((h, _)) = ShardHeader::parse(&d) {
                     ro.on_shard(h.frame, now);
@@ -298,7 +414,7 @@ pub async fn run(
                 }
                 recent_acked.push_back(c.frame);
                 let _ = conn.send_datagram(bytes::Bytes::copy_from_slice(
-                    &Ack { frame: c.frame, recovered: c.recovered, prev_mask }.encode(),
+                    &Ack { frame: c.frame, recovered: c.recovered, resent: c.resent, prev_mask }.encode(),
                 ));
                 let Some((header, body)) = FrameHeader::parse(&c.data) else { continue };
                 if crate::trace::on() {
@@ -329,6 +445,12 @@ pub async fn run(
             }
             _ = check.tick() => {
                 let now = Instant::now();
+                ro.resend = HOST_RESENDS.load(Ordering::Relaxed);
+                for f in ro.resends(now) {
+                    if let Some(shards) = asm.wanted(f) {
+                        let _ = conn.send_datagram(Resend { frame: f, shards }.encode().into());
+                    }
+                }
                 let lost = ro.lost;
                 let asked = ro.tick(now);
                 if asked {
@@ -344,20 +466,45 @@ pub async fn run(
             _ = tick.tick() => {
                 let now = Instant::now();
                 ro.rtt = Duration::from_secs_f64(crate::net::selected_path(&conn).2.max(0.0) / 1000.0);
+                // Shards sent again must still find their frame.
+                asm.set_linger(FRAME_LINGER.max(ro.rtt * 2 + RESEND_SLACK));
                 asm.expire(now);
                 let r = asm.take_report();
                 if r.shards_expected > 0 {
                     let _ = conn.send_datagram(r.encode().into());
                 }
+                if let Some(p) = probe.take_if(|p| now.duration_since(p.3) >= PROBE_DONE) {
+                    send_probe_result(&conn, p);
+                }
                 let mut k = counters.lock().unwrap();
                 k.key_requests += ro.key_requests - prev_key_requests;
                 k.lost += ro.lost - prev_lost;
+                k.resend_asked += ro.resend_asked - prev_resends.0;
+                k.resend_saved += ro.resend_saved - prev_resends.1;
                 prev_key_requests = ro.key_requests;
                 prev_lost = ro.lost;
+                prev_resends = (ro.resend_asked, ro.resend_saved);
                 k.failed += r.frames_failed as u64;
             }
         }
     }
+}
+
+/// Tells the host what arrived while its probe did (`rc_stream::rate`):
+/// the bytes after the probe's first datagram up to its last, and the time
+/// between them. `p`: number, first arrival and byte count, last ones.
+fn send_probe_result(conn: &Connection, p: (u16, Instant, u64, Instant, u64)) {
+    let (id, first, first_total, last, last_total) = p;
+    let span = last.duration_since(first);
+    if span.is_zero() {
+        return;
+    }
+    let r = ProbeResult {
+        id,
+        bytes: (last_total - first_total).min(u32::MAX as u64) as u32,
+        span_us: span.as_micros().min(u32::MAX as u128) as u32,
+    };
+    let _ = conn.send_datagram(bytes::Bytes::copy_from_slice(&r.encode()));
 }
 
 #[cfg(test)]
@@ -469,6 +616,67 @@ mod tests {
         }
         assert_eq!(r.push(1, frame(false), t + Duration::from_millis(500)).len(), 1);
         assert_eq!(r.lost, 0);
+    }
+
+    fn resending(rtt_ms: u64) -> Reorder {
+        Reorder { resend: true, rtt: Duration::from_millis(rtt_ms), ..Default::default() }
+    }
+
+    #[test]
+    fn missing_shards_are_asked_for_again_before_a_key_frame() {
+        let mut r = resending(20);
+        let t = Instant::now();
+        let ms = |n| t + Duration::from_millis(n);
+        r.push(0, frame(true), t);
+        r.on_shard(1, t);
+        r.on_shard(2, ms(1));
+        assert!(r.push(2, frame(false), ms(1)).is_empty());
+        assert!(r.resends(ms(2)).is_empty(), "the network may reorder a little");
+        assert_eq!(r.resends(ms(5)), vec![1]);
+        assert!(r.resends(ms(6)).is_empty(), "asked once");
+        assert!(!r.tick(ms(40)), "the shards may still come back");
+        assert_eq!(ids(&r.push(1, frame(false), ms(45)), 1), vec![1, 2]);
+        assert_eq!((r.lost, r.key_requests, r.resend_saved), (0, 0, 1));
+    }
+
+    #[test]
+    fn shards_that_do_not_come_back_end_in_a_key_frame_request() {
+        let mut r = resending(20);
+        let t = Instant::now();
+        let ms = |n| t + Duration::from_millis(n);
+        r.push(0, frame(true), t);
+        r.on_shard(2, ms(1));
+        r.push(2, frame(false), ms(1));
+        assert_eq!(r.resends(ms(5)), vec![1], "a frame with no shard at all too");
+        assert!(r.tick(ms(70)), "1.5 round trips and the slack are over");
+        assert_eq!(r.lost, 1);
+        assert!(r.resends(ms(75)).is_empty(), "nothing more to ask until the key frame");
+    }
+
+    #[test]
+    fn the_newest_frame_is_asked_for_again_once_its_shards_stop() {
+        let mut r = resending(20);
+        let t = Instant::now();
+        let ms = |n| t + Duration::from_millis(n);
+        r.push(0, frame(true), t);
+        r.on_shard(1, t);
+        assert!(r.resends(ms(40)).is_empty(), "shards of a large frame may be spread out");
+        assert_eq!(r.resends(ms(51)), vec![1]);
+        assert!(!r.tick(ms(120)));
+        assert!(r.tick(ms(130)));
+    }
+
+    #[test]
+    fn after_an_outage_a_key_frame_is_asked_for_at_once() {
+        let mut r = resending(20);
+        let t = Instant::now();
+        let ms = |n| t + Duration::from_millis(n);
+        r.push(0, frame(true), t);
+        let later = 1 + BEHIND_MAX + 1;
+        r.on_shard(later, ms(1));
+        r.push(later, frame(false), ms(1));
+        assert!(r.resends(ms(5)).is_empty(), "too many to send again");
+        assert!(r.tick(ms(20)));
     }
 
     #[test]

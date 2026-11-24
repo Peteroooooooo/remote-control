@@ -240,7 +240,7 @@ async fn serve(conn: Connection, peer: &str) -> Result<()> {
                     continue;
                 }
                 if let Some(c) = asm.push(&d, Instant::now()) {
-                    let ack = Ack { frame: c.frame, recovered: c.recovered, prev_mask: 0 };
+                    let ack = Ack { frame: c.frame, recovered: c.recovered, resent: c.resent, prev_mask: 0 };
                     let _ = conn.send_datagram(bytes::Bytes::copy_from_slice(&ack.encode()));
                 }
             }
