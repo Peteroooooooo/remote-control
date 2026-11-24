@@ -123,6 +123,9 @@ enum Cmd {
         from: String,
         to: String,
     },
+    /// Change settings as the Settings page does, e.g. `set relay rcr1… public off`.
+    #[command(after_help = cli::SET_HELP)]
+    Set(cli::SetArgs),
     /// Send one request to the running lobby, host or service (for tests).
     #[command(hide = true)]
     Ctl(cli::CtlArgs),
@@ -270,6 +273,7 @@ fn main() -> Result<()> {
         Cmd::Shell { device } => exit_with(term::shell(&device)),
         Cmd::Exec { device, cwd, command } => exit_with(term::exec(&device, &command.join(" "), cwd.as_deref())),
         Cmd::Cp { from, to } => term::cp(&from, &to),
+        Cmd::Set(a) => cli::set(a),
         Cmd::Ctl(a) => cli::ctl(a),
         Cmd::EncTest(a) => enctest::run(a),
         Cmd::InstallService { allow, from_lobby, lobby_pid } => {

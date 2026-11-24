@@ -238,6 +238,8 @@ pub struct Settings {
     pub stay_awake: bool,
     /// UI language preference (auto follows Windows UI language).
     pub language: crate::i18n::LangPref,
+    /// 只被控: the lobby leaves out every way of controlling other devices.
+    pub host_only: bool,
 }
 
 impl Default for Settings {
@@ -251,6 +253,7 @@ impl Default for Settings {
             lock_control: true,
             stay_awake: true,
             language: crate::i18n::LangPref::Auto,
+            host_only: false,
         }
     }
 }
@@ -278,6 +281,7 @@ impl Settings {
                     Some(("lock_control", v)) => s.lock_control = v.trim() != "0",
                     Some(("stay_awake", v)) => s.stay_awake = v.trim() != "0",
                     Some(("language", v)) => s.language = crate::i18n::LangPref::parse(v),
+                    Some(("host_only", v)) => s.host_only = v.trim() == "1",
                     _ => {}
                 }
             }
@@ -292,13 +296,14 @@ impl Settings {
             text += &format!("relay={}\n", url_list(r));
         }
         text += &format!(
-            "public_relays={}\nlan_visible={}\nboot_online={}\nlock_control={}\nstay_awake={}\nlanguage={}\n",
+            "public_relays={}\nlan_visible={}\nboot_online={}\nlock_control={}\nstay_awake={}\nlanguage={}\nhost_only={}\n",
             self.public_relays as u8,
             self.lan_visible as u8,
             self.boot_online as u8,
             self.lock_control as u8,
             self.stay_awake as u8,
             self.language.as_str(),
+            self.host_only as u8,
         );
         write_atomic(path, text.as_bytes())
     }
@@ -425,6 +430,7 @@ mod tests {
         assert!(Settings::default().boot_online);
         assert!(Settings::default().lock_control);
         assert!(Settings::default().stay_awake);
+        assert!(!Settings::default().host_only);
         // A phase 1 file, and switches that are gone.
         std::fs::write(&p, "name=客厅\nallow_control=1\naccept_new=0\nclipboard=0\n").unwrap();
         assert_eq!(Settings::load(&p), Settings { name: "客厅".into(), ..Settings::default() });
@@ -440,6 +446,7 @@ mod tests {
             lock_control: false,
             stay_awake: true,
             language: crate::i18n::LangPref::En,
+            host_only: true,
         };
         s.save(&p).unwrap();
         assert_eq!(Settings::load(&p), s);

@@ -1505,6 +1505,7 @@ impl Node {
                     "boot" => Ok(self.settings(|s| s.boot_online = on)),
                     "lock" => Ok(self.settings(|s| s.lock_control = on)),
                     "awake" => Ok(self.settings(|s| s.stay_awake = on)),
+                    "host-only" => Ok(self.settings(|s| s.host_only = on)),
                     _ => Err(anyhow!("unknown settings key {key}")),
                 }
             }
@@ -1588,7 +1589,7 @@ impl Node {
         out += &format!("me\t{}\t{}\n", sh.me, sh.opts.service as u8);
         let s = &st.settings;
         out += &format!(
-            "settings\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            "settings\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
             s.shown_name(),
             s.name,
             s.public_relays as u8,
@@ -1597,6 +1598,7 @@ impl Node {
             s.lock_control as u8,
             s.stay_awake as u8,
             s.language.as_str(),
+            s.host_only as u8,
         );
         // In the order of the list, the chosen relay first. home: in use;
         // temp: in use while the chosen one does not answer; idle: joined,
@@ -3326,6 +3328,13 @@ pub fn call(req: &str) -> Result<String> {
         }
     }
     Err(last)
+}
+
+/// One request to the node whose settings are this user's: the service's,
+/// else the one in this Windows session, never another session's.
+pub fn call_here(req: &str) -> Result<String> {
+    let wait = Duration::from_secs(2);
+    crate::pipe::call(PIPE, req, wait).or_else(|_| crate::pipe::call(&user_pipe(my_session()), req, wait))
 }
 
 /// The node of `remote-control host` and of the service's helper: no window.

@@ -34,6 +34,8 @@ pub struct Snap {
     pub lock: bool,
     pub awake: bool,
     pub language: crate::i18n::LangPref,
+    /// 只被控: no way of controlling other devices in the window.
+    pub host_only: bool,
     /// Own relays, tried in turn.
     pub relays: Vec<Relay>,
     pub hosting: Option<String>,
@@ -126,6 +128,7 @@ fn parse_snap(text: &str) -> (Snap, bool) {
                     s.language = crate::i18n::LangPref::parse(&lang_field);
                     has_lang = true;
                 }
+                s.host_only = on(9);
             }
             "relay" => s.relays.push(Relay { url: g(1), state: g(2) }),
             "hosting" => s.hosting = Some(g(2)),
@@ -213,6 +216,8 @@ enum Mode {
 struct Sh {
     key: PathBuf,
     lan: bool,
+    /// The node always runs here, never the service's (tests).
+    own_node: bool,
     view_args: Vec<String>,
     rt: tokio::runtime::Runtime,
     mode: Mutex<Mode>,
@@ -377,7 +382,7 @@ impl Sh {
             }
             if last_mode_check.elapsed() >= Duration::from_secs(1) {
                 last_mode_check = Instant::now();
-                let running = self.refresh_service_cache();
+                let running = self.refresh_service_cache() && !self.own_node;
                 let busy = self.busy.lock().unwrap().is_some();
                 let mode = match &*self.mode.lock().unwrap() {
                     Mode::Local(_) => 0,
@@ -444,11 +449,12 @@ impl Sh {
 }
 
 impl Backend {
-    pub fn start(key: PathBuf, view_args: Vec<String>, lan: bool, visible: bool) -> Result<Backend> {
+    pub fn start(key: PathBuf, view_args: Vec<String>, lan: bool, visible: bool, own_node: bool) -> Result<Backend> {
         let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
         let sh = Arc::new(Sh {
             key,
             lan,
+            own_node,
             view_args,
             rt,
             mode: Mutex::new(Mode::Off),
@@ -466,7 +472,7 @@ impl Backend {
             visible: visible.into(),
             shown: Default::default(),
         });
-        if service_up() {
+        if !own_node && service_up() {
             log!("lobby: the service runs: talking to it");
             *sh.mode.lock().unwrap() = Mode::Remote;
         } else {
@@ -476,6 +482,9 @@ impl Backend {
         let s2 = sh.clone();
         std::thread::Builder::new().name("lobby-poll".into()).spawn(move || s2.poll())?;
         // `remote-control ctl` reaches the node in this process here.
+        if own_node {
+            return Ok(Backend { sh });
+        }
         let s3 = sh.clone();
         let pipe = format!(r"\\.\pipe\remote-control-node-s{}", my_session());
         std::thread::Builder::new().name("lobby-pipe".into()).spawn(move || {

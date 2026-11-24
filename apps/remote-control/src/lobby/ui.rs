@@ -449,6 +449,8 @@ pub struct App {
     focus_name: bool,
     skill_state: crate::term::SkillState,
     self_update: SelfUpdate,
+    /// 只被控 in this frame's snapshot: no way of controlling other devices.
+    host_only: bool,
 }
 
 /// `hidden`: started at sign-in, with only the icon in the tray.
@@ -492,6 +494,7 @@ pub fn run(b: Backend, hidden: bool) -> anyhow::Result<()> {
                 focus_name: false,
                 skill_state: crate::term::skill_state(),
                 self_update: SelfUpdate::default(),
+                host_only: false,
             }
         },
     )
@@ -1215,6 +1218,7 @@ impl host::LobbyApp for App {
     fn ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         let snap = self.b.snap();
+        self.host_only = snap.host_only;
         self.take_notices(&snap);
         if let Some(stage) = self.self_update.take_ready() {
             let active = !self.b.sessions().is_empty() || snap.hosting.is_some() || snap.asking.is_some();
@@ -1232,7 +1236,7 @@ impl host::LobbyApp for App {
                 }
             }
         }
-        if self.confirm.is_none() {
+        if self.confirm.is_none() && !self.host_only {
             self.paste_anywhere(&ctx);
         }
         let esc = ctx.memory(|m| m.focused().is_none()) && ctx.input(|i| i.key_pressed(egui::Key::Escape));
@@ -1529,6 +1533,8 @@ impl App {
         ui.painter().galley(pos2(x, top), g, TEXT);
         let (dot, state) = if snap.me.is_empty() {
             (GONE, tr("本机 · 正在启动", "This PC · Starting"))
+        } else if snap.host_only {
+            (GREEN, tr("本机 · 在线 · 只被控", "Online · Host Only"))
         } else {
             (GREEN, tr("本机 · 在线", "This PC · Online"))
         };
@@ -1734,7 +1740,9 @@ impl App {
             });
         });
         ui.add_space(6.0);
-        self.connect_field(ui);
+        if !snap.host_only {
+            self.connect_field(ui);
+        }
         let codes = &snap.codes;
         if !codes.is_empty() {
             ui.horizontal_wrapped(|ui| {
@@ -1804,14 +1812,18 @@ impl App {
                 ui.label(RichText::new(ic::DEVICES.to_string()).font(FontId::new(40.0, FontFamily::Name(ICONS.into()))).color(FAINT));
                 ui.add_space(4.0);
                 ui.label(tr("还没有设备", "No devices yet"));
-                ui.label(
-                    RichText::new(tr(
+                let hint = if snap.host_only {
+                    tr(
+                        "同一局域网会自动出现；跨网请复制连接码发给对方",
+                        "Devices on the same LAN appear automatically; across networks, copy your code and send it",
+                    )
+                } else {
+                    tr(
                         "同一局域网会自动出现；跨网请复制连接码发给对方，或贴到上方",
                         "Devices on the same LAN appear automatically; across networks, copy your code or paste one above",
-                    ))
-                    .size(12.0)
-                    .color(DIM),
-                );
+                    )
+                };
+                ui.label(RichText::new(hint).size(12.0).color(DIM));
             });
         }
     }
@@ -1970,6 +1982,7 @@ impl App {
                         self.why = if self.why == Some(d.id) { None } else { Some(d.id) };
                     }
                 }
+                None if self.host_only => {}
                 None => {
                     let acc = if is_en() { format!("Control {}", d.name) } else { format!("控制 {}", d.name) };
                     let r = Btn::new(tr("控制", "Control")).look(Look::Soft).enabled(online).name(acc).show(&mut acts);
@@ -2006,7 +2019,7 @@ impl App {
         }
         let acts_used = acts.min_rect();
         let on_acts = ui.input(|i| i.pointer.latest_pos().is_some_and(|pos| acts_used.contains(pos)));
-        if online && session.is_none() && !asked && self.renaming.is_none() && !on_acts && row.double_clicked() {
+        if online && !self.host_only && session.is_none() && !asked && self.renaming.is_none() && !on_acts && row.double_clicked() {
             self.b.control(d.id, &d.name);
         }
         let text_right = acts_used.left() - 12.0;
@@ -2087,7 +2100,7 @@ impl App {
         egui::Popup::menu(&more).align(RectAlign::BOTTOM_END).gap(4.0).show(|ui| {
             ui.set_width(MENU_WIDTH);
             ui.spacing_mut().item_spacing.y = 0.0;
-            if menu_item_enabled(ui, Some(ic::TERM), tr("终端", "Terminal"), None, false, false, online).clicked() {
+            if !self.host_only && menu_item_enabled(ui, Some(ic::TERM), tr("终端", "Terminal"), None, false, false, online).clicked() {
                 ui.close();
                 if let Err(e) = crate::term::open_window(d.id, &d.name) {
                     let msg = if is_en() { format!("Could not open terminal: {e:#}") } else { format!("打不开终端：{e:#}") };
@@ -2130,7 +2143,9 @@ impl App {
                     }
                 }
             }
-            menu_sep(ui);
+            if d.listed || !self.host_only {
+                menu_sep(ui);
+            }
             if menu_item(ui, Some(ic::DEL), tr("删除", "Remove"), None, false, true).clicked() {
                 ui.close();
                 let there = matches!(d.status, Status::Online { .. } | Status::Unreachable);
@@ -2270,6 +2285,18 @@ impl App {
                             });
                         });
                 });
+            let mut host_only = snap.host_only;
+            let host_only_title = tr("只被控", "Host Only");
+            Item::new(Lead::Icon(ic::DESKTOP), host_only_title)
+                .desc(tr(
+                    "隐藏控制别人的入口：粘贴连接码、控制、终端、AI 集成",
+                    "Hide the ways of controlling others: pasting codes, Control, Terminal, AI Integration",
+                ))
+                .show(ui, |ui| {
+                    if switch(ui, &mut host_only, true, host_only_title).changed() {
+                        b.act(&format!("set\thost-only\t{}", host_only as u8));
+                    }
+                });
         });
         if self.scroll_to_settings == Some(SettingsTarget::SelfName) {
             self.scroll_to_settings = None;
@@ -2403,32 +2430,35 @@ impl App {
             crate::term::SkillState::Installed => tr("已安装 · 支持 Claude Code、Codex", "Installed · Claude Code & Codex"),
             crate::term::SkillState::Outdated => tr("已安装（当前程序路径或版本有变化）", "Installed (executable path or version changed)"),
         };
-        section_head(ui, tr("AI 集成", "AI Integration"), None);
-        group(ui, |ui| {
-            Item::new(Lead::Icon(ic::BOT), tr("配置 AI Skills", "Configure AI Skills"))
-                .desc(skill_desc)
-                .first(true)
-                .show(ui, |ui| match self.skill_state {
-                    crate::term::SkillState::NotInstalled => {
-                        if Btn::new(tr("安装", "Install")).show(ui).clicked() {
-                            skill_act = Some(SkillAct::Install);
+        if !snap.host_only {
+            section_head(ui, tr("AI 集成", "AI Integration"), None);
+            group(ui, |ui| {
+                Item::new(Lead::Icon(ic::BOT), tr("配置 AI Skills", "Configure AI Skills"))
+                    .desc(skill_desc)
+                    .first(true)
+                    .show(ui, |ui| match self.skill_state {
+                        crate::term::SkillState::NotInstalled => {
+                            if Btn::new(tr("安装", "Install")).show(ui).clicked() {
+                                skill_act = Some(SkillAct::Install);
+                            }
                         }
-                    }
-                    crate::term::SkillState::Installed => {
-                        if Btn::new(tr("卸载", "Uninstall")).show(ui).clicked() {
-                            skill_act = Some(SkillAct::Uninstall);
+                        crate::term::SkillState::Installed => {
+                            if Btn::new(tr("卸载", "Uninstall")).show(ui).clicked() {
+                                skill_act = Some(SkillAct::Uninstall);
+                            }
                         }
-                    }
-                    crate::term::SkillState::Outdated => {
-                        if Btn::new(tr("卸载", "Uninstall")).show(ui).clicked() {
-                            skill_act = Some(SkillAct::Uninstall);
+                        crate::term::SkillState::Outdated => {
+                            if Btn::new(tr("卸载", "Uninstall")).show(ui).clicked() {
+                                skill_act = Some(SkillAct::Uninstall);
+                            }
+                            if Btn::new(tr("更新", "Update")).look(Look::Primary).show(ui).clicked() {
+                                skill_act = Some(SkillAct::Update);
+                            }
                         }
-                        if Btn::new(tr("更新", "Update")).look(Look::Primary).show(ui).clicked() {
-                            skill_act = Some(SkillAct::Update);
-                        }
-                    }
-                });
-        });
+                    });
+            });
+            ui.add_space(12.0);
+        }
         if let Some(act) = skill_act {
             match act {
                 SkillAct::Install => match crate::term::install_skill() {
@@ -2463,7 +2493,6 @@ impl App {
             self.skill_state = crate::term::skill_state();
         }
 
-        ui.add_space(12.0);
         let phase = self.self_update.snapshot();
         let active_session = !self.b.sessions().is_empty() || snap.hosting.is_some() || snap.asking.is_some();
         let title = format!("Remote Control v{}", crate::update::APP_VERSION);

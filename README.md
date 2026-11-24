@@ -107,6 +107,20 @@ volumes:
 
 动态 IP 绑定域名、自定义 TLS 证书及更多配置见 [apps/rc-relay/README.md](apps/rc-relay/README.md)。
 
+### 5. 命令行配置与批量部署
+
+`remote-control set` 和设置页一一对应，适合写进 `.bat` 或交给批量下发工具：
+
+```powershell
+remote-control set relay rcr1… public off host-only on   # 加入自建中转、关闭公网辅助、只被控
+remote-control install-service                           # 安装后台服务（需管理员）
+```
+
+- 所有机器用同一个中转码即可，中转面板里每台单独列出；电脑名不好认时加 `name 财务-01`。
+- 只改写出的项，其余不变；软件开着时立即生效。任何一项写错都不做改动并返回非 0 退出码。
+- 配置属于运行命令的那个 Windows 用户，请在实际使用这台电脑的用户下运行。
+- 全部项目见 `remote-control set --help`。「只被控」会隐藏粘贴连接码、控制、终端和 AI 集成，在设置里可随时关掉。
+
 ---
 
 Apache-2.0 许可证，见 [LICENSE](LICENSE)。社区交流：[LINUX DO](https://linux.do)。

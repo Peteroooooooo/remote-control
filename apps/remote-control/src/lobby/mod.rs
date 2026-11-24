@@ -25,6 +25,9 @@ pub struct LobbyArgs {
     /// Neither answer nor search on the LAN (for tests of connection codes).
     #[arg(long, hide = true)]
     no_lan: bool,
+    /// Run the node here, never the service's (for tests with `--key`).
+    #[arg(long, hide = true)]
+    own_node: bool,
     /// Start in the tray, without the window (at logon, with the service).
     #[arg(long, hide = true)]
     hidden: bool,
@@ -124,7 +127,7 @@ pub fn run(a: LobbyArgs) -> Result<()> {
     leave_own_console(&log);
     crate::goaway::install(false);
     let view_args = a.view_args.map(|s| s.split_whitespace().map(String::from).collect()).unwrap_or_default();
-    let b = backend::Backend::start(key, view_args, !a.no_lan, !a.hidden)?;
+    let b = backend::Backend::start(key, view_args, !a.no_lan, !a.hidden, a.own_node)?;
     {
         let (shown, quit) = (b.clone(), b.clone());
         tray::spawn(move || shown.set_visible(true), move || quit.quit());
