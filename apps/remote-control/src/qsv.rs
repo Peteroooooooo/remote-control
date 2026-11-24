@@ -1198,6 +1198,16 @@ impl QsvEncoder {
         (self.aligned_w, self.aligned_h)
     }
 
+    /// The highest bitrate `set_bitrate` reaches, bits/s: the rate the
+    /// encoder was made with (`init_max_kbps`). None in QP-control mode.
+    pub fn max_bitrate(&self) -> Option<u32> {
+        if self.qp_control {
+            return None;
+        }
+        let mult = self.params.mfx.brc_param_multiplier.max(1) as u32;
+        Some((self.init_max_kbps as u32).saturating_mul(mult).saturating_mul(1000))
+    }
+
     pub fn set_bitrate(&mut self, bps: u32) {
         if self.qp_control {
             return;

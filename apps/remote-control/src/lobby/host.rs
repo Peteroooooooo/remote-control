@@ -578,6 +578,17 @@ impl Renderer {
         Ok(())
     }
 
+    /// After a failed paint: a device that is gone (a driver reset or
+    /// update) is made again, with the textures. Any call can be the first to
+    /// fail then (`Map`, `CreateTexture2D`), not only `Present`.
+    fn recover(&mut self) -> Result<bool> {
+        if unsafe { self.gpu.device.GetDeviceRemovedReason() }.is_ok() {
+            return Ok(false);
+        }
+        self.recreate_after_device_lost()?;
+        Ok(true)
+    }
+
     fn resize(&mut self, width: u32, height: u32) -> Result<()> {
         if width == 0 || height == 0 || (width, height) == self.size {
             return Ok(());
@@ -931,6 +942,14 @@ impl<A: LobbyApp> ActiveHost<A> {
         let sync_interval = if in_resize { 0 } else { 1 };
         if let Err(e) = self.renderer.paint(clear, ppp, &full_output.textures_delta, &primitives, sync_interval) {
             crate::log!("lobby paint failed: {e:#}");
+            match self.renderer.recover() {
+                Ok(true) => {
+                    crate::log!("lobby: graphics device lost; made again");
+                    self.schedule_repaint(Instant::now());
+                }
+                Ok(false) => {}
+                Err(e) => crate::log!("lobby: graphics device lost, not made again: {e:#}"),
+            }
         }
 
         if repaint_delay == Duration::ZERO {

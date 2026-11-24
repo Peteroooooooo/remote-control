@@ -376,9 +376,13 @@ impl RateController {
             None => self.shown = self.shown.max(got),
         }
         // Again soon while probes get everything through or read the link
-        // higher than before, or read it well under what it was.
+        // higher than before, or read it well under what it was. Not after
+        // a shortfall our own queue may explain: that reading moved nothing,
+        // and the next one would only flood the link again (netshape 8 then
+        // 1.5 Mbps, 2026-11-25: a probe at 9.5 Mbps every 0.5 s for 4 s, and
+        // the key frames lost in it froze the picture for up to 4 s).
         let again = match before {
-            Some(l) => (full || got > 1.05 * l) && !capped || got < 0.8 * l,
+            Some(l) => (full || got > 1.05 * l) && !capped || got < 0.8 * l && !own_limited,
             None => full && !capped,
         };
         self.next_probe = Some(now + if again { PROBE_AGAIN } else { PROBE_EVERY });
@@ -1258,6 +1262,28 @@ mod tests {
         }
         assert!(answered);
         assert!(c.link().unwrap() <= link.max(0.7 * MBPS) * 1.001, "{:?} {link}", c.link());
+    }
+
+    #[test]
+    fn a_shortfall_our_queue_explains_is_not_probed_again_soon() {
+        let mut t = Instant::now();
+        let mut c = RateController::new(RateConfig::new(1.5 * MBPS, 30.0 * MBPS), t);
+        run(&mut c, &mut t, 100, 5.0, 8.0 * MBPS);
+        let step = |c: &mut RateController, t: &mut Instant| {
+            *t += Duration::from_millis(100);
+            for _ in 0..6 {
+                let bytes = (c.bitrate() / 8.0 / 60.0) as u64;
+                c.on_frame_offered(bytes);
+                c.on_frame_acked(5.0, bytes);
+            }
+            c.update(*t);
+            c.probe(*t)
+        };
+        let p = (0..200).find_map(|_| step(&mut c, &mut t)).expect("a probe");
+        c.on_probe(t, p.id, p.bps, 0.3 * p.bps, true);
+        let answered = t;
+        let next = (0..200).find_map(|_| step(&mut c, &mut t).map(|_| t)).expect("a later probe");
+        assert!(next.duration_since(answered) >= PROBE_EVERY, "{:?}", next.duration_since(answered));
     }
 
     #[test]

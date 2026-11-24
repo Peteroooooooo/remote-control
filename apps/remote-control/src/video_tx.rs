@@ -150,6 +150,11 @@ struct State {
     wire_sent: u64,
     wire_seen: u64,
     wire_bps: f64,
+    /// Probe padding bytes handed to the connection so far.
+    padding_sent: u64,
+    /// Bytes handed over (`wire_sent` + `padding_sent`) once the latest key
+    /// frame was: until that many have left our queues, it has not either.
+    key_end: Option<u64>,
     /// The probe running: its rate, until when the transport's floor
     /// follows it.
     probe_floor: Option<(f64, Instant)>,
@@ -157,6 +162,12 @@ struct State {
     /// ran (frames and padding, bits/s) and whether our own queue held some
     /// padding back.
     probe_sent: Option<(u16, f64, bool)>,
+    /// The probe whose padding is still going out, and the viewer's answer
+    /// if it came before the padding ended: the viewer answers once no
+    /// padding came for `PROBE_DONE` (video_rx), which padding held back by
+    /// our own queue can be. Such an answer waits for the probe to end.
+    probe_running: Option<u16>,
+    probe_early: Option<ProbeResult>,
 }
 
 /// A frame queued for the pacer task.
@@ -220,8 +231,12 @@ impl VideoTx {
                 wire_sent: 0,
                 wire_seen: 0,
                 wire_bps: 0.0,
+                padding_sent: 0,
+                key_end: None,
                 probe_floor: None,
                 probe_sent: None,
+                probe_running: None,
+                probe_early: None,
             }),
             encoder: Mutex::new(FrameEncoder::new()),
             sent: Mutex::new(Sent::default()),
@@ -259,6 +274,17 @@ impl VideoTx {
         } else {
             s.rc.set_max(max_bps);
         }
+    }
+
+    /// True while some of the latest key frame still waits in our own
+    /// queues: a key frame asked for now was asked for before that one could
+    /// arrive. On a 1.5 Mbps link a 140 KB key frame takes 0.75 s, the
+    /// viewer asked again every 300 ms meanwhile, and a second key frame
+    /// made the picture stand still 1.8 s (2026-11-24).
+    pub fn key_frame_queued(&self) -> bool {
+        let queued = SEND_BUFFER.saturating_sub(self.conn.datagram_send_buffer_space()) + self.pacer_bytes.load(Ordering::Relaxed);
+        let s = self.st.lock().unwrap();
+        s.key_end.is_some_and(|end| (s.wire_sent + s.padding_sent).saturating_sub(queued as u64) < end)
     }
 
     /// The rate controller's bitrate now, bits/s.
@@ -313,7 +339,7 @@ impl VideoTx {
             return 0;
         }
         let max = self.conn.max_datagram_size().unwrap_or(1200).min(MAX_DATAGRAM);
-        let (f, fec_pct, min_parity, rate_bps) = {
+        let (f, fec_pct, min_parity, rate_bps, is_key) = {
             let mut s = self.st.lock().unwrap();
             let f = s.frame;
             s.frame = s.frame.wrapping_add(1);
@@ -339,13 +365,19 @@ impl VideoTx {
             if payload.len() > 3 * budget {
                 s.sec.big.push((payload.len(), budget, is_key));
             }
-            (f, s.rc.fec_pct(), s.rc.min_parity(), s.rc.bitrate())
+            (f, s.rc.fec_pct(), s.rc.min_parity(), s.rc.bitrate(), is_key)
         };
         let packets: Vec<Bytes> =
             self.encoder.lock().unwrap().encode_frame(f, payload, max, fec_pct, min_parity).into_iter().map(Bytes::from).collect();
         let bytes: usize = packets.iter().map(Bytes::len).sum();
         self.sent.lock().unwrap().add(f, Instant::now(), packets.clone());
-        self.st.lock().unwrap().wire_sent += bytes as u64;
+        {
+            let mut s = self.st.lock().unwrap();
+            s.wire_sent += bytes as u64;
+            if is_key {
+                s.key_end = Some(s.wire_sent + s.padding_sent);
+            }
+        }
         let link_bps = net::path_congestion(&self.conn)
             .and_then(|(_, bw, _, _)| bw)
             .filter(|&bw| bw > 0)
@@ -466,21 +498,11 @@ impl VideoTx {
                     }
                 }
                 Some(&T_PROBE_RESULT) => {
-                    if let Some(r) = ProbeResult::parse(&d)
-                        && let Some((id, sent, held)) = s.probe_sent
-                        && id == r.id
-                    {
-                        s.probe_sent = None;
-                        // Both in wire bytes; the rate controller counts frame bytes.
-                        let wire = 1.0 + s.rc.fec_pct() as f64 / 100.0;
-                        let got = r.bps();
-                        crate::log!(
-                            "probe {id}: {:.1} Mbps sent, {:.1} got through{}",
-                            sent / 1e6,
-                            got / 1e6,
-                            if held { " (padding held back by our own queue)" } else { "" }
-                        );
-                        s.rc.on_probe(Instant::now(), id, sent / wire, got / wire, held);
+                    let Some(r) = ProbeResult::parse(&d) else { continue };
+                    if s.probe_sent.is_some_and(|(id, _, _)| id == r.id) {
+                        probe_answered(&mut s, r);
+                    } else if s.probe_running == Some(r.id) {
+                        s.probe_early.get_or_insert(r);
                     }
                 }
                 _ => {}
@@ -551,6 +573,8 @@ impl VideoTx {
                 let quiet = now + PROBE_TIME + PROBE_QUIET;
                 s.own_backlog_until = Some(s.own_backlog_until.map_or(quiet, |t| t.max(quiet)));
                 s.probe_sent = None;
+                s.probe_running = Some(p.id);
+                s.probe_early = None;
                 tokio::spawn(self.clone().send_probe(p.id, pad, max, max_queue));
             }
             let floor = match s.probe_floor {
@@ -603,6 +627,7 @@ impl VideoTx {
                     return;
                 }
                 sent += len;
+                self.st.lock().unwrap().padding_sent += len as u64;
                 if first.is_none() {
                     first = Some((Instant::now(), wire_now(sent)));
                 }
@@ -615,13 +640,41 @@ impl VideoTx {
             (Some((t0, b0)), Some((t1, b1))) if t1 > t0 => (b1 - b0) as f64 * 8.0 / (t1 - t0).as_secs_f64(),
             _ => (wire_now(sent) - wire0) as f64 * 8.0 / start.elapsed().as_secs_f64().max(1e-3),
         };
-        self.st.lock().unwrap().probe_sent = Some((id, bps, held));
+        let mut s = self.st.lock().unwrap();
+        if s.probe_running != Some(id) {
+            // A newer probe started meanwhile.
+            return;
+        }
+        s.probe_running = None;
+        s.probe_sent = Some((id, bps, held));
+        if let Some(r) = s.probe_early.take() {
+            probe_answered(&mut s, r);
+        }
     }
+}
+
+/// The viewer answered the probe in `s.probe_sent` with `r`.
+fn probe_answered(s: &mut State, r: ProbeResult) {
+    let Some((id, sent, held)) = s.probe_sent.take() else { return };
+    // Both in wire bytes; the rate controller counts frame bytes.
+    let wire = 1.0 + s.rc.fec_pct() as f64 / 100.0;
+    let got = r.bps();
+    crate::log!(
+        "probe {id}: {:.1} Mbps sent, {:.1} got through{}",
+        sent / 1e6,
+        got / 1e6,
+        if held { " (padding held back by our own queue)" } else { "" }
+    );
+    s.rc.on_probe(Instant::now(), id, sent / wire, got / wire, held);
 }
 
 /// Estimates the wire datagram bytes (payload + FEC parity + shard headers)
 /// emitted for a frame of `payload` bytes. Monotonically non-decreasing in
-/// both `payload` and `fec_pct`.
+/// both `payload` and `fec_pct`. Parity counts as its share of the payload,
+/// under what a small frame's whole-shard parity really is; the queue limits
+/// that use it are set for this. With the exact size, frames queued longer
+/// and the picture took longer to come back after the link dropped from 8 to
+/// 1.5 Mbps (netshape, 2026-11-25).
 fn wire_frame_bytes(payload: usize, fec_pct: u32, max_datagram: usize, min_parity: u16) -> usize {
     let max_payload = (max_datagram.saturating_sub(SHARD_HDR) & !1).max(2);
     let data_shards = payload.div_ceil(max_payload).max(1);

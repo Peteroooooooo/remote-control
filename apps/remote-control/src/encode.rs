@@ -416,6 +416,15 @@ impl Encoder {
         }
     }
 
+    /// The highest bitrate `set_bitrate` can give this encoder, if it has one
+    /// (QSV: the rate it was made with). None: any.
+    pub fn max_bitrate(&self) -> Option<u32> {
+        match &self.backend {
+            Backend::Qsv(q) => q.max_bitrate(),
+            Backend::Mf(_) => None,
+        }
+    }
+
     /// Preferred NV12 input dimensions (16-aligned for QSV zero-copy, `None` for MF).
     pub fn preferred_input_size(&self) -> Option<(u32, u32)> {
         match &self.backend {

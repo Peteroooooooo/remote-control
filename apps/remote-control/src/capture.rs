@@ -47,6 +47,8 @@ enum Source {
 pub struct Capture {
     src: Source,
     image: Option<ID3D11Texture2D>,
+    /// `image` holds a grabbed image.
+    grabbed: bool,
     pub width: u32,
     pub height: u32,
     /// Degrees clockwise the image must be turned to look like the display:
@@ -91,6 +93,7 @@ impl Capture {
             Ok(Capture {
                 src: Source::Dxgi(dupl),
                 image: None,
+                grabbed: false,
                 width: w,
                 height: h,
                 rotation: crate::monitors::rotation_degrees(dd.Rotation),
@@ -103,14 +106,14 @@ impl Capture {
         let monitor = unsafe { output.GetDesc()? }.Monitor;
         let w = Wgc::start(gpu, monitor)?;
         let (width, height) = (w.width, w.height);
-        Ok(Capture { src: Source::Wgc(w), image: None, width, height, rotation: 0 })
+        Ok(Capture { src: Source::Wgc(w), image: None, grabbed: false, width, height, rotation: 0 })
     }
 
     /// WGC in an agent running as the console user (for the service's helper).
     pub fn agent(gpu: &Gpu, output: &IDXGIOutput1) -> Result<Capture> {
         let a = Agent::start(gpu, &device_name(output)?)?;
         let (width, height) = (a.width, a.height);
-        Ok(Capture { src: Source::Agent(a), image: None, width, height, rotation: 0 })
+        Ok(Capture { src: Source::Agent(a), image: None, grabbed: false, width, height, rotation: 0 })
     }
 
     /// Staging BGRA texture holding the last grabbed frame, allocated on first use.
@@ -157,16 +160,36 @@ impl Capture {
         }
     }
 
+    /// For a new picture from this capture: a still screen brings no new
+    /// image, so the last one is used again. With `wgc::Agent` straight from
+    /// its slot (`on_slot`, as in `grab_agent_with`), else it is still in
+    /// `image`. False if there is none (a new one comes with the next update).
+    pub fn again(&self, on_slot: impl FnOnce(usize)) -> bool {
+        match &self.src {
+            Source::Agent(a) => a.again_with(on_slot),
+            _ => false,
+        }
+    }
+
+    /// `image` holds the last grabbed image (see `again`).
+    pub fn has_image(&self) -> bool {
+        self.grabbed
+    }
+
     pub fn grab(&mut self, gpu: &Gpu, timeout_ms: u32) -> Result<Grab> {
         if self.image.is_none() {
             self.image = Some(bgra_texture(gpu, self.width, self.height, 0)?);
         }
         let image = self.image.as_ref().expect("created above");
-        match &self.src {
+        let g = match &self.src {
             Source::Dxgi(dupl) => grab_dxgi(dupl, image, gpu, timeout_ms),
             Source::Wgc(w) => w.grab(gpu, image, timeout_ms),
             Source::Agent(a) => a.grab(gpu, image, timeout_ms),
+        };
+        if matches!(g, Ok(Grab::New { .. })) {
+            self.grabbed = true;
         }
+        g
     }
 }
 

@@ -352,6 +352,7 @@ pub async fn run(
     // first and last datagram's arrival and the count at each.
     let mut total = 0u64;
     let mut probe: Option<(u16, Instant, u64, Instant, u64)> = None;
+    let mut probe_again: Option<ProbeResult> = None;
     loop {
         tokio::select! {
             d = conn.read_datagram() => {
@@ -370,7 +371,7 @@ pub async fn run(
                         Some(p) if p.0 == id => (p.3, p.4) = (now, total),
                         _ => {
                             if let Some(p) = probe.take() {
-                                send_probe_result(&conn, p);
+                                probe_again = send_probe_result(&conn, p);
                             }
                             probe = Some((id, now, total, now, total));
                         }
@@ -473,8 +474,11 @@ pub async fn run(
                 if r.shards_expected > 0 {
                     let _ = conn.send_datagram(r.encode().into());
                 }
+                if let Some(r) = probe_again.take() {
+                    let _ = conn.send_datagram(bytes::Bytes::copy_from_slice(&r.encode()));
+                }
                 if let Some(p) = probe.take_if(|p| now.duration_since(p.3) >= PROBE_DONE) {
-                    send_probe_result(&conn, p);
+                    probe_again = send_probe_result(&conn, p);
                 }
                 let mut k = counters.lock().unwrap();
                 k.key_requests += ro.key_requests - prev_key_requests;
@@ -493,11 +497,13 @@ pub async fn run(
 /// Tells the host what arrived while its probe did (`rc_stream::rate`):
 /// the bytes after the probe's first datagram up to its last, and the time
 /// between them. `p`: number, first arrival and byte count, last ones.
-fn send_probe_result(conn: &Connection, p: (u16, Instant, u64, Instant, u64)) {
+/// Returns the answer, to be sent once more a report interval later: it is
+/// one datagram, and the host stops probing after three go unanswered.
+fn send_probe_result(conn: &Connection, p: (u16, Instant, u64, Instant, u64)) -> Option<ProbeResult> {
     let (id, first, first_total, last, last_total) = p;
     let span = last.duration_since(first);
     if span.is_zero() {
-        return;
+        return None;
     }
     let r = ProbeResult {
         id,
@@ -505,6 +511,7 @@ fn send_probe_result(conn: &Connection, p: (u16, Instant, u64, Instant, u64)) {
         span_us: span.as_micros().min(u32::MAX as u128) as u32,
     };
     let _ = conn.send_datagram(bytes::Bytes::copy_from_slice(&r.encode()));
+    Some(r)
 }
 
 #[cfg(test)]

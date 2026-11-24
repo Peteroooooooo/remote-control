@@ -5,7 +5,8 @@
 //! its slot, and a newer update replaces it while it waits.
 //!
 //! The picture's size, frame rate and highest bitrate follow the viewer's
-//! choice (`proto::Quality`); a new choice rebuilds the capture and encoder.
+//! choice (`proto::Quality`); a new choice rebuilds the encoder, and goes on
+//! with the same capture (see `Next`).
 //!
 //! After the screen changes, the same picture keeps being encoded at the
 //! frame rate for a while (`REFINE`): on a slow link the frames of a moving
@@ -576,6 +577,18 @@ fn new_encoder(
     Ok(e)
 }
 
+/// Why the stream of one picture ended.
+enum Next {
+    /// Another picture (size, frame rate, 4:4:4, encoder) from the same
+    /// capture: a new capture would cost 0.4 s more (0.48 s from the viewer's
+    /// choice to the new picture with the service's agent, 2026-11-24), most
+    /// of it the agent starting again and the graphics device being made.
+    Picture,
+    /// The capture is opened again: a desktop switch, another display, WGC
+    /// failed, the image was lost.
+    Capture,
+}
+
 fn run_once(
     cfg: PipeConfig,
     tx: &VideoTx,
@@ -591,6 +604,27 @@ fn run_once(
     *sh.display.lock().unwrap() = rect;
     let _ = info.send(crate::monitors::message(&sh.monitors));
     let mut cap = open_capture(&gpu, &output, desktop.as_deref(), &mut quirks.wgc_after)?;
+    while !sh.stop.load(Ordering::Relaxed) {
+        if let Next::Capture = stream(cfg, tx, sh, info, quirks, auto, &gpu, &mut cap, desktop.as_deref())? {
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// Streams one picture from `cap` until something asks for another one.
+#[allow(clippy::too_many_arguments)]
+fn stream(
+    cfg: PipeConfig,
+    tx: &VideoTx,
+    sh: &PipeShared,
+    info: &UnboundedSender<Msg>,
+    quirks: &mut RateQuirks,
+    auto: &mut AutoSize,
+    gpu: &Gpu,
+    cap: &mut Capture,
+    desktop: Option<&str>,
+) -> Result<Next> {
     let (cw, ch) = cap.upright_size();
     let quality = {
         let g = sh.quality.lock().unwrap();
@@ -604,16 +638,16 @@ fn run_once(
     let ((w, h), fps) = auto.pick(quality, full, full_fps);
     tx.configure(fps, max_bps as f64);
     // The shader that makes the 4:4:4 picture does not turn it.
-    let mut can444 = cfg.viewer444 && !quirks.no_hevc && !quirks.no_444 && cap.rotation == 0 && can_encode_444(&gpu);
+    let mut can444 = cfg.viewer444 && !quirks.no_hevc && !quirks.no_444 && cap.rotation == 0 && can_encode_444(gpu);
     let yuv444 = can444 && quality.yuv444;
     // Mid-session (another picture) at the rate the link carries, not the
     // highest: the encoder's first frame is a key frame.
     let start_bps = (tx.bitrate() as u32).clamp(1_000_000, max_bps);
-    let mut enc = match new_encoder(&gpu, w, h, fps, &cfg, quirks, start_bps, yuv444) {
+    let mut enc = match new_encoder(gpu, w, h, fps, &cfg, quirks, start_bps, yuv444) {
         Err(e) if yuv444 => {
             log!("4:4:4 encoder: {e:#}; 4:2:0 from now on");
             quirks.no_444 = true;
-            return Ok(());
+            return Ok(Next::Picture);
         }
         r => r?,
     };
@@ -622,18 +656,18 @@ fn run_once(
         can444 = false;
     }
     let (pic_w, pic_h) = if yuv444 { (w, h) } else { enc.preferred_input_size().unwrap_or((w, h)) };
-    let pic = yuv_texture(&gpu, pic_w, pic_h, yuv444)?;
+    let pic = yuv_texture(gpu, pic_w, pic_h, yuv444)?;
     let conv = if yuv444 {
-        let ayuv_res = crate::yuv444::ToAyuv::shader(&gpu, (w, h)).and_then(|shader| {
+        let ayuv_res = crate::yuv444::ToAyuv::shader(gpu, (w, h)).and_then(|shader| {
             if let Some(ring) = cap.agent_ring() {
                 let views = ring
                     .iter()
-                    .map(|t| shader.make_views(&gpu, t, &pic))
+                    .map(|t| shader.make_views(gpu, t, &pic))
                     .collect::<Result<Vec<_>>>()?;
                 Ok(Convert::AyuvAgent(shader, views))
             } else {
-                let img = cap.image(&gpu)?;
-                let views = shader.make_views(&gpu, img, &pic)?;
+                let img = cap.image(gpu)?;
+                let views = shader.make_views(gpu, img, &pic)?;
                 Ok(Convert::Ayuv(shader, views))
             }
         });
@@ -642,20 +676,20 @@ fn run_once(
             Err(e) => {
                 log!("4:4:4: {e:#}; 4:2:0 from now on");
                 quirks.no_444 = true;
-                return Ok(());
+                return Ok(Next::Picture);
             }
         }
     } else if cap.rotation == 0 {
-        let nv12_res = crate::nv12::ToNv12::new(&gpu, (w, h)).and_then(|shader| {
+        let nv12_res = crate::nv12::ToNv12::new(gpu, (w, h)).and_then(|shader| {
             if let Some(ring) = cap.agent_ring() {
                 let views = ring
                     .iter()
-                    .map(|t| shader.make_views(&gpu, t, &pic))
+                    .map(|t| shader.make_views(gpu, t, &pic))
                     .collect::<Result<Vec<_>>>()?;
                 Ok(Convert::Nv12Agent(shader, views))
             } else {
-                let img = cap.image(&gpu)?;
-                let views = shader.make_views(&gpu, img, &pic)?;
+                let img = cap.image(gpu)?;
+                let views = shader.make_views(gpu, img, &pic)?;
                 Ok(Convert::Nv12(shader, views))
             }
         });
@@ -663,18 +697,18 @@ fn run_once(
             Ok(c) => c,
             Err(e) => {
                 log!("nv12 shader: {e:#}; falling back to VideoProcessor");
-                let vp = Vp::new(&gpu, (cap.width, cap.height), (w, h), vp::RGB_FULL, vp::YUV_709)?;
-                let img = cap.image(&gpu)?;
+                let vp = Vp::new(gpu, (cap.width, cap.height), (w, h), vp::RGB_FULL, vp::YUV_709)?;
+                let img = cap.image(gpu)?;
                 let views = vp.make_views(img, 0, &pic)?;
                 Convert::Vp(vp, views)
             }
         }
     } else {
-        let vp = Vp::new(&gpu, (cap.width, cap.height), (w, h), vp::RGB_FULL, vp::YUV_709)?;
+        let vp = Vp::new(gpu, (cap.width, cap.height), (w, h), vp::RGB_FULL, vp::YUV_709)?;
         if !vp.rotate(cap.rotation) {
             log!("this video processor cannot rotate: the {}° display is sent sideways", cap.rotation);
         }
-        let img = cap.image(&gpu)?;
+        let img = cap.image(gpu)?;
         let views = vp.make_views(img, 0, &pic)?;
         Convert::Vp(vp, views)
     };
@@ -697,16 +731,26 @@ fn run_once(
     let _ = info.send(info_msg(&enc, can444));
     if let Some(name) = desktop {
         log!("capturing desktop {name}");
-        let _ = info.send(Msg::Desktop { name });
+        let _ = info.send(Msg::Desktop { name: name.to_string() });
     }
     sh.want_key.store(true, Ordering::Relaxed);
 
     let freq = qpc_freq();
     let pace = Pace::new(fps, refresh);
     let full = RECT { left: 0, top: 0, right: w as i32, bottom: h as i32 };
-    let mut pending: Option<i64> = None;
-    let mut have_image = false;
-    let mut pic_dirty = false;
+    // A capture that goes on from the last picture brings no new image while
+    // the screen is still: start from the last one.
+    let again = match &conv {
+        Convert::Nv12Agent(shader, views) => cap.again(|slot| shader.run(gpu, &views[slot])),
+        Convert::AyuvAgent(shader, views) => cap.again(|slot| shader.run_views(gpu, &views[slot])),
+        _ => cap.has_image(),
+    };
+    if again {
+        log!("the new picture starts from the last image");
+    }
+    let mut pending: Option<i64> = again.then(qpc);
+    let mut have_image = again;
+    let mut pic_dirty = again;
     // Encoding the still picture again until then (see the module notes),
     // and how many nearly empty frames came out of that in a row.
     let mut refine_until: Option<Instant> = None;
@@ -729,17 +773,17 @@ fn run_once(
     while !sh.stop.load(Ordering::Relaxed) {
         if sh.quality_changed.load(Ordering::Acquire) {
             log!("the viewer chose another picture");
-            return Ok(());
+            return Ok(Next::Picture);
         }
         if frames > 0 && auto.step(tx.bitrate(), max_bps as f64, Instant::now()) {
-            return Ok(());
+            return Ok(Next::Picture);
         }
         // Service mode: do not count on the duplication to report a desktop
         // switch (the Winlogon desktop is often still); look every 200 ms.
         if desktop_checked.elapsed() >= Duration::from_millis(200) {
             desktop_checked = Instant::now();
             if crate::desktop::switched() || crate::monitors::should_reopen(&sh.monitors) {
-                return Ok(());
+                return Ok(Next::Capture);
             }
         }
         if tx.is_paused() {
@@ -761,22 +805,22 @@ fn run_once(
         let wait_ms = wait.as_micros().div_ceil(1000) as u32;
         let grab_res = match &conv {
             Convert::Nv12Agent(shader, views) => cap
-                .grab_agent_with(wait_ms, |slot| shader.run(&gpu, &views[slot]))
+                .grab_agent_with(wait_ms, |slot| shader.run(gpu, &views[slot]))
                 .expect("Nv12Agent is only constructed for Agent capture"),
             Convert::AyuvAgent(shader, views) => cap
-                .grab_agent_with(wait_ms, |slot| shader.run_views(&gpu, &views[slot]))
+                .grab_agent_with(wait_ms, |slot| shader.run_views(gpu, &views[slot]))
                 .expect("AyuvAgent is only constructed for Agent capture"),
-            _ => cap.grab(&gpu, wait_ms),
+            _ => cap.grab(gpu, wait_ms),
         };
         let grab = match grab_res {
             Ok(g) => g,
             // Leaving Winlogon ends its duplication with DXGI_ERROR_INVALID_CALL
             // (test laptop 2026-11-08): rebuild now rather than after the error pause.
-            Err(_) if crate::desktop::switched() => return Ok(()),
+            Err(_) if crate::desktop::switched() => return Ok(Next::Capture),
             Err(e) if cap.is_wgc() => {
                 log!("WGC: {e:#}; DXGI duplication for at least {} s", WGC_RETRY.as_secs());
                 quirks.wgc_after = Some(Instant::now() + WGC_RETRY);
-                return Ok(());
+                return Ok(Next::Capture);
             }
             Err(e) => return Err(e),
         };
@@ -789,7 +833,11 @@ fn run_once(
                 refining = false;
             }
             Grab::Timeout => {}
-            Grab::Lost => return Ok(()),
+            Grab::Lost => return Ok(Next::Capture),
+        }
+        if sh.want_key.load(Ordering::Relaxed) && tx.key_frame_queued() {
+            sh.want_key.store(false, Ordering::Relaxed);
+            log!("a key frame was asked for while the last one is still on its way: not sending another");
         }
         if pending.is_none() && have_image && sh.want_key.load(Ordering::Relaxed) {
             // A key frame was asked for while the screen is still: send the last image again.
@@ -835,8 +883,28 @@ fn run_once(
             if quirks.dies {
                 // A new encoder starts with a key frame, like a change on an
                 // encoder that rekeys anyway.
-                enc = new_encoder(&gpu, w, h, fps, &cfg, quirks, rate, yuv444)?;
+                enc = new_encoder(gpu, w, h, fps, &cfg, quirks, rate, yuv444)?;
                 no_output_since = None;
+            } else if let Some(top) =
+                enc.max_bitrate().filter(|&top| !shrunk && rate > top && should_change(top, rate, last_change.elapsed(), true))
+            {
+                // QSV goes no higher than the rate it was made with, and one
+                // made mid-session starts at the link's rate then (see above):
+                // once the link carries more, only a new encoder can follow.
+                // It starts with a key frame, so only for a clearly higher
+                // rate. Room for twice the rate, so a climbing rate needs few of them.
+                let room = (rate as u64 * 2).min(max_bps as u64) as u32;
+                log!("encoder tops out at {:.1} Mbps, the rate is {:.1}: new encoder for up to {:.1}", top as f64 / 1e6, rate as f64 / 1e6, room as f64 / 1e6);
+                enc = new_encoder(gpu, w, h, fps, &cfg, quirks, room, yuv444)?;
+                if room > rate {
+                    enc.set_bitrate(rate);
+                }
+                no_output_since = None;
+                changed_at = None;
+                rate_cooldown_until = None;
+                if !yuv444 && enc.preferred_input_size().unwrap_or((w, h)) != (pic_w, pic_h) {
+                    return Ok(Next::Picture);
+                }
             } else {
                 let prev = enc.bitrate;
                 enc.set_bitrate(rate);
@@ -859,7 +927,7 @@ fn run_once(
         match &conv {
             Convert::Nv12Agent(_, _) | Convert::AyuvAgent(_, _) => pic_dirty = false,
             Convert::Nv12(s, views) if pic_dirty => {
-                s.run(&gpu, views);
+                s.run(gpu, views);
                 pic_dirty = false;
             }
             Convert::Vp(v, views) if pic_dirty => {
@@ -867,7 +935,7 @@ fn run_once(
                 pic_dirty = false;
             }
             Convert::Ayuv(a, views) if pic_dirty => {
-                a.run_views(&gpu, views);
+                a.run_views(gpu, views);
                 pic_dirty = false;
             }
             Convert::Nv12(_, _) | Convert::Vp(_, _) | Convert::Ayuv(_, _) => {}
@@ -885,7 +953,7 @@ fn run_once(
             Err(err) if enc.yuv444 => {
                 log!("4:4:4 encoder failed ({err:#}); 4:2:0 from now on");
                 quirks.no_444 = true;
-                return Ok(());
+                return Ok(Next::Picture);
             }
             Err(err) if enc.format == Codec::Hevc => {
                 log!("HEVC encoder failed ({err:#}); using H.264 from now on");
@@ -895,12 +963,12 @@ fn run_once(
                 no_output_since = None;
                 let prev_bitrate = enc.bitrate;
                 let init_bitrate = if quirks.dies { prev_bitrate } else { max_bps };
-                enc = new_encoder(&gpu, w, h, fps, &cfg, quirks, init_bitrate, false)?;
+                enc = new_encoder(gpu, w, h, fps, &cfg, quirks, init_bitrate, false)?;
                 if !quirks.dies && prev_bitrate < max_bps {
                     enc.set_bitrate(prev_bitrate);
                 }
                 if enc.preferred_input_size().unwrap_or((w, h)) != (pic_w, pic_h) {
-                    return Ok(());
+                    return Ok(Next::Picture);
                 }
                 let _ = info.send(info_msg(&enc, false));
                 pending = Some(shown_at);
@@ -914,9 +982,9 @@ fn run_once(
                 no_output_since = None;
                 tried = true;
                 let prev_bitrate = enc.bitrate;
-                enc = new_encoder(&gpu, w, h, fps, &cfg, quirks, prev_bitrate, yuv444)?;
+                enc = new_encoder(gpu, w, h, fps, &cfg, quirks, prev_bitrate, yuv444)?;
                 if !yuv444 && enc.preferred_input_size().unwrap_or((w, h)) != (pic_w, pic_h) {
-                    return Ok(());
+                    return Ok(Next::Picture);
                 }
                 last_change = Instant::now();
                 pending = Some(shown_at);
@@ -966,7 +1034,7 @@ fn run_once(
             crate::trace::value(f, "bytes", payload.len() as i64);
         }
     }
-    Ok(())
+    Ok(Next::Capture)
 }
 
 fn log_refined(r: &(u32, usize, Instant), why: &str) {

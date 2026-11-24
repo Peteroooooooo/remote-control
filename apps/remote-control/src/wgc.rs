@@ -336,6 +336,8 @@ pub struct Agent {
     _exec: term_proc::Exec,
     rx: mpsc::Receiver<Msg>,
     ring: Vec<(ID3D11Texture2D, IDXGIKeyedMutex)>,
+    /// The slot consumed last (see `again_with`).
+    last: std::cell::Cell<Option<usize>>,
     pub width: u32,
     pub height: u32,
 }
@@ -387,7 +389,7 @@ impl Agent {
             ring.push((tex, km));
         }
         log!("capture agent ready in {} ms", t0.elapsed().as_millis());
-        Ok(Agent { _exec: exec, rx, ring, width, height })
+        Ok(Agent { _exec: exec, rx, ring, last: std::cell::Cell::new(None), width, height })
     }
 
     /// Returns the shared ring textures opened on the helper's D3D11 device so
@@ -420,12 +422,30 @@ impl Agent {
             if n + 1 == frames.len() {
                 on_slot(slot);
                 got = Grab::New { present_qpc: m.a as i64 };
+                self.last.set(Some(slot));
             }
             unsafe {
                 let _ = km.ReleaseSync(0);
             }
         }
         Ok(got)
+    }
+
+    /// Invokes `on_slot` again with the slot `grab_with` consumed last, if
+    /// the agent has not taken it back since (then a newer frame is on its
+    /// way). The agent only writes to a slot it holds with key 0, so holding
+    /// it with key 0 here keeps the image as it is.
+    pub fn again_with(&self, on_slot: impl FnOnce(usize)) -> bool {
+        let Some(slot) = self.last.get() else { return false };
+        let Some((_, km)) = self.ring.get(slot) else { return false };
+        if !acquire(km, 0, 0) {
+            return false;
+        }
+        on_slot(slot);
+        unsafe {
+            let _ = km.ReleaseSync(0);
+        }
+        true
     }
 
     /// Waits up to `timeout_ms` for frames and copies the newest into
