@@ -109,7 +109,7 @@ See [apps/rc-relay/README.en.md](apps/rc-relay/README.en.md) for custom domains,
 
 ### 5. Command-Line Setup & Batch Deployment
 
-`remote-control set` mirrors the Settings page, for `.bat` files and deployment tools:
+`remote-control set` changes the Settings page's options, for `.bat` files and deployment tools:
 
 ```powershell
 remote-control set relay rcr1… public off host-only on   # Join a private relay, turn off public assist, host only
@@ -119,4 +119,4 @@ remote-control install-service                           # Install the backgroun
 - Every PC can use the same relay code; the relay lists each one separately. Add `name Finance-01` when computer names are hard to tell apart.
 - Only the settings given change; a running lobby or service applies them at once. If any value is wrong, nothing changes and the exit code is non-zero.
 - Settings belong to the Windows user who runs the command, so run it as the user who uses the PC.
-- See `remote-control set --help` for every setting. **Host Only** hides pasting codes, Control, Terminal and AI Integration, and can be turned off in Settings.
+- See `remote-control set --help` for every setting. **Host Only** hides pasting codes, Control, Terminal and AI Integration. It is set from the command line only, not in Settings; turn it off with `remote-control set host-only off`.

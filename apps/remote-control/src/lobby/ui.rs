@@ -2285,18 +2285,6 @@ impl App {
                             });
                         });
                 });
-            let mut host_only = snap.host_only;
-            let host_only_title = tr("只被控", "Host Only");
-            Item::new(Lead::Icon(ic::DESKTOP), host_only_title)
-                .desc(tr(
-                    "隐藏控制别人的入口：粘贴连接码、控制、终端、AI 集成",
-                    "Hide the ways of controlling others: pasting codes, Control, Terminal, AI Integration",
-                ))
-                .show(ui, |ui| {
-                    if switch(ui, &mut host_only, true, host_only_title).changed() {
-                        b.act(&format!("set\thost-only\t{}", host_only as u8));
-                    }
-                });
         });
         if self.scroll_to_settings == Some(SettingsTarget::SelfName) {
             self.scroll_to_settings = None;
