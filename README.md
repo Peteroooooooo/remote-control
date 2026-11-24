@@ -131,6 +131,7 @@ volumes:
 
 ```powershell
 remote-control set relay rcr1… public off host-only on   # 加入自建中转、关闭公网辅助、只被控
+remote-control set relay rcr1A… relay rcr1B…             # 两个中转：平时走 A，A 连不上时自动切到 B
 remote-control install-service                           # 安装后台服务（需管理员）
 ```
 

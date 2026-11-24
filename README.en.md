@@ -131,6 +131,7 @@ See [apps/rc-relay/README.en.md](apps/rc-relay/README.en.md) for custom domains,
 
 ```powershell
 remote-control set relay rcr1… public off host-only on   # Join a private relay, turn off public assist, host only
+remote-control set relay rcr1A… relay rcr1B…             # Two relays: A normally, B when A cannot be reached
 remote-control install-service                           # Install the background service (admin)
 ```
 
