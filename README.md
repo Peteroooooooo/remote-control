@@ -83,6 +83,22 @@ remote-control exec laptop --cwd D:\proj "git status"
 remote-control cp .\report.pdf laptop:Desktop   # 上传文件或文件夹（参数对调即为下载）
 ```
 
+全部命令（`remote-control <命令> --help` 查看各自的参数）：
+
+| 命令 | 作用 |
+|---|---|
+| `remote-control` | 打开大厅窗口（不带命令时） |
+| `devices` | 列出设备及在线状态 |
+| `shell <设备>` | 进入远程交互式 PowerShell |
+| `exec <设备> "<命令>"` | 在远程执行一条命令并返回结果 |
+| `cp <源> <目标>` | 传文件或文件夹，远程一侧写成 `设备:路径` |
+| `set <设置> <值> …` | 改设置，见[第 5 节](#5-命令行配置与批量部署) |
+| `install-service` / `uninstall-service` | 安装 / 卸载后台服务（需管理员） |
+| `service-status` | 查看后台服务是否在运行 |
+| `update` | 检查并安装新版本 |
+| `id` | 显示本机设备 ID |
+| `host` | 不开窗口，只在后台保持在线、等待被连 |
+
 ### 4. 部署私有中转（可选）
 
 ```yaml
@@ -115,6 +131,18 @@ volumes:
 remote-control set relay rcr1… public off host-only on   # 加入自建中转、关闭公网辅助、只被控
 remote-control install-service                           # 安装后台服务（需管理员）
 ```
+
+| 设置 | 值 | 对应界面里的 |
+|---|---|---|
+| `relay` | 中转码 `rcr1…` | 自建中转 |
+| `public` | `on` / `off` | 公网辅助连接 |
+| `lan` | `on` / `off` | 局域网发现 |
+| `name` | 名称，写 `""` 表示用计算机名 | 设备名称 |
+| `language` | `auto` / `zh` / `en` | 语言 |
+| `boot` | `on` / `off` | 开机自启（需后台服务） |
+| `lock` | `on` / `off` | 允许锁屏控制（需后台服务） |
+| `awake` | `on` / `off` | 接通电源时阻止睡眠（需后台服务） |
+| `host-only` | `on` / `off` | 只被控（界面里没有，只能用命令改） |
 
 - 所有机器用同一个中转码即可，中转面板里每台单独列出；电脑名不好认时加 `name 财务-01`。
 - 只改写出的项，其余不变；软件开着时立即生效。任何一项写错都不做改动并返回非 0 退出码。

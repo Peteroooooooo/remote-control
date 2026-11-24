@@ -83,6 +83,22 @@ remote-control exec laptop --cwd D:\proj "git status"
 remote-control cp .\report.pdf laptop:Desktop   # Upload file/folder (reverse args to download)
 ```
 
+All commands (`remote-control <command> --help` shows each one's options):
+
+| Command | What it does |
+|---|---|
+| `remote-control` | Open the lobby window (no command) |
+| `devices` | List devices and whether they are online |
+| `shell <device>` | Interactive remote PowerShell |
+| `exec <device> "<command>"` | Run one command remotely and return its output |
+| `cp <from> <to>` | Copy files or folders; write the remote side as `device:path` |
+| `set <setting> <value> …` | Change settings, see [section 5](#5-command-line-setup--batch-deployment) |
+| `install-service` / `uninstall-service` | Install / remove the background service (admin) |
+| `service-status` | Show whether the background service is running |
+| `update` | Check for and install a new version |
+| `id` | Show this device's ID |
+| `host` | Stay online without the window, waiting to be connected to |
+
 ### 4. Deploy a Private Relay (Optional)
 
 ```yaml
@@ -115,6 +131,18 @@ See [apps/rc-relay/README.en.md](apps/rc-relay/README.en.md) for custom domains,
 remote-control set relay rcr1… public off host-only on   # Join a private relay, turn off public assist, host only
 remote-control install-service                           # Install the background service (admin)
 ```
+
+| Setting | Value | In the window |
+|---|---|---|
+| `relay` | relay code `rcr1…` | Private Relays |
+| `public` | `on` / `off` | Public Relay Assist |
+| `lan` | `on` / `off` | LAN Discovery |
+| `name` | a name; `""` for the computer name | Device Name |
+| `language` | `auto` / `zh` / `en` | Language |
+| `boot` | `on` / `off` | Start with Windows (background service) |
+| `lock` | `on` / `off` | Allow Lock Screen Control (background service) |
+| `awake` | `on` / `off` | Keep Awake on AC Power (background service) |
+| `host-only` | `on` / `off` | Host Only (not in the window; command line only) |
 
 - Every PC can use the same relay code; the relay lists each one separately. Add `name Finance-01` when computer names are hard to tell apart.
 - Only the settings given change; a running lobby or service applies them at once. If any value is wrong, nothing changes and the exit code is non-zero.
