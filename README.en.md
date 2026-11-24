@@ -120,3 +120,15 @@ remote-control install-service                           # Install the backgroun
 - Only the settings given change; a running lobby or service applies them at once. If any value is wrong, nothing changes and the exit code is non-zero.
 - Settings belong to the Windows user who runs the command, so run it as the user who uses the PC.
 - See `remote-control set --help` for every setting. **Host Only** hides pasting codes, Control, Terminal and AI Integration. It is set from the command line only, not in Settings; turn it off with `remote-control set host-only off`.
+
+To deploy to many PCs, put this `deploy.bat` next to `remote-control.exe` (a zip is easiest to send), fill in your relay code, and have each PC double-click `deploy.bat`:
+
+```bat
+@echo off
+"%~dp0remote-control.exe" set relay rcr1… public off host-only on
+"%~dp0remote-control.exe" install-service
+pause
+```
+
+- `%~dp0` is the folder the `.bat` is in, so it finds the exe wherever the zip is extracted.
+- The second line installs the background service (reachable on the lock and login screens and UAC prompts). It needs **Run as administrator**, from the account that normally uses the PC. Without the service, delete that line and just double-click.

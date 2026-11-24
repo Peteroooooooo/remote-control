@@ -121,6 +121,18 @@ remote-control install-service                           # 安装后台服务（
 - 配置属于运行命令的那个 Windows 用户，请在实际使用这台电脑的用户下运行。
 - 全部项目见 `remote-control set --help`。「只被控」会隐藏粘贴连接码、控制、终端和 AI 集成；它只能用命令开关，设置页里没有，关掉用 `remote-control set host-only off`。
 
+批量部署时，把下面的 `部署.bat` 和 `remote-control.exe` 放在同一个文件夹里（打成 zip 发出去最方便），改好中转码，让对方双击 `部署.bat`：
+
+```bat
+@echo off
+"%~dp0remote-control.exe" set relay rcr1… public off host-only on
+"%~dp0remote-control.exe" install-service
+pause
+```
+
+- `%~dp0` 是 `.bat` 所在的文件夹，解压到哪里都能找到 exe。
+- 第二行安装后台服务（锁屏、登录界面、UAC 弹窗时也能连），需要右键「以管理员身份运行」，且要用这台电脑平时登录的账号。不需要后台服务就删掉这一行，直接双击即可。
+
 ---
 
 Apache-2.0 许可证，见 [LICENSE](LICENSE)。社区交流：[LINUX DO](https://linux.do)。
