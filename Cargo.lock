@@ -3176,7 +3176,7 @@ dependencies = [
 
 [[package]]
 name = "netshape"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "anyhow",
  "clap",
@@ -3186,7 +3186,7 @@ dependencies = [
 
 [[package]]
 name = "nettest"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "anyhow",
  "bytes",
@@ -4341,7 +4341,7 @@ checksum = "20675572f6f24e9e76ef639bc5552774ed45f1c30e2951e1e99c59888861c539"
 
 [[package]]
 name = "rc-ident"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "blake3",
  "bs58",
@@ -4350,7 +4350,7 @@ dependencies = [
 
 [[package]]
 name = "rc-relay"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "anyhow",
  "blake3",
@@ -4380,7 +4380,7 @@ dependencies = [
 
 [[package]]
 name = "rc-stream"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "reed-solomon-simd",
 ]
@@ -4490,7 +4490,7 @@ dependencies = [
 
 [[package]]
 name = "remote-control"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "anyhow",
  "bytes",
