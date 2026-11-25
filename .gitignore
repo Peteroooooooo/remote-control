@@ -4,6 +4,8 @@ target/
 /docs/*
 !/docs/index.html
 !/docs/images/
+!/docs/home-relay.md
+!/docs/home-relay.en.md
 /scripts/
 *.csv
 *.key

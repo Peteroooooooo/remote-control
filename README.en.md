@@ -50,7 +50,7 @@
 | Firewall blocks all UDP                              | **Requires private relay** (via TCP) |
 
 - **Public Relay Assist**: Uses free public iroh nodes solely to exchange addresses for hole-punching — **never forwards screen video or input** (can be disabled in **Settings → Network & Discovery → Public Relay Assist**).
-- **Private Relay**: Forwards end-to-end encrypted traffic only when direct P2P fails. Try enabling IPv6 on your router first before deploying a relay.
+- **Private Relay**: Forwards end-to-end encrypted traffic only when direct P2P fails. Try enabling IPv6 on your router first before deploying a relay (mobile hotspots and many campus networks have IPv6; most corporate LANs do not).
 
 ---
 
@@ -123,7 +123,7 @@ volumes:
 
    ![Relay TUI](docs/images/relay-tui.png)
 
-See [apps/rc-relay/README.en.md](apps/rc-relay/README.en.md) for custom domains, TLS certificates, and advanced options.
+If you don't want to rent a cloud VPS, you can run `rc-relay` on a home Raspberry Pi, Linux SBC, or mini server (note: most corporate LANs lack IPv6 and still need a public IPv4 relay; see [Home Broadband Relay Guide](docs/home-relay.en.md) for trade-offs and setup). See [apps/rc-relay/README.en.md](apps/rc-relay/README.en.md) for custom domains, TLS certificates, and advanced options.
 
 ### 5. Command-Line Setup & Batch Deployment
 
