@@ -36,12 +36,13 @@ use windows::{
         Foundation::{CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE, S_OK, WAIT_OBJECT_0},
         Graphics::{
             Direct3D11::{
-                D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX, D3D11_RESOURCE_MISC_SHARED_NTHANDLE, ID3D11Device1,
-                ID3D11Texture2D,
+                D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX, D3D11_RESOURCE_MISC_SHARED_NTHANDLE, D3D11_TEXTURE2D_DESC,
+                ID3D11Device1, ID3D11Texture2D,
             },
             Dxgi::{
-                CreateDXGIFactory1, DXGI_SHARED_RESOURCE_READ, DXGI_SHARED_RESOURCE_WRITE, IDXGIDevice, IDXGIFactory1,
-                IDXGIKeyedMutex, IDXGIOutput1, IDXGIResource1,
+                Common::DXGI_FORMAT_R16G16B16A16_FLOAT, CreateDXGIFactory1, DXGI_SHARED_RESOURCE_READ,
+                DXGI_SHARED_RESOURCE_WRITE, IDXGIDevice, IDXGIFactory1, IDXGIKeyedMutex, IDXGIOutput1,
+                IDXGIResource1,
             },
             Gdi::HMONITOR,
         },
@@ -93,19 +94,49 @@ pub struct Wgc {
     closed_token: i64,
     pub width: u32,
     pub height: u32,
+    pub fp16: bool,
 }
 
 impl Wgc {
     /// Captures `monitor` onto `gpu`'s device. Fails where WGC cannot leave
     /// the pointer out or capture without its yellow border (Windows 10):
-    /// DXGI then.
-    pub fn start(gpu: &Gpu, monitor: HMONITOR) -> Result<Wgc> {
+    /// DXGI then. When `want_fp16` is true (HDR display), creates an FP16 scRGB
+    /// frame pool with seamless fallback to BGRA8 if unsupported.
+    pub fn start(gpu: &Gpu, monitor: HMONITOR, want_fp16: bool) -> Result<Wgc> {
         let interop = windows::core::factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>().context("WGC")?;
         let item: GraphicsCaptureItem = unsafe { interop.CreateForMonitor(monitor) }.context("CreateForMonitor")?;
         let size = item.Size()?;
         let dxgi: IDXGIDevice = gpu.device.cast()?;
         let d3d: IDirect3DDevice = unsafe { CreateDirect3D11DeviceFromDXGIDevice(&dxgi) }?.cast()?;
-        let pool = Direct3D11CaptureFramePool::CreateFreeThreaded(&d3d, DirectXPixelFormat::B8G8R8A8UIntNormalized, 2, size)?;
+        let (pool, fp16) = if want_fp16 {
+            match Direct3D11CaptureFramePool::CreateFreeThreaded(
+                &d3d,
+                DirectXPixelFormat::R16G16B16A16Float,
+                2,
+                size,
+            ) {
+                Ok(p) => (p, true),
+                Err(_) => (
+                    Direct3D11CaptureFramePool::CreateFreeThreaded(
+                        &d3d,
+                        DirectXPixelFormat::B8G8R8A8UIntNormalized,
+                        2,
+                        size,
+                    )?,
+                    false,
+                ),
+            }
+        } else {
+            (
+                Direct3D11CaptureFramePool::CreateFreeThreaded(
+                    &d3d,
+                    DirectXPixelFormat::B8G8R8A8UIntNormalized,
+                    2,
+                    size,
+                )?,
+                false,
+            )
+        };
         let session = pool.CreateCaptureSession(&item)?;
         session.SetIsCursorCaptureEnabled(false).context("leaving the pointer out")?;
         session.SetIsBorderRequired(false).context("capturing without the yellow border")?;
@@ -143,6 +174,7 @@ impl Wgc {
             closed_token,
             width: size.Width as u32,
             height: size.Height as u32,
+            fp16,
         })
     }
 
@@ -288,12 +320,17 @@ pub fn serve(device: &str) -> Result<()> {
         std::process::exit(0);
     });
     let (gpu, output) = find_output(device)?;
-    let wgc = Wgc::start(&gpu, unsafe { output.GetDesc()? }.Monitor)?;
+    let hdr_info = crate::hdr::query_display_hdr(device);
+    let wgc = Wgc::start(&gpu, unsafe { output.GetDesc()? }.Monitor, hdr_info.hdr_enabled)?;
     let mut out = std::io::stdout().lock();
     let mut ring = Vec::new();
     for slot in 0..RING {
         let misc = (D3D11_RESOURCE_MISC_SHARED_NTHANDLE.0 | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX.0) as u32;
-        let t = crate::capture::bgra_texture(&gpu, wgc.width, wgc.height, misc)?;
+        let t = if wgc.fp16 {
+            crate::capture::fp16_texture(&gpu, wgc.width, wgc.height, misc)?
+        } else {
+            crate::capture::bgra_texture(&gpu, wgc.width, wgc.height, misc)?
+        };
         let access = DXGI_SHARED_RESOURCE_READ.0 | DXGI_SHARED_RESOURCE_WRITE.0;
         let h = unsafe { t.cast::<IDXGIResource1>()?.CreateSharedHandle(None, access, PCWSTR::null())? };
         let size = wgc.width as u64 | (wgc.height as u64) << 32;
@@ -340,6 +377,7 @@ pub struct Agent {
     last: std::cell::Cell<Option<usize>>,
     pub width: u32,
     pub height: u32,
+    pub fp16: bool,
 }
 
 impl Agent {
@@ -388,8 +426,14 @@ impl Agent {
             let km = tex.cast()?;
             ring.push((tex, km));
         }
-        log!("capture agent ready in {} ms", t0.elapsed().as_millis());
-        Ok(Agent { _exec: exec, rx, ring, last: std::cell::Cell::new(None), width, height })
+        let mut fp16 = false;
+        if let Some((first_tex, _)) = ring.first() {
+            let mut desc = D3D11_TEXTURE2D_DESC::default();
+            unsafe { first_tex.GetDesc(&mut desc) };
+            fp16 = desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT;
+        }
+        log!("capture agent ready in {} ms{}", t0.elapsed().as_millis(), if fp16 { " (HDR FP16)" } else { "" });
+        Ok(Agent { _exec: exec, rx, ring, last: std::cell::Cell::new(None), width, height, fp16 })
     }
 
     /// Returns the shared ring textures opened on the helper's D3D11 device so

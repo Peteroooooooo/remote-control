@@ -232,7 +232,12 @@ async fn stream(conn: &Connection, mut send: SendStream, recv: &mut RecvStream, 
         });
     }
     let audio_paused = Arc::new(AtomicBool::new(false));
-    let audio_host = AudioHost::start(conn.clone(), tokio::runtime::Handle::current(), audio_paused.clone());
+    let audio_host = AudioHost::start(
+        conn.clone(),
+        tokio::runtime::Handle::current(),
+        audio_paused.clone(),
+        tx.audio_red_level(),
+    );
     tokio::spawn(watch_path(conn.clone(), tx.clone(), audio_paused, sh.clone(), wtx.clone()));
     tokio::spawn(watch_hint(conn.clone(), sh.clone(), wtx.clone()));
     let result = control_loop(recv, &sh, &wtx, clip.as_deref(), &audio_host).await;
@@ -368,6 +373,9 @@ async fn control_loop(
         }
         inj.release_all();
     })?;
+    let guard_epoch = Instant::now();
+    let mut input_guard = crate::input_guard::InputGuard::new();
+    let mut batch_verdict = crate::input_guard::InputVerdict::Accept;
     let result = loop {
         let msg = match read_msg(recv).await {
             Ok(m) => m,
@@ -375,20 +383,46 @@ async fn control_loop(
         };
         let display = *sh.display.lock().unwrap();
         match msg {
+            Msg::InputTick { ms } => {
+                let recv_ms = guard_epoch.elapsed().as_millis() as u64;
+                batch_verdict = input_guard.check(ms, recv_ms);
+                if matches!(batch_verdict, crate::input_guard::InputVerdict::Drop { release_all: true }) {
+                    log!("stale input (>2 s late): dropping buffered events and releasing held keys");
+                    let _ = inj_tx.send(InjectCmd::ReleaseAll { display });
+                }
+            }
             Msg::MouseMove { x, y } => {
-                let _ = inj_tx.send(InjectCmd::Move { display, x, y });
+                if matches!(batch_verdict, crate::input_guard::InputVerdict::Accept) {
+                    let _ = inj_tx.send(InjectCmd::Move { display, x, y });
+                }
             }
             Msg::MouseButton { button, down } => {
-                let _ = inj_tx.send(InjectCmd::Button { display, button, down });
+                if matches!(batch_verdict, crate::input_guard::InputVerdict::Accept) {
+                    let _ = inj_tx.send(InjectCmd::Button { display, button, down });
+                }
             }
             Msg::Wheel { delta, horizontal } => {
-                let _ = inj_tx.send(InjectCmd::Wheel { display, delta, horizontal });
+                if matches!(batch_verdict, crate::input_guard::InputVerdict::Accept) {
+                    let _ = inj_tx.send(InjectCmd::Wheel { display, delta, horizontal });
+                }
             }
             Msg::Key { scan, down } => {
-                let _ = inj_tx.send(InjectCmd::Key { display, scan, down });
+                if matches!(batch_verdict, crate::input_guard::InputVerdict::Accept) {
+                    let _ = inj_tx.send(InjectCmd::Key { display, scan, down });
+                }
             }
             Msg::ReleaseAll => {
                 let _ = inj_tx.send(InjectCmd::ReleaseAll { display });
+            }
+            Msg::Throttle { fps } => {
+                let prev = sh.throttle_fps.swap(fps, Ordering::Relaxed);
+                if prev != fps {
+                    if fps > 0 {
+                        log!("viewer minimized: throttling capture to {fps} fps (keeping encoder)");
+                    } else {
+                        log!("viewer restored: resuming full frame rate");
+                    }
+                }
             }
             Msg::RequestKeyframe => sh.want_key.store(true, Ordering::Relaxed),
             Msg::Quality(q) => {

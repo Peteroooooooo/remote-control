@@ -182,6 +182,7 @@ enum ActiveRelayMessage {
 /// which can be blocking.  So the actor may not always be processing that inbox.  Messages
 /// here are processed immediately.
 #[derive(Debug)]
+#[allow(dead_code)]
 enum ActiveRelayPrioMessage {
     /// Returns whether or not this relay can reach the EndpointId.
     HasEndpointRoute(EndpointId, oneshot::Sender<bool>),
@@ -1208,9 +1209,13 @@ impl RelayActor {
         item: RelaySendItem,
     ) -> Option<impl Future<Output = ()> + use<>> {
         let url = item.url.clone();
-        let handle = self
-            .active_relay_handle_for_endpoint(&item.url, &item.remote_endpoint)
-            .await;
+        // remote-control patch (see PATCHES.md): always send over the requested
+        // relay URL instead of redirecting through `active_relay_handle_for_endpoint`.
+        // When an endpoint already heard from a peer on one relay (e.g. a public
+        // home relay) and later opens a path or keeper on another relay (e.g. the
+        // peer's self-hosted relay), redirecting silently sends the packets over
+        // the old relay and never connects to the requested relay.
+        let handle = self.active_relay_handle(url.clone());
         match handle.datagrams_send_queue.try_send(item) {
             Ok(()) => None,
             Err(mpsc::error::TrySendError::Closed(_)) => {
@@ -1276,6 +1281,7 @@ impl RelayActor {
     /// The endpoint is expected to be reachable on `url`, but if no [`ActiveRelayActor`] for
     /// `url` exists but another existing [`ActiveRelayActor`] already knows about the endpoint,
     /// that other endpoint is used.
+    #[allow(dead_code)]
     async fn active_relay_handle_for_endpoint(
         &mut self,
         url: &RelayUrl,
@@ -2026,5 +2032,117 @@ mod tests {
             watch.get(),
             Some(RelayStatus::new(b, RelayConnectionState::Connected)),
         );
+    }
+
+    /// Regression test for remote-control patch: sending to a second relay URL
+    /// for a peer already seen on an existing active relay must actually open
+    /// and use the second relay instead of redirecting back to the first one.
+    #[tokio::test]
+    #[traced_test]
+    async fn test_send_to_second_relay_does_not_redirect() -> Result {
+        let (_map_a, url_a, _server_a) = test_utils::run_relay_server().await?;
+        let (_map_b, url_b, _server_b) = test_utils::run_relay_server().await?;
+
+        let peer_key = SecretKey::from_bytes(&[9u8; 32]);
+        let peer_id = peer_key.public();
+        let spawn_echo = |key: SecretKey, url: RelayUrl| {
+            let (recv_tx, mut recv_rx) = mpsc::channel(16);
+            let (send_tx, send_rx) = mpsc::channel(16);
+            let (prio_tx, prio_rx) = mpsc::channel(8);
+            let (inbox_tx, inbox_rx) = mpsc::channel(16);
+            let cancel = CancellationToken::new();
+            let actor = start_active_relay_actor(
+                key,
+                cancel.clone(),
+                url.clone(),
+                prio_rx,
+                inbox_rx,
+                send_rx,
+                recv_tx,
+                Arc::new(SocketMetrics::default()),
+                info_span!("echo-peer", %url),
+            );
+            AbortOnDropHandle::new(tokio::spawn(async move {
+                let _actor = actor;
+                let _cancel = cancel;
+                let _prio_tx = prio_tx;
+                let _inbox_tx = inbox_tx;
+                while let Some(msg) = recv_rx.recv().await {
+                    let _ = send_tx
+                        .send(RelaySendItem {
+                            remote_endpoint: msg.src,
+                            url: msg.url,
+                            datagrams: msg.datagrams,
+                        })
+                        .await;
+                }
+            }))
+        };
+        let _echo_a = spawn_echo(peer_key.clone(), url_a.clone());
+        let _echo_b = spawn_echo(peer_key, url_b.clone());
+
+        let (datagram_recv_tx, mut datagram_recv_rx) = mpsc::channel(16);
+        let (datagram_send_tx, datagram_send_rx) = mpsc::channel(16);
+        let (_actor_tx, actor_rx) = mpsc::channel(16);
+        let cancel_token = CancellationToken::new();
+        let config = Config {
+            my_relay: super::HomeRelayWatch::default(),
+            secret_key: SecretKey::from_bytes(&[1u8; 32]),
+            dns_resolver: DnsResolver::new(),
+            proxy_url: None,
+            ipv6_reported: Arc::new(AtomicBool::new(false)),
+            tls_config: CaTlsConfig::insecure_skip_verify()
+                .client_config(default_provider())
+                .expect("infallible"),
+            metrics: Arc::new(SocketMetrics::default()),
+            relay_map: RelayMap::empty(),
+        };
+        let relay_actor = RelayActor::new(config, datagram_recv_tx, cancel_token.clone());
+        let actor_task = tokio::spawn(async move {
+            relay_actor.run(actor_rx, datagram_send_rx).await;
+        });
+
+        // 1. Exchange via relay A so relay A records `peer_id` in `endpoints_present`.
+        send_recv_echo(
+            RelaySendItem {
+                remote_endpoint: peer_id,
+                url: url_a.clone(),
+                datagrams: Datagrams::from(b"via-a"),
+            },
+            &datagram_send_tx,
+            &mut datagram_recv_rx,
+        )
+        .await?;
+
+        // 2. Now send explicitly to relay B for the same peer. Must arrive via relay B, not A.
+        let recv_b = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                datagram_send_tx
+                    .send(RelaySendItem {
+                        remote_endpoint: peer_id,
+                        url: url_b.clone(),
+                        datagrams: Datagrams::from(b"via-b"),
+                    })
+                    .await
+                    .expect("actor alive");
+                if let Ok(Some(msg)) =
+                    tokio::time::timeout(Duration::from_millis(200), datagram_recv_rx.recv()).await
+                {
+                    return msg;
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for echo via relay B");
+
+        assert_eq!(
+            recv_b.url, url_b,
+            "datagram targeting relay B was redirected to another relay"
+        );
+        assert_eq!(recv_b.datagrams.contents.as_ref(), b"via-b");
+
+        cancel_token.cancel();
+        actor_task.await.std_context("relay actor shutdown")?;
+        Ok(())
     }
 }

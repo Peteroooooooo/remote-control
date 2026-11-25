@@ -6,19 +6,19 @@ use std::{
     io::{BufRead, BufReader, Read, Write},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU8, Ordering},
     },
     thread::JoinHandle,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::Result;
 use bytes::Bytes;
 use iroh::endpoint::{Connection, SendStream};
-use rc_stream::wire::T_AUDIO;
 
 use super::{
     codec::{CODEC_OPUS, CODEC_PCM24},
+    red::RedEncoder,
     wasapi::{CaptureLoop, CaptureState},
 };
 use crate::{
@@ -98,7 +98,12 @@ pub struct AudioHost {
 }
 
 impl AudioHost {
-    pub fn start(conn: Connection, rt: tokio::runtime::Handle, paused: Arc<AtomicBool>) -> Self {
+    pub fn start(
+        conn: Connection,
+        rt: tokio::runtime::Handle,
+        paused: Arc<AtomicBool>,
+        red_level: Arc<AtomicU8>,
+    ) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let state = Arc::new(CaptureState::new(false, 2, false, false));
         let cfg = Arc::new(Mutex::new(AudioCfg {
@@ -116,9 +121,9 @@ impl AudioHost {
                 .name("audio-host".into())
                 .spawn(move || {
                     if crate::desktop::enabled() {
-                        run_service_agent(conn, rt, paused, stop, cfg, agent_stdin);
+                        run_service_agent(conn, rt, paused, red_level, stop, cfg, agent_stdin);
                     } else {
-                        run_in_process(conn, rt, paused, stop, state);
+                        run_in_process(conn, rt, paused, red_level, stop, state);
                     }
                 })
                 .ok()
@@ -164,6 +169,9 @@ struct AudioSender {
     conn: Connection,
     rt: tokio::runtime::Handle,
     paused: Arc<AtomicBool>,
+    red_level: Arc<AtomicU8>,
+    red_enc: RedEncoder,
+    started_at: Instant,
     stream: Option<SendStream>,
     wire_buf: Vec<u8>,
     /// Monotonic connection-wide sequence number, surviving `audio-agent` restarts.
@@ -171,8 +179,23 @@ struct AudioSender {
 }
 
 impl AudioSender {
-    fn new(conn: Connection, rt: tokio::runtime::Handle, paused: Arc<AtomicBool>) -> Self {
-        Self { conn, rt, paused, stream: None, wire_buf: Vec::with_capacity(16_384), tx_seq: 0 }
+    fn new(
+        conn: Connection,
+        rt: tokio::runtime::Handle,
+        paused: Arc<AtomicBool>,
+        red_level: Arc<AtomicU8>,
+    ) -> Self {
+        Self {
+            conn,
+            rt,
+            paused,
+            red_level,
+            red_enc: RedEncoder::new(),
+            started_at: Instant::now(),
+            stream: None,
+            wire_buf: Vec::with_capacity(16_384),
+            tx_seq: 0,
+        }
     }
 
     fn close_stream(&mut self) {
@@ -184,19 +207,19 @@ impl AudioSender {
     fn send(&mut self, codec: u8, _seq: u16, ch: u8, rate: u32, payload: &[u8]) {
         if self.paused.load(Ordering::Relaxed) {
             self.close_stream();
+            self.red_enc.reset();
             return;
         }
         let seq = self.tx_seq;
         self.tx_seq = self.tx_seq.wrapping_add(1);
         if codec == CODEC_OPUS {
             self.close_stream();
-            let mut pkt = Vec::with_capacity(4 + payload.len());
-            pkt.push(T_AUDIO);
-            pkt.extend_from_slice(&seq.to_be_bytes());
-            pkt.push(ch);
-            pkt.extend_from_slice(payload);
+            let level = self.red_level.load(Ordering::Relaxed);
+            let now_ms = self.started_at.elapsed().as_millis() as u64;
+            let pkt = self.red_enc.encode(seq, ch, payload, level, now_ms);
             let _ = self.conn.send_datagram(Bytes::from(pkt));
         } else if codec == CODEC_PCM24 {
+            self.red_enc.reset();
             let body_len = 8 + payload.len();
             self.wire_buf.clear();
             self.wire_buf.extend_from_slice(&(body_len as u32).to_be_bytes());
@@ -240,10 +263,11 @@ fn run_in_process(
     conn: Connection,
     rt: tokio::runtime::Handle,
     paused: Arc<AtomicBool>,
+    red_level: Arc<AtomicU8>,
     stop: Arc<AtomicBool>,
     state: Arc<CaptureState>,
 ) {
-    let mut sender = AudioSender::new(conn.clone(), rt, paused);
+    let mut sender = AudioSender::new(conn.clone(), rt, paused, red_level);
     while !stop.load(Ordering::Relaxed) && conn.close_reason().is_none() {
         if !state.enabled.load(Ordering::Relaxed) && !state.mute_host.load(Ordering::Relaxed) {
             sender.close_stream();
@@ -276,11 +300,12 @@ fn run_service_agent(
     conn: Connection,
     rt: tokio::runtime::Handle,
     paused: Arc<AtomicBool>,
+    red_level: Arc<AtomicU8>,
     stop: Arc<AtomicBool>,
     cfg: Arc<Mutex<AudioCfg>>,
     agent_stdin: Arc<Mutex<Option<File>>>,
 ) {
-    let mut sender = AudioSender::new(conn.clone(), rt, paused);
+    let mut sender = AudioSender::new(conn.clone(), rt, paused, red_level);
     while !stop.load(Ordering::Relaxed) && conn.close_reason().is_none() {
         let cur = *cfg.lock().unwrap();
         if !cur.enabled && !cur.mute_host {

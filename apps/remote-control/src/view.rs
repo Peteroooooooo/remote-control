@@ -541,6 +541,10 @@ fn run_connected(
         // before clicks, keys, or wheels. Prevents both half-duplex Wi-Fi
         // uplink floods and Windows 11 Explorer/WebView2 drag stutter.
         const MOUSE_PACE: Duration = Duration::from_millis(8);
+        let input_epoch = Instant::now();
+        let is_input = |m: &Msg| {
+            matches!(m, Msg::MouseMove { .. } | Msg::MouseButton { .. } | Msg::Wheel { .. } | Msg::Key { .. })
+        };
         let mut current: Option<SendStream> = None;
         let mut batch: Vec<Msg> = Vec::with_capacity(16);
         let mut wire: Vec<u8> = Vec::with_capacity(256);
@@ -588,6 +592,10 @@ fn run_connected(
                     }
                     if let Some(s) = current.as_mut() {
                         wire.clear();
+                        if batch.iter().any(is_input) {
+                            let ms = input_epoch.elapsed().as_millis() as u32;
+                            wire.extend_from_slice(&Msg::InputTick { ms }.encode());
+                        }
                         for msg in batch.drain(..) {
                             wire.extend_from_slice(&msg.encode());
                         }
@@ -604,10 +612,14 @@ fn run_connected(
                 }, if pending_move.is_some() => {
                     if let Some((x, y)) = pending_move.take() {
                         last_move_sent = Some(Instant::now());
-                        if let Some(s) = current.as_mut()
-                            && s.write_all(&Msg::MouseMove { x, y }.encode()).await.is_err()
-                        {
-                            current = None;
+                        if let Some(s) = current.as_mut() {
+                            wire.clear();
+                            let ms = input_epoch.elapsed().as_millis() as u32;
+                            wire.extend_from_slice(&Msg::InputTick { ms }.encode());
+                            wire.extend_from_slice(&Msg::MouseMove { x, y }.encode());
+                            if s.write_all(&wire).await.is_err() {
+                                current = None;
+                            }
                         }
                     }
                 }
@@ -1330,7 +1342,12 @@ fn render_loop(sh: &Shared, frames: Arc<FrameQueue>, hwnd: HWND) -> Result<()> {
     let mut last_key_req: Option<Instant> = None;
     let mut dec_switched = false;
     let mut pending_present = false;
+    const MINIMIZE_THROTTLE_AFTER: Duration = Duration::from_secs(2);
+    const MINIMIZE_THROTTLE_FPS: u8 = 5;
     let mut was_minimized = false;
+    let mut minimized_since: Option<Instant> = None;
+    let mut throttled = false;
+    let mut was_reconnecting = false;
     while !sh.quit.load(Ordering::Relaxed) {
         if let Some((p, s)) = &last
             && let Some(path) = sh.shot.lock().unwrap().take()
@@ -1341,6 +1358,7 @@ fn render_loop(sh: &Shared, frames: Arc<FrameQueue>, hwnd: HWND) -> Result<()> {
         let Some(batch) = frames.take_wait(Duration::from_millis(50)) else {
             break;
         };
+        let reconnecting = sh.reconnecting.load(Ordering::Relaxed);
         let minimized = is_minimized(hwnd);
         if was_minimized && !minimized && last.is_some() {
             pending_present = true;
@@ -1349,7 +1367,21 @@ fn render_loop(sh: &Shared, frames: Arc<FrameQueue>, hwnd: HWND) -> Result<()> {
         if minimized {
             // Time spent minimized is no gap in the picture.
             last_shown = None;
+            let since = *minimized_since.get_or_insert_with(Instant::now);
+            if !throttled && since.elapsed() >= MINIMIZE_THROTTLE_AFTER {
+                throttled = true;
+                let _ = sh.ctrl.send(Msg::Throttle { fps: MINIMIZE_THROTTLE_FPS });
+            } else if throttled && was_reconnecting && !reconnecting {
+                let _ = sh.ctrl.send(Msg::Throttle { fps: MINIMIZE_THROTTLE_FPS });
+            }
+        } else {
+            minimized_since = None;
+            if throttled {
+                throttled = false;
+                let _ = sh.ctrl.send(Msg::Throttle { fps: 0 });
+            }
         }
+        was_reconnecting = reconnecting;
 
         let mut newest = None;
         if !batch.is_empty() {

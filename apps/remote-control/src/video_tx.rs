@@ -6,7 +6,7 @@ use std::{
     collections::{HashMap, VecDeque},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -168,6 +168,10 @@ struct State {
     /// our own queue can be. Such an answer waits for the probe to end.
     probe_running: Option<u16>,
     probe_early: Option<ProbeResult>,
+    /// Adaptive Opus RED redundancy controller driven by loss reports, timeouts,
+    /// and path switches.
+    red_ctrl: crate::audio::red::RedLevelCtrl,
+    started_at: Instant,
 }
 
 /// A frame queued for the pacer task.
@@ -201,6 +205,9 @@ pub struct VideoTx {
     ctrl_pending: Arc<AtomicBool>,
     /// Encoded frames are dropped instead of sent (see `host::watch_path`).
     pub paused: AtomicBool,
+    /// Desired Opus RED redundancy level (`0`, `1`, or `2`), updated by the
+    /// feedback/control tasks and read lock-free by `AudioSender`.
+    audio_red_level: Arc<AtomicU8>,
 }
 
 /// Lowest bitrate the rate controller goes down to (when the highest allows).
@@ -217,10 +224,12 @@ impl VideoTx {
         let fps = Arc::new(AtomicU32::new(fps.max(1)));
         let pacer_bytes = Arc::new(AtomicUsize::new(0));
         let ctrl_pending = Arc::new(AtomicBool::new(false));
+        let audio_red_level = Arc::new(AtomicU8::new(0));
+        let now = Instant::now();
         let tx = Arc::new(VideoTx {
             conn: conn.clone(),
             st: Mutex::new(State {
-                rc: RateController::new(RateConfig::new(MIN_BPS.min(max_bps), max_bps), Instant::now()),
+                rc: RateController::new(RateConfig::new(MIN_BPS.min(max_bps), max_bps), now),
                 in_flight: HashMap::new(),
                 frame: 0,
                 sec: Second::default(),
@@ -237,6 +246,8 @@ impl VideoTx {
                 probe_sent: None,
                 probe_running: None,
                 probe_early: None,
+                red_ctrl: crate::audio::red::RedLevelCtrl::new(),
+                started_at: now,
             }),
             encoder: Mutex::new(FrameEncoder::new()),
             sent: Mutex::new(Sent::default()),
@@ -246,6 +257,7 @@ impl VideoTx {
             want_key,
             ctrl_pending: ctrl_pending.clone(),
             paused: AtomicBool::new(false),
+            audio_red_level,
         });
         tokio::spawn(pace(conn, prx, fps, pacer_bytes, ctrl_pending));
         tokio::spawn(tx.clone().read_feedback());
@@ -451,6 +463,11 @@ impl VideoTx {
         }
     }
 
+    /// Lock-free handle to the current adaptive Opus RED redundancy level (`0..=2`).
+    pub fn audio_red_level(&self) -> Arc<AtomicU8> {
+        self.audio_red_level.clone()
+    }
+
     async fn read_feedback(self: Arc<Self>) {
         while let Ok(d) = self.conn.read_datagram().await {
             let mut s = self.st.lock().unwrap();
@@ -483,6 +500,10 @@ impl VideoTx {
                 Some(&T_REPORT) => {
                     if let Some(r) = Report::parse(&d) {
                         s.rc.on_report(&r);
+                        let now_ms = s.started_at.elapsed().as_millis() as u64;
+                        let lost = r.shards_expected.saturating_sub(r.shards_received);
+                        s.red_ctrl.on_report(r.shards_expected, lost, r.max_run, now_ms);
+                        self.audio_red_level.store(s.red_ctrl.level(), Ordering::Relaxed);
                     }
                 }
                 Some(&T_RESEND) => {
@@ -525,7 +546,11 @@ impl VideoTx {
             let last_sent = (s.frame > 0).then(|| s.frame.wrapping_sub(1));
             let last_was_in_flight = last_sent.is_some_and(|f| s.in_flight.contains_key(&f));
             s.in_flight.retain(|_, (at, _)| now.duration_since(*at) < timeout);
+            let now_ms = now.saturating_duration_since(s.started_at).as_millis() as u64;
             let timed_out = before - s.in_flight.len();
+            if timed_out > 0 {
+                s.red_ctrl.on_timeout(now_ms);
+            }
             for _ in 0..timed_out {
                 s.rc.on_frame_failed();
             }
@@ -546,8 +571,13 @@ impl VideoTx {
             // leaving a phone hotspot for WiFi stays "direct").
             if (k, &addr) != (last_path.0, &last_path.1) {
                 s.rc.new_path();
+                if last_path.0 != net::PathKind::None {
+                    s.red_ctrl.on_path_change(now_ms);
+                }
                 last_path = (k, addr);
             }
+            let red_lv = s.red_ctrl.tick(now_ms);
+            self.audio_red_level.store(red_lv, Ordering::Relaxed);
             let rate = s.rc.update(now);
             let fec = s.rc.fec_pct();
             let wire = (s.wire_sent - s.wire_seen) as f64 * 8.0 / REPORT_EVERY.as_secs_f64();

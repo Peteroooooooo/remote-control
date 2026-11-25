@@ -1,6 +1,7 @@
 pub mod agent;
 pub mod codec;
 pub mod config;
+pub mod red;
 pub mod wasapi;
 
 /// RAII guard for Windows multimedia timer resolution (`timeBeginPeriod` / `timeEndPeriod`).

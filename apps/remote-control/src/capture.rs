@@ -16,9 +16,11 @@ use windows::{
             ID3D11Texture2D,
         },
         Dxgi::{
-            Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC},
+            Common::{
+                DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_SAMPLE_DESC,
+            },
             DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO, IDXGIOutput1,
-            IDXGIOutputDuplication, IDXGIResource,
+            IDXGIOutput5, IDXGIOutputDuplication, IDXGIResource,
         },
     },
     core::Interface,
@@ -55,16 +57,21 @@ pub struct Capture {
     /// a rotated display is duplicated in its unrotated (panel) orientation
     /// (WGC's image is upright).
     pub rotation: u16,
+    /// Display HDR status and SDR white-level scale (`1.0 = 80 nits`).
+    pub hdr_info: crate::hdr::DisplayHdrInfo,
+    /// Whether captured textures are `DXGI_FORMAT_R16G16B16A16_FLOAT` scRGB
+    /// (HDR) instead of `DXGI_FORMAT_B8G8R8A8_UNORM` (SDR).
+    pub fp16: bool,
 }
 
-/// A BGRA texture the video processor can read and write.
-pub fn bgra_texture(gpu: &Gpu, w: u32, h: u32, misc: u32) -> Result<ID3D11Texture2D> {
+/// A texture with the requested format that GPU shaders and video processors can read.
+pub fn surface_texture(gpu: &Gpu, w: u32, h: u32, format: DXGI_FORMAT, misc: u32) -> Result<ID3D11Texture2D> {
     let desc = D3D11_TEXTURE2D_DESC {
         Width: w,
         Height: h,
         MipLevels: 1,
         ArraySize: 1,
-        Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+        Format: format,
         SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
         Usage: D3D11_USAGE_DEFAULT,
         BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
@@ -76,6 +83,16 @@ pub fn bgra_texture(gpu: &Gpu, w: u32, h: u32, misc: u32) -> Result<ID3D11Textur
     t.context("CreateTexture2D")
 }
 
+/// A BGRA texture the video processor can read and write.
+pub fn bgra_texture(gpu: &Gpu, w: u32, h: u32, misc: u32) -> Result<ID3D11Texture2D> {
+    surface_texture(gpu, w, h, DXGI_FORMAT_B8G8R8A8_UNORM, misc)
+}
+
+/// A 16-bit float scRGB texture for HDR desktop capture.
+pub fn fp16_texture(gpu: &Gpu, w: u32, h: u32, misc: u32) -> Result<ID3D11Texture2D> {
+    surface_texture(gpu, w, h, DXGI_FORMAT_R16G16B16A16_FLOAT, misc)
+}
+
 /// The display's device name (`\\.\DISPLAY1`).
 pub fn device_name(output: &IDXGIOutput1) -> Result<String> {
     let d = unsafe { output.GetDesc()? };
@@ -84,12 +101,27 @@ pub fn device_name(output: &IDXGIOutput1) -> Result<String> {
 }
 
 impl Capture {
-    /// DXGI desktop duplication.
+    /// DXGI desktop duplication. Uses `DuplicateOutput1` with FP16 support when
+    /// HDR is active on the display so HDR desktops are captured in linear scRGB
+    /// and tone-mapped on the GPU without clipping or washed-out colors.
     pub fn dxgi(gpu: &Gpu, output: &IDXGIOutput1) -> Result<Capture> {
+        let hdr_info = device_name(output)
+            .map(|n| crate::hdr::query_display_hdr(&n))
+            .unwrap_or_else(|_| crate::hdr::DisplayHdrInfo::sdr());
         unsafe {
-            let dupl = output.DuplicateOutput(&gpu.device).context("DuplicateOutput")?;
+            let dupl = if hdr_info.hdr_enabled
+                && let Ok(out5) = output.cast::<IDXGIOutput5>()
+            {
+                let fmts = [DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_B8G8R8A8_UNORM];
+                out5.DuplicateOutput1(&gpu.device, 0, &fmts)
+                    .or_else(|_| output.DuplicateOutput(&gpu.device))
+                    .context("DuplicateOutput")?
+            } else {
+                output.DuplicateOutput(&gpu.device).context("DuplicateOutput")?
+            };
             let dd = dupl.GetDesc();
             let (w, h) = (dd.ModeDesc.Width, dd.ModeDesc.Height);
+            let fp16 = dd.ModeDesc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT;
             Ok(Capture {
                 src: Source::Dxgi(dupl),
                 image: None,
@@ -97,29 +129,60 @@ impl Capture {
                 width: w,
                 height: h,
                 rotation: crate::monitors::rotation_degrees(dd.Rotation),
+                hdr_info,
+                fp16,
             })
         }
     }
 
     /// WGC in this process (it must not be SYSTEM).
     pub fn wgc(gpu: &Gpu, output: &IDXGIOutput1) -> Result<Capture> {
+        let hdr_info = device_name(output)
+            .map(|n| crate::hdr::query_display_hdr(&n))
+            .unwrap_or_else(|_| crate::hdr::DisplayHdrInfo::sdr());
         let monitor = unsafe { output.GetDesc()? }.Monitor;
-        let w = Wgc::start(gpu, monitor)?;
-        let (width, height) = (w.width, w.height);
-        Ok(Capture { src: Source::Wgc(w), image: None, grabbed: false, width, height, rotation: 0 })
+        let w = Wgc::start(gpu, monitor, hdr_info.hdr_enabled)?;
+        let (width, height, fp16) = (w.width, w.height, w.fp16);
+        Ok(Capture {
+            src: Source::Wgc(w),
+            image: None,
+            grabbed: false,
+            width,
+            height,
+            rotation: 0,
+            hdr_info,
+            fp16,
+        })
     }
 
     /// WGC in an agent running as the console user (for the service's helper).
     pub fn agent(gpu: &Gpu, output: &IDXGIOutput1) -> Result<Capture> {
-        let a = Agent::start(gpu, &device_name(output)?)?;
-        let (width, height) = (a.width, a.height);
-        Ok(Capture { src: Source::Agent(a), image: None, grabbed: false, width, height, rotation: 0 })
+        let dev = device_name(output)?;
+        let hdr_info = crate::hdr::query_display_hdr(&dev);
+        let a = Agent::start(gpu, &dev)?;
+        let (width, height, fp16) = (a.width, a.height, a.fp16);
+        Ok(Capture {
+            src: Source::Agent(a),
+            image: None,
+            grabbed: false,
+            width,
+            height,
+            rotation: 0,
+            hdr_info,
+            fp16,
+        })
     }
 
-    /// Staging BGRA texture holding the last grabbed frame, allocated on first use.
+    /// Staging texture holding the last grabbed frame, allocated on first use
+    /// in the matching pixel format (`R16G16B16A16_FLOAT` for HDR, `B8G8R8A8_UNORM` for SDR).
     pub fn image(&mut self, gpu: &Gpu) -> Result<&ID3D11Texture2D> {
         if self.image.is_none() {
-            self.image = Some(bgra_texture(gpu, self.width, self.height, 0)?);
+            let tex = if self.fp16 {
+                fp16_texture(gpu, self.width, self.height, 0)?
+            } else {
+                bgra_texture(gpu, self.width, self.height, 0)?
+            };
+            self.image = Some(tex);
         }
         Ok(self.image.as_ref().expect("created above"))
     }
@@ -178,11 +241,17 @@ impl Capture {
 
     pub fn grab(&mut self, gpu: &Gpu, timeout_ms: u32) -> Result<Grab> {
         if self.image.is_none() {
-            self.image = Some(bgra_texture(gpu, self.width, self.height, 0)?);
+            let tex = if self.fp16 {
+                fp16_texture(gpu, self.width, self.height, 0)?
+            } else {
+                bgra_texture(gpu, self.width, self.height, 0)?
+            };
+            self.image = Some(tex);
         }
         let image = self.image.as_ref().expect("created above");
+        let expected_fp16 = self.fp16;
         let g = match &self.src {
-            Source::Dxgi(dupl) => grab_dxgi(dupl, image, gpu, timeout_ms),
+            Source::Dxgi(dupl) => grab_dxgi(dupl, image, expected_fp16, gpu, timeout_ms),
             Source::Wgc(w) => w.grab(gpu, image, timeout_ms),
             Source::Agent(a) => a.grab(gpu, image, timeout_ms),
         };
@@ -203,7 +272,13 @@ impl Drop for FrameGuard<'_> {
     }
 }
 
-fn grab_dxgi(dupl: &IDXGIOutputDuplication, image: &ID3D11Texture2D, gpu: &Gpu, timeout_ms: u32) -> Result<Grab> {
+fn grab_dxgi(
+    dupl: &IDXGIOutputDuplication,
+    image: &ID3D11Texture2D,
+    expected_fp16: bool,
+    gpu: &Gpu,
+    timeout_ms: u32,
+) -> Result<Grab> {
     unsafe {
         let acquired = {
             let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
@@ -224,6 +299,15 @@ fn grab_dxgi(dupl: &IDXGIOutputDuplication, image: &ID3D11Texture2D, gpu: &Gpu, 
         let fresh = info.LastPresentTime != 0;
         if fresh && let Some(r) = res {
             let tex: ID3D11Texture2D = r.cast()?;
+            let mut td = D3D11_TEXTURE2D_DESC::default();
+            tex.GetDesc(&mut td);
+            let actual_fp16 = td.Format == DXGI_FORMAT_R16G16B16A16_FLOAT;
+            if actual_fp16 != expected_fp16 {
+                // Display toggled HDR/SDR or driver switched surface format:
+                // rebuild capture + shader views cleanly instead of silently
+                // failing CopyResource due to mismatched formats.
+                return Ok(Grab::Lost);
+            }
             gpu.ctx.CopyResource(image, &tex);
         }
         Ok(if fresh { Grab::New { present_qpc: info.LastPresentTime } } else { Grab::Timeout })

@@ -16,7 +16,7 @@ use std::{
 use iroh::endpoint::Connection;
 use rc_stream::{
     fec::Assembler,
-    wire::{self, Ack, ProbeResult, Resend, ShardHeader, T_AUDIO, T_PROBE},
+    wire::{self, Ack, ProbeResult, Resend, ShardHeader, T_AUDIO, T_AUDIO_RED, T_PROBE},
 };
 use tokio::sync::mpsc;
 
@@ -357,7 +357,7 @@ pub async fn run(
         tokio::select! {
             d = conn.read_datagram() => {
                 let Ok(d) = d else { return };
-                if d.first() == Some(&T_AUDIO) {
+                if matches!(d.first(), Some(&T_AUDIO | &T_AUDIO_RED)) {
                     total += d.len() as u64;
                     if let Some(a) = &audio {
                         let _ = a.send(d);

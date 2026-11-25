@@ -20,7 +20,7 @@ use windows::{
             ID3D11RenderTargetView, ID3D11SamplerState, ID3D11ShaderResourceView, ID3D11Texture2D,
             ID3D11VertexShader,
         },
-        Dxgi::Common::{DXGI_FORMAT_R8_UNORM, DXGI_FORMAT_R8G8_UNORM},
+        Dxgi::Common::{DXGI_FORMAT_R8_UNORM, DXGI_FORMAT_R8G8_UNORM, DXGI_FORMAT_R16G16B16A16_FLOAT},
     },
     core::{PCSTR, s},
 };
@@ -35,7 +35,7 @@ cbuffer consts : register(b0) {
     float uv_shift_x;
     float step_x;
     float step_y;
-    float _pad;
+    float inv_sdr_white;
 };
 
 struct VsOut {
@@ -48,6 +48,20 @@ VsOut vs_main(uint id : SV_VertexID) {
     o.uv = float2((id << 1) & 2, id & 2);
     o.pos = float4(o.uv * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.0, 1.0);
     return o;
+}
+
+float3 hdr_to_srgb(float3 c) {
+    c = max(c, 0.0) * inv_sdr_white;
+    float l = dot(c, float3(0.2126, 0.7152, 0.0722));
+    if (l > 0.85) {
+        float over = l - 0.85;
+        float l_new = 0.85 + 0.15 * (over / (over + 0.15));
+        c *= (l_new / l);
+    }
+    c = saturate(c);
+    float3 lo = c * 12.92;
+    float3 hi = 1.055 * pow(max(c, 0.0031308), 1.0 / 2.4) - 0.055;
+    return lerp(lo, hi, step(0.0031308, c));
 }
 
 float ps_y(VsOut i) : SV_Target {
@@ -88,6 +102,45 @@ float2 ps_uv_down(VsOut i) : SV_Target {
     float v = (c.r - y) / 1.5748;
     return float2((u * 224.0 + 128.0) / 255.0, (v * 224.0 + 128.0) / 255.0);
 }
+
+float ps_y_hdr(VsOut i) : SV_Target {
+    float3 c = hdr_to_srgb(src.Sample(smp, i.uv).rgb);
+    float y = dot(c, float3(0.2126, 0.7152, 0.0722));
+    return (y * 219.0 + 16.0) / 255.0;
+}
+
+float2 ps_uv_hdr(VsOut i) : SV_Target {
+    float3 c = hdr_to_srgb(src.Sample(smp, i.uv + float2(uv_shift_x, 0.0)).rgb);
+    float y = dot(c, float3(0.2126, 0.7152, 0.0722));
+    float u = (c.b - y) / 1.8556;
+    float v = (c.r - y) / 1.5748;
+    return float2((u * 224.0 + 128.0) / 255.0, (v * 224.0 + 128.0) / 255.0);
+}
+
+float ps_y_down_hdr(VsOut i) : SV_Target {
+    float3 c = hdr_to_srgb(0.25 * (
+        src.Sample(smp, i.uv + float2(-step_x, -step_y)).rgb +
+        src.Sample(smp, i.uv + float2( step_x, -step_y)).rgb +
+        src.Sample(smp, i.uv + float2(-step_x,  step_y)).rgb +
+        src.Sample(smp, i.uv + float2( step_x,  step_y)).rgb
+    ));
+    float y = dot(c, float3(0.2126, 0.7152, 0.0722));
+    return (y * 219.0 + 16.0) / 255.0;
+}
+
+float2 ps_uv_down_hdr(VsOut i) : SV_Target {
+    float2 base = i.uv + float2(uv_shift_x, 0.0);
+    float3 c = hdr_to_srgb(0.25 * (
+        src.Sample(smp, base + float2(-step_x, -step_y)).rgb +
+        src.Sample(smp, base + float2( step_x, -step_y)).rgb +
+        src.Sample(smp, base + float2(-step_x,  step_y)).rgb +
+        src.Sample(smp, base + float2( step_x,  step_y)).rgb
+    ));
+    float y = dot(c, float3(0.2126, 0.7152, 0.0722));
+    float u = (c.b - y) / 1.8556;
+    float v = (c.r - y) / 1.5748;
+    return float2((u * 224.0 + 128.0) / 255.0, (v * 224.0 + 128.0) / 255.0);
+}
 "#;
 
 #[repr(C)]
@@ -96,7 +149,7 @@ struct Consts {
     uv_shift_x: f32,
     step_x: f32,
     step_y: f32,
-    _pad: f32,
+    inv_sdr_white: f32,
 }
 
 const _: () = assert!(std::mem::size_of::<Consts>() == 16);
@@ -133,6 +186,7 @@ pub struct Nv12Views {
     rtv_y: ID3D11RenderTargetView,
     rtv_uv: ID3D11RenderTargetView,
     downscale: bool,
+    hdr: bool,
 }
 
 pub struct ToNv12 {
@@ -141,6 +195,10 @@ pub struct ToNv12 {
     ps_uv: ID3D11PixelShader,
     ps_y_down: ID3D11PixelShader,
     ps_uv_down: ID3D11PixelShader,
+    ps_y_hdr: ID3D11PixelShader,
+    ps_uv_hdr: ID3D11PixelShader,
+    ps_y_down_hdr: ID3D11PixelShader,
+    ps_uv_down_hdr: ID3D11PixelShader,
     sampler: ID3D11SamplerState,
     rast: ID3D11RasterizerState,
     consts: ID3D11Buffer,
@@ -150,38 +208,30 @@ pub struct ToNv12 {
 }
 
 impl ToNv12 {
-    pub fn new(gpu: &Gpu, out: (u32, u32)) -> Result<ToNv12> {
+    pub fn new_with_hdr(gpu: &Gpu, out: (u32, u32), inv_sdr_white: f32) -> Result<ToNv12> {
         unsafe {
+            let create_ps = |entry: PCSTR, label: &str| -> Result<ID3D11PixelShader> {
+                let blob = compile(entry, s!("ps_5_0"))?;
+                let bytes = std::slice::from_raw_parts(blob.GetBufferPointer() as *const u8, blob.GetBufferSize());
+                let mut ps = None;
+                gpu.device
+                    .CreatePixelShader(bytes, None, Some(&mut ps))
+                    .with_context(|| format!("CreatePixelShader({label})"))?;
+                ps.with_context(|| format!("no {label}"))
+            };
             let vs_blob = compile(s!("vs_main"), s!("vs_5_0"))?;
-            let py_blob = compile(s!("ps_y"), s!("ps_5_0"))?;
-            let puv_blob = compile(s!("ps_uv"), s!("ps_5_0"))?;
-            let py_down_blob = compile(s!("ps_y_down"), s!("ps_5_0"))?;
-            let puv_down_blob = compile(s!("ps_uv_down"), s!("ps_5_0"))?;
             let vs_bytes = std::slice::from_raw_parts(vs_blob.GetBufferPointer() as *const u8, vs_blob.GetBufferSize());
-            let py_bytes = std::slice::from_raw_parts(py_blob.GetBufferPointer() as *const u8, py_blob.GetBufferSize());
-            let puv_bytes =
-                std::slice::from_raw_parts(puv_blob.GetBufferPointer() as *const u8, puv_blob.GetBufferSize());
-            let py_down_bytes =
-                std::slice::from_raw_parts(py_down_blob.GetBufferPointer() as *const u8, py_down_blob.GetBufferSize());
-            let puv_down_bytes = std::slice::from_raw_parts(
-                puv_down_blob.GetBufferPointer() as *const u8,
-                puv_down_blob.GetBufferSize(),
-            );
-
             let mut vs = None;
             gpu.device.CreateVertexShader(vs_bytes, None, Some(&mut vs)).context("CreateVertexShader")?;
-            let mut ps_y = None;
-            gpu.device.CreatePixelShader(py_bytes, None, Some(&mut ps_y)).context("CreatePixelShader(Y)")?;
-            let mut ps_uv = None;
-            gpu.device.CreatePixelShader(puv_bytes, None, Some(&mut ps_uv)).context("CreatePixelShader(UV)")?;
-            let mut ps_y_down = None;
-            gpu.device
-                .CreatePixelShader(py_down_bytes, None, Some(&mut ps_y_down))
-                .context("CreatePixelShader(Y down)")?;
-            let mut ps_uv_down = None;
-            gpu.device
-                .CreatePixelShader(puv_down_bytes, None, Some(&mut ps_uv_down))
-                .context("CreatePixelShader(UV down)")?;
+
+            let ps_y = create_ps(s!("ps_y"), "Y")?;
+            let ps_uv = create_ps(s!("ps_uv"), "UV")?;
+            let ps_y_down = create_ps(s!("ps_y_down"), "Y down")?;
+            let ps_uv_down = create_ps(s!("ps_uv_down"), "UV down")?;
+            let ps_y_hdr = create_ps(s!("ps_y_hdr"), "Y HDR")?;
+            let ps_uv_hdr = create_ps(s!("ps_uv_hdr"), "UV HDR")?;
+            let ps_y_down_hdr = create_ps(s!("ps_y_down_hdr"), "Y down HDR")?;
+            let ps_uv_down_hdr = create_ps(s!("ps_uv_down_hdr"), "UV down HDR")?;
 
             let sd = D3D11_SAMPLER_DESC {
                 Filter: D3D11_FILTER_MIN_MAG_MIP_LINEAR,
@@ -207,7 +257,7 @@ impl ToNv12 {
                 uv_shift_x: -0.5 / out.0.max(1) as f32,
                 step_x: 0.25 / out.0.max(1) as f32,
                 step_y: 0.25 / out.1.max(1) as f32,
-                _pad: 0.0,
+                inv_sdr_white,
             };
             let bd = D3D11_BUFFER_DESC {
                 ByteWidth: size_of::<Consts>() as u32,
@@ -221,10 +271,14 @@ impl ToNv12 {
 
             Ok(ToNv12 {
                 vs: vs.context("no vs")?,
-                ps_y: ps_y.context("no ps_y")?,
-                ps_uv: ps_uv.context("no ps_uv")?,
-                ps_y_down: ps_y_down.context("no ps_y_down")?,
-                ps_uv_down: ps_uv_down.context("no ps_uv_down")?,
+                ps_y,
+                ps_uv,
+                ps_y_down,
+                ps_uv_down,
+                ps_y_hdr,
+                ps_uv_hdr,
+                ps_y_down_hdr,
+                ps_uv_down_hdr,
                 sampler: sampler.context("no sampler")?,
                 rast: rast.context("no rast")?,
                 consts: consts.context("no consts")?,
@@ -254,6 +308,7 @@ impl ToNv12 {
             let mut src_desc = D3D11_TEXTURE2D_DESC::default();
             src.GetDesc(&mut src_desc);
             let downscale = src_desc.Width > self.out.0 || src_desc.Height > self.out.1;
+            let hdr = src_desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT;
 
             let mut srv = None;
             gpu.device.CreateShaderResourceView(src, None, Some(&mut srv)).context("NV12 src SRV")?;
@@ -280,15 +335,19 @@ impl ToNv12 {
                 gpu.ctx.ClearRenderTargetView(&rtv_y, &[0.0, 0.0, 0.0, 1.0]);
                 gpu.ctx.ClearRenderTargetView(&rtv_uv, &[0.5, 0.5, 0.0, 1.0]);
             }
-            Ok(Nv12Views { srv: srv.context("no srv")?, rtv_y, rtv_uv, downscale })
+            Ok(Nv12Views { srv: srv.context("no srv")?, rtv_y, rtv_uv, downscale, hdr })
         }
     }
 
     pub fn run(&self, gpu: &Gpu, views: &Nv12Views) {
         unsafe {
             let c = &gpu.ctx;
-            let (ps_y, ps_uv) =
-                if views.downscale { (&self.ps_y_down, &self.ps_uv_down) } else { (&self.ps_y, &self.ps_uv) };
+            let (ps_y, ps_uv) = match (views.hdr, views.downscale) {
+                (false, false) => (&self.ps_y, &self.ps_uv),
+                (false, true) => (&self.ps_y_down, &self.ps_uv_down),
+                (true, false) => (&self.ps_y_hdr, &self.ps_uv_hdr),
+                (true, true) => (&self.ps_y_down_hdr, &self.ps_uv_down_hdr),
+            };
             c.IASetInputLayout(None);
             c.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
             c.VSSetShader(&self.vs, None);
@@ -315,5 +374,47 @@ impl ToNv12 {
             c.OMSetRenderTargets(Some(&[None]), None);
             c.PSSetShaderResources(0, Some(&[None]));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hlsl_sdr_and_hdr_shaders_compile_on_d3d11() {
+        // Verify FXC compiles every SDR and HDR shader entry cleanly.
+        for (entry, target) in [
+            (s!("vs_main"), s!("vs_5_0")),
+            (s!("ps_y"), s!("ps_5_0")),
+            (s!("ps_uv"), s!("ps_5_0")),
+            (s!("ps_y_down"), s!("ps_5_0")),
+            (s!("ps_uv_down"), s!("ps_5_0")),
+            (s!("ps_y_hdr"), s!("ps_5_0")),
+            (s!("ps_uv_hdr"), s!("ps_5_0")),
+            (s!("ps_y_down_hdr"), s!("ps_5_0")),
+            (s!("ps_uv_down_hdr"), s!("ps_5_0")),
+        ] {
+            let blob = compile(entry, target).expect("nv12 HLSL compile failed");
+            assert!(unsafe { blob.GetBufferSize() } > 0);
+        }
+    }
+
+    #[test]
+    fn fp16_hdr_views_and_gpu_pass_execute_cleanly() {
+        let Ok(gpu) = Gpu::default_adapter() else { return };
+        let conv = ToNv12::new_with_hdr(&gpu, (64, 64), 1.0 / 2.5).expect("ToNv12::new_with_hdr");
+        let src = crate::capture::fp16_texture(&gpu, 64, 64, 0).expect("fp16_texture");
+        let dst = crate::pipeline::nv12_texture(&gpu, 64, 64).expect("nv12_texture");
+        let views = conv.make_views(&gpu, &src, &dst).expect("make_views for FP16");
+        assert!(views.hdr, "FP16 source texture must activate HDR shader path");
+        assert!(!views.downscale);
+        conv.run(&gpu, &views);
+
+        // SDR BGRA source must stay on zero-overhead non-HDR path.
+        let src_sdr = crate::capture::bgra_texture(&gpu, 64, 64, 0).expect("bgra_texture");
+        let views_sdr = conv.make_views(&gpu, &src_sdr, &dst).expect("make_views for BGRA");
+        assert!(!views_sdr.hdr, "BGRA8 source texture must stay on SDR shader path");
+        conv.run(&gpu, &views_sdr);
     }
 }

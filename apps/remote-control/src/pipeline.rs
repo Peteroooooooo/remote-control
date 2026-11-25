@@ -24,7 +24,7 @@
 use std::{
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU8, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -89,6 +89,9 @@ pub struct PipeShared {
     /// since the capture loop last started.
     pub quality: Mutex<Quality>,
     pub quality_changed: AtomicBool,
+    /// Optional lightweight capture FPS cap from `Msg::Throttle` (`0` = full
+    /// chosen fps, `>0` = throttle pacing without rebuilding the encoder).
+    pub throttle_fps: AtomicU8,
 }
 
 /// After a screen change, the same picture is encoded again for at most this
@@ -493,6 +496,16 @@ enum Convert {
     Ayuv(crate::yuv444::ToAyuv, crate::yuv444::AyuvViews),
 }
 
+/// Computes the active capture pacing FPS given the encoder's configured `fps`
+/// and optional lightweight `throttle_fps` (`0` = unthrottled).
+pub(crate) fn effective_pace_fps(fps: u32, throttle_fps: u8) -> u32 {
+    if throttle_fps > 0 {
+        fps.min(throttle_fps as u32).max(1)
+    } else {
+        fps.max(1)
+    }
+}
+
 /// Minimum spacing between encoded frames. When streaming at the display's
 /// full refresh rate, capture already paces to VSync, so a looser guard avoids
 /// slipping a frame whenever the previous encode finishes slightly late. When
@@ -657,8 +670,10 @@ fn stream(
     }
     let (pic_w, pic_h) = if yuv444 { (w, h) } else { enc.preferred_input_size().unwrap_or((w, h)) };
     let pic = yuv_texture(gpu, pic_w, pic_h, yuv444)?;
+    let inv_sdr_white = cap.hdr_info.inv_sdr_white();
+    let vp_in_cs = if cap.fp16 { vp::RGB_SCRGB } else { vp::RGB_FULL };
     let conv = if yuv444 {
-        let ayuv_res = crate::yuv444::ToAyuv::shader(gpu, (w, h)).and_then(|shader| {
+        let ayuv_res = crate::yuv444::ToAyuv::shader_with_hdr(gpu, (w, h), inv_sdr_white).and_then(|shader| {
             if let Some(ring) = cap.agent_ring() {
                 let views = ring
                     .iter()
@@ -680,7 +695,7 @@ fn stream(
             }
         }
     } else if cap.rotation == 0 {
-        let nv12_res = crate::nv12::ToNv12::new(gpu, (w, h)).and_then(|shader| {
+        let nv12_res = crate::nv12::ToNv12::new_with_hdr(gpu, (w, h), inv_sdr_white).and_then(|shader| {
             if let Some(ring) = cap.agent_ring() {
                 let views = ring
                     .iter()
@@ -697,14 +712,14 @@ fn stream(
             Ok(c) => c,
             Err(e) => {
                 log!("nv12 shader: {e:#}; falling back to VideoProcessor");
-                let vp = Vp::new(gpu, (cap.width, cap.height), (w, h), vp::RGB_FULL, vp::YUV_709)?;
+                let vp = Vp::new(gpu, (cap.width, cap.height), (w, h), vp_in_cs, vp::YUV_709)?;
                 let img = cap.image(gpu)?;
                 let views = vp.make_views(img, 0, &pic)?;
                 Convert::Vp(vp, views)
             }
         }
     } else {
-        let vp = Vp::new(gpu, (cap.width, cap.height), (w, h), vp::RGB_FULL, vp::YUV_709)?;
+        let vp = Vp::new(gpu, (cap.width, cap.height), (w, h), vp_in_cs, vp::YUV_709)?;
         if !vp.rotate(cap.rotation) {
             log!("this video processor cannot rotate: the {}° display is sent sideways", cap.rotation);
         }
@@ -712,8 +727,13 @@ fn stream(
         let views = vp.make_views(img, 0, &pic)?;
         Convert::Vp(vp, views)
     };
+    let hdr_tag = if cap.fp16 {
+        format!(" [HDR FP16, SDR white {:.2}x]", cap.hdr_info.sdr_white_scale)
+    } else {
+        String::new()
+    };
     log!(
-        "capturing {}x{} at {refresh} Hz on {} with {}, encoding {w}x{h} {} at up to {fps} fps and {:.1} Mbps with {} ({quality:?})",
+        "capturing {}x{} at {refresh} Hz on {} with {}{hdr_tag}, encoding {w}x{h} {} at up to {fps} fps and {:.1} Mbps with {} ({quality:?})",
         cap.width,
         cap.height,
         gpu.name,
@@ -736,7 +756,8 @@ fn stream(
     sh.want_key.store(true, Ordering::Relaxed);
 
     let freq = qpc_freq();
-    let pace = Pace::new(fps, refresh);
+    let mut cur_pace_fps = effective_pace_fps(fps, sh.throttle_fps.load(Ordering::Relaxed));
+    let mut pace = Pace::new(cur_pace_fps, refresh);
     let full = RECT { left: 0, top: 0, right: w as i32, bottom: h as i32 };
     // A capture that goes on from the last picture brings no new image while
     // the screen is still: start from the last one.
@@ -775,7 +796,19 @@ fn stream(
             log!("the viewer chose another picture");
             return Ok(Next::Picture);
         }
-        if frames > 0 && auto.step(tx.bitrate(), max_bps as f64, Instant::now()) {
+        let throttle = sh.throttle_fps.load(Ordering::Relaxed);
+        let eff_fps = effective_pace_fps(fps, throttle);
+        if eff_fps != cur_pace_fps {
+            let restoring = eff_fps > cur_pace_fps;
+            cur_pace_fps = eff_fps;
+            pace = Pace::new(eff_fps, refresh);
+            if restoring {
+                // Zero-latency restore when unminimizing: do not wait out a
+                // leftover 200 ms throttled slot.
+                due = None;
+            }
+        }
+        if throttle == 0 && frames > 0 && auto.step(tx.bitrate(), max_bps as f64, Instant::now()) {
             return Ok(Next::Picture);
         }
         // Service mode: do not count on the duplication to report a desktop
@@ -794,6 +827,9 @@ fn stream(
             std::thread::sleep(Duration::from_millis(50));
             continue;
         }
+        if throttle > 0 {
+            refine_until = None;
+        }
         if refine_until.is_some_and(|t| Instant::now() >= t) {
             log_refined(&refined, "time up");
             refine_until = None;
@@ -802,6 +838,8 @@ fn stream(
         let since_new = last_new_frame.elapsed();
         let next_slot = || due.map_or(Duration::ZERO, |d| d.saturating_duration_since(Instant::now()));
         let wait = capture_wait(pending.is_some(), refine_armed, since_new, next_slot());
+        // Cap grab wait while throttled so unminimizing wakes and restores full FPS promptly.
+        let wait = if throttle > 0 { wait.min(Duration::from_millis(50)) } else { wait };
         let wait_ms = wait.as_micros().div_ceil(1000) as u32;
         let grab_res = match &conv {
             Convert::Nv12Agent(shader, views) => cap

@@ -27,6 +27,8 @@ pub const T_PROBE: u8 = 0x15;
 pub const T_PROBE_RESULT: u8 = 0x16;
 pub const T_RESEND: u8 = 0x17;
 pub const T_SHARD_RESENT: u8 = 0x18;
+/// Opus audio datagram carrying primary + 1–2 historical redundant copies (RED).
+pub const T_AUDIO_RED: u8 = 0x19;
 
 /// Most shard indexes one resend request names.
 pub const RESEND_MAX: usize = 256;

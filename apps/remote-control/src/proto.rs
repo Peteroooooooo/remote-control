@@ -262,6 +262,14 @@ pub enum Msg {
     Hint { what: u8 },
     /// Viewer -> host: audio capture/mute preference.
     Audio(AudioCfg),
+    /// Viewer -> host: monotonic millisecond timestamp prefixed before a batch
+    /// of input events so the host can discard stale buffered inputs (>2 s late).
+    /// Older hosts ignore unknown message tags cleanly.
+    InputTick { ms: u32 },
+    /// Viewer -> host: lightweight capture FPS throttle (`0` = full chosen fps,
+    /// `>0` = cap pacing to this fps without rebuilding the encoder, e.g. 5 fps
+    /// while the viewer window is minimized). Older hosts ignore unknown tags.
+    Throttle { fps: u8 },
 }
 
 pub const HINT_NONE: u8 = 0;
@@ -422,6 +430,8 @@ impl Msg {
             Msg::SelectMonitor { .. } => 71,
             Msg::Hint { .. } => 16,
             Msg::Quality(_) => 17,
+            Msg::InputTick { .. } => 18,
+            Msg::Throttle { .. } => 19,
             Msg::Audio(_) => 80,
         }
     }
@@ -522,6 +532,12 @@ impl Msg {
                     .u8(c.lossless as u8)
                     .u32(c.max_rate_hz);
             }
+            Msg::InputTick { ms } => {
+                w.u32(*ms);
+            }
+            Msg::Throttle { fps } => {
+                w.u8(*fps);
+            }
         }
         let len = (w.0.len() - 4) as u32;
         w.0[..4].copy_from_slice(&len.to_be_bytes());
@@ -544,6 +560,8 @@ impl Msg {
                 Msg::Hello { max_kbps, fps, caps, proof, quality }
             }
             17 => Msg::Quality(Quality::read(&mut r)?),
+            18 => Msg::InputTick { ms: r.u32()? },
+            19 => Msg::Throttle { fps: r.u8()? },
             2 => Msg::MouseMove { x: r.u16()?, y: r.u16()? },
             3 => Msg::MouseButton { button: r.u8()?, down: r.u8()? != 0 },
             4 => Msg::Wheel { delta: r.u16()? as i16, horizontal: r.u8()? != 0 },
@@ -725,6 +743,9 @@ mod tests {
             Msg::SelectMonitor { index: 7 },
             Msg::Audio(AudioCfg::default()),
             Msg::Audio(AudioCfg { enabled: false, channels: 1, mute_host: true, lossless: true, max_rate_hz: 96_000 }),
+            Msg::InputTick { ms: 0xDEAD_BEEF },
+            Msg::Throttle { fps: 5 },
+            Msg::Throttle { fps: 0 },
         ];
         for m in all {
             let e = m.encode();

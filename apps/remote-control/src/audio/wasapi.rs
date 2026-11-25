@@ -654,26 +654,37 @@ struct ParsedPkt {
     ch: u8,
     rate: u32,
     payload: Bytes,
+    is_redundant: bool,
 }
 
-fn parse_incoming_pkt(d: Bytes) -> Option<ParsedPkt> {
+fn parse_incoming_pkts(d: Bytes) -> Option<Vec<ParsedPkt>> {
     match *d.first()? {
-        T_AUDIO if d.len() >= 4 => Some(ParsedPkt {
-            codec: CODEC_OPUS,
-            seq: u16::from_be_bytes([d[1], d[2]]),
-            ch: d[3].clamp(1, 2),
-            rate: SAMPLE_RATE,
-            payload: d.slice(4..),
-        }),
+        T_AUDIO | rc_stream::wire::T_AUDIO_RED => {
+            let frames = super::red::decode_audio_datagram(&d)?;
+            Some(
+                frames
+                    .into_iter()
+                    .map(|f| ParsedPkt {
+                        codec: CODEC_OPUS,
+                        seq: f.seq,
+                        ch: f.ch,
+                        rate: SAMPLE_RATE,
+                        payload: f.payload,
+                        is_redundant: f.is_redundant,
+                    })
+                    .collect(),
+            )
+        }
         T_AUDIO_PCM24 if d.len() >= 8 => {
             let rate = normalize_lossless_rate(u32::from_be_bytes([d[4], d[5], d[6], d[7]]));
-            Some(ParsedPkt {
+            Some(vec![ParsedPkt {
                 codec: CODEC_PCM24,
                 seq: u16::from_be_bytes([d[1], d[2]]),
                 ch: d[3].clamp(1, 2),
                 rate,
                 payload: d.slice(8..),
-            })
+                is_redundant: false,
+            }])
         }
         _ => None,
     }
@@ -1021,7 +1032,7 @@ impl Player {
                 loop {
                     match rx.try_recv() {
                         Ok(d) => {
-                            let Some(pkt) = parse_incoming_pkt(d) else {
+                            let Some(pkts) = parse_incoming_pkts(d) else {
                                 continue;
                             };
                             if !super::config::viewer_enabled() {
@@ -1039,83 +1050,87 @@ impl Player {
                                 jitter.reset_stream();
                             }
                             last_rx_at = Some(Instant::now());
-                            // Drop stale in-flight packets from the previous codec so Opus <-> PCM24
-                            // transitions never ping-pong and flush the playback queue.
-                            if pkt.codec != cur_codec
-                                && let Some((prev_u16, _)) = last_rx
-                                && (pkt.seq.wrapping_sub(prev_u16) as i16) <= 0
-                            {
-                                continue;
-                            }
-                            if pkt.rate != active_rate {
-                                desired_rate = pkt.rate;
-                                cur_codec = pkt.codec;
-                                pending.clear();
-                                pcm_queue.clear();
-                                resampler.reset();
-                                jitter.reset_stream();
-                                last_rx = Some((pkt.seq, pkt.seq as i64));
-                                expected_seq = Some(pkt.seq as i64);
-                                pending.insert(pkt.seq as i64, (pkt.codec, pkt.ch, pkt.payload));
-                                break 'reopen;
-                            }
-                            if pkt.codec != cur_codec {
-                                cur_codec = pkt.codec;
-                                pending.clear();
-                                fade_out_tail(&mut pcm_queue, fmt.rate, dev_ch);
-                                resampler.reset();
-                                last_rx = None;
-                                expected_seq = None;
-                                primed = false;
-                                first_pending_at = Some(Instant::now());
-                                underrun_armed = false;
-                                jitter.reset_stream();
-                            }
-                            let u_seq = match last_rx {
-                                None => {
-                                    last_rx = Some((pkt.seq, pkt.seq as i64));
-                                    pkt.seq as i64
+                            for pkt in pkts {
+                                // Drop stale in-flight packets from the previous codec so Opus <-> PCM24
+                                // transitions never ping-pong and flush the playback queue.
+                                if pkt.codec != cur_codec
+                                    && let Some((prev_u16, _)) = last_rx
+                                    && (pkt.seq.wrapping_sub(prev_u16) as i16) <= 0
+                                {
+                                    continue;
                                 }
-                                Some((prev_u16, prev_u)) => {
-                                    let diff = pkt.seq.wrapping_sub(prev_u16) as i16 as i64;
-                                    let val = prev_u + diff;
-                                    if diff > 0 {
-                                        last_rx = Some((pkt.seq, val));
-                                    }
-                                    val
-                                }
-                            };
-                            match expected_seq {
-                                None => {
-                                    expected_seq = Some(u_seq);
-                                    primed = false;
-                                    first_pending_at = Some(Instant::now());
-                                    jitter.reset_stream();
-                                }
-                                Some(e) if (u_seq - e).abs() > 100 => {
+                                if pkt.rate != active_rate {
+                                    desired_rate = pkt.rate;
+                                    cur_codec = pkt.codec;
                                     pending.clear();
                                     pcm_queue.clear();
                                     resampler.reset();
-                                    expected_seq = Some(u_seq);
+                                    jitter.reset_stream();
+                                    last_rx = Some((pkt.seq, pkt.seq as i64));
+                                    expected_seq = Some(pkt.seq as i64);
+                                    pending.insert(pkt.seq as i64, (pkt.codec, pkt.ch, pkt.payload));
+                                    break 'reopen;
+                                }
+                                if pkt.codec != cur_codec {
+                                    cur_codec = pkt.codec;
+                                    pending.clear();
+                                    fade_out_tail(&mut pcm_queue, fmt.rate, dev_ch);
+                                    resampler.reset();
+                                    last_rx = None;
+                                    expected_seq = None;
                                     primed = false;
                                     first_pending_at = Some(Instant::now());
                                     underrun_armed = false;
                                     jitter.reset_stream();
                                 }
-                                _ => {}
-                            }
-                            if underrun_armed {
-                                jitter.on_jitter_event(Instant::now());
-                                underrun_armed = false;
-                            }
-                            if let Some(e) = expected_seq {
-                                if u_seq >= e {
-                                    pending.entry(u_seq).or_insert((pkt.codec, pkt.ch, pkt.payload));
-                                    if !primed && first_pending_at.is_none() {
-                                        first_pending_at = Some(Instant::now());
+                                let u_seq = match last_rx {
+                                    None => {
+                                        last_rx = Some((pkt.seq, pkt.seq as i64));
+                                        pkt.seq as i64
                                     }
-                                } else {
+                                    Some((prev_u16, prev_u)) => {
+                                        let diff = pkt.seq.wrapping_sub(prev_u16) as i16 as i64;
+                                        let val = prev_u + diff;
+                                        if diff > 0 {
+                                            last_rx = Some((pkt.seq, val));
+                                        }
+                                        val
+                                    }
+                                };
+                                match expected_seq {
+                                    None => {
+                                        expected_seq = Some(u_seq);
+                                        primed = false;
+                                        first_pending_at = Some(Instant::now());
+                                        jitter.reset_stream();
+                                    }
+                                    Some(e) if (u_seq - e).abs() > 100 => {
+                                        pending.clear();
+                                        pcm_queue.clear();
+                                        resampler.reset();
+                                        expected_seq = Some(u_seq);
+                                        primed = false;
+                                        first_pending_at = Some(Instant::now());
+                                        underrun_armed = false;
+                                        jitter.reset_stream();
+                                    }
+                                    _ => {}
+                                }
+                                if underrun_armed && !pkt.is_redundant {
                                     jitter.on_jitter_event(Instant::now());
+                                    underrun_armed = false;
+                                }
+                                if let Some(e) = expected_seq {
+                                    if u_seq >= e {
+                                        pending.entry(u_seq).or_insert((pkt.codec, pkt.ch, pkt.payload));
+                                        if !primed && first_pending_at.is_none() {
+                                            first_pending_at = Some(Instant::now());
+                                        }
+                                    } else if !pkt.is_redundant {
+                                        // Redundant RED historical copies for already-played
+                                        // frames are normal and must NOT inflate JitterCtrl.
+                                        jitter.on_jitter_event(Instant::now());
+                                    }
                                 }
                             }
                         }
