@@ -14,6 +14,16 @@ lto = "thin"
 codegen-units = 4
 strip = true
 
+# Size-optimized profile for Android `librc_android.so` (leaves Windows release untouched).
+# Keep default `panic = "unwind"` because transitive Android TLS crates use `catch_unwind`
+# around `ndk_context::android_context()`.
+[profile.android-dist]
+inherits = "release"
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+
 # Our relay needs hooks iroh-relay does not have (see vendor/iroh-relay/PATCHES.md).
 # iroh's client side uses the same crate, so everything builds against the patched copy.
 [patch.crates-io]

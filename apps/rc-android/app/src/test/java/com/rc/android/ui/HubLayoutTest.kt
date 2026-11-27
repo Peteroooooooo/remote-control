@@ -28,10 +28,19 @@ class HubLayoutTest {
     }
 
     @Test fun tabletLandscapeDependsOnPcShape() {
-        assertTrue(HubLayout.compute(1252f, 690f, r169).sideBySide)
+        val wide = HubLayout.compute(1252f, 690f, r169)
+        assertTrue(wide.sideBySide)
+        assertTrue("tablet side-by-side TV centers vertically above dock", wide.tv.y > 20f)
+        assertTrue("tablet TV stays above the floating dock", wide.tv.y + wide.tv.h <= 690f - HubLayout.DOCK_ROOM + 0.5f)
         val ultrawide = HubLayout.compute(1252f, 690f, 21f / 9f)
         assertFalse(ultrawide.sideBySide)
         assertTrue("ultrawide TV takes most of the height", ultrawide.tv.h > 690f * 0.55f)
+    }
+
+    @Test fun phoneLandscapeTvStaysTopAligned() {
+        val l = HubLayout.compute(887f, 300f, r169)
+        assertTrue(l.sideBySide)
+        assertEquals(0f, l.tv.y, 0.01f)
     }
 
     @Test fun tabletPortraitUsesFourColumns() {

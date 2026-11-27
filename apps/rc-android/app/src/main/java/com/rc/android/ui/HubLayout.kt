@@ -81,8 +81,11 @@ object HubLayout {
             // Frame hugs the picture: when the column is narrower than a full-height picture,
             // the frame gets shorter instead of leaving empty strips above and below.
             val tvH = min(ah, tvW / ratio)
+            // Center vertically in the space above the floating dock so wide tall screens
+            // (e.g. 16:10 tablets) have balanced whitespace above and below the TV.
+            val tvY = ((ah - dockRoom - tvH) * 0.5f).coerceAtLeast(0f)
             val list = DpBox(tvW + GAP, 0f, aw - tvW - GAP, ah)
-            HubLayoutResult(true, DpBox(0f, 0f, tvW, tvH), list, columnsFor(list.w))
+            HubLayoutResult(true, DpBox(0f, tvY, tvW, tvH), list, columnsFor(list.w))
         } else {
             // Never taller than the picture, so no empty strips above and below it.
             val tvH = max(topH, 60f)

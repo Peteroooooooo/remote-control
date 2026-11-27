@@ -149,11 +149,11 @@ class AppUpdater(context: Context) {
                     .filter { it.startsWith("https://") || it.startsWith("http://127.0.0.1") }
                 if (urls.isEmpty()) throw IllegalStateException("no download url")
                 return UpdateManifest(
-                    version = root.getString("version").trim().removePrefix("v"),
+                    version = j.optString("version").ifEmpty { root.getString("version") }.trim().removePrefix("v"),
                     code = j.getLong("code"),
                     sha256 = j.getString("sha256").lowercase(),
                     size = j.optLong("size", -1L),
-                    notes = root.optString("notes", ""),
+                    notes = j.optString("notes").ifEmpty { root.optString("notes", "") },
                     urls = urls,
                 )
             } catch (e: Exception) {

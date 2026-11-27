@@ -67,6 +67,7 @@ android {
         ndk {
             abiFilters += listOf("arm64-v8a")
         }
+        resourceConfigurations += listOf("zh", "en")
     }
 
     signingConfigs {
@@ -116,7 +117,7 @@ android {
             useLegacyPackaging = true
         }
         resources {
-            excludes += "/META-INF/{AL2.0,LGPL2.1}"
+            excludes += listOf("/META-INF/{AL2.0,LGPL2.1}", "DebugProbesKt.bin")
         }
     }
 }
