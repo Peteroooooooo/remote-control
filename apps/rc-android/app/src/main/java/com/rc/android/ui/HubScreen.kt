@@ -269,6 +269,7 @@ fun HubScreen(
                     appIcons = state.appIcons,
                     windowThumbs = state.windowThumbs,
                     appWindowCounts = appWindowCounts,
+                    selectedWindowHwnd = state.activeWindow?.hwnd,
                     pinnedAppKey = dockPinnedApp,
                     pulseToken = dockPulseToken,
                     columns = layout.columns,
@@ -844,6 +845,7 @@ private fun MissionControlWindowsSection(
     appIcons: Map<String, ImageBitmap>,
     windowThumbs: Map<Long, ImageBitmap>,
     appWindowCounts: Map<String, Int>,
+    selectedWindowHwnd: Long?,
     pinnedAppKey: String?,
     pulseToken: Int,
     columns: Int,
@@ -892,11 +894,13 @@ private fun MissionControlWindowsSection(
             ) {
                 items(windows, key = { it.id }) { win ->
                     val isPinned = pinnedAppKey != null && win.appKey == pinnedAppKey
+                    val isSelected = selectedWindowHwnd != null && win.hwnd == selectedWindowHwnd
                     WindowThumbCard(
                         window = win,
                         realIcon = appIcons[win.appKey],
                         thumb = windowThumbs[win.hwnd],
                         appWindowCount = appWindowCounts[win.appKey] ?: 1,
+                        selected = isSelected,
                         pinned = isPinned,
                         pulseToken = if (isPinned) pulseToken else 0,
                         compact = compact,
@@ -950,6 +954,7 @@ private fun WindowThumbCard(
     realIcon: ImageBitmap?,
     thumb: ImageBitmap?,
     appWindowCount: Int,
+    selected: Boolean,
     pinned: Boolean,
     pulseToken: Int,
     compact: Boolean,
@@ -1003,13 +1008,16 @@ private fun WindowThumbCard(
     }
 
     val glow = glowAlpha.value
-    val borderWidth = if (glow > 0.05f) (0.75f + 1.35f * glow).dp else 0.75.dp
-    val borderColor = if (glow > 0.05f) {
-        Color(0xFF0A84FF).copy(alpha = (0.35f + 0.65f * glow).coerceIn(0f, 1f))
-    } else if (c.isDark) {
-        Color(0x24FFFFFF)
-    } else {
-        Color(0x18000000)
+    val borderWidth = when {
+        selected -> 2.dp
+        glow > 0.05f -> (0.75f + 1.35f * glow).dp
+        else -> 0.75.dp
+    }
+    val borderColor = when {
+        selected -> Color(0xFF0A84FF)
+        glow > 0.05f -> Color(0xFF0A84FF).copy(alpha = (0.35f + 0.65f * glow).coerceIn(0f, 1f))
+        c.isDark -> Color(0x24FFFFFF)
+        else -> Color(0x18000000)
     }
 
     Column(

@@ -368,6 +368,7 @@ class RcViewModel : ViewModel(), NativeCallback {
         val vw = viewportWidthPx
         val vh = viewportHeightPx
         val stNow = _ui.value
+        val alreadyPreviewing = stNow.layer == AppLayer.Hub && stNow.activeWindow?.hwnd == window.hwnd
         val targetMon = stNow.monitors.getOrNull(window.monitor)
         if (targetMon != null && targetMon.width > 0 && targetMon.height > 0) {
             val targetWide = targetMon.width >= targetMon.height
@@ -385,7 +386,9 @@ class RcViewModel : ViewModel(), NativeCallback {
             } else {
                 st.currentMonitorIndex
             }
-            val nextLayer = if (st.sessionPhase == SessionPhase.Connected) {
+            // First tap brings the window to front for live preview in the Hub TV;
+            // tapping the selected card again (or double-tapping) enters Fullscreen.
+            val nextLayer = if (alreadyPreviewing && st.sessionPhase == SessionPhase.Connected) {
                 AppLayer.Fullscreen
             } else {
                 st.layer
