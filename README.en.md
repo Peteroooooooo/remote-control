@@ -67,7 +67,7 @@ Run `remote-control.exe` on both PCs:
 
 ### 2. Control a PC from Your Phone
 
-Install `remote-control.apk` from [Releases](https://github.com/Peteroooooooo/remote-control/releases/latest) (Android 10+, arm64). PCs on the same LAN appear automatically; tap one to connect. Across networks, tap **+** and paste the PC's connection code. Gestures, the white / yellow / blue circles on screen, and the keyboard are explained in the [Android guide](docs/android.en.md).
+Install the latest `remote-control.apk` from [Releases](https://github.com/Peteroooooooo/remote-control/releases) (Android 10+, arm64). PCs on the same LAN appear automatically; tap one to connect. Across networks, tap **+** and paste the PC's connection code. Gestures, scroll wheel, and keyboard usage are explained in the [Android guide](docs/android.en.md).
 
 ### 3. Background Service
 
@@ -168,3 +168,7 @@ pause
 
 - `%~dp0` is the folder the `.bat` is in, so it finds the exe wherever the zip is extracted.
 - The second line installs the background service (reachable on the lock and login screens and UAC prompts). It needs **Run as administrator**, from the account that normally uses the PC. Without the service, delete that line and just double-click.
+
+---
+
+Licensed under AGPL-3.0, see [LICENSE](LICENSE).

@@ -67,7 +67,7 @@
 
 ### 2. 用手机控制电脑
 
-从 [Releases](https://github.com/Peteroooooooo/remote-control/releases/latest) 下载 `remote-control.apk` 安装（Android 10+，arm64）。同一局域网的电脑会自动出现，点一下即可连接；跨网络时点右上角 **+** 粘贴电脑的连接码。手势、屏幕上白 / 黄 / 蓝圆圈的含义、键盘用法见 [Android 使用指南](docs/android.md)。
+从 [Releases](https://github.com/Peteroooooooo/remote-control/releases) 下载最新 `remote-control.apk` 安装（Android 10+，arm64）。同一局域网的电脑会自动出现，点一下即可连接；跨网络时点右上角 **+** 粘贴电脑的连接码。手势、滚轮、键盘用法见 [Android 使用指南](docs/android.md)。
 
 ### 3. 后台服务
 
@@ -171,4 +171,4 @@ pause
 
 ---
 
-Apache-2.0 许可证，见 [LICENSE](LICENSE)。社区交流：[LINUX DO](https://linux.do)。
+AGPL-3.0 许可证，见 [LICENSE](LICENSE)。社区交流：[LINUX DO](https://linux.do)。
