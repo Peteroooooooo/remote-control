@@ -519,6 +519,7 @@ impl App {
                     let (id, name) = (&guest.id, &guest.name);
                     let on = online.contains(id);
                     let (tag, tag_fg) = match guest.kind {
+                        Kind::Mine if guest.phone => ("My Android", CYAN),
                         Kind::Mine => ("My PC", CYAN),
                         Kind::Trusted => ("Trusted", GUEST_FG),
                         Kind::Unknown | Kind::Temp => ("Guest", DIM),
@@ -532,7 +533,7 @@ impl App {
                         }
                     };
                     let sid = id.fmt_short().to_string();
-                    let name_w = (inner.width as usize).saturating_sub(right_w + 10 + 8);
+                    let name_w = (inner.width as usize).saturating_sub(right_w + 12 + 8);
                     let dot = if on { Span::styled("● ", Style::new().fg(GREEN)) } else { Span::styled("○ ", Style::new().fg(DIM)) };
                     f.render_widget(
                         Line::from(vec![
@@ -545,7 +546,7 @@ impl App {
                         row,
                     );
                     let tail = Line::from(vec![
-                        Span::styled(pad(tag, 10, false), Style::new().fg(tag_fg)),
+                        Span::styled(pad(tag, 12, false), Style::new().fg(tag_fg)),
                         Span::styled(format!("{sid:<12}"), Style::new().fg(DIM)),
                         Span::styled(format!("{} ", pad(&when, 10, true)), Style::new().fg(if on { GREEN } else { DIM })),
                     ])
@@ -830,6 +831,7 @@ fn make_demo(dir: &std::path::Path) -> Result<Store> {
         &[
             Guest::new(key(4), "Friend Laptop", Kind::Trusted),
             Guest::new(key(5), "Study PC", Kind::Mine),
+            Guest::new(key(8), "OPPO PFEM10", Kind::Mine).with_phone(true),
             Guest::new(key(6), "Cousin Phone", Kind::Temp),
         ],
     )?;

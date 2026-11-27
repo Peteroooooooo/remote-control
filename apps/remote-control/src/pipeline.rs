@@ -24,7 +24,7 @@
 use std::{
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU8, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -92,6 +92,9 @@ pub struct PipeShared {
     /// Optional lightweight capture FPS cap from `Msg::Throttle` (`0` = full
     /// chosen fps, `>0` = throttle pacing without rebuilding the encoder).
     pub throttle_fps: AtomicU8,
+    /// Optional single-window exclusive capture HWND (`0` = stream full monitor).
+    pub target_window: AtomicU64,
+    pub target_window_changed: AtomicBool,
 }
 
 /// After a screen change, the same picture is encoded again for at most this
@@ -402,10 +405,12 @@ pub fn run(cfg: PipeConfig, tx: Arc<VideoTx>, sh: Arc<PipeShared>, info: Unbound
     // encoder is rebuilt after a desktop switch.
     let mut quirks = RateQuirks::default();
     let mut auto = AutoSize::default();
+    let mut cached_gpu: Option<Gpu> = None;
     while !sh.stop.load(Ordering::Relaxed) {
-        match run_once(cfg, &tx, &sh, &info, &mut quirks, &mut auto) {
+        match run_once(cfg, &tx, &sh, &info, &mut quirks, &mut auto, &mut cached_gpu) {
             Ok(()) => last_err.clear(),
             Err(e) => {
+                cached_gpu = None;
                 let s = format!("{e:#}");
                 sh.no_display.store(s.contains(crate::monitors::NO_DISPLAY), Ordering::Relaxed);
                 if s != last_err {
@@ -609,16 +614,48 @@ fn run_once(
     info: &UnboundedSender<Msg>,
     quirks: &mut RateQuirks,
     auto: &mut AutoSize,
+    cached_gpu: &mut Option<Gpu>,
 ) -> Result<()> {
     // Service mode: capture the desktop that is shown now (see desktop.rs).
     let desktop = crate::desktop::follow()?;
-    let (gpu, output, rect) = crate::monitors::open(&sh.monitors)?;
+    let (output, rect) = crate::monitors::open_with_gpu(&sh.monitors, cached_gpu)?;
+    let gpu = cached_gpu.as_ref().expect("gpu initialized by open_with_gpu");
     sh.no_display.store(false, Ordering::Relaxed);
     *sh.display.lock().unwrap() = rect;
     let _ = info.send(crate::monitors::message(&sh.monitors));
-    let mut cap = open_capture(&gpu, &output, desktop.as_deref(), &mut quirks.wgc_after)?;
+    sh.target_window_changed.store(false, Ordering::Release);
+    let target_hwnd = sh.target_window.load(Ordering::Acquire);
+    let mut cap = if target_hwnd != 0 && desktop.as_deref().is_none_or(|d| d.eq_ignore_ascii_case("Default")) {
+        if crate::winlist::is_window_capturable(target_hwnd) {
+            let win_cap = if desktop.is_some() {
+                Capture::agent_window(gpu, &output, target_hwnd)
+            } else {
+                Capture::wgc_window(gpu, target_hwnd)
+            };
+            match win_cap {
+                Ok(c) => {
+                    if let Some(wr) = crate::winlist::window_rect_matching_size(target_hwnd, c.width, c.height) {
+                        *sh.display.lock().unwrap() = wr;
+                    }
+                    log!("streaming single window 0x{target_hwnd:x} ({}x{})", c.width, c.height);
+                    c
+                }
+                Err(e) => {
+                    log!("single-window WGC 0x{target_hwnd:x} failed: {e:#}; falling back to full display");
+                    sh.target_window.store(0, Ordering::Release);
+                    open_capture(gpu, &output, desktop.as_deref(), &mut quirks.wgc_after)?
+                }
+            }
+        } else {
+            log!("target window 0x{target_hwnd:x} is no longer capturable; falling back to full display");
+            sh.target_window.store(0, Ordering::Release);
+            open_capture(gpu, &output, desktop.as_deref(), &mut quirks.wgc_after)?
+        }
+    } else {
+        open_capture(gpu, &output, desktop.as_deref(), &mut quirks.wgc_after)?
+    };
     while !sh.stop.load(Ordering::Relaxed) {
-        if let Next::Capture = stream(cfg, tx, sh, info, quirks, auto, &gpu, &mut cap, desktop.as_deref())? {
+        if let Next::Capture = stream(cfg, tx, sh, info, quirks, auto, gpu, &mut cap, desktop.as_deref())? {
             break;
         }
     }
@@ -639,11 +676,17 @@ fn stream(
     desktop: Option<&str>,
 ) -> Result<Next> {
     let (cw, ch) = cap.upright_size();
-    let quality = {
+    let mut quality = {
         let g = sh.quality.lock().unwrap();
         sh.quality_changed.store(false, Ordering::Release);
         *g
     };
+    if quality.fit_w > 0
+        && quality.fit_h > 0
+        && (cw < ch) != (quality.fit_w < quality.fit_h)
+    {
+        std::mem::swap(&mut quality.fit_w, &mut quality.fit_h);
+    }
     let full = picture_size(cw, ch, &quality, cfg.max_width);
     let refresh = crate::monitors::refresh_hz(&sh.monitors);
     let full_fps = stream_fps(&quality, &cfg, refresh);
@@ -792,6 +835,10 @@ fn stream(
     let mut frames = 0u64;
     let mut desktop_checked = Instant::now();
     while !sh.stop.load(Ordering::Relaxed) {
+        if sh.target_window_changed.swap(false, Ordering::AcqRel) {
+            log!("switching capture target (single-window / full-display)");
+            return Ok(Next::Capture);
+        }
         if sh.quality_changed.load(Ordering::Acquire) {
             log!("the viewer chose another picture");
             return Ok(Next::Picture);
@@ -817,6 +864,17 @@ fn stream(
             desktop_checked = Instant::now();
             if crate::desktop::switched() || crate::monitors::should_reopen(&sh.monitors) {
                 return Ok(Next::Capture);
+            }
+            let target_hwnd = sh.target_window.load(Ordering::Acquire);
+            if target_hwnd != 0 {
+                if !crate::winlist::is_window_capturable(target_hwnd) {
+                    log!("single-window 0x{target_hwnd:x} closed or minimized; returning to full display");
+                    sh.target_window.store(0, Ordering::Release);
+                    return Ok(Next::Capture);
+                }
+                if let Some(wr) = crate::winlist::window_rect_matching_size(target_hwnd, cap.width, cap.height) {
+                    *sh.display.lock().unwrap() = wr;
+                }
             }
         }
         if tx.is_paused() {
@@ -856,8 +914,12 @@ fn stream(
             // (test laptop 2026-11-08): rebuild now rather than after the error pause.
             Err(_) if crate::desktop::switched() => return Ok(Next::Capture),
             Err(e) if cap.is_wgc() => {
-                log!("WGC: {e:#}; DXGI duplication for at least {} s", WGC_RETRY.as_secs());
-                quirks.wgc_after = Some(Instant::now() + WGC_RETRY);
+                if sh.target_window.swap(0, Ordering::AcqRel) != 0 {
+                    log!("single-window WGC ended: {e:#}; returning to full display");
+                } else {
+                    log!("WGC: {e:#}; DXGI duplication for at least {} s", WGC_RETRY.as_secs());
+                    quirks.wgc_after = Some(Instant::now() + WGC_RETRY);
+                }
                 return Ok(Next::Capture);
             }
             Err(e) => return Err(e),

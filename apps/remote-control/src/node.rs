@@ -131,6 +131,8 @@ struct Peer {
     /// Bumped when a freshly pasted code supplies new addresses/relay/token so
     /// an in-flight dial or stale connection is dropped and redialed at once.
     redial: u64,
+    /// It said it is a phone in its last hello or welcome.
+    phone: bool,
 }
 
 /// A meet connection that only holds a path through a device's self-hosted
@@ -166,6 +168,7 @@ impl Peer {
             keep_after: None,
             keep_wait: KEEP_WAIT,
             redial: 0,
+            phone: false,
         }
     }
 
@@ -429,6 +432,14 @@ impl Shared {
         (!self.opts.service && st.lobby_window.is_none()) || st.lobby_seen.is_some_and(|t| t.elapsed() < LOBBY_GONE)
     }
 
+    /// Whether devices met on the LAN (not listed) are welcome: always while
+    /// "visible on the LAN" is on, so a new phone finds this computer and can ask
+    /// to connect even with the lobby in the tray; otherwise only while the lobby
+    /// shows. Devices met with a code stay tied to the lobby window.
+    fn lan_open(&self, st: &St) -> bool {
+        st.settings.lan_visible || self.lobby_open(st)
+    }
+
     /// Acts on the lobby window opening or closing (or going to the tray).
     fn lobby_check(&self, st: &mut St) -> bool {
         let open = self.lobby_open(st);
@@ -450,7 +461,9 @@ impl Shared {
     fn forget_strangers(&self, st: &mut St) {
         lobby_closed(st);
         for c in self.meets.lock().unwrap().iter() {
-            if st.store.get(&c.remote_id()).is_none() {
+            let id = c.remote_id();
+            let lan_kept = st.peers.get(&id).is_some_and(|p| p.met == Some(Met::Lan));
+            if st.store.get(&id).is_none() && !lan_kept {
                 c.close(0u32.into(), b"forgotten");
             }
         }
@@ -492,12 +505,11 @@ impl Shared {
             return true;
         }
         let Some(p) = st.peers.get(id) else { return false };
-        self.lobby_open(st)
-            && match p.met {
-                Some(Met::Code) => true,
-                Some(Met::Lan) => p.lan_active(),
-                None => false,
-            }
+        match p.met {
+            Some(Met::Code) => self.lobby_open(st),
+            Some(Met::Lan) => self.lan_open(st) && p.lan_active(),
+            None => false,
+        }
     }
 
     /// The devices this computer lets use its own relay (`target-plan` 5.2):
@@ -508,12 +520,12 @@ impl Shared {
         let mut m: BTreeMap<EndpointId, Guest> = st
             .store
             .listed()
-            .map(|d| (d.id, Guest::new(d.id, d.name.clone(), if d.auto_accept { GuestKind::Mine } else { GuestKind::Trusted })))
+            .map(|d| (d.id, Guest::new(d.id, d.name.clone(), if d.auto_accept { GuestKind::Mine } else { GuestKind::Trusted }).with_phone(d.phone)))
             .collect();
         if self.lobby_open(st) && !self.is_stopped() && !self.leaving.load(std::sync::atomic::Ordering::SeqCst) {
             for (id, p) in &st.peers {
                 if p.met == Some(Met::Code) {
-                    m.entry(*id).or_insert_with(|| Guest::new(*id, p.name.clone(), GuestKind::Temp));
+                    m.entry(*id).or_insert_with(|| Guest::new(*id, p.name.clone(), GuestKind::Temp).with_phone(p.phone));
                 }
             }
         }
@@ -761,9 +773,13 @@ impl Shared {
     /// a trusted device. `tell`: it does not list this computer yet.
     fn befriend(self: &Arc<Self>, st: &mut St, id: EndpointId, tell: bool) {
         let name = st.peers.get(&id).map(|p| p.name.clone()).unwrap_or_default();
+        let phone = st.peers.get(&id).map(|p| p.phone);
         let d = st.store.add(id);
         if d.name.is_empty() {
             d.name = name;
+        }
+        if let Some(phone) = phone {
+            d.phone = phone;
         }
         d.tell = tell;
         if let Some(p) = st.peers.get_mut(&id) {
@@ -773,6 +789,26 @@ impl Shared {
         self.save(st);
         log!("{} and this computer remember each other now (trusted)", id.fmt_short());
         self.ensure(st, id);
+    }
+
+    /// What `id` said it is in its hello or welcome (`proto::PLATFORM_*`),
+    /// on every meet connection: kept with it and in the device list, so the
+    /// guest list for this computer's relay tells phones from computers.
+    fn said_platform(&self, st: &mut St, id: &EndpointId, platform: u8) {
+        let phone = platform == proto::PLATFORM_ANDROID;
+        if let Some(p) = st.peers.get_mut(id) {
+            p.phone = phone;
+        }
+        let dirty = match st.store.get_mut(id) {
+            Some(d) if d.phone != phone => {
+                d.phone = phone;
+                true
+            }
+            _ => false,
+        };
+        if dirty {
+            self.save(st);
+        }
     }
 
     /// What `from` said of this computer's place in its list, in a hello or
@@ -843,7 +879,7 @@ impl Shared {
         let event = self.wish(st, id);
         let home = url_list(&self.home_list(st));
         let token = st.peers.get(id).and_then(|p| p.token);
-        (Msg::MeetHi { name: st.settings.shown_name(), home, token, event, grant: Some(String::new()) }, event)
+        (Msg::MeetHi { name: st.settings.shown_name(), home, token, event, grant: Some(String::new()), platform: proto::PLATFORM_PC }, event)
     }
 
     /// Status of a connected device from its connection's selected path.
@@ -873,7 +909,7 @@ impl Shared {
 
     /// `event`: where this computer stands in its list (see `heard`).
     #[allow(clippy::too_many_arguments)]
-    fn welcomed(self: &Arc<Self>, st: &mut St, id: &EndpointId, conn: &Connection, name: String, home: String, sent: u8, event: u8) {
+    fn welcomed(self: &Arc<Self>, st: &mut St, id: &EndpointId, conn: &Connection, name: String, home: String, sent: u8, event: u8, platform: u8) {
         if sent == meet::EVENT_FORGET {
             // Re-added (e.g. a freshly pasted connection code) while this delete
             // was in flight: keep the new peer state intact.
@@ -894,6 +930,7 @@ impl Shared {
         }
         let name = clean(&name);
         let home = relay_urls(&home);
+        self.said_platform(st, id, platform);
         if let Some(p) = st.peers.get_mut(id) {
             // Met: the code has done its work. Shown again after the other side
             // forgot this computer, it would only read as a void code.
@@ -994,22 +1031,23 @@ impl Shared {
     /// device list, or it was met while the lobby is open.
     fn knows(&self, st: &St, id: &EndpointId) -> bool {
         st.store.get(id).is_some()
-            || (self.lobby_open(st)
-                && st.peers.get(id).is_some_and(|p| match p.met {
-                    Some(Met::Code) => true,
-                    Some(Met::Lan) => p.lan_active(),
-                    None => false,
-                }))
+            || st.peers.get(id).is_some_and(|p| match p.met {
+                Some(Met::Code) => self.lobby_open(st),
+                Some(Met::Lan) => self.lan_open(st) && p.lan_active(),
+                None => false,
+            })
     }
 
     /// The answer to a hello from `from` (see `meet`).
-    fn on_hi(self: &Arc<Self>, from: EndpointId, conn: &Connection, name: String, home: String, token: Option<[u8; 8]>, event: u8) -> Msg {
+    #[allow(clippy::too_many_arguments)]
+    fn on_hi(self: &Arc<Self>, from: EndpointId, conn: &Connection, name: String, home: String, token: Option<[u8; 8]>, event: u8, platform: u8) -> Msg {
         let mut st = self.st.lock().unwrap();
         let welcome = |st: &St, event: u8| Msg::MeetWelcome {
             name: st.settings.shown_name(),
             home: url_list(&self.home_list(st)),
             grant: Some(String::new()),
             event,
+            platform: proto::PLATFORM_PC,
         };
         let name = clean(&name);
         if event == meet::EVENT_FORGET && token.is_none() {
@@ -1074,7 +1112,7 @@ impl Shared {
         if !known(&st) {
             let lan_direct = net::direct_addr(conn).filter(|a| net::is_lan(a.ip()));
             let lan = st.peers.get(&from).is_some_and(|p| p.on_lan()) || lan_direct.is_some();
-            if !(open && lan && st.settings.lan_visible) {
+            if !(lan && st.settings.lan_visible) {
                 return Msg::MeetRefuse { reason: meet::REFUSE_UNKNOWN };
             }
             let p = st.peers.entry(from).or_insert_with(Peer::new);
@@ -1093,6 +1131,7 @@ impl Shared {
                 p.home = h;
             }
         }
+        self.said_platform(&mut st, &from, platform);
         self.heard(&mut st, from, event);
         // Waking a connected peer task here would make the two sides' hellos wake
         // each other forever; only an idle one (not connected) needs it.
@@ -2203,11 +2242,11 @@ async fn talk(sh: &Arc<Shared>, id: EndpointId, conn: &Connection, wake: &Notify
             meet::ask(conn, &hi).await
         };
         match reply {
-            Ok(Msg::MeetWelcome { name, home, event, .. }) => {
+            Ok(Msg::MeetWelcome { name, home, event, platform, .. }) => {
                 let (first, done) = {
                     let mut st = sh.st.lock().unwrap();
                     let first = sent != meet::EVENT_FORGET && st.peers.get(&id).is_none_or(|p| p.conn.is_none());
-                    sh.welcomed(&mut st, &id, conn, name.clone(), home, sent, event);
+                    sh.welcomed(&mut st, &id, conn, name.clone(), home, sent, event, platform);
                     (first, sent == meet::EVENT_FORGET || !sh.wanted(&st, &id))
                 };
                 if first {
@@ -2298,9 +2337,9 @@ async fn serve_meet(sh: Arc<Shared>, conn: Connection) {
     let mut watching = false;
     loop {
         match meet::next_hi(&conn).await {
-            Ok(Some((Msg::MeetHi { name, home, token, event, .. }, send))) => {
+            Ok(Some((Msg::MeetHi { name, home, token, event, platform, .. }, send))) => {
                 let forget = event == meet::EVENT_FORGET && token.is_none();
-                let reply = sh.on_hi(from, &conn, name, home, token, event);
+                let reply = sh.on_hi(from, &conn, name, home, token, event, platform);
                 let welcomed = matches!(reply, Msg::MeetWelcome { .. });
                 if let Err(e) = meet::answer(send, &reply).await {
                     log!("answer to {}: {e:#}", from.fmt_short());
@@ -2338,7 +2377,7 @@ async fn watch_incoming(sh: Arc<Shared>, conn: Connection) {
         {
             let mut st = sh.st.lock().unwrap();
             let lan_ok = st.peers.get(&from).is_some_and(|p| p.met == Some(Met::Lan)) && is_lan_conn(&conn);
-            if sh.is_stopped() || !(sh.knows(&st, &from) || sh.lobby_open(&st) && lan_ok) {
+            if sh.is_stopped() || !(sh.knows(&st, &from) || sh.lan_open(&st) && lan_ok) {
                 drop(st);
                 conn.close(0u32.into(), b"forgotten");
                 break;
@@ -2504,7 +2543,10 @@ async fn admit(sh: &Arc<Shared>, device: EndpointId, conn: &Connection, send: &m
         if !desktop::user_desktop_shown() {
             return Err(net::CLOSE_LOCKED);
         }
-        let met = if sh.lobby_open(&st) { st.peers.get(&device).and_then(|p| p.met) } else { None };
+        let met = st.peers.get(&device).and_then(|p| p.met).filter(|m| match m {
+            Met::Lan => sh.lan_open(&st),
+            Met::Code => sh.lobby_open(&st),
+        });
         let kind = match (&listed, met) {
             (Some(_), _) => Kind::Trusted,
             (None, Some(m)) => Kind::New { via_code: m == Met::Code },
@@ -2682,7 +2724,12 @@ fn process_alive(pid: &str) -> bool {
 /// What follows from the lobby window closing in service mode.
 fn lobby_closed(st: &mut St) {
     st.codes.clear();
+    // Devices met on the LAN stay while "visible on the LAN" is on (see `lan_open`).
+    let keep_lan = st.settings.lan_visible;
     for p in st.peers.values_mut() {
+        if keep_lan && p.met == Some(Met::Lan) {
+            continue;
+        }
         p.met = None;
         p.token = None;
         p.invite = None;
@@ -3201,11 +3248,7 @@ fn serve_endpoint(sh: &Arc<Shared>, ep: &Endpoint) {
             Arc::new(move |asker| {
                 let st = s2.st.lock().unwrap();
                 let listed = asker.is_some_and(|a| st.store.get(&a).is_some());
-                let allowed = if st.settings.lan_visible {
-                    s2.lobby_open(&st) || listed
-                } else {
-                    listed
-                };
+                let allowed = listed || st.settings.lan_visible;
                 allowed.then(|| st.settings.shown_name())
             }),
         );
@@ -4070,6 +4113,51 @@ mod handoff_tests {
             assert!(!node.sh.wanted(&st, &peer));
         }
 
+        rt.block_on(node.goodbye(0));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_phone_says_so_and_the_relay_guest_list_carries_it() {
+        let dir = temp_dir("phone_guest");
+        let mut o = host::HostArgs::defaults().node_options(false);
+        o.key = dir.join("device.key");
+        o.lan = false;
+        let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+        let node = rt.block_on(Node::start(o)).unwrap();
+        let (phone, pc, new_phone) = (id(50), id(51), id(52));
+        {
+            let mut st = node.sh.st.lock().unwrap();
+            for d in [phone, pc] {
+                st.peers.insert(d, Peer::new());
+                st.store.add(d).auto_accept = true;
+            }
+            // Listed devices learn it from every hello or welcome; an older
+            // app (no platform) is a computer.
+            node.sh.said_platform(&mut st, &phone, proto::PLATFORM_ANDROID);
+            node.sh.said_platform(&mut st, &pc, proto::PLATFORM_PC);
+            assert!(st.peers[&phone].phone && st.store.get(&phone).unwrap().phone);
+            assert!(!st.store.get(&pc).unwrap().phone);
+            let g = node.sh.guests(&st);
+            let of = |id| g.iter().find(|g| g.id == id).unwrap();
+            assert!(of(phone).phone && of(phone).kind == GuestKind::Mine);
+            assert!(!of(pc).phone && of(pc).kind == GuestKind::Mine);
+            // Saved: back after a restart.
+            let saved = Store::load(&store::devices_path(&dir.join("device.key"))).unwrap();
+            assert!(saved.get(&phone).unwrap().phone && !saved.get(&pc).unwrap().phone);
+            // A phone heard before it is listed keeps the mark when listed
+            // (`running`: no dialing task for this made-up device).
+            let mut p = Peer::new();
+            p.running = true;
+            st.peers.insert(new_phone, p);
+            node.sh.said_platform(&mut st, &new_phone, proto::PLATFORM_ANDROID);
+            assert!(st.store.get(&new_phone).is_none());
+        }
+        {
+            let mut st = node.sh.st.lock().unwrap();
+            node.sh.befriend(&mut st, new_phone, false);
+            assert!(st.store.get(&new_phone).unwrap().phone);
+        }
         rt.block_on(node.goodbye(0));
         let _ = std::fs::remove_dir_all(&dir);
     }

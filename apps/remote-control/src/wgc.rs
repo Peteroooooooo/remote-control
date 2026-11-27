@@ -33,7 +33,7 @@ use windows::{
         DirectX::{Direct3D11::IDirect3DDevice, DirectXPixelFormat},
     },
     Win32::{
-        Foundation::{CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE, S_OK, WAIT_OBJECT_0},
+        Foundation::{CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE, HWND, S_OK, WAIT_OBJECT_0},
         Graphics::{
             Direct3D11::{
                 D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX, D3D11_RESOURCE_MISC_SHARED_NTHANDLE, D3D11_TEXTURE2D_DESC,
@@ -105,7 +105,22 @@ impl Wgc {
     pub fn start(gpu: &Gpu, monitor: HMONITOR, want_fp16: bool) -> Result<Wgc> {
         let interop = windows::core::factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>().context("WGC")?;
         let item: GraphicsCaptureItem = unsafe { interop.CreateForMonitor(monitor) }.context("CreateForMonitor")?;
+        Self::start_item(gpu, item, want_fp16)
+    }
+
+    /// Captures a single top-level window `hwnd` onto `gpu`'s device via WGC
+    /// (`CreateForWindow`), leaving the cursor and yellow border out.
+    pub fn start_window(gpu: &Gpu, hwnd: HWND) -> Result<Wgc> {
+        let interop = windows::core::factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>().context("WGC")?;
+        let item: GraphicsCaptureItem = unsafe { interop.CreateForWindow(hwnd) }.context("CreateForWindow")?;
+        Self::start_item(gpu, item, false)
+    }
+
+    fn start_item(gpu: &Gpu, item: GraphicsCaptureItem, want_fp16: bool) -> Result<Wgc> {
         let size = item.Size()?;
+        if size.Width <= 0 || size.Height <= 0 {
+            bail!("WGC item has zero size");
+        }
         let dxgi: IDXGIDevice = gpu.device.cast()?;
         let d3d: IDirect3DDevice = unsafe { CreateDirect3D11DeviceFromDXGIDevice(&dxgi) }?.cast()?;
         let (pool, fp16) = if want_fp16 {
@@ -138,8 +153,9 @@ impl Wgc {
             )
         };
         let session = pool.CreateCaptureSession(&item)?;
-        session.SetIsCursorCaptureEnabled(false).context("leaving the pointer out")?;
-        session.SetIsBorderRequired(false).context("capturing without the yellow border")?;
+        let _ = session.SetIsCursorCaptureEnabled(false);
+        let _ = session.SetIsBorderRequired(false);
+        let _ = session.SetIncludeSecondaryWindows(true);
         // Every composed frame, not at most 60 a second (newer Windows 11 only).
         let _ = session.SetMinUpdateInterval(TimeSpan { Duration: 10_000 });
         let ev = unsafe { CreateEventW(None, false, false, PCWSTR::null()) }.context("CreateEventW")?;
@@ -319,9 +335,18 @@ pub fn serve(device: &str) -> Result<()> {
         let _ = std::io::stdin().read_to_end(&mut Vec::new());
         std::process::exit(0);
     });
-    let (gpu, output) = find_output(device)?;
-    let hdr_info = crate::hdr::query_display_hdr(device);
-    let wgc = Wgc::start(&gpu, unsafe { output.GetDesc()? }.Monitor, hdr_info.hdr_enabled)?;
+    let (gpu, wgc) = if let Some(rest) = device.strip_prefix("window:") {
+        let (hwnd_str, disp) = rest.split_once('|').context("invalid window target")?;
+        let hwnd_raw: u64 = hwnd_str.parse().context("invalid window hwnd")?;
+        let (gpu, _output) = find_output(disp)?;
+        let wgc = Wgc::start_window(&gpu, HWND(hwnd_raw as usize as *mut _))?;
+        (gpu, wgc)
+    } else {
+        let (gpu, output) = find_output(device)?;
+        let hdr_info = crate::hdr::query_display_hdr(device);
+        let wgc = Wgc::start(&gpu, unsafe { output.GetDesc()? }.Monitor, hdr_info.hdr_enabled)?;
+        (gpu, wgc)
+    };
     let mut out = std::io::stdout().lock();
     let mut ring = Vec::new();
     for slot in 0..RING {

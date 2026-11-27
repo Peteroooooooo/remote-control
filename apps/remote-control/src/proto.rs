@@ -192,6 +192,22 @@ pub struct MonitorDesc {
     pub rotation: u16,
 }
 
+/// One visible top-level window running on the host desktop.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WindowDesc {
+    pub hwnd: u64,
+    pub app_key: String,
+    pub app_name: String,
+    pub title: String,
+    pub monitor: u8,
+    pub minimized: bool,
+    /// Normalized `0..=65535` bounds relative to `monitor` (`0` = unknown).
+    pub rx: u16,
+    pub ry: u16,
+    pub rw: u16,
+    pub rh: u16,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Msg {
     /// Viewer -> host, first message. caps: CAN_HEVC. `proof`: an `rcd1`
@@ -215,6 +231,18 @@ pub enum Msg {
     Wheel { delta: i16, horizontal: bool },
     /// Set-1 scan code; 0xE0xx for extended keys.
     Key { scan: u16, down: bool },
+    /// Viewer -> host: direct UTF-8 text input (Chinese/voice IME), injected via KEYEVENTF_UNICODE.
+    TextInput { text: String },
+    /// Host -> viewer: remote pointer / focus is over an editable text area.
+    TextFocus { editable: bool },
+    /// Viewer -> host: native touch contact (`phase`: 0 down, 1 move, 2 up, 3 cancel).
+    Touch { id: u8, phase: u8, x: u16, y: u16 },
+    /// Viewer -> host: precision touchpad gesture (`phase`: 0..2 scroll, 3..5 pinch).
+    Touchpad { phase: u8, dx: i16, dy: i16, scale_milli: u16 },
+    /// Viewer -> host: stylus/pen input (`phase`: 0 hover, 1 down, 2 move, 3 up, 4 cancel).
+    Pen { phase: u8, x: u16, y: u16, pressure: u16, tilt_x: i8, tilt_y: i8, flags: u8 },
+    /// Viewer -> host: external physical mouse relative motion.
+    MouseDelta { dx: i16, dy: i16 },
     /// Viewer lost focus: let go of every key and button.
     ReleaseAll,
     RequestKeyframe,
@@ -237,19 +265,23 @@ pub enum Msg {
     /// Host -> viewer: show the image sent earlier under `id`.
     CursorUse { id: u32 },
     CursorHidden,
+    /// Host -> viewer: semantic cursor kind (`0` normal, `1` interactive/hand/resize, `2` text/ibeam).
+    CursorMeta { kind: u8 },
     /// Either way: the sender's clipboard changed (its copy `seq`, made after
     /// hearing of the receiver's copy `seen`); the data follows on its own stream.
     ClipOffer { seq: u32, seen: u32, format: u8, bytes: u32 },
     /// On the meet ALPN, from the one who connected: who I am, where I am
     /// reachable (my home relay), the token of the other side's connection
     /// code if I am redeeming one, a change to its place in my device
-    /// list (`meet::EVENT_*`), and the relays I give it (`grant`).
-    MeetHi { name: String, home: String, token: Option<[u8; 8]>, event: u8, grant: Option<String> },
+    /// list (`meet::EVENT_*`), the relays I give it (`grant`), and what I
+    /// am (`PLATFORM_*`; a computer, which older versions all are, says nothing).
+    MeetHi { name: String, home: String, token: Option<[u8; 8]>, event: u8, grant: Option<String>, platform: u8 },
     /// The answer: the other side knows me, and where I stand in its device
-    /// list (`meet::EVENT_*`, as in a hello; 0 from an older version).
-    /// Anything after `home` on the wire other than a grant and that event
-    /// (an older version's door sent more) is left unread.
-    MeetWelcome { name: String, home: String, grant: Option<String>, event: u8 },
+    /// list (`meet::EVENT_*`, as in a hello; 0 from an older version), and
+    /// what it is (`PLATFORM_*`, as in a hello).
+    /// Anything after `home` on the wire other than a grant, that event and
+    /// the platform (an older version's door sent more) is left unread.
+    MeetWelcome { name: String, home: String, grant: Option<String>, event: u8, platform: u8 },
     /// The answer: it does not (`meet::REFUSE_*`).
     MeetRefuse { reason: u8 },
     /// Host -> viewer, on connect and whenever the displays or the streamed one
@@ -257,6 +289,16 @@ pub enum Msg {
     Monitors { list: Vec<MonitorDesc>, current: u8 },
     /// Viewer -> host: stream display `index` of the latest list.
     SelectMonitor { index: u8 },
+    /// Host -> viewer: visible top-level application windows on the host desktop.
+    Windows { list: Vec<WindowDesc> },
+    /// Viewer -> host: restore/focus window `hwnd` and adapt it to `(vw, vh)` viewport (`0` = exit single-window mode).
+    FocusWindow { hwnd: u64, vw: u16, vh: u16 },
+    /// Host -> viewer: real Windows process/window icon as PNG bytes, keyed by `app_key`.
+    AppIcon { app_key: String, png: Vec<u8> },
+    /// Host -> viewer: real live thumbnail screenshot of `hwnd` as PNG bytes.
+    WindowThumb { hwnd: u64, png: Vec<u8> },
+    /// Bidirectional: request or report phone virtual display state.
+    VirtualDisplay { active: bool, width: u16, height: u16, dpi_percent: u16 },
     /// Host -> viewer: why there is no picture now, or what did not work
     /// (`HINT_*`); `HINT_NONE` when the picture is back.
     Hint { what: u8 },
@@ -328,6 +370,13 @@ impl W {
         }
         self
     }
+    /// A meet platform: `PLATFORM_MARK`, then the byte; nothing for a computer.
+    fn platform(&mut self, p: u8) -> &mut Self {
+        if p != PLATFORM_PC {
+            self.u8(PLATFORM_MARK).u8(p);
+        }
+        self
+    }
 }
 
 /// Starts a grant at the end of a meet message. Not 0, which an older
@@ -339,6 +388,14 @@ const EVENT_MARK: u8 = 0xA8;
 const QUALITY_MARK: u8 = 0xA9;
 /// Starts what is streamed at the end of an info.
 const STREAMING_MARK: u8 = 0xAA;
+/// Starts the platform byte at the very end of a meet hello or welcome
+/// (after the grant, and a welcome's event). Older versions stop before it.
+const PLATFORM_MARK: u8 = 0xAB;
+
+/// A computer, or a sender too old to say.
+pub const PLATFORM_PC: u8 = 0;
+/// An Android phone (`crates/rc-proto` sends it).
+pub const PLATFORM_ANDROID: u8 = 1;
 
 struct R<'a>(&'a [u8]);
 
@@ -389,6 +446,17 @@ impl R<'_> {
         self.u8()?;
         Ok(Some(self.long_str()?))
     }
+    /// What `W::platform` wrote, or `PLATFORM_PC` (a computer, or an older version).
+    fn platform(&mut self) -> u8 {
+        match self.0 {
+            [PLATFORM_MARK, p, rest @ ..] => {
+                let p = *p;
+                self.0 = rest;
+                p
+            }
+            _ => PLATFORM_PC,
+        }
+    }
     fn text(&mut self, n: usize) -> Result<String> {
         if self.0.len() < n {
             bail!("message too short");
@@ -422,12 +490,24 @@ impl Msg {
             Msg::CursorShape { .. } => 30,
             Msg::CursorUse { .. } => 31,
             Msg::CursorHidden => 32,
+            Msg::CursorMeta { .. } => 33,
+            Msg::TextInput { .. } => 40,
+            Msg::TextFocus { .. } => 41,
+            Msg::Touch { .. } => 42,
+            Msg::Touchpad { .. } => 43,
+            Msg::Pen { .. } => 44,
+            Msg::MouseDelta { .. } => 45,
             Msg::ClipOffer { .. } => 20,
             Msg::MeetHi { .. } => 60,
             Msg::MeetWelcome { .. } => 61,
             Msg::MeetRefuse { .. } => 62,
             Msg::Monitors { .. } => 70,
             Msg::SelectMonitor { .. } => 71,
+            Msg::Windows { .. } => 72,
+            Msg::FocusWindow { .. } => 73,
+            Msg::AppIcon { .. } => 74,
+            Msg::WindowThumb { .. } => 75,
+            Msg::VirtualDisplay { .. } => 76,
             Msg::Hint { .. } => 16,
             Msg::Quality(_) => 17,
             Msg::InputTick { .. } => 18,
@@ -464,6 +544,33 @@ impl Msg {
             Msg::Key { scan, down } => {
                 w.u16(*scan).u8(*down as u8);
             }
+            Msg::TextInput { text } => {
+                w.long_str(text);
+            }
+            Msg::TextFocus { editable } => {
+                w.u8(*editable as u8);
+            }
+            Msg::Touch { id, phase, x, y } => {
+                w.u8(*id).u8(*phase).u16(*x).u16(*y);
+            }
+            Msg::Touchpad { phase, dx, dy, scale_milli } => {
+                w.u8(*phase).u16(*dx as u16).u16(*dy as u16).u16(*scale_milli);
+            }
+            Msg::Pen { phase, x, y, pressure, tilt_x, tilt_y, flags } => {
+                w.u8(*phase)
+                    .u16(*x)
+                    .u16(*y)
+                    .u16(*pressure)
+                    .u8(*tilt_x as u8)
+                    .u8(*tilt_y as u8)
+                    .u8(*flags);
+            }
+            Msg::MouseDelta { dx, dy } => {
+                w.u16(*dx as u16).u16(*dy as u16);
+            }
+            Msg::CursorMeta { kind } => {
+                w.u8(*kind);
+            }
             Msg::ReleaseAll | Msg::RequestKeyframe | Msg::SendSas | Msg::CursorHidden => {}
             Msg::Ping { t_us } | Msg::Pong { t_us } => {
                 w.u64(*t_us);
@@ -481,18 +588,19 @@ impl Msg {
                 w.u8(name.len() as u8);
                 w.0.extend_from_slice(name);
             }
-            Msg::MeetHi { name, home, token, event, grant } => {
+            Msg::MeetHi { name, home, token, event, grant, platform } => {
                 w.str(name).long_str(home).u8(*event).u8(token.is_some() as u8);
                 if let Some(t) = token {
                     w.0.extend_from_slice(t);
                 }
-                w.grant(grant);
+                w.grant(grant).platform(*platform);
             }
-            Msg::MeetWelcome { name, home, grant, event } => {
+            Msg::MeetWelcome { name, home, grant, event, platform } => {
                 w.str(name).long_str(home).grant(grant);
                 if *event != 0 {
                     w.u8(EVENT_MARK).u8(*event);
                 }
+                w.platform(*platform);
             }
             Msg::MeetRefuse { reason } => {
                 w.u8(*reason);
@@ -524,6 +632,34 @@ impl Msg {
             }
             Msg::SelectMonitor { index } | Msg::Hint { what: index } => {
                 w.u8(*index);
+            }
+            Msg::Windows { list } => {
+                let list = &list[..list.len().min(64)];
+                w.u8(list.len() as u8);
+                for win in list {
+                    w.u64(win.hwnd)
+                        .str(&win.app_key)
+                        .str(&win.app_name)
+                        .str(&win.title)
+                        .u8(win.monitor)
+                        .u8(win.minimized as u8)
+                        .u16(win.rx)
+                        .u16(win.ry)
+                        .u16(win.rw)
+                        .u16(win.rh);
+                }
+            }
+            Msg::FocusWindow { hwnd, vw, vh } => {
+                w.u64(*hwnd).u16(*vw).u16(*vh);
+            }
+            Msg::AppIcon { app_key, png } => {
+                w.str(app_key).u32(png.len() as u32).0.extend_from_slice(png);
+            }
+            Msg::WindowThumb { hwnd, png } => {
+                w.u64(*hwnd).u32(png.len() as u32).0.extend_from_slice(png);
+            }
+            Msg::VirtualDisplay { active, width, height, dpi_percent } => {
+                w.u8(*active as u8).u16(*width).u16(*height).u16(*dpi_percent);
             }
             Msg::Audio(c) => {
                 w.u8(c.enabled as u8)
@@ -624,17 +760,45 @@ impl Msg {
             }
             31 => Msg::CursorUse { id: r.u32()? },
             32 => Msg::CursorHidden,
+            33 => Msg::CursorMeta { kind: r.u8()? },
+            40 => Msg::TextInput { text: r.long_str()? },
+            41 => Msg::TextFocus { editable: r.u8()? != 0 },
+            42 => Msg::Touch { id: r.u8()?, phase: r.u8()?, x: r.u16()?, y: r.u16()? },
+            43 => Msg::Touchpad {
+                phase: r.u8()?,
+                dx: r.u16()? as i16,
+                dy: r.u16()? as i16,
+                scale_milli: r.u16()?,
+            },
+            44 => Msg::Pen {
+                phase: r.u8()?,
+                x: r.u16()?,
+                y: r.u16()?,
+                pressure: r.u16()?,
+                tilt_x: r.u8()? as i8,
+                tilt_y: r.u8()? as i8,
+                flags: r.u8()?,
+            },
+            45 => Msg::MouseDelta { dx: r.u16()? as i16, dy: r.u16()? as i16 },
             20 => Msg::ClipOffer { seq: r.u32()?, seen: r.u32()?, format: r.u8()?, bytes: r.u32()? },
             60 => {
                 let (name, home, event) = (r.str()?, r.long_str()?, r.u8()?);
                 let token = if r.u8()? != 0 { Some(r.take()?) } else { None };
-                Msg::MeetHi { name, home, token, event, grant: r.grant()? }
+                let grant = r.grant()?;
+                Msg::MeetHi { name, home, token, event, grant, platform: r.platform() }
             }
             61 => {
                 let (name, home) = (r.str()?, r.long_str()?);
                 let grant = r.grant()?;
-                let event = if r.0.first() == Some(&EVENT_MARK) && r.0.len() >= 2 { r.0[1] } else { 0 };
-                Msg::MeetWelcome { name, home, grant, event }
+                let event = match r.0 {
+                    [EVENT_MARK, e, rest @ ..] => {
+                        let e = *e;
+                        r.0 = rest;
+                        e
+                    }
+                    _ => 0,
+                };
+                Msg::MeetWelcome { name, home, grant, event, platform: r.platform() }
             }
             62 => Msg::MeetRefuse { reason: r.u8()? },
             70 => {
@@ -648,6 +812,37 @@ impl Msg {
                 Msg::Monitors { list, current }
             }
             71 => Msg::SelectMonitor { index: r.u8()? },
+            72 => {
+                let n = r.u8()? as usize;
+                let mut list = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let hwnd = r.u64()?;
+                    let app_key = r.str()?;
+                    let app_name = r.str()?;
+                    let title = r.str()?;
+                    let monitor = r.u8()?;
+                    let minimized = r.u8()? != 0;
+                    let rx = r.u16()?;
+                    let ry = r.u16()?;
+                    let rw = r.u16()?;
+                    let rh = r.u16()?;
+                    list.push(WindowDesc { hwnd, app_key, app_name, title, monitor, minimized, rx, ry, rw, rh });
+                }
+                Msg::Windows { list }
+            }
+            73 => Msg::FocusWindow {
+                hwnd: r.u64()?,
+                vw: r.u16().unwrap_or(0),
+                vh: r.u16().unwrap_or(0),
+            },
+            74 => Msg::AppIcon { app_key: r.str()?, png: r.bytes()? },
+            75 => Msg::WindowThumb { hwnd: r.u64()?, png: r.bytes()? },
+            76 => Msg::VirtualDisplay {
+                active: r.u8()? != 0,
+                width: r.u16()?,
+                height: r.u16()?,
+                dpi_percent: r.u16()?,
+            },
             16 => Msg::Hint { what: r.u8()? },
             80 => Msg::Audio(AudioCfg {
                 enabled: r.u8()? != 0,
@@ -723,13 +918,13 @@ mod tests {
             Msg::CursorUse { id: 3 },
             Msg::CursorHidden,
             Msg::ClipOffer { seq: 9, seen: 4, format: 2, bytes: 1 << 24 },
-            Msg::MeetHi { name: "书房".into(), home: "https://aps1-1.relay.n0.iroh.link./".into(), token: None, event: 0, grant: None },
-            Msg::MeetHi { name: "x".repeat(200), home: String::new(), token: Some([7; 8]), event: 2, grant: Some(String::new()) },
-            Msg::MeetHi { name: "y".into(), home: String::new(), token: None, event: 0, grant: Some("https://a/,https://b/ https://c/".into()) },
-            Msg::MeetWelcome { name: "laptop".into(), home: String::new(), grant: None, event: 0 },
-            Msg::MeetWelcome { name: "书房".into(), home: "https://a/,https://b/".into(), grant: Some("https://a/".into()), event: 0 },
-            Msg::MeetWelcome { name: "书房".into(), home: String::new(), grant: Some(String::new()), event: 3 },
-            Msg::MeetWelcome { name: "x".into(), home: String::new(), grant: None, event: 1 },
+            Msg::MeetHi { name: "书房".into(), home: "https://aps1-1.relay.n0.iroh.link./".into(), token: None, event: 0, grant: None, platform: PLATFORM_PC },
+            Msg::MeetHi { name: "x".repeat(200), home: String::new(), token: Some([7; 8]), event: 2, grant: Some(String::new()), platform: PLATFORM_ANDROID },
+            Msg::MeetHi { name: "y".into(), home: String::new(), token: None, event: 0, grant: Some("https://a/,https://b/ https://c/".into()), platform: PLATFORM_PC },
+            Msg::MeetWelcome { name: "laptop".into(), home: String::new(), grant: None, event: 0, platform: PLATFORM_PC },
+            Msg::MeetWelcome { name: "书房".into(), home: "https://a/,https://b/".into(), grant: Some("https://a/".into()), event: 0, platform: PLATFORM_PC },
+            Msg::MeetWelcome { name: "书房".into(), home: String::new(), grant: Some(String::new()), event: 3, platform: PLATFORM_ANDROID },
+            Msg::MeetWelcome { name: "x".into(), home: String::new(), grant: None, event: 1, platform: PLATFORM_PC },
             Msg::Hint { what: HINT_LOCKED },
             Msg::MeetRefuse { reason: 3 },
             Msg::Monitors {
@@ -741,6 +936,24 @@ mod tests {
             },
             Msg::Monitors { list: vec![], current: 0 },
             Msg::SelectMonitor { index: 7 },
+            Msg::TextInput { text: "你好世界 👋 hello\nline2".into() },
+            Msg::Windows {
+                list: vec![WindowDesc {
+                    hwnd: 0x0012_3456,
+                    app_key: "code".into(),
+                    app_name: "VS Code".into(),
+                    title: "rc-android - Visual Studio Code".into(),
+                    monitor: 1,
+                    minimized: true,
+                    rx: 6554,
+                    ry: 3277,
+                    rw: 39321,
+                    rh: 52428,
+                }],
+            },
+            Msg::FocusWindow { hwnd: 0x0012_3456, vw: 1080, vh: 2412 },
+            Msg::AppIcon { app_key: "code".into(), png: vec![0x89, b'P', b'N', b'G', 1, 2, 3] },
+            Msg::WindowThumb { hwnd: 0x0012_3456, png: vec![0x89, b'P', b'N', b'G', 4, 5, 6] },
             Msg::Audio(AudioCfg::default()),
             Msg::Audio(AudioCfg { enabled: false, channels: 1, mute_host: true, lossless: true, max_rate_hz: 96_000 }),
             Msg::InputTick { ms: 0xDEAD_BEEF },
@@ -756,18 +969,62 @@ mod tests {
 
     #[test]
     fn long_names_are_cut_on_a_character_boundary() {
-        let e = Msg::MeetWelcome { name: "设".repeat(100), home: String::new(), grant: None, event: 0 }.encode();
+        let e = Msg::MeetWelcome { name: "设".repeat(100), home: String::new(), grant: None, event: 0, platform: PLATFORM_PC }.encode();
         let Msg::MeetWelcome { name, .. } = Msg::decode(&e[4..]).unwrap() else { panic!() };
         assert_eq!(name, "设".repeat(66));
     }
 
     #[test]
     fn a_welcome_with_more_after_home_still_reads() {
-        let mut e = Msg::MeetWelcome { name: "书房".into(), home: "https://a/".into(), grant: None, event: 0 }.encode();
+        let mut e = Msg::MeetWelcome { name: "书房".into(), home: "https://a/".into(), grant: None, event: 0, platform: PLATFORM_PC }.encode();
         e.extend_from_slice(&[0, 0, 0, 3, b'r', b'c', b'd']);
         let len = (e.len() - 4) as u32;
         e[..4].copy_from_slice(&len.to_be_bytes());
-        assert_eq!(Msg::decode(&e[4..]).unwrap(), Msg::MeetWelcome { name: "书房".into(), home: "https://a/".into(), grant: None, event: 0 });
+        assert_eq!(Msg::decode(&e[4..]).unwrap(), Msg::MeetWelcome { name: "书房".into(), home: "https://a/".into(), grant: None, event: 0, platform: PLATFORM_PC });
+    }
+
+    #[test]
+    fn meet_platform_is_a_tail_older_versions_do_not_read() {
+        // As a phone writes a hello and a welcome: the older message, then
+        // the mark and the platform.
+        let mut w = W(vec![0, 0, 0, 0, 60]);
+        w.str("OPPO PFEM10").long_str("").u8(3).u8(1);
+        w.0.extend_from_slice(&[9; 8]);
+        w.u8(GRANT_MARK).long_str("");
+        let old_hi = w.0.clone();
+        w.u8(PLATFORM_MARK).u8(PLATFORM_ANDROID);
+        let hi = |platform| Msg::MeetHi {
+            name: "OPPO PFEM10".into(),
+            home: String::new(),
+            token: Some([9; 8]),
+            event: 3,
+            grant: Some(String::new()),
+            platform,
+        };
+        assert_eq!(Msg::decode(&w.0[4..]).unwrap(), hi(PLATFORM_ANDROID));
+        // The same bytes without the tail are what an older version sends.
+        assert_eq!(Msg::decode(&old_hi[4..]).unwrap(), hi(PLATFORM_PC));
+        assert_eq!(hi(PLATFORM_PC).encode()[4..], old_hi[4..], "a computer writes what older versions wrote");
+        // Without a grant, and a welcome with and without an event.
+        let msgs = |platform| {
+            [
+                Msg::MeetHi { name: "p".into(), home: String::new(), token: None, event: 0, grant: None, platform },
+                Msg::MeetWelcome { name: "p".into(), home: String::new(), grant: None, event: 0, platform },
+                Msg::MeetWelcome { name: "p".into(), home: String::new(), grant: Some(String::new()), event: 1, platform },
+            ]
+        };
+        for (m, pc) in msgs(PLATFORM_ANDROID).into_iter().zip(msgs(PLATFORM_PC)) {
+            let (p, c) = (m.encode(), pc.encode());
+            assert_eq!(p.len(), c.len() + 2);
+            assert_eq!(p[4..c.len()], c[4..]);
+            assert_eq!(p[c.len()..], [PLATFORM_MARK, PLATFORM_ANDROID]);
+            assert_eq!(Msg::decode(&p[4..]).unwrap(), m);
+        }
+        // A newer platform number is kept; a mark without its byte is none.
+        let mut e = Msg::MeetWelcome { name: "p".into(), home: String::new(), grant: None, event: 2, platform: 9 }.encode();
+        assert!(matches!(Msg::decode(&e[4..]).unwrap(), Msg::MeetWelcome { platform: 9, event: 2, .. }));
+        e.truncate(e.len() - 1);
+        assert!(matches!(Msg::decode(&e[4..]).unwrap(), Msg::MeetWelcome { platform: PLATFORM_PC, event: 2, .. }));
     }
 
     #[test]

@@ -59,6 +59,7 @@ mod toolbar;
 mod torgb;
 mod trace;
 mod update;
+mod vdisplay;
 mod video_rx;
 mod video_tx;
 mod view;
@@ -67,6 +68,7 @@ mod vp;
 mod weak_net_tests;
 mod wgc;
 mod window;
+mod winlist;
 mod wlan;
 mod yuv444;
 

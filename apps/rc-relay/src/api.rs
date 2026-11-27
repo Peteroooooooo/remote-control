@@ -264,17 +264,24 @@ pub struct Guest {
     pub id: PublicKey,
     pub name: String,
     pub kind: Kind,
+    /// A phone, as the device said in its hello (false: a computer, or not said).
+    pub phone: bool,
 }
 
 impl Guest {
     pub fn new(id: PublicKey, name: impl Into<String>, kind: Kind) -> Guest {
-        Guest { id, name: name.into(), kind }
+        Guest { id, name: name.into(), kind, phone: false }
+    }
+
+    pub fn with_phone(mut self, phone: bool) -> Guest {
+        self.phone = phone;
+        self
     }
 }
 
 impl From<PublicKey> for Guest {
     fn from(id: PublicKey) -> Guest {
-        Guest { id, name: String::new(), kind: Kind::Unknown }
+        Guest { id, name: String::new(), kind: Kind::Unknown, phone: false }
     }
 }
 
@@ -293,24 +300,40 @@ pub struct GuestsRequest {
 /// Version 1 lists keys only. Version 2 (older apps) adds a byte after each
 /// key, which marked "my computer"; it is read and left unused. Version 3
 /// adds each guest's name (length byte, UTF-8); version 4 a [`Kind`] byte
-/// after the name.
+/// after the name; version 5 a flags byte after the kind ([`GUEST_PHONE`];
+/// other bits are left for later and ignored). Version 5 is sent only when
+/// a guest is a phone, so lists without phones still reach older relays.
 const GUESTS_MARKED: u8 = 2;
 const GUESTS_NAMED: u8 = 3;
 const GUESTS_KINDS: u8 = 4;
+const GUESTS_FLAGS: u8 = 5;
+/// Flags bit: the guest is a phone.
+const GUEST_PHONE: u8 = 1;
+
+impl Guest {
+    fn flags(&self) -> u8 {
+        if self.phone { GUEST_PHONE } else { 0 }
+    }
+}
 /// Longest guest name kept (bytes, keeps the header compact).
 pub const MAX_GUEST_NAME: usize = 32;
 
-fn guests_signed(version: u8, device: &PublicKey, time: u64, nonce: &[u8; 16], guests: &[Guest], marks: &[u8]) -> Vec<u8> {
+/// `extra`: each guest's mark (version 2) or flags byte as sent (version 5,
+/// unknown bits included so they are checked as they came).
+fn guests_signed(version: u8, device: &PublicKey, time: u64, nonce: &[u8; 16], guests: &[Guest], extra: &[u8]) -> Vec<u8> {
     let mut v = [GUESTS_DOMAIN, &[version], device.as_bytes(), &time.to_be_bytes(), nonce].concat();
     for (i, g) in guests.iter().enumerate() {
         v.extend_from_slice(g.id.as_bytes());
         match version {
-            GUESTS_MARKED => v.push(marks[i]),
-            GUESTS_NAMED | GUESTS_KINDS => {
+            GUESTS_MARKED => v.push(extra[i]),
+            GUESTS_NAMED | GUESTS_KINDS | GUESTS_FLAGS => {
                 v.push(g.name.len() as u8);
                 v.extend_from_slice(g.name.as_bytes());
-                if version == GUESTS_KINDS {
+                if version >= GUESTS_KINDS {
                     v.push(g.kind.byte());
+                }
+                if version == GUESTS_FLAGS {
+                    v.push(extra[i]);
                 }
             }
             _ => {}
@@ -325,16 +348,19 @@ impl GuestsRequest {
         let guests: Vec<Guest> = guests
             .iter()
             .take(MAX_GUESTS)
-            .map(|g| Guest { id: g.id, name: cut(&g.name, MAX_GUEST_NAME), kind: g.kind })
+            .map(|g| Guest { id: g.id, name: cut(&g.name, MAX_GUEST_NAME), kind: g.kind, phone: g.phone })
             .collect();
         let nonce = random_key();
         let version = Self::version_for(&guests);
-        let signature = device.sign(&guests_signed(version, &device.public(), time, &nonce, &guests, &[]));
+        let flags: Vec<u8> = guests.iter().map(Guest::flags).collect();
+        let signature = device.sign(&guests_signed(version, &device.public(), time, &nonce, &guests, &flags));
         GuestsRequest { device: device.public(), time, nonce, guests, signature }
     }
 
     fn version_for(guests: &[Guest]) -> u8 {
-        if guests.iter().any(|g| g.kind != Kind::Unknown) {
+        if guests.iter().any(|g| g.phone) {
+            GUESTS_FLAGS
+        } else if guests.iter().any(|g| g.kind != Kind::Unknown) {
             GUESTS_KINDS
         } else if guests.iter().any(|g| !g.name.is_empty()) {
             GUESTS_NAMED
@@ -353,8 +379,11 @@ impl GuestsRequest {
                 v.push(g.name.len() as u8);
                 v.extend_from_slice(g.name.as_bytes());
             }
-            if version == GUESTS_KINDS {
+            if version >= GUESTS_KINDS {
                 v.push(g.kind.byte());
+            }
+            if version == GUESTS_FLAGS {
+                v.push(g.flags());
             }
         }
         text::encode(GUESTS_PREFIX, &v)
@@ -365,39 +394,44 @@ impl GuestsRequest {
         let p = text::decode(GUESTS_PREFIX, s)?;
         let mut r = Reader::new(&p);
         let version = match r.u8()? {
-            v @ (VERSION | GUESTS_MARKED | GUESTS_NAMED | GUESTS_KINDS) => v,
+            v @ (VERSION | GUESTS_MARKED | GUESTS_NAMED | GUESTS_KINDS | GUESTS_FLAGS) => v,
             v => return Err(Error::Version(v)),
         };
         let device = PublicKey::from_bytes(&r.array()?).map_err(|_| Error::Field("device key"))?;
         let time = r.u64()?;
         let nonce = r.array()?;
         let signature = Signature::from_bytes(&r.array()?);
-        let (mut guests, mut marks) = (Vec::new(), Vec::new());
+        let (mut guests, mut extra) = (Vec::new(), Vec::new());
         while let Ok(g) = r.array::<32>() {
             if guests.len() == MAX_GUESTS {
                 return Err(Error::Length);
             }
             let id = PublicKey::from_bytes(&g).map_err(|_| Error::Field("guest key"))?;
-            let (mut name, mut kind) = (String::new(), Kind::Unknown);
+            let (mut name, mut kind, mut phone) = (String::new(), Kind::Unknown, false);
             match version {
-                GUESTS_MARKED => marks.push(r.u8()?),
-                GUESTS_NAMED | GUESTS_KINDS => {
+                GUESTS_MARKED => extra.push(r.u8()?),
+                GUESTS_NAMED | GUESTS_KINDS | GUESTS_FLAGS => {
                     let n = r.u8()? as usize;
                     if n > MAX_GUEST_NAME {
                         return Err(Error::Field("guest name"));
                     }
                     name = std::str::from_utf8(r.take(n)?).map_err(|_| Error::Field("guest name"))?.to_string();
-                    if version == GUESTS_KINDS {
+                    if version >= GUESTS_KINDS {
                         kind = Kind::from_byte(r.u8()?);
+                    }
+                    if version == GUESTS_FLAGS {
+                        let f = r.u8()?;
+                        phone = f & GUEST_PHONE != 0;
+                        extra.push(f);
                     }
                 }
                 _ => {}
             }
-            guests.push(Guest { id, name, kind });
+            guests.push(Guest { id, name, kind, phone });
         }
         r.finish()?;
         device
-            .verify(&guests_signed(version, &device, time, &nonce, &guests, &marks), &signature)
+            .verify(&guests_signed(version, &device, time, &nonce, &guests, &extra), &signature)
             .map_err(|_| Error::Signature)?;
         Ok(GuestsRequest { device, time, nonce, guests, signature })
     }
@@ -680,6 +714,50 @@ mod tests {
         // A mark changed after signing.
         let n = v.len();
         v[n - 1] = 1;
+        assert_eq!(GuestsRequest::decode(&text::encode(GUESTS_PREFIX, &v)), Err(Error::Signature));
+    }
+
+    #[test]
+    fn guests_with_phones_use_version_5() {
+        let guests = [
+            Guest::new(key(2).public(), "OPPO PFEM10", Kind::Mine).with_phone(true),
+            Guest::new(key(3).public(), "laptop", Kind::Mine),
+        ];
+        let r = GuestsRequest::new(&key(1), 1_000, &guests);
+        assert_eq!(text::decode(GUESTS_PREFIX, &r.encode()).unwrap()[0], GUESTS_FLAGS);
+        let d = GuestsRequest::decode(&r.encode()).unwrap();
+        assert_eq!(d.guests, guests);
+        assert!(d.guests[0].phone && !d.guests[1].phone);
+        // The phone mark changed after signing.
+        let mut f = r.clone();
+        f.guests[1].phone = true;
+        assert_eq!(GuestsRequest::decode(&f.encode()), Err(Error::Signature));
+        // Without phones: version 4, as older relays take it, every guest a computer.
+        let pcs: Vec<Guest> = guests.iter().map(|g| g.clone().with_phone(false)).collect();
+        let v4 = GuestsRequest::new(&key(1), 1_000, &pcs);
+        assert_eq!(text::decode(GUESTS_PREFIX, &v4.encode()).unwrap()[0], GUESTS_KINDS);
+        assert!(GuestsRequest::decode(&v4.encode()).unwrap().guests.iter().all(|g| !g.phone));
+        // A phone without a kind still goes as version 5.
+        let bare = GuestsRequest::new(&key(1), 1_000, &[Guest::from(key(4).public()).with_phone(true)]);
+        assert_eq!(GuestsRequest::decode(&bare.encode()).unwrap(), bare);
+    }
+
+    #[test]
+    fn guests_version_5_keeps_unknown_flag_bits_signed() {
+        // A newer app's flags byte with a bit this relay does not know.
+        let (k, nonce) = (key(1), [3; 16]);
+        let guests = [Guest::new(key(2).public(), "pad", Kind::Trusted).with_phone(true)];
+        let signed = guests_signed(GUESTS_FLAGS, &k.public(), 1_000, &nonce, &guests, &[GUEST_PHONE | 0x80]);
+        let mut v = [&[GUESTS_FLAGS][..], k.public().as_bytes(), &1_000u64.to_be_bytes(), &nonce, &k.sign(&signed).to_bytes()].concat();
+        v.extend_from_slice(guests[0].id.as_bytes());
+        v.push(3);
+        v.extend_from_slice(b"pad");
+        v.push(Kind::Trusted.byte());
+        v.push(GUEST_PHONE | 0x80);
+        assert_eq!(GuestsRequest::decode(&text::encode(GUESTS_PREFIX, &v)).unwrap().guests, guests);
+        // The unknown bit changed after signing.
+        let n = v.len();
+        v[n - 1] = GUEST_PHONE;
         assert_eq!(GuestsRequest::decode(&text::encode(GUESTS_PREFIX, &v)), Err(Error::Signature));
     }
 

@@ -363,7 +363,8 @@ impl Store {
     }
 
     /// Lines: owner id, guest id, guest name, kind (`Kind::word`; a `mine`
-    /// mark in the name's place in the oldest files is left out). A missing
+    /// mark in the name's place in the oldest files is left out), and `phone`
+    /// for a phone (left out for a computer, as in older files). A missing
     /// file is no guests.
     pub fn guests(&self) -> Result<BTreeMap<EndpointId, Vec<Guest>>> {
         let path = self.guests_path();
@@ -385,7 +386,8 @@ impl Store {
                 f.get(2).map(|s| clean(s)).unwrap_or_default()
             };
             let kind = if named { f.get(3).map_or(Kind::Unknown, |w| Kind::from_word(w)) } else { Kind::Unknown };
-            m.entry(owner).or_default().push(Guest { id, name, kind });
+            let phone = named && f.get(4).is_some_and(|w| w.trim() == "phone");
+            m.entry(owner).or_default().push(Guest { id, name, kind, phone });
         }
         Ok(m)
     }
@@ -398,7 +400,7 @@ impl Store {
 
     fn set_guests_locked(&self, owner: &EndpointId, guests: &[Guest]) -> Result<()> {
         let mut m = self.guests()?;
-        let cleaned: Vec<Guest> = guests.iter().map(|g| Guest { id: g.id, name: clean(&g.name), kind: g.kind }).collect();
+        let cleaned: Vec<Guest> = guests.iter().map(|g| Guest { name: clean(&g.name), ..g.clone() }).collect();
         let old = m.remove(owner).unwrap_or_default();
         if old == cleaned {
             return Ok(());
@@ -406,10 +408,11 @@ impl Store {
         if !cleaned.is_empty() {
             m.insert(*owner, cleaned);
         }
-        let mut text = String::from("# rc-relay guests v3: owner id, guest id, name, kind\n");
+        let mut text = String::from("# rc-relay guests v3: owner id, guest id, name, kind, phone (empty = a computer)\n");
         for (o, gs) in &m {
             for g in gs {
-                text += &format!("{o}\t{}\t{}\t{}\n", g.id, clean(&g.name), g.kind.word());
+                let phone = if g.phone { "\tphone" } else { "" };
+                text += &format!("{o}\t{}\t{}\t{}{phone}\n", g.id, clean(&g.name), g.kind.word());
             }
         }
         self.write(&self.guests_path(), &text)
@@ -488,7 +491,7 @@ impl Store {
         if add_to_list {
             let mut gs = self.guests()?.remove(owner).unwrap_or_default();
             if !gs.iter().any(|g| g.id == guest.id) {
-                gs.push(Guest { id: guest.id, name: clean(&guest.name), kind: guest.kind });
+                gs.push(Guest { name: clean(&guest.name), ..guest.clone() });
                 self.set_guests_locked(owner, &gs)?;
             }
         }
@@ -800,6 +803,29 @@ mod tests {
         // A file from before kinds: no kind.
         std::fs::write(s.guests_path(), format!("# rc-relay guests v2: owner id, guest id, name\n{}\t{}\tpc\n", id(1), id(5))).unwrap();
         assert_eq!(s.guests().unwrap()[&id(1)], [g(5, "pc")]);
+    }
+
+    #[test]
+    fn guests_phone_column() {
+        let s = temp("phones");
+        let list = [
+            Guest::new(id(5), "OPPO PFEM10", Kind::Mine).with_phone(true),
+            Guest::new(id(6), "laptop", Kind::Mine),
+            Guest::from(id(7)).with_phone(true),
+        ];
+        s.set_guests(&id(1), &list).unwrap();
+        assert_eq!(s.guests().unwrap()[&id(1)], list, "phones kept");
+        let text = std::fs::read_to_string(s.guests_path()).unwrap();
+        let lines: Vec<&str> = text.lines().skip(1).collect();
+        assert_eq!(lines[0], format!("{}\t{}\tOPPO PFEM10\tmine\tphone", id(1), id(5)));
+        assert_eq!(lines[1], format!("{}\t{}\tlaptop\tmine", id(1), id(6)), "a computer has no 5th column");
+        assert_eq!(lines[2], format!("{}\t{}\t\t\tphone", id(1), id(7)));
+        // A file from before phones (4 columns): every guest a computer.
+        std::fs::write(s.guests_path(), format!("# rc-relay guests v3: owner id, guest id, name, kind\n{}\t{}\tOPPO\tmine\n", id(1), id(5))).unwrap();
+        assert_eq!(s.guests().unwrap()[&id(1)], [Guest::new(id(5), "OPPO", Kind::Mine)]);
+        // An unknown word in the 5th column is a computer.
+        std::fs::write(s.guests_path(), format!("# rc-relay guests v3: x\n{}\t{}\tOPPO\tmine\ttablet\n", id(1), id(5))).unwrap();
+        assert!(!s.guests().unwrap()[&id(1)][0].phone);
     }
 
     #[test]

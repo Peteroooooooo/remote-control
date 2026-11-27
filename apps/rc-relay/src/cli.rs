@@ -152,6 +152,7 @@ fn codes(cfg: &Config) -> Result<()> {
                 for g in gs {
                     if g.kind != Kind::Temp && !owner_ids.contains(&g.id) && !kicked.contains(&(o.id, g.id)) && seen.insert(g.id) {
                         let tag = match g.kind {
+                            Kind::Mine if g.phone => "My Android",
                             Kind::Mine => "My PC",
                             Kind::Trusted => "Trusted",
                             Kind::Unknown | Kind::Temp => "Guest",

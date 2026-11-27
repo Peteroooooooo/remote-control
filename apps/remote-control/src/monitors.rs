@@ -43,6 +43,13 @@ pub struct Selection(Mutex<State>);
 struct State {
     /// Device name the viewer asked for; None streams the primary display.
     wanted: Option<String>,
+    /// Transient per-session phone virtual display device name (hidden from Hub list).
+    virtual_device: Option<String>,
+    /// True while a virtual display is being created/destroyed so the capture loop
+    /// doesn't prematurely reopen the old monitor or flash the virtual monitor in Hub.
+    transitioning: bool,
+    /// Saved physical monitor name before switching to the virtual display.
+    physical_wanted: Option<String>,
     /// The displays when the capture was last opened, and the streamed one.
     list: Vec<MonitorDesc>,
     current: usize,
@@ -110,12 +117,13 @@ fn choose(list: &[MonitorDesc], wanted: Option<&str>) -> Option<(usize, bool)> {
     (!list.is_empty()).then_some((i, wanted.is_some()))
 }
 
-/// Opens the display to stream, on the adapter that drives it, with its
-/// place on the desktop. Called by the capture loop before each (re)start.
 /// The error when the desktop has no display at all (see `PipeShared::no_display`).
 pub const NO_DISPLAY: &str = "no display attached to the desktop";
 
-pub fn open(sel: &Selection) -> Result<(Gpu, IDXGIOutput1, RECT)> {
+/// Opens the display to stream, reusing `cached_gpu` when the target display is
+/// driven by the same graphics adapter (saves ~120-200 ms of D3D11 device creation
+/// when switching between monitors on the same GPU).
+pub fn open_with_gpu(sel: &Selection, cached_gpu: &mut Option<Gpu>) -> Result<(IDXGIOutput1, RECT)> {
     let found = enumerate()?;
     let list: Vec<MonitorDesc> = found.iter().map(|f| f.desc.clone()).collect();
     let mut s = sel.0.lock().unwrap();
@@ -152,14 +160,101 @@ pub fn open(sel: &Selection) -> Result<(Gpu, IDXGIOutput1, RECT)> {
         let factory: IDXGIFactory1 = CreateDXGIFactory1()?;
         let adapter = factory.EnumAdapters1(f.adapter).context("display adapter went away")?;
         let output = adapter.EnumOutputs(f.output).context("display went away")?;
-        Ok((Gpu::new(adapter)?, output.cast()?, rect))
+        let target_luid = adapter.GetDesc1()?.AdapterLuid;
+        let can_reuse = cached_gpu.as_ref().is_some_and(|g| {
+            g.luid.LowPart == target_luid.LowPart
+                && g.luid.HighPart == target_luid.HighPart
+                && g.device.GetDeviceRemovedReason().is_ok()
+        });
+        if !can_reuse {
+            *cached_gpu = Some(Gpu::new(adapter)?);
+        }
+        Ok((output.cast()?, rect))
     }
 }
 
-/// The list for the viewer, with the streamed display.
+fn physical_list(s: &State) -> Vec<MonitorDesc> {
+    match &s.virtual_device {
+        Some(vd) => s.list.iter().filter(|m| &m.name != vd).cloned().collect(),
+        None => s.list.clone(),
+    }
+}
+
+/// The list for the viewer, with the streamed physical display (transient virtual
+/// phone displays are excluded so they don't appear as phantom desktop cards).
 pub fn message(sel: &Selection) -> Msg {
     let s = sel.0.lock().unwrap();
-    Msg::Monitors { list: s.list.clone(), current: s.current as u8 }
+    let list = physical_list(&s);
+    let cur_name = s.list.get(s.current).map(|m| m.name.as_str());
+    let cur_idx = cur_name
+        .and_then(|n| list.iter().position(|m| m.name == n))
+        .or_else(|| {
+            s.physical_wanted
+                .as_deref()
+                .and_then(|n| list.iter().position(|m| m.name == n))
+        })
+        .or_else(|| list.iter().position(|m| m.primary))
+        .unwrap_or(0);
+    Msg::Monitors { list, current: cur_idx as u8 }
+}
+
+/// Snapshot of the current physical displays list (left to right).
+pub fn snapshot(sel: &Selection) -> Vec<MonitorDesc> {
+    let s = sel.0.lock().unwrap();
+    physical_list(&s)
+}
+
+/// Pauses/resumes automatic display-change reopen while a virtual display is
+/// mid-create or mid-destroy.
+pub fn set_vdisplay_transitioning(sel: &Selection, transitioning: bool) {
+    let mut s = sel.0.lock().unwrap();
+    s.transitioning = transitioning;
+    if !transitioning {
+        s.checked = Some(Instant::now());
+    }
+}
+
+/// Switches capture to the per-session phone virtual display `device_name`.
+/// Returns `true` when capture actually needs to reopen (different monitor or resolution),
+/// and `false` for DPI-only live updates on the already-streamed virtual monitor.
+pub fn select_virtual(sel: &Selection, device_name: String, width: u16, height: u16) -> bool {
+    let mut s = sel.0.lock().unwrap();
+    s.transitioning = false;
+    let already_streaming = s.virtual_device.as_deref() == Some(device_name.as_str())
+        && s.list
+            .get(s.current)
+            .is_some_and(|m| m.name == device_name && m.width == width as u32 && m.height == height as u32);
+    if s.virtual_device.is_none() {
+        s.physical_wanted = s
+            .wanted
+            .clone()
+            .or_else(|| s.list.get(s.current).map(|m| m.name.clone()));
+    }
+    s.virtual_device = Some(device_name.clone());
+    s.wanted = Some(device_name);
+    if already_streaming {
+        s.checked = Some(Instant::now());
+        false
+    } else {
+        s.switch = true;
+        true
+    }
+}
+
+/// Leaves the per-session virtual display and restores capture on the physical monitor.
+pub fn clear_virtual(sel: &Selection) -> bool {
+    let mut s = sel.0.lock().unwrap();
+    s.transitioning = false;
+    let was = s.virtual_device.take().is_some();
+    if was {
+        s.wanted = s.physical_wanted.clone();
+        s.switch = true;
+    }
+    was
+}
+
+pub fn is_virtual_active(sel: &Selection) -> bool {
+    sel.0.lock().unwrap().virtual_device.is_some()
 }
 
 /// The streamed display's refresh rate in Hz: the most frames it can show
@@ -180,18 +275,24 @@ pub fn refresh_hz(sel: &Selection) -> u32 {
     if ok && dm.dmDisplayFrequency > 1 { dm.dmDisplayFrequency } else { 60 }
 }
 
-/// The viewer asked for display `index` (0-based) of the list it was sent.
+/// The viewer asked for physical display `index` (0-based) of the list it was sent.
 /// True when the capture has to move to another display.
 pub fn select(sel: &Selection, index: u8) -> Result<bool> {
     let mut s = sel.0.lock().unwrap();
+    let phys = physical_list(&s);
     let i = index as usize;
-    if i >= s.list.len() {
-        bail!("the viewer asked for display {}, but there are {}", i + 1, s.list.len());
+    if i >= phys.len() {
+        bail!("the viewer asked for display {}, but there are {}", i + 1, phys.len());
     }
-    if i == s.current {
+    let target_name = phys[i].name.clone();
+    let leaving_virtual = s.virtual_device.take().is_some();
+    let already_streaming = !leaving_virtual
+        && s.list.get(s.current).is_some_and(|m| m.name == target_name);
+    if already_streaming {
         return Ok(false);
     }
-    s.wanted = Some(s.list[i].name.clone());
+    s.physical_wanted = Some(target_name.clone());
+    s.wanted = Some(target_name);
     s.switch = true;
     Ok(true)
 }
@@ -201,6 +302,9 @@ pub fn select(sel: &Selection, index: u8) -> Result<bool> {
 pub fn should_reopen(sel: &Selection) -> bool {
     {
         let mut s = sel.0.lock().unwrap();
+        if s.transitioning {
+            return false;
+        }
         if s.switch {
             return true;
         }

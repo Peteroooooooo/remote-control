@@ -27,11 +27,14 @@ pub struct Device {
     pub forgotten: bool,
     /// Added here, the other side not told yet.
     pub tell: bool,
+    /// It said it is a phone (in its meet hello or welcome); false for a
+    /// computer, and for any device from before this was kept.
+    pub phone: bool,
 }
 
 impl Device {
     pub fn new(id: EndpointId) -> Device {
-        Device { id, name: String::new(), auto_accept: false, relays: Vec::new(), addrs: Vec::new(), forgotten: false, tell: false }
+        Device { id, name: String::new(), auto_accept: false, relays: Vec::new(), addrs: Vec::new(), forgotten: false, tell: false, phone: false }
     }
 }
 
@@ -48,7 +51,7 @@ pub fn settings_path(key: &Path) -> PathBuf {
     key.with_file_name("settings.txt")
 }
 
-const HEADER: &str = "# remote-control devices v2: id, flags (a = may control without asking, f = deleted, other side not told yet, t = added, other side not told yet), name, relay addresses, addresses";
+const HEADER: &str = "# remote-control devices v2: id, flags (a = may control without asking, f = deleted, other side not told yet, t = added, other side not told yet, p = a phone), name, relay addresses, addresses";
 
 /// Names go in a tab-separated line.
 pub fn clean(name: &str) -> String {
@@ -126,6 +129,7 @@ impl Store {
                         addrs: addrs(f.get(4).copied()),
                         forgotten: flags.contains('f'),
                         tell: flags.contains('t'),
+                        phone: flags.contains('p'),
                     }
                 } else {
                     if flags.contains('s') {
@@ -150,10 +154,11 @@ impl Store {
         let mut text = format!("{HEADER}\n");
         for d in &self.devices {
             let flags = format!(
-                "{}{}{}",
+                "{}{}{}{}",
                 if d.auto_accept { "a" } else { "" },
                 if d.forgotten { "f" } else { "" },
-                if d.tell { "t" } else { "" }
+                if d.tell { "t" } else { "" },
+                if d.phone { "p" } else { "" }
             );
             let addrs: Vec<String> = d.addrs.iter().map(|a| a.to_string()).collect();
             let relay = url_list(&d.relays);
@@ -417,6 +422,32 @@ mod tests {
         let s = Store::load(&p).unwrap();
         assert_eq!(s.devices.len(), 1);
         assert!(!s.devices[0].auto_accept);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn phone_flag_round_trips_and_older_lists_are_computers() {
+        let dir = temp("phone");
+        let p = devices_path(&dir.join("device.key"));
+        let mut s = Store::load(&p).unwrap();
+        {
+            let d = s.add(id(1));
+            d.name = "OPPO PFEM10".into();
+            d.auto_accept = true;
+            d.phone = true;
+        }
+        s.add(id(2)).name = "laptop".into();
+        s.save().unwrap();
+        let text = std::fs::read_to_string(&p).unwrap();
+        assert!(text.lines().any(|l| l.starts_with(&format!("{}\tap\t", id(1)))), "{text}");
+        assert!(text.lines().any(|l| l.starts_with(&format!("{}\t\tlaptop", id(2)))), "{text}");
+        let t = Store::load(&p).unwrap();
+        assert_eq!(t.devices, s.devices);
+        assert!(t.get(&id(1)).unwrap().phone && !t.get(&id(2)).unwrap().phone);
+        // A list written before phones were kept: no `p`, every device a computer.
+        std::fs::write(&p, format!("# remote-control devices v2: id, flags, name, relay addresses, addresses\n{}\tat\tOPPO\t\t\n", id(3))).unwrap();
+        let d = Store::load(&p).unwrap().devices.remove(0);
+        assert!(d.auto_accept && d.tell && !d.phone);
         let _ = std::fs::remove_dir_all(dir);
     }
 

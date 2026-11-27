@@ -19,6 +19,7 @@
 
 - **Cross-Device Control for AI Agents**: One-click Skill install (`~/.claude/skills`, `~/.agents/skills`) lets Claude Code and Codex call `devices`, `exec`, and `cp` on your other Windows PCs, reusing the lobby's connections and device permissions.
 - **Remote Desktop**: GPU hardware encoding/decoding and DXGI rendering (up to 144 fps, 4:4:4 crisp text mode, FEC packet-loss recovery); supports multi-monitor switching, clipboard sync (text, images, files, folders), `Ctrl+Alt+Del`, and lock-screen control.
+- **Android Controller**: Control your PCs from a phone or tablet with trackpad and direct-touch modes, local zoom, and a full PC keyboard with modifier keys. See the [Android guide](docs/android.en.md).
 - **Remote Audio**: Supports Opus and lossless 24-bit PCM modes with independent volume control and one-click remote speaker mute.
 - **Remote Terminal & File Transfer**: Drop straight into remote PowerShell, run commands, or transfer files/folders via CLI without starting a desktop stream.
 - **Private Relay (Optional)**: Single Docker image with built-in self-signed TLS, no domain required, forwarding end-to-end encrypted traffic exclusively for your devices.
@@ -33,7 +34,7 @@
 | **Account**             | None; local keys + connection codes                                              | None; ID + password                                                          | Account required for controller / unattended access |
 | **Distribution**        | Single portable `.exe` (optional background service)                             | Installer / portable (optional background service)                           | Installer / portable                                |
 | **Connection & Relay**  | Direct P2P first; public nodes never relay video; self-host relay if P2P fails   | Direct P2P first; falls back to free public relays or self-hosted `hbbs+hbbr` | Vendor-routed relays; free tier has limits          |
-| **Platform**            | Windows 10/11 only                                                               | Cross-platform (desktop + mobile)                                            | Cross-platform (desktop + mobile)                   |
+| **Platform**            | Windows 10/11 (host and controller); Android 10+ (controller)                    | Cross-platform (desktop + mobile)                                            | Cross-platform (desktop + mobile)                   |
 
 ---
 
@@ -64,14 +65,18 @@ Run `remote-control.exe` on both PCs:
 - **Across Networks**: Have the other side click **Copy Connection Code** and paste it into the top input bar (or press `Ctrl+V`). Codes are single-use and valid for 1 hour.
 - **Frequent Devices**: Click **Remember** on a temporary device to add each other as **Trusted Devices**; set a device as **My Devices** in the `···` menu for prompt-free connections on double-click.
 
-### 2. Background Service
+### 2. Control a PC from Your Phone
+
+Install `remote-control.apk` from [Releases](https://github.com/Peteroooooooo/remote-control/releases/latest) (Android 10+, arm64). PCs on the same LAN appear automatically; tap one to connect. Across networks, tap **+** and paste the PC's connection code. Gestures, the white / yellow / blue circles on screen, and the keyboard are explained in the [Android guide](docs/android.en.md).
+
+### 3. Background Service
 
 Enable via **Settings → Background Service → Install** (requires administrator privileges):
 
 - Enables auto-start at boot, background presence after closing the window, and control across the lock screen, sign-in screen, and UAC prompts (lock-screen control applies only to **My Devices**).
 - Runs the current `.exe` directly and stores keys/config in `%APPDATA%\remote-control`. Right-click the tray icon → **Exit** to stop the service and go offline.
 
-### 3. AI Agent & CLI
+### 4. AI Agent & CLI
 
 Install via **Settings → AI Integration → AI Skills → Install** on the controller PC so Claude Code / Codex can run commands and transfer files across devices (**My Devices** run without prompts, **Trusted Devices** prompt once, and commands run elevated when the target has the background service installed).
 
@@ -94,14 +99,14 @@ All commands (`remote-control <command> --help` shows each one's options):
 | `shell <device>` | Interactive remote PowerShell |
 | `exec <device> "<command>"` | Run one command remotely and return its output |
 | `cp <from> <to>` | Copy files or folders; write the remote side as `device:path` |
-| `set <setting> <value> …` | Change settings, see [section 5](#5-command-line-setup--batch-deployment) |
+| `set <setting> <value> …` | Change settings, see [section 6](#6-command-line-setup--batch-deployment) |
 | `install-service` / `uninstall-service` | Install / remove the background service (admin) |
 | `service-status` | Show whether the background service is running |
 | `update` | Check for and install a new version |
 | `id` | Show this device's ID |
 | `host` | Stay online without the window, waiting to be connected to |
 
-### 4. Deploy a Private Relay (Optional)
+### 5. Deploy a Private Relay (Optional)
 
 ```yaml
 services:
@@ -125,7 +130,7 @@ volumes:
 
 If you don't want to rent a cloud VPS, you can run `rc-relay` on a home Raspberry Pi, Linux SBC, or mini server (note: most corporate LANs lack IPv6 and still need a public IPv4 relay; see [Home Broadband Relay Guide](docs/home-relay.en.md) for trade-offs and setup). See [apps/rc-relay/README.en.md](apps/rc-relay/README.en.md) for custom domains, TLS certificates, and advanced options.
 
-### 5. Command-Line Setup & Batch Deployment
+### 6. Command-Line Setup & Batch Deployment
 
 `remote-control set` changes the Settings page's options, for `.bat` files and deployment tools:
 

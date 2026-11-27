@@ -32,8 +32,67 @@ jobs:
           path: target/release/remote-control.exe
           if-no-files-found: error
 
+  android:
+    runs-on: ubuntu-latest
+    env:
+      NDK_VERSION: 27.2.12479018
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: android
+
+      - name: Install Android NDK and cargo-ndk
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;$NDK_VERSION" > /dev/null
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
+          cargo install cargo-ndk --locked --version 4.1.2
+
+      - name: Build librc_android.so
+        run: |
+          JNI=apps/rc-android/app/src/main/jniLibs
+          cargo ndk -t arm64-v8a -P 29 -o "$JNI" build --release --locked -p rc-android
+          find "$JNI/arm64-v8a" -type f ! -name librc_android.so -delete
+          ls -l "$JNI/arm64-v8a"
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.11.1"
+
+      - name: Build remote-control.apk
+        env:
+          RC_BUILD_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}
+          ANDROID_KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+          RC_ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          RC_ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          RC_ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          export RC_ANDROID_KEYSTORE_PATH="$RUNNER_TEMP/release.jks"
+          echo "$ANDROID_KEYSTORE_B64" | base64 -d > "$RC_ANDROID_KEYSTORE_PATH"
+          gradle --no-daemon -p apps/rc-android :app:assembleRelease
+          rm -f "$RC_ANDROID_KEYSTORE_PATH"
+          # Without the keystore Gradle would quietly emit *-unsigned.apk; fail instead.
+          mkdir -p dist
+          cp apps/rc-android/app/build/outputs/apk/release/remote-control-release.apk dist/remote-control.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: remote-control-android-arm64
+          path: dist/remote-control.apk
+          if-no-files-found: error
+
   publish:
-    needs: windows
+    needs: [windows, android]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
@@ -44,10 +103,16 @@ jobs:
           name: remote-control-windows-x86_64
           path: dist
 
+      - uses: actions/download-artifact@v4
+        with:
+          name: remote-control-android-arm64
+          path: dist
+
       - name: Generate and sign latest.json
         env:
           TAG: ${{ github.ref_name }}
           EXE_PATH: dist/remote-control.exe
+          APK_PATH: dist/remote-control.apk
           OUT_MANIFEST: dist/latest.json
           GITHUB_REPO: ${{ github.repository }}
           CNB_REPO: peteroooooooo/remote-control
@@ -59,6 +124,7 @@ jobs:
         with:
           files: |
             dist/remote-control.exe
+            dist/remote-control.apk
             dist/latest.json
           generate_release_notes: true
 
@@ -66,6 +132,7 @@ jobs:
         env:
           TAG: ${{ github.ref_name }}
           EXE_PATH: dist/remote-control.exe
+          APK_PATH: dist/remote-control.apk
           OUT_MANIFEST: dist/latest.json
           CNB_REPO: peteroooooooo/remote-control
           CNB_TOKEN: ${{ secrets.CNB_TOKEN }}

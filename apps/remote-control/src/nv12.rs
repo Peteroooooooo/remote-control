@@ -70,12 +70,60 @@ float ps_y(VsOut i) : SV_Target {
     return (y * 219.0 + 16.0) / 255.0;
 }
 
-float2 ps_uv(VsOut i) : SV_Target {
-    float3 c = src.Sample(smp, i.uv + float2(uv_shift_x, 0.0)).rgb;
-    float y = dot(c, float3(0.2126, 0.7152, 0.0722));
-    float u = (c.b - y) / 1.8556;
-    float v = (c.r - y) / 1.5748;
+// ---- 1:1 chroma with ClearType de-fringe -------------------------------------------------
+// ClearType paints thin opposite-hue edges (red on one side of a stem, blue on the other).
+// 4:2:0 keeps one chroma sample per 2x2 block, so those edges survive as red/blue bars on
+// text. Before downsampling chroma we look along each row: where a pixel sits within 2 px of
+// an opposite-direction chroma pair, its chroma is replaced by a 1-4-6-4-1 average, which
+// cancels the fringe. Real colored text has same-direction chroma and is left alone. Luma is
+// computed by ps_y from the untouched pixels, so sharpness is unchanged.
+static const float3 LUMA_W = float3(0.2126, 0.7152, 0.0722);
+static const float DEFRINGE_T2 = (6.0 / 255.0) * (6.0 / 255.0);
+
+float3 load_px(int2 p, int2 dims, bool hdr) {
+    p = clamp(p, int2(0, 0), dims - 1);
+    float3 c = src.Load(int3(p, 0)).rgb;
+    return hdr ? hdr_to_srgb(c) : c;
+}
+
+float3 defringe_at(float3 ch[7], int j) {
+    bool strong = false;
+    bool opposite = false;
+    [unroll] for (int a = -2; a <= 2; a++) {
+        float3 ca = ch[j + a];
+        if (dot(ca, ca) > DEFRINGE_T2) strong = true;
+        [unroll] for (int b = a + 1; b <= 2; b++) {
+            if (dot(ca, ch[j + b]) < -DEFRINGE_T2) opposite = true;
+        }
+    }
+    if (!(strong && opposite)) return ch[j];
+    return (ch[j - 2] + 4.0 * ch[j - 1] + 6.0 * ch[j] + 4.0 * ch[j + 1] + ch[j + 2]) / 16.0;
+}
+
+// Chroma (rgb - luma) for one source row at column x0, left-sited [1 2 1] downsample.
+float3 row_chroma(int x0, int y, int2 dims, bool hdr) {
+    float3 ch[7];
+    [unroll] for (int k = 0; k < 7; k++) {
+        float3 c = load_px(int2(x0 - 3 + k, y), dims, hdr);
+        ch[k] = c - dot(c, LUMA_W);
+    }
+    return 0.25 * defringe_at(ch, 2) + 0.5 * defringe_at(ch, 3) + 0.25 * defringe_at(ch, 4);
+}
+
+float2 uv_defringed(VsOut i, bool hdr) {
+    uint w, h;
+    src.GetDimensions(w, h);
+    int2 dims = int2(w, h);
+    // Top-left source pixel of this chroma sample's 2x2 block.
+    int2 base = int2(floor(i.uv * float2(dims) - 0.5));
+    float3 cc = 0.5 * (row_chroma(base.x, base.y, dims, hdr) + row_chroma(base.x, base.y + 1, dims, hdr));
+    float u = cc.b / 1.8556;
+    float v = cc.r / 1.5748;
     return float2((u * 224.0 + 128.0) / 255.0, (v * 224.0 + 128.0) / 255.0);
+}
+
+float2 ps_uv(VsOut i) : SV_Target {
+    return uv_defringed(i, false);
 }
 
 float ps_y_down(VsOut i) : SV_Target {
@@ -110,11 +158,7 @@ float ps_y_hdr(VsOut i) : SV_Target {
 }
 
 float2 ps_uv_hdr(VsOut i) : SV_Target {
-    float3 c = hdr_to_srgb(src.Sample(smp, i.uv + float2(uv_shift_x, 0.0)).rgb);
-    float y = dot(c, float3(0.2126, 0.7152, 0.0722));
-    float u = (c.b - y) / 1.8556;
-    float v = (c.r - y) / 1.5748;
-    return float2((u * 224.0 + 128.0) / 255.0, (v * 224.0 + 128.0) / 255.0);
+    return uv_defringed(i, true);
 }
 
 float ps_y_down_hdr(VsOut i) : SV_Target {

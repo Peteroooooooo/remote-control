@@ -1,12 +1,12 @@
 [workspace]
 resolver = "3"
-members = ["apps/remote-control", "apps/rc-relay", "crates/rc-ident", "crates/rc-stream", "spikes/nettest", "spikes/netshape"]
+members = ["apps/remote-control", "apps/rc-relay", "crates/rc-ident", "crates/rc-stream", "crates/rc-proto", "crates/rc-android", "spikes/nettest", "spikes/netshape"]
 exclude = ["vendor/iroh-relay", "vendor/iroh"]
 
 [workspace.package]
 edition = "2024"
 license = "Apache-2.0"
-version = "0.3.5"
+version = "0.3.6"
 publish = false
 
 [profile.release]

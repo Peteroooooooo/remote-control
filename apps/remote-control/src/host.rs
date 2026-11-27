@@ -210,6 +210,10 @@ async fn stream(conn: &Connection, mut send: SendStream, recv: &mut RecvStream, 
         let (out, sh) = (wtx.clone(), sh.clone());
         std::thread::Builder::new().name("cursor".into()).spawn(move || cursor::watch(out, sh))?;
     }
+    let win_watch = {
+        let (out, sh) = (wtx.clone(), sh.clone());
+        std::thread::Builder::new().name("windows".into()).spawn(move || watch_windows(out, sh))?
+    };
     let clip = match ClipSync::start_clip(conn, wtx.clone(), true, service) {
         Ok(c) => Some(c),
         Err(e) => {
@@ -243,9 +247,104 @@ async fn stream(conn: &Connection, mut send: SendStream, recv: &mut RecvStream, 
     let result = control_loop(recv, &sh, &wtx, clip.as_deref(), &audio_host).await;
     let _ = tokio::task::spawn_blocking(move || drop(audio_host)).await;
     sh.stop.store(true, Ordering::Relaxed);
-    let _ = tokio::task::spawn_blocking(move || pipe.join()).await;
+    let _ = tokio::task::spawn_blocking(move || {
+        let _ = pipe.join();
+        let _ = win_watch.join();
+    }).await;
     conn.close(0u32.into(), b"bye");
     result
+}
+
+/// Polls real visible top-level windows on a dedicated thread (so `SetThreadDesktop`
+/// never leaks onto Tokio worker threads), pushes `Msg::Windows` on change,
+/// real Windows process icons (`Msg::AppIcon`) once per app_key, and live
+/// window thumbnails (`Msg::WindowThumb`) whenever a window's image changes.
+fn watch_windows(out: mpsc::UnboundedSender<Msg>, sh: Arc<PipeShared>) {
+    use std::collections::{HashMap, HashSet};
+
+    let mut last: Option<Vec<crate::proto::WindowDesc>> = None;
+    let mut sent_icons: HashSet<String> = HashSet::new();
+    let mut thumb_hashes: HashMap<u64, u64> = HashMap::new();
+    let mut waited_for_monitors = 0u32;
+    let mut cycle: u32 = 0;
+
+    fn fnv64(data: &[u8]) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for &b in data {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        h
+    }
+
+    while !sh.stop.load(Ordering::Relaxed) {
+        let mons = crate::monitors::snapshot(&sh.monitors);
+        if mons.is_empty() && waited_for_monitors < 10 {
+            waited_for_monitors += 1;
+            std::thread::sleep(Duration::from_millis(80));
+            continue;
+        }
+        let list = crate::winlist::enumerate(&mons);
+        let list_changed = last.as_ref() != Some(&list);
+        if list_changed {
+            last = Some(list.clone());
+            if out.send(Msg::Windows { list: list.clone() }).is_err() {
+                return;
+            }
+        }
+
+        // Send real Windows process/window icon PNG once per app_key.
+        for win in &list {
+            if sh.stop.load(Ordering::Relaxed) {
+                return;
+            }
+            if !sent_icons.contains(&win.app_key) {
+                if let Some(png) = crate::winlist::extract_app_icon_png(win.hwnd) {
+                    sent_icons.insert(win.app_key.clone());
+                    if out.send(Msg::AppIcon { app_key: win.app_key.clone(), png }).is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+
+        // Capture real live window thumbnails on first sight, list change, or every 2nd cycle (~2.5 s).
+        // Skip while in single-window or virtual-display fullscreen mode to keep zero extra CPU load.
+        let in_focused_stream =
+            sh.target_window.load(Ordering::Relaxed) != 0 || crate::monitors::is_virtual_active(&sh.monitors);
+        if !in_focused_stream && (list_changed || cycle % 2 == 0) {
+            let live_hwnds: HashSet<u64> = list.iter().map(|w| w.hwnd).collect();
+            thumb_hashes.retain(|h, _| live_hwnds.contains(h));
+            for win in list.iter().take(24) {
+                if sh.stop.load(Ordering::Relaxed)
+                    || sh.target_window.load(Ordering::Relaxed) != 0
+                    || crate::monitors::is_virtual_active(&sh.monitors)
+                {
+                    break;
+                }
+                if win.minimized {
+                    continue;
+                }
+                if let Some(png) = crate::winlist::capture_window_thumb_png(win.hwnd) {
+                    let h = fnv64(&png);
+                    if thumb_hashes.get(&win.hwnd) != Some(&h) {
+                        thumb_hashes.insert(win.hwnd, h);
+                        if out.send(Msg::WindowThumb { hwnd: win.hwnd, png }).is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+
+        cycle = cycle.wrapping_add(1);
+        for _ in 0..12 {
+            if sh.stop.load(Ordering::Relaxed) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
 }
 
 /// How long the picture may stay paused before the session ends.
@@ -321,17 +420,40 @@ async fn watch_hint(conn: Connection, sh: Arc<PipeShared>, wtx: mpsc::UnboundedS
 
 enum InjectCmd {
     Move { display: windows::Win32::Foundation::RECT, x: u16, y: u16 },
+    MouseDelta { display: windows::Win32::Foundation::RECT, dx: i16, dy: i16 },
     Button { display: windows::Win32::Foundation::RECT, button: u8, down: bool },
+    Touch { display: windows::Win32::Foundation::RECT, id: u8, phase: u8, x: u16, y: u16 },
+    Touchpad { display: windows::Win32::Foundation::RECT, phase: u8, dx: i16, dy: i16, scale_milli: u16 },
+    Pen { display: windows::Win32::Foundation::RECT, phase: u8, x: u16, y: u16, pressure: u16, tilt_x: i8, tilt_y: i8, flags: u8 },
     Wheel { display: windows::Win32::Foundation::RECT, delta: i16, horizontal: bool },
     Key { display: windows::Win32::Foundation::RECT, scan: u16, down: bool },
+    Text { display: windows::Win32::Foundation::RECT, text: String },
+    FocusWindow {
+        hwnd: u64,
+        monitors: Vec<crate::proto::MonitorDesc>,
+        reply: tokio::sync::oneshot::Sender<Option<(u8, Vec<crate::proto::WindowDesc>)>>,
+    },
+    ConfigureVirtualDisplay {
+        active: bool,
+        width: u16,
+        height: u16,
+        dpi_percent: u16,
+        reply: tokio::sync::oneshot::Sender<Option<crate::vdisplay::ActiveVirtualDisplay>>,
+    },
+    RestoreWindow {
+        destroy_vdisplay: bool,
+        reply: tokio::sync::oneshot::Sender<bool>,
+    },
     ReleaseAll { display: windows::Win32::Foundation::RECT },
+    CheckTextFocus { wtx: mpsc::UnboundedSender<Msg> },
     Cursor { display: windows::Win32::Foundation::RECT, reply: tokio::sync::oneshot::Sender<(u16, u16)> },
 }
 
 /// Applies the viewer's input until the control stream ends.
-/// All `SetThreadDesktop` / `SendInput` / `GetCursorPos` calls are isolated to
-/// a dedicated OS thread so Tokio worker threads never have their desktop
-/// binding mutated or blocked by input injection.
+/// All `SetThreadDesktop` / `SendInput` / `GetCursorPos` / virtual-display
+/// lifecycle calls are isolated to a dedicated OS thread so Tokio worker threads
+/// never have their desktop binding mutated or blocked, and window restore
+/// always executes strictly before virtual-display teardown.
 async fn control_loop(
     recv: &mut RecvStream,
     sh: &PipeShared,
@@ -343,15 +465,65 @@ async fn control_loop(
     let (inj_tx, inj_rx) = std::sync::mpsc::channel::<InjectCmd>();
     let inj_thread = std::thread::Builder::new().name("inject".into()).spawn(move || {
         let mut inj = Injector::new(init_display);
-        while let Ok(cmd) = inj_rx.recv() {
+        let mut vdisplay = crate::vdisplay::VirtualDisplayManager::new();
+        let mut saved_win: Option<crate::winlist::SavedWindow> = None;
+        let mut last_move_pos: Option<(u16, u16)> = None;
+        let mut last_move_at = Instant::now() - Duration::from_secs(1);
+        let mut caret_before: Option<(isize, i32, i32)> = None;
+        loop {
+            // While a finger is held still, wake up to keep the touch contact alive.
+            let cmd = match inj.touch_keepalive_wait() {
+                Some(wait) => match inj_rx.recv_timeout(wait) {
+                    Ok(cmd) => cmd,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        inj.touch_keepalive();
+                        continue;
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                },
+                None => match inj_rx.recv() {
+                    Ok(cmd) => cmd,
+                    Err(_) => break,
+                },
+            };
             match cmd {
                 InjectCmd::Move { display, x, y } => {
                     inj.set_display(display);
+                    let moved = last_move_pos.is_none_or(|(px, py)| px.abs_diff(x) > 8 || py.abs_diff(y) > 8);
                     inj.move_to(x, y);
+                    last_move_pos = Some((x, y));
+                    if moved {
+                        last_move_at = Instant::now();
+                    }
+                }
+                InjectCmd::MouseDelta { display, dx, dy } => {
+                    inj.set_display(display);
+                    inj.move_delta(dx, dy);
                 }
                 InjectCmd::Button { display, button, down } => {
                     inj.set_display(display);
+                    if button == 0 && down {
+                        if last_move_at.elapsed() < Duration::from_millis(8) {
+                            std::thread::sleep(Duration::from_millis(6));
+                        }
+                        caret_before = crate::cursor::caret_snapshot();
+                    }
                     inj.button(button, down);
+                }
+                InjectCmd::Touch { display, id, phase, x, y } => {
+                    inj.set_display(display);
+                    if id == 0 && phase == 0 {
+                        caret_before = crate::cursor::caret_snapshot();
+                    }
+                    inj.touch(id, phase, x, y);
+                }
+                InjectCmd::Touchpad { display, phase, dx, dy, scale_milli } => {
+                    inj.set_display(display);
+                    inj.touchpad(phase, dx, dy, scale_milli);
+                }
+                InjectCmd::Pen { display, phase, x, y, pressure, tilt_x, tilt_y, flags } => {
+                    inj.set_display(display);
+                    inj.pen(phase, x, y, pressure, tilt_x, tilt_y, flags);
                 }
                 InjectCmd::Wheel { display, delta, horizontal } => {
                     inj.set_display(display);
@@ -361,9 +533,65 @@ async fn control_loop(
                     inj.set_display(display);
                     inj.key(scan, down);
                 }
+                InjectCmd::Text { display, text } => {
+                    inj.set_display(display);
+                    inj.text(&text);
+                }
+                InjectCmd::FocusWindow { hwnd, monitors, reply } => {
+                    if let Some(prev) = saved_win.take() {
+                        crate::winlist::restore_placement(prev);
+                    }
+                    let res = crate::winlist::focus_window_only(hwnd, &monitors)
+                        .map(|mon_idx| (mon_idx, crate::winlist::enumerate(&monitors)));
+                    let _ = reply.send(res);
+                }
+                InjectCmd::ConfigureVirtualDisplay { active, width, height, dpi_percent, reply } => {
+                    if !active {
+                        if let Some(prev) = saved_win.take() {
+                            crate::winlist::restore_placement(prev);
+                        }
+                        vdisplay.destroy();
+                        let _ = reply.send(None);
+                        continue;
+                    }
+                    if !vdisplay.is_supported() {
+                        let _ = reply.send(None);
+                        continue;
+                    }
+                    match vdisplay.ensure(width, height, dpi_percent) {
+                        Ok(vd) => {
+                            if let Some(saved) = saved_win {
+                                let _ = crate::winlist::teleport_window_to_monitor(saved.hwnd, vd.rect);
+                            }
+                            let _ = reply.send(Some(vd));
+                        }
+                        Err(e) => {
+                            log!("vdisplay: configure failed: {e:#}");
+                            let _ = reply.send(None);
+                        }
+                    }
+                }
+                InjectCmd::RestoreWindow { destroy_vdisplay, reply } => {
+                    if let Some(prev) = saved_win.take() {
+                        crate::winlist::restore_placement(prev);
+                    }
+                    let mut destroyed = false;
+                    if destroy_vdisplay && vdisplay.active().is_some() {
+                        vdisplay.destroy();
+                        destroyed = true;
+                    }
+                    let _ = reply.send(destroyed);
+                }
                 InjectCmd::ReleaseAll { display } => {
                     inj.set_display(display);
                     inj.release_all();
+                }
+                InjectCmd::CheckTextFocus { wtx } => {
+                    let after = crate::cursor::caret_snapshot();
+                    let caret_activated = after.is_some() && after != caret_before;
+                    if caret_activated || crate::cursor::is_uia_editable_now() {
+                        let _ = wtx.send(Msg::TextFocus { editable: true });
+                    }
                 }
                 InjectCmd::Cursor { display, reply } => {
                     inj.set_display(display);
@@ -371,7 +599,12 @@ async fn control_loop(
                 }
             }
         }
+        // Strictly restore window placement BEFORE destroying the virtual display.
+        if let Some(prev) = saved_win.take() {
+            crate::winlist::restore_placement(prev);
+        }
         inj.release_all();
+        vdisplay.destroy();
     })?;
     let guard_epoch = Instant::now();
     let mut input_guard = crate::input_guard::InputGuard::new();
@@ -396,9 +629,45 @@ async fn control_loop(
                     let _ = inj_tx.send(InjectCmd::Move { display, x, y });
                 }
             }
+            Msg::MouseDelta { dx, dy } => {
+                if matches!(batch_verdict, crate::input_guard::InputVerdict::Accept) {
+                    let _ = inj_tx.send(InjectCmd::MouseDelta { display, dx, dy });
+                }
+            }
             Msg::MouseButton { button, down } => {
                 if matches!(batch_verdict, crate::input_guard::InputVerdict::Accept) {
                     let _ = inj_tx.send(InjectCmd::Button { display, button, down });
+                    if button == 0 && !down {
+                        let tx = inj_tx.clone();
+                        let wtx_clone = wtx.clone();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(Duration::from_millis(65)).await;
+                            let _ = tx.send(InjectCmd::CheckTextFocus { wtx: wtx_clone });
+                        });
+                    }
+                }
+            }
+            Msg::Touch { id, phase, x, y } => {
+                if matches!(batch_verdict, crate::input_guard::InputVerdict::Accept) {
+                    let _ = inj_tx.send(InjectCmd::Touch { display, id, phase, x, y });
+                    if id == 0 && phase == 2 {
+                        let tx = inj_tx.clone();
+                        let wtx_clone = wtx.clone();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(Duration::from_millis(70)).await;
+                            let _ = tx.send(InjectCmd::CheckTextFocus { wtx: wtx_clone });
+                        });
+                    }
+                }
+            }
+            Msg::Touchpad { phase, dx, dy, scale_milli } => {
+                if matches!(batch_verdict, crate::input_guard::InputVerdict::Accept) {
+                    let _ = inj_tx.send(InjectCmd::Touchpad { display, phase, dx, dy, scale_milli });
+                }
+            }
+            Msg::Pen { phase, x, y, pressure, tilt_x, tilt_y, flags } => {
+                if matches!(batch_verdict, crate::input_guard::InputVerdict::Accept) {
+                    let _ = inj_tx.send(InjectCmd::Pen { display, phase, x, y, pressure, tilt_x, tilt_y, flags });
                 }
             }
             Msg::Wheel { delta, horizontal } => {
@@ -409,6 +678,129 @@ async fn control_loop(
             Msg::Key { scan, down } => {
                 if matches!(batch_verdict, crate::input_guard::InputVerdict::Accept) {
                     let _ = inj_tx.send(InjectCmd::Key { display, scan, down });
+                }
+            }
+            Msg::TextInput { text } => {
+                if matches!(batch_verdict, crate::input_guard::InputVerdict::Accept) && !text.is_empty() {
+                    let _ = inj_tx.send(InjectCmd::Text { display, text });
+                }
+            }
+            Msg::FocusWindow { hwnd, .. } => {
+                if hwnd == 0 {
+                    crate::monitors::set_vdisplay_transitioning(&sh.monitors, true);
+                    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                    let destroyed_vd = if inj_tx
+                        .send(InjectCmd::RestoreWindow { destroy_vdisplay: true, reply: reply_tx })
+                        .is_ok()
+                    {
+                        reply_rx.await.unwrap_or(false)
+                    } else {
+                        false
+                    };
+                    let cleared_vd = crate::monitors::clear_virtual(&sh.monitors);
+                    if sh.target_window.swap(0, Ordering::AcqRel) != 0 || cleared_vd || destroyed_vd {
+                        log!("viewer exited window/virtual mode: returning to physical display");
+                        sh.target_window_changed.store(true, Ordering::Release);
+                    }
+                    if cleared_vd || destroyed_vd {
+                        let _ = wtx.send(Msg::VirtualDisplay {
+                            active: false,
+                            width: 0,
+                            height: 0,
+                            dpi_percent: 0,
+                        });
+                    }
+                } else {
+                    let monitors = crate::monitors::snapshot(&sh.monitors);
+                    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                    if inj_tx
+                        .send(InjectCmd::FocusWindow { hwnd, monitors, reply: reply_tx })
+                        .is_ok()
+                        && let Ok(Some((mon_idx, list))) = reply_rx.await
+                    {
+                        if sh.target_window.swap(0, Ordering::AcqRel) != 0 {
+                            sh.target_window_changed.store(true, Ordering::Release);
+                        }
+                        match crate::monitors::select(&sh.monitors, mon_idx) {
+                            Ok(true) => {
+                                log!(
+                                    "viewer focused window 0x{hwnd:x} on physical display {} (switching monitor)",
+                                    mon_idx as u32 + 1
+                                );
+                            }
+                            Ok(false) => {
+                                let _ = wtx.send(crate::monitors::message(&sh.monitors));
+                                log!(
+                                    "viewer focused window 0x{hwnd:x} on physical display {}",
+                                    mon_idx as u32 + 1
+                                );
+                            }
+                            Err(e) => {
+                                log!(
+                                    "focus window 0x{hwnd:x}: failed to select display {}: {e:#}",
+                                    mon_idx as u32 + 1
+                                );
+                            }
+                        }
+                        let _ = wtx.send(Msg::Windows { list });
+                    }
+                }
+            }
+            Msg::VirtualDisplay { active, width, height, dpi_percent } => {
+                crate::monitors::set_vdisplay_transitioning(&sh.monitors, true);
+                let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                if inj_tx
+                    .send(InjectCmd::ConfigureVirtualDisplay {
+                        active,
+                        width,
+                        height,
+                        dpi_percent,
+                        reply: reply_tx,
+                    })
+                    .is_ok()
+                    && let Ok(vd_opt) = reply_rx.await
+                {
+                    match vd_opt {
+                        Some(vd) => {
+                            let reopen = crate::monitors::select_virtual(
+                                &sh.monitors,
+                                vd.device_name.clone(),
+                                vd.width,
+                                vd.height,
+                            );
+                            sh.target_window.store(0, Ordering::Release);
+                            if reopen {
+                                sh.target_window_changed.store(true, Ordering::Release);
+                            }
+                            let _ = wtx.send(Msg::VirtualDisplay {
+                                active: true,
+                                width: vd.width,
+                                height: vd.height,
+                                dpi_percent: vd.dpi_percent,
+                            });
+                            log!(
+                                "virtual display active: {} ({}x{} @ {}%, reopen={reopen})",
+                                vd.device_name,
+                                vd.width,
+                                vd.height,
+                                vd.dpi_percent
+                            );
+                        }
+                        None => {
+                            let cleared = crate::monitors::clear_virtual(&sh.monitors);
+                            if cleared {
+                                sh.target_window_changed.store(true, Ordering::Release);
+                            }
+                            let _ = wtx.send(Msg::VirtualDisplay {
+                                active: false,
+                                width: 0,
+                                height: 0,
+                                dpi_percent: 0,
+                            });
+                        }
+                    }
+                } else {
+                    crate::monitors::set_vdisplay_transitioning(&sh.monitors, false);
                 }
             }
             Msg::ReleaseAll => {
@@ -433,16 +825,40 @@ async fn control_loop(
                     sh.quality_changed.store(true, Ordering::Release);
                 }
             }
-            Msg::SelectMonitor { index } => match crate::monitors::select(&sh.monitors, index) {
-                // The capture loop reopens and sends the new list itself.
-                Ok(true) => log!("viewer picked display {}", index as u32 + 1),
-                r => {
-                    if let Err(e) = r {
-                        log!("{e:#}");
-                    }
-                    let _ = wtx.send(crate::monitors::message(&sh.monitors));
+            Msg::SelectMonitor { index } => {
+                crate::monitors::set_vdisplay_transitioning(&sh.monitors, true);
+                let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                let destroyed_vd = if inj_tx
+                    .send(InjectCmd::RestoreWindow { destroy_vdisplay: true, reply: reply_tx })
+                    .is_ok()
+                {
+                    reply_rx.await.unwrap_or(false)
+                } else {
+                    false
+                };
+                let cleared_vd = crate::monitors::clear_virtual(&sh.monitors);
+                if sh.target_window.swap(0, Ordering::AcqRel) != 0 || cleared_vd || destroyed_vd {
+                    sh.target_window_changed.store(true, Ordering::Release);
                 }
-            },
+                if cleared_vd || destroyed_vd {
+                    let _ = wtx.send(Msg::VirtualDisplay {
+                        active: false,
+                        width: 0,
+                        height: 0,
+                        dpi_percent: 0,
+                    });
+                }
+                match crate::monitors::select(&sh.monitors, index) {
+                    // The capture loop reopens and sends the new list itself.
+                    Ok(true) => log!("viewer picked display {}", index as u32 + 1),
+                    r => {
+                        if let Err(e) = r {
+                            log!("{e:#}");
+                        }
+                        let _ = wtx.send(crate::monitors::message(&sh.monitors));
+                    }
+                }
+            }
             Msg::SendSas => {
                 let r = tokio::task::spawn_blocking(crate::service::request_sas).await;
                 let sent = matches!(r, Ok(Ok(())));

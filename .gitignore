@@ -6,7 +6,15 @@ target/
 !/docs/images/
 !/docs/home-relay.md
 !/docs/home-relay.en.md
+!/docs/android.md
+!/docs/android.en.md
 /scripts/
 *.csv
 *.key
 *.lnk
+
+# Local release output
+/dist/
+
+# Local scratch build dirs
+/target-*/

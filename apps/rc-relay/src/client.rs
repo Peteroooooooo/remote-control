@@ -129,7 +129,8 @@ pub async fn claim(code: &RelayCode, device: &SecretKey, name: &str, ca: &CaTlsC
 /// Tells the relay, as its owner `device`, the whole list of devices that
 /// may use it to reach this owner (replaces the list sent before).
 /// Returns any guest IDs the relay kicked and asks this owner to drop.
-/// An older relay that does not take guest names gets the keys alone.
+/// An older relay that does not take phone marks gets the list without them;
+/// one that does not take guest names either gets the keys alone.
 pub async fn set_guests(relay: &[RelayUrl], device: &SecretKey, ca: &CaTlsConfig, guests: &[Guest]) -> Result<Vec<PublicKey>> {
     let client = http(ca)?;
     let send = |guests: &[Guest]| {
@@ -137,7 +138,12 @@ pub async fn set_guests(relay: &[RelayUrl], device: &SecretKey, ca: &CaTlsConfig
         let client = client.clone();
         async move { race(relay, |u| call(client.clone(), u, api::GUESTS_PATH, req.clone())).await }
     };
-    let body = match send(guests).await?.1 {
+    let mut r = send(guests).await?.1;
+    if r == Err(Refusal::BadRequest) && guests.iter().any(|g| g.phone) {
+        let pcs: Vec<Guest> = guests.iter().map(|g| g.clone().with_phone(false)).collect();
+        r = send(&pcs).await?.1;
+    }
+    let body = match r {
         Err(Refusal::BadRequest) if guests.iter().any(|g| !g.name.is_empty() || g.kind != Kind::Unknown) => {
             let plain: Vec<Guest> = guests.iter().map(|g| Guest::from(g.id)).collect();
             send(&plain).await?.1?

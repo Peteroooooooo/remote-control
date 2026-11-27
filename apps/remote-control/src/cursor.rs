@@ -19,10 +19,17 @@ use windows::Win32::{
         DIB_RGB_COLORS, DeleteDC, DeleteObject, GetBitmapBits, GetDC, GetDIBits, GetObjectW, HBITMAP, HGDIOBJ,
         ReleaseDC, SelectObject,
     },
-    UI::WindowsAndMessaging::{
-        CURSOR_SHOWING, CURSORINFO, CreateIconIndirect, DI_NORMAL, DrawIconEx, GetCursorInfo, GetIconInfo, HCURSOR,
-        HICON, ICONINFO,
+    UI::{
+        Accessibility::{
+            CUIAutomation, IUIAutomation, IUIAutomationValuePattern, UIA_EditControlTypeId, UIA_ValuePatternId,
+        },
+        WindowsAndMessaging::{
+            CURSOR_SHOWING, CURSORINFO, CreateIconIndirect, DI_NORMAL, DrawIconEx, GUITHREADINFO, GetCursorInfo,
+            GetGUIThreadInfo, GetIconInfo, HCURSOR, HICON, ICONINFO, IDC_CROSS, IDC_HAND, IDC_IBEAM, IDC_SIZEALL,
+            IDC_SIZENESW, IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE, LoadCursorW,
+        },
     },
+    System::Com::{CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx},
 };
 
 use crate::{log, pipeline::PipeShared, proto::Msg};
@@ -230,11 +237,29 @@ const HOST_CURSOR_CACHE: usize = 256;
 
 /// Host side, on its own thread until `sh.stop`: watches the cursor and
 /// sends its shape when it changes, at the size the host shows it.
+/// Also emits semantic `Msg::CursorMeta` (`0` normal, `1` interactive/resize, `2` text)
+/// for mobile trackpad Hover Assist without falsely popping up the soft keyboard.
 pub fn watch(out: UnboundedSender<Msg>, sh: Arc<PipeShared>) {
+    let ibeam_cursor = unsafe { LoadCursorW(None, IDC_IBEAM) }.ok();
+    let ibeam_img = ibeam_cursor.and_then(read);
+    let interactive_cursors: Vec<HCURSOR> = [
+        IDC_HAND,
+        IDC_SIZEWE,
+        IDC_SIZENS,
+        IDC_SIZENWSE,
+        IDC_SIZENESW,
+        IDC_SIZEALL,
+        IDC_CROSS,
+    ]
+    .into_iter()
+    .filter_map(|id| unsafe { LoadCursorW(None, id) }.ok())
+    .collect();
+
     let mut ids: HashMap<u64, (u32, u64)> = HashMap::new();
     let mut next_id = 1u32;
     let mut tick = 0u64;
     let mut last: Option<(bool, isize)> = None;
+    let mut last_meta: Option<u8> = None;
     let mut shapes_sent = 0u64;
     let mut repeats = 0u32;
     let mut follow_failed = 0u64;
@@ -258,15 +283,25 @@ pub fn watch(out: UnboundedSender<Msg>, sh: Arc<PipeShared>) {
             continue;
         }
         last = Some(key);
-        let msg = if !showing {
-            Msg::CursorHidden
+        let (msg, meta_kind) = if !showing {
+            (Msg::CursorHidden, 0u8)
         } else {
             let Some(img) = read(ci.hCursor) else { continue };
+            let is_ibeam = ibeam_cursor.is_some_and(|h| h == ci.hCursor)
+                || ibeam_img.as_ref().is_some_and(|ref_img| *ref_img == img);
+            let is_interactive = interactive_cursors.iter().any(|&h| h == ci.hCursor);
+            let meta_kind = if is_ibeam {
+                2u8
+            } else if is_interactive {
+                1u8
+            } else {
+                0u8
+            };
             let mut hasher = DefaultHasher::new();
             img.hash(&mut hasher);
             let hash = hasher.finish();
             tick += 1;
-            if let Some((id, last_tick)) = ids.get_mut(&hash) {
+            let msg = if let Some((id, last_tick)) = ids.get_mut(&hash) {
                 *last_tick = tick;
                 repeats += 1;
                 Msg::CursorUse { id: *id }
@@ -284,13 +319,81 @@ pub fn watch(out: UnboundedSender<Msg>, sh: Arc<PipeShared>) {
                 ids.insert(hash, (id, tick));
                 shapes_sent += 1;
                 Msg::CursorShape { id, image: img }
-            }
+            };
+            (msg, meta_kind)
         };
         if out.send(msg).is_err() {
             break;
         }
+        if last_meta != Some(meta_kind) {
+            last_meta = Some(meta_kind);
+            if out.send(Msg::CursorMeta { kind: meta_kind }).is_err() {
+                break;
+            }
+        }
     }
     log!("cursor watch stopped: {shapes_sent} shapes sent, {repeats} repeats sent as ids");
+}
+
+/// Returns the foreground thread's active Win32 caret `(hwnd, left, top)` if present.
+pub fn caret_snapshot() -> Option<(isize, i32, i32)> {
+    let mut gti = GUITHREADINFO { cbSize: size_of::<GUITHREADINFO>() as u32, ..Default::default() };
+    unsafe {
+        if GetGUIThreadInfo(0, &mut gti).is_err() {
+            return None;
+        }
+    }
+    if !gti.hwndCaret.is_invalid()
+        && (gti.rcCaret.right > gti.rcCaret.left || gti.rcCaret.bottom > gti.rcCaret.top)
+    {
+        Some((gti.hwndCaret.0 as isize, gti.rcCaret.left, gti.rcCaret.top))
+    } else {
+        None
+    }
+}
+
+/// Checks via UI Automation whether the currently focused control is an editable
+/// text field (covers Chrome/Electron/Edge/WeChat inputs even when Windows
+/// hides the mouse cursor during Touch input).
+pub fn is_uia_editable_now() -> bool {
+    use std::cell::RefCell;
+    use windows::core::Interface;
+
+    thread_local! {
+        static UIA_AUTO: RefCell<Option<IUIAutomation>> = const { RefCell::new(None) };
+    }
+
+    let _ = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+    let auto: Option<IUIAutomation> = UIA_AUTO.with(|slot| {
+        let mut borrow = slot.borrow_mut();
+        if borrow.is_none() {
+            *borrow = unsafe { CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER) }.ok();
+        }
+        borrow.clone()
+    });
+    let Some(auto) = auto else {
+        return false;
+    };
+    let Ok(elem) = (unsafe { auto.GetFocusedElement() }) else {
+        return false;
+    };
+    if let Ok(enabled) = unsafe { elem.CurrentIsEnabled() }
+        && !enabled.as_bool()
+    {
+        return false;
+    }
+    if let Ok(unk) = unsafe { elem.GetCurrentPattern(UIA_ValuePatternId) }
+        && let Ok(vp) = unk.cast::<IUIAutomationValuePattern>()
+        && let Ok(ro) = unsafe { vp.CurrentIsReadOnly() }
+    {
+        return !ro.as_bool();
+    }
+    if let Ok(ct) = unsafe { elem.CurrentControlType() }
+        && ct == UIA_EditControlTypeId
+    {
+        return true;
+    }
+    false
 }
 
 #[cfg(test)]

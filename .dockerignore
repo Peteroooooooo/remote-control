@@ -1,5 +1,8 @@
 # What `docker build` of apps/rc-relay/Dockerfile does not need.
 target
+target-*
+apps/rc-android
+rc-relay-state
 measurements-raw
 docs
 scripts

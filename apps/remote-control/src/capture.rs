@@ -173,6 +173,41 @@ impl Capture {
         })
     }
 
+    /// Single-window WGC in this process (`CreateForWindow`).
+    pub fn wgc_window(gpu: &Gpu, hwnd_raw: u64) -> Result<Capture> {
+        let hwnd = windows::Win32::Foundation::HWND(hwnd_raw as usize as *mut _);
+        let w = Wgc::start_window(gpu, hwnd)?;
+        let (width, height, fp16) = (w.width, w.height, w.fp16);
+        Ok(Capture {
+            src: Source::Wgc(w),
+            image: None,
+            grabbed: false,
+            width,
+            height,
+            rotation: 0,
+            hdr_info: crate::hdr::DisplayHdrInfo::sdr(),
+            fp16,
+        })
+    }
+
+    /// Single-window WGC in the console-user capture agent (for the service's helper).
+    pub fn agent_window(gpu: &Gpu, output: &IDXGIOutput1, hwnd_raw: u64) -> Result<Capture> {
+        let dev = device_name(output)?;
+        let target = format!("window:{hwnd_raw}|{dev}");
+        let a = Agent::start(gpu, &target)?;
+        let (width, height, fp16) = (a.width, a.height, a.fp16);
+        Ok(Capture {
+            src: Source::Agent(a),
+            image: None,
+            grabbed: false,
+            width,
+            height,
+            rotation: 0,
+            hdr_info: crate::hdr::DisplayHdrInfo::sdr(),
+            fp16,
+        })
+    }
+
     /// Staging texture holding the last grabbed frame, allocated on first use
     /// in the matching pixel format (`R16G16B16A16_FLOAT` for HDR, `B8G8R8A8_UNORM` for SDR).
     pub fn image(&mut self, gpu: &Gpu) -> Result<&ID3D11Texture2D> {

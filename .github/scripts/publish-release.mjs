@@ -5,6 +5,7 @@ import crypto from 'node:crypto';
 const args = new Set(process.argv.slice(2));
 const tag = process.env.TAG || '';
 const exePath = process.env.EXE_PATH || '';
+const apkPath = (process.env.APK_PATH || '').trim();
 const manifestOut = process.env.OUT_MANIFEST || 'latest.json';
 const githubRepo = process.env.GITHUB_REPO || '';
 const cnbRepo = (process.env.CNB_REPO || '').trim();
@@ -48,6 +49,25 @@ function buildManifest() {
   urls.push(`https://github.com/${githubRepo}/releases/download/${tag}/remote-control.exe`);
 
   const manifest = { version, sha256, notes, urls, sig };
+
+  // Phone section. Android checks the APK's own signing certificate, so it needs no manifest
+  // signature; the PC signature above covers only version + exe sha256, so this section can sit
+  // beside it. versionCode must match apps/rc-android/app/build.gradle.kts.
+  if (apkPath) {
+    const apk = fs.readFileSync(apkPath);
+    const parts = version.split('-')[0].split('.').map((p) => parseInt(p, 10) || 0);
+    const code = Math.max(1, (parts[0] || 0) * 1_000_000 + (parts[1] || 0) * 1_000 + (parts[2] || 0));
+    const name = path.basename(apkPath);
+    const apkUrls = [];
+    if (cnbRepo) apkUrls.push(`https://cnb.cool/${cnbRepo}/-/releases/download/${tag}/${name}`);
+    apkUrls.push(`https://github.com/${githubRepo}/releases/download/${tag}/${name}`);
+    manifest.android = {
+      code,
+      sha256: crypto.createHash('sha256').update(apk).digest('hex'),
+      size: apk.length,
+      urls: apkUrls,
+    };
+  }
   fs.writeFileSync(manifestOut, JSON.stringify(manifest, null, 2) + '\n', 'utf8');
   console.log(`Generated ${manifestOut}: version=${version}, sha256=${sha256}`);
 }
@@ -138,6 +158,7 @@ async function syncCnb() {
   const branch = await defaultBranch();
   const rel = await ensureRelease(tag, tag, branch, true);
   await uploadAsset(rel.id, exePath, path.basename(exePath));
+  if (apkPath) await uploadAsset(rel.id, apkPath, path.basename(apkPath));
   await uploadAsset(rel.id, manifestOut, 'latest.json');
 
   const latestRel = await ensureRelease('latest', 'latest', branch, false);
