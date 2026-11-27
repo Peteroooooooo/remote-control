@@ -462,12 +462,14 @@ class RcViewModel : ViewModel(), NativeCallback {
         val rawFps = sp.getInt("fps", 0)
         val rawMbps = sp.getInt("mbps", 0)
         val rawRelayOnly = sp.getBoolean("relay_only", false)
+        val rawShowStatsHud = sp.getBoolean("show_stats_hud", false)
         return QualityPrefs(
             resPreset = if (rawRes in setOf(0, 1, 1440, 1080, 720)) rawRes else 0,
             fpsPreset = if (rawFps in setOf(0, 30, 60, 120, 144)) rawFps else 0,
             mbpsPreset = if (rawMbps in setOf(0, 10, 20, 40, 80)) rawMbps else 0,
             sharpText = false,
             relayOnly = rawRelayOnly,
+            showStatsHud = rawShowStatsHud,
         )
     }
 
@@ -477,6 +479,7 @@ class RcViewModel : ViewModel(), NativeCallback {
             .putInt("fps", q.fpsPreset)
             .putInt("mbps", q.mbpsPreset)
             .putBoolean("relay_only", q.relayOnly)
+            .putBoolean("show_stats_hud", q.showStatsHud)
             .apply()
     }
 

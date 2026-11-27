@@ -1561,6 +1561,41 @@ fun FullscreenScreen(
             CursorAndRippleOverlay()
         }
 
+        // Optional lightweight live FPS + RTT HUD badge in Fullscreen (never intercepts touch)
+        if (state.quality.showStatsHud) {
+            val stats = state.liveStats
+            val hudText = buildString {
+                if (stats.fps > 0) append("${stats.fps} fps")
+                if (stats.rttMs > 0) {
+                    if (isNotEmpty()) append(" · ")
+                    append("${stats.rttMs} ms")
+                }
+            }
+            if (hudText.isNotEmpty()) {
+                Box(
+                    modifier = Modifier
+                        .align(Alignment.TopStart)
+                        .displayCutoutPadding()
+                        .padding(start = 12.dp, top = 12.dp)
+                        .clip(RoundedCornerShape(999.dp))
+                        .background(Color(0x730E1014))
+                        .border(0.5.dp, Color(0x2BFFFFFF), RoundedCornerShape(999.dp))
+                        .padding(horizontal = 9.dp, vertical = 4.dp),
+                ) {
+                    Text(
+                        text = hudText,
+                        color = Color(0xE6FFFFFF),
+                        style = TextStyle(
+                            fontSize = 11.5.sp,
+                            fontWeight = FontWeight.Medium,
+                            fontFeatureSettings = "tnum",
+                        ),
+                        maxLines = 1,
+                    )
+                }
+            }
+        }
+
         // Tap-outside scrim for floating menu
         if (menuExpanded) {
             Box(

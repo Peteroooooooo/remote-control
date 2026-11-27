@@ -575,8 +575,7 @@ val QualityMbpsPresets = listOf(
 /** User-facing name of the live connection path reported by the engine. */
 fun pathKindLabel(kind: String): String = when (kind) {
     "direct" -> "直连"
-    "relay" -> "自建中转"
-    "public" -> "公共中转"
+    "relay", "public" -> "中转"
     else -> ""
 }
 
@@ -707,6 +706,28 @@ fun QualitySettingsSection(
                     onCheckedChange = { on -> onUpdateQuality { it.copy(relayOnly = on) } },
                 )
             }
+        }
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(0.5.dp)
+                .background(RcInk.hairline),
+        )
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                text = "显示帧率与延迟",
+                color = RcInk.primary,
+                fontSize = 15.sp,
+                fontWeight = FontWeight.Normal,
+                modifier = Modifier.weight(1f),
+            )
+            RcSwitch(
+                checked = quality.showStatsHud,
+                onCheckedChange = { on -> onUpdateQuality { it.copy(showStatsHud = on) } },
+            )
         }
     }
 }

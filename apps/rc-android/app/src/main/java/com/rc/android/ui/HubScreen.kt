@@ -14,8 +14,6 @@ import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
-import androidx.compose.animation.scaleIn
-import androidx.compose.animation.scaleOut
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -42,7 +40,6 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
@@ -50,7 +47,6 @@ import androidx.compose.foundation.lazy.grid.rememberLazyGridState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.Send
 import androidx.compose.material.icons.outlined.DesktopWindows
@@ -61,7 +57,6 @@ import androidx.compose.material.icons.rounded.Folder
 import androidx.compose.material.icons.rounded.Forum
 import androidx.compose.material.icons.rounded.GridView
 import androidx.compose.material.icons.rounded.HeadsetMic
-import androidx.compose.material.icons.rounded.KeyboardArrowDown
 import androidx.compose.material.icons.rounded.Language
 import androidx.compose.material.icons.rounded.MusicNote
 import androidx.compose.material.icons.rounded.OpenInFull
@@ -101,13 +96,11 @@ import androidx.compose.ui.layout.positionInRoot
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ImageBitmap
-import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
 import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.layout.ContentScale
-import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.text.PlatformTextStyle
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.TextStyle
@@ -119,7 +112,6 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.rc.android.model.MonitorInfo
-import com.rc.android.model.QualityPrefs
 import com.rc.android.model.RcUiState
 import com.rc.android.model.RunningWindowItem
 import com.rc.android.model.SessionPhase
@@ -137,19 +129,16 @@ fun HubScreen(
     onEnterFullscreen: () -> Unit,
     onFocusWindow: (RunningWindowItem) -> Unit,
     onSelectMonitor: (Int) -> Unit,
-    onUpdateQuality: ((QualityPrefs) -> QualityPrefs) -> Unit,
     onReconnect: () -> Unit,
     onToggleOrientation: () -> Unit,
     onSurfaceReady: (Surface) -> Unit,
     onSurfaceDestroyed: (Surface) -> Unit,
 ) {
     val c = RcThemeColors.current
-    val config = LocalConfiguration.current
 
     // Tapping a Dock app floats that app's windows smoothly to the top (zero extra header row / layout jump)
     var dockPinnedApp by remember { mutableStateOf<String?>(null) }
     var dockPulseToken by remember { mutableIntStateOf(0) }
-    var qualityPopoverOpen by remember { mutableStateOf(false) }
 
     val appGroups = remember(state.windows) {
         val order = LinkedHashMap<String, DockAppGroup>()
@@ -221,8 +210,6 @@ fun HubScreen(
                 WideHubTopBar(
                     state = state,
                     compact = compactBar,
-                    qualityPopoverOpen = qualityPopoverOpen,
-                    onToggleQualityPopover = { qualityPopoverOpen = !qualityPopoverOpen },
                     onBackToDevices = onBackToDevices,
                     onSelectMonitor = onSelectMonitor,
                     onToggleOrientation = onToggleOrientation,
@@ -230,8 +217,6 @@ fun HubScreen(
             } else {
                 PortraitHubTopBar(
                     state = state,
-                    qualityPopoverOpen = qualityPopoverOpen,
-                    onToggleQualityPopover = { qualityPopoverOpen = !qualityPopoverOpen },
                     onBackToDevices = onBackToDevices,
                     onToggleOrientation = onToggleOrientation,
                 )
@@ -327,71 +312,6 @@ fun HubScreen(
                     .padding(bottom = if (compactBar) 8.dp else 10.dp),
             )
         }
-
-        // Tap-outside scrim + live Liquid Glass Quality Popover triggered directly from top telemetry pill
-        if (qualityPopoverOpen) {
-            Box(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .clickable(
-                        interactionSource = remember { MutableInteractionSource() },
-                        indication = null,
-                    ) { qualityPopoverOpen = false },
-            )
-        }
-
-        AnimatedVisibility(
-            visible = qualityPopoverOpen,
-            enter = fadeIn(tween(140)) + scaleIn(
-                initialScale = 0.92f,
-                transformOrigin = TransformOrigin(0.5f, 0f),
-                animationSpec = spring(
-                    dampingRatio = Spring.DampingRatioNoBouncy,
-                    stiffness = Spring.StiffnessMedium,
-                ),
-            ),
-            exit = fadeOut(tween(110)) + scaleOut(
-                targetScale = 0.94f,
-                transformOrigin = TransformOrigin(0.5f, 0f),
-            ),
-            modifier = Modifier
-                .align(Alignment.TopCenter)
-                .padding(top = if (compactBar) 48.dp else 62.dp)
-                .padding(horizontal = 12.dp, vertical = 4.dp),
-        ) {
-            val showRouteOption = state.ownRelayCount > 0 || state.activeDevice?.hasSelfHostedRelay == true
-            val compactPopover = config.screenHeightDp < 480
-            val maxPopoverH = (config.screenHeightDp.dp - if (compactBar) 64.dp else 96.dp).coerceAtLeast(160.dp)
-            val maxPopoverW = (config.screenWidthDp.dp - 24.dp).coerceAtLeast(220.dp)
-            FloatingGlass(
-                cornerRadius = 20.dp,
-                darkOverlay = true,
-                elevation = 20.dp,
-                modifier = Modifier
-                    .widthIn(max = maxPopoverW)
-                    .width(304.dp)
-                    .heightIn(max = maxPopoverH),
-            ) {
-                Column(
-                    modifier = Modifier
-                        .background(Color(0x99141416))
-                        .verticalScroll(rememberScrollState())
-                        .clickable(
-                            interactionSource = remember { MutableInteractionSource() },
-                            indication = null,
-                        ) {}
-                        .padding(horizontal = 16.dp, vertical = if (compactPopover) 12.dp else 16.dp),
-                ) {
-                    QualitySettingsSection(
-                        quality = state.quality,
-                        onUpdateQuality = onUpdateQuality,
-                        showRouteOption = showRouteOption,
-                        routeHint = pathKindLabel(state.liveStats.pathKind).let { if (it.isEmpty()) "" else "当前：$it" },
-                        compact = compactPopover,
-                    )
-                }
-            }
-        }
     }
 }
 
@@ -399,71 +319,20 @@ private const val HUB_PAD_H = 14f
 private val HUB_TV_RADIUS = 12.dp
 
 @Composable
-private fun HubTelemetryPill(
-    text: String,
-    active: Boolean,
-    enabled: Boolean,
-    onClick: () -> Unit,
-) {
-    val c = RcThemeColors.current
-    val pillBg = when {
-        active -> Color(0x330A84FF)
-        c.isDark -> Color(0x29767680)
-        else -> Color(0x14767680)
-    }
-    val fg = if (active) c.accent else c.label2
-    Row(
-        modifier = Modifier
-            .liquidPress(enabled = enabled, pressedScale = 0.94f, onClick = onClick)
-            .height(28.dp)
-            .clip(RoundedCornerShape(999.dp))
-            .background(pillBg)
-            .padding(start = 12.dp, end = if (enabled) 8.dp else 12.dp),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(3.dp),
-    ) {
-        Text(
-            text = text,
-            color = fg,
-            style = TextStyle(
-                fontSize = 12.5.sp,
-                lineHeight = 15.sp,
-                fontWeight = FontWeight.Medium,
-                fontFeatureSettings = "tnum",
-                platformStyle = PlatformTextStyle(includeFontPadding = false),
-            ),
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-        )
-        if (enabled) {
-            Icon(
-                imageVector = Icons.Rounded.KeyboardArrowDown,
-                contentDescription = null,
-                tint = fg,
-                modifier = Modifier.size(16.dp),
-            )
-        }
-    }
-}
-
-
-@Composable
 private fun PortraitHubTopBar(
     state: RcUiState,
-    qualityPopoverOpen: Boolean,
-    onToggleQualityPopover: () -> Unit,
     onBackToDevices: () -> Unit,
     onToggleOrientation: () -> Unit,
 ) {
     val c = RcThemeColors.current
     val devName = state.activeDevice?.name ?: "Windows"
-    val telemetry = formatTelemetry(state, includeResolution = true)
+    val connStatus = formatConnectionStatus(state)
     val isLive = state.sessionPhase == SessionPhase.Connected
 
     Box(
         modifier = Modifier
             .fillMaxWidth()
-            .heightIn(min = 58.dp)
+            .heightIn(min = 48.dp)
             .padding(horizontal = 10.dp, vertical = 4.dp),
     ) {
         NavBackButton(
@@ -471,39 +340,43 @@ private fun PortraitHubTopBar(
             modifier = Modifier.align(Alignment.CenterStart),
         )
 
-        Column(
+        Row(
             modifier = Modifier
                 .align(Alignment.Center)
-                .padding(horizontal = 56.dp),
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.spacedBy(4.dp),
+                .padding(horizontal = 52.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
         ) {
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(5.dp),
-            ) {
-                if (isLive) {
-                    StatusDot(color = c.green, size = 6.dp)
-                }
+            if (isLive) {
+                StatusDot(color = c.green, size = 6.dp)
+            }
+            Text(
+                text = devName,
+                color = c.label,
+                style = TextStyle(
+                    fontSize = 16.sp,
+                    lineHeight = 19.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    platformStyle = PlatformTextStyle(includeFontPadding = false),
+                ),
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f, fill = false),
+            )
+            if (connStatus.isNotEmpty()) {
                 Text(
-                    text = devName,
-                    color = c.label,
+                    text = connStatus,
+                    color = c.label2,
                     style = TextStyle(
-                        fontSize = 17.sp,
-                        lineHeight = 20.sp,
-                        fontWeight = FontWeight.SemiBold,
+                        fontSize = 12.5.sp,
+                        lineHeight = 15.sp,
+                        fontWeight = FontWeight.Medium,
+                        fontFeatureSettings = "tnum",
                         platformStyle = PlatformTextStyle(includeFontPadding = false),
                     ),
                     maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
                 )
             }
-            HubTelemetryPill(
-                text = telemetry,
-                active = qualityPopoverOpen,
-                enabled = isLive,
-                onClick = onToggleQualityPopover,
-            )
         }
 
         FramelessIconButton(
@@ -521,15 +394,13 @@ private fun PortraitHubTopBar(
 private fun WideHubTopBar(
     state: RcUiState,
     compact: Boolean,
-    qualityPopoverOpen: Boolean,
-    onToggleQualityPopover: () -> Unit,
     onBackToDevices: () -> Unit,
     onSelectMonitor: (Int) -> Unit,
     onToggleOrientation: () -> Unit,
 ) {
     val c = RcThemeColors.current
     val devName = state.activeDevice?.name ?: "Windows"
-    val telemetry = formatTelemetry(state, includeResolution = true)
+    val connStatus = formatConnectionStatus(state)
     val isLive = state.sessionPhase == SessionPhase.Connected
 
     Row(
@@ -572,12 +443,20 @@ private fun WideHubTopBar(
                     ),
                     maxLines = 1,
                 )
-                HubTelemetryPill(
-                    text = telemetry,
-                    active = qualityPopoverOpen,
-                    enabled = isLive,
-                    onClick = onToggleQualityPopover,
-                )
+                if (connStatus.isNotEmpty()) {
+                    Text(
+                        text = connStatus,
+                        color = c.label2,
+                        style = TextStyle(
+                            fontSize = 12.5.sp,
+                            lineHeight = 15.sp,
+                            fontWeight = FontWeight.Medium,
+                            fontFeatureSettings = "tnum",
+                            platformStyle = PlatformTextStyle(includeFontPadding = false),
+                        ),
+                        maxLines = 1,
+                    )
+                }
             }
         }
 
@@ -1425,23 +1304,15 @@ private fun appVisualFor(appKey: String): AppVisualStyle = when (appKey.lowercas
     else -> AppVisualStyle(Color(0xFF434752), Color(0xFF2A2D35), Icons.Rounded.WebAsset)
 }
 
-private fun formatTelemetry(state: RcUiState, includeResolution: Boolean): String {
+private fun formatConnectionStatus(state: RcUiState): String {
     val stats = state.liveStats
     return when (state.sessionPhase) {
         SessionPhase.Connected -> buildString {
-            if (stats.fps > 0) append("${stats.fps} fps")
+            val route = pathKindLabel(stats.pathKind)
+            if (route.isNotEmpty()) append(route)
             if (stats.rttMs > 0) {
                 if (isNotEmpty()) append(" · ")
                 append("${stats.rttMs} ms")
-            }
-            if (includeResolution) {
-                val curMon = state.monitors.getOrNull(state.currentMonitorIndex)
-                val res = curMon?.shortRes?.takeIf { it.isNotEmpty() }
-                    ?: state.streamMeta.height.takeIf { it > 0 }?.let { "${it}p" }
-                if (res != null) {
-                    if (isNotEmpty()) append(" · ")
-                    append(res)
-                }
             }
             if (isEmpty()) append("已连接")
         }

@@ -228,7 +228,6 @@ class MainActivity : ComponentActivity() {
                                     onEnterFullscreen = { vm.enterFullscreen() },
                                     onFocusWindow = { vm.focusWindow(it) },
                                     onSelectMonitor = { vm.selectMonitor(it) },
-                                    onUpdateQuality = { vm.setQuality(it) },
                                     onReconnect = {
                                         val (w, h) = currentScreenPixels()
                                         vm.reconnectActive(w, h)

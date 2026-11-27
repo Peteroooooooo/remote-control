@@ -121,6 +121,8 @@ data class QualityPrefs(
     val sharpText: Boolean = false,
     /** false = 自动(优先直连), true = 只走自建中转 */
     val relayOnly: Boolean = false,
+    /** 全屏界面常驻显示实时帧率与延迟角标 */
+    val showStatsHud: Boolean = false,
 )
 
 data class VirtualDisplayState(
