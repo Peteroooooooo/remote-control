@@ -297,6 +297,12 @@ pub fn select(sel: &Selection, index: u8) -> Result<bool> {
     Ok(true)
 }
 
+/// The viewer asked for another display (cheap: called on every frame).
+pub fn switch_pending(sel: &Selection) -> bool {
+    let s = sel.0.lock().unwrap();
+    s.switch && !s.transitioning
+}
+
 /// Called often by the capture loop: true when it should reopen, because the
 /// viewer picked another display or the displays changed.
 pub fn should_reopen(sel: &Selection) -> bool {

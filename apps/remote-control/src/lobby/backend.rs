@@ -238,6 +238,7 @@ struct Sh {
     /// Cached SCM status so UI frames never block on SCM RPCs.
     service_installed: AtomicBool,
     service_other: AtomicBool,
+    service_missing: AtomicBool,
     /// Whether the window shows (not only the tray icon).
     visible: AtomicBool,
     /// Counts the window's showings: the node takes a window shown again as
@@ -343,10 +344,17 @@ impl Sh {
         let state = install::service_running();
         let installed = state.is_some();
         let running = state == Some(true);
-        let other = installed && install::service_elsewhere().is_some();
+        let svc_exe = installed.then(install::service_exe).flatten();
+        let me = install::live_exe().ok();
+        let other = match (&me, &svc_exe) {
+            (Some(me), Some(theirs)) => !install::same_file(me, theirs),
+            _ => false,
+        };
+        let missing = svc_exe.as_ref().is_some_and(|p| !p.exists());
         let prev_installed = self.service_installed.swap(installed, Ordering::SeqCst);
         let prev_other = self.service_other.swap(other, Ordering::SeqCst);
-        if prev_installed != installed || prev_other != other {
+        let prev_missing = self.service_missing.swap(missing, Ordering::SeqCst);
+        if prev_installed != installed || prev_other != other || prev_missing != missing {
             self.changed();
         }
         running
@@ -354,16 +362,16 @@ impl Sh {
 
     /// While the service runs this exe, the lobby starts hidden at logon if
     /// the service starts with Windows (开机自动在线); otherwise not.
-    fn sync_autostart(&self, last: &mut Option<bool>) {
-        let Ok(me) = std::env::current_exe() else { return };
+    fn sync_autostart(&self, last: &mut Option<(bool, PathBuf)>) {
+        let Ok(me) = install::live_exe() else { return };
         let want = match install::service_exe() {
             Some(exe) if install::same_file(&me, &exe) => self.snap.lock().unwrap().boot,
             Some(_) => return,
             None => false,
         };
-        if *last != Some(want) {
+        if last.as_ref().is_none_or(|(w, p)| *w != want || p != &me) {
             match install::set_autostart(&me, want) {
-                Ok(()) => *last = Some(want),
+                Ok(()) => *last = Some((want, me)),
                 Err(e) => log!("lobby: start at logon: {e:#}"),
             }
         }
@@ -469,6 +477,7 @@ impl Backend {
             undoables: Mutex::default(),
             service_installed: AtomicBool::new(false),
             service_other: AtomicBool::new(false),
+            service_missing: AtomicBool::new(false),
             visible: visible.into(),
             shown: Default::default(),
         });
@@ -762,6 +771,10 @@ impl Backend {
         self.sh.service_other.load(Ordering::SeqCst)
     }
 
+    pub fn service_missing(&self) -> bool {
+        self.sh.service_missing.load(Ordering::SeqCst)
+    }
+
     /// The window shows (`true`) or went to the tray. Hidden, it does not
     /// count as open: connection codes are void and the temporary devices
     /// forgotten, as when it closed before there was a tray.
@@ -894,7 +907,7 @@ fn session(sh: &Arc<Sh>, id: EndpointId, name: &str) -> Result<()> {
     }
     let mut log_file = std::fs::File::create(&log_path)?;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let mut cmd = std::process::Command::new(std::env::current_exe()?);
+    let mut cmd = std::process::Command::new(install::live_exe()?);
     cmd.args(&args);
     if !sh.view_args.iter().any(|x| x == "--key" || x.starts_with("--key=")) {
         cmd.arg("--key").arg(&sh.key);
@@ -995,7 +1008,7 @@ fn run_elevated(install: bool, key: &Path) -> Result<String> {
     };
     let report = key.with_file_name("service-setup.log");
     let _ = std::fs::remove_file(&report);
-    let exe = std::env::current_exe()?;
+    let exe = install::live_exe()?;
     let params = format!(
         "{} --from-lobby \"{}\" --lobby-pid {}",
         if install { "install-service" } else { "uninstall-service" },

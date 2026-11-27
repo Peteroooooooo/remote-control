@@ -198,7 +198,21 @@ struct Consts {
 
 const _: () = assert!(std::mem::size_of::<Consts>() == 16);
 
-fn compile(entry: PCSTR, target: PCSTR) -> Result<ID3DBlob> {
+/// The compiled shader: compiled once per process (nine of them took about
+/// 0.23 s on every new picture, e.g. each display switch, 2026-11-28).
+fn compile(entry: PCSTR, target: PCSTR) -> Result<Vec<u8>> {
+    static CACHE: std::sync::Mutex<Vec<(String, Vec<u8>)>> = std::sync::Mutex::new(Vec::new());
+    let key = unsafe { format!("{}/{}", entry.display(), target.display()) };
+    if let Some((_, code)) = CACHE.lock().unwrap().iter().find(|(k, _)| *k == key) {
+        return Ok(code.clone());
+    }
+    let code = compile_now(entry, target)?;
+    let bytes = unsafe { std::slice::from_raw_parts(code.GetBufferPointer() as *const u8, code.GetBufferSize()) }.to_vec();
+    CACHE.lock().unwrap().push((key, bytes.clone()));
+    Ok(bytes)
+}
+
+fn compile_now(entry: PCSTR, target: PCSTR) -> Result<ID3DBlob> {
     unsafe {
         let mut code: Option<ID3DBlob> = None;
         let mut errors: Option<ID3DBlob> = None;
@@ -255,18 +269,16 @@ impl ToNv12 {
     pub fn new_with_hdr(gpu: &Gpu, out: (u32, u32), inv_sdr_white: f32) -> Result<ToNv12> {
         unsafe {
             let create_ps = |entry: PCSTR, label: &str| -> Result<ID3D11PixelShader> {
-                let blob = compile(entry, s!("ps_5_0"))?;
-                let bytes = std::slice::from_raw_parts(blob.GetBufferPointer() as *const u8, blob.GetBufferSize());
+                let bytes = compile(entry, s!("ps_5_0"))?;
                 let mut ps = None;
                 gpu.device
-                    .CreatePixelShader(bytes, None, Some(&mut ps))
+                    .CreatePixelShader(&bytes, None, Some(&mut ps))
                     .with_context(|| format!("CreatePixelShader({label})"))?;
                 ps.with_context(|| format!("no {label}"))
             };
-            let vs_blob = compile(s!("vs_main"), s!("vs_5_0"))?;
-            let vs_bytes = std::slice::from_raw_parts(vs_blob.GetBufferPointer() as *const u8, vs_blob.GetBufferSize());
+            let vs_bytes = compile(s!("vs_main"), s!("vs_5_0"))?;
             let mut vs = None;
-            gpu.device.CreateVertexShader(vs_bytes, None, Some(&mut vs)).context("CreateVertexShader")?;
+            gpu.device.CreateVertexShader(&vs_bytes, None, Some(&mut vs)).context("CreateVertexShader")?;
 
             let ps_y = create_ps(s!("ps_y"), "Y")?;
             let ps_uv = create_ps(s!("ps_uv"), "UV")?;
@@ -440,7 +452,7 @@ mod tests {
             (s!("ps_uv_down_hdr"), s!("ps_5_0")),
         ] {
             let blob = compile(entry, target).expect("nv12 HLSL compile failed");
-            assert!(unsafe { blob.GetBufferSize() } > 0);
+            assert!(!blob.is_empty());
         }
     }
 

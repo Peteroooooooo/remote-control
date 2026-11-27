@@ -1,14 +1,19 @@
 package com.rc.android.ui
 
 import android.content.Context
+import android.graphics.Color
+import android.os.SystemClock
+import android.text.Editable
 import android.text.InputType
-import android.text.Selection
+import android.text.TextWatcher
+import android.util.TypedValue
+import android.view.Gravity
 import android.view.KeyEvent
-import android.view.View
-import android.view.inputmethod.BaseInputConnection
 import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputConnection
+import android.view.inputmethod.InputConnectionWrapper
 import android.view.inputmethod.InputMethodManager
+import android.widget.EditText
 
 /** Windows set-1 scan codes used by the key bar and the keyboard sink. */
 internal object Scan {
@@ -73,56 +78,110 @@ internal fun charToScan(ch: Char): Int {
 }
 
 /**
- * Invisible editor that receives the phone keyboard's output and forwards it to the
- * remote PC as it happens: committed text is sent at once, composing text (pinyin before a
- * candidate is picked) stays local, and Backspace / Enter / arrows on the phone keyboard
- * become the PC's keys even when nothing has been typed.
+ * Visible single-line draft input box mounted in the top key bar.
+ * Lets the user compose, inspect, and edit text locally (including Chinese IME candidates)
+ * before sending it to the remote cursor, while still forwarding Backspace / Delete / Enter
+ * directly to the remote PC whenever the draft is empty.
  */
-internal class RemoteImeSinkView(context: Context) : View(context) {
+internal class RemoteDraftEditText(context: Context) : EditText(context) {
     interface Listener {
-        /** Text the user finished typing (a letter, a word, or picked Chinese characters). */
-        fun onCommitText(text: String)
+        /** Sends composed draft text to the remote PC, optionally followed by Enter. */
+        fun onSendDraft(text: String, withEnter: Boolean)
 
-        /** The pinyin / word still being composed, "" when none. */
-        fun onComposing(text: String)
-
-        /** A key the phone keyboard pressed (Backspace, Enter, arrows...). */
+        /** Sends a single hardware key scan code to the remote PC. */
         fun onKey(scan: Int)
 
-        /** True while a sticky modifier (Ctrl / Alt / Win, or Shift) is active. */
+        /** Sends typed text as modifier chord keys while Ctrl/Alt/Win/Shift is armed. */
+        fun onModifierChordText(text: String)
+
+        /** True while a sticky modifier (Ctrl / Alt / Win / Shift) is active. */
         fun modifierActive(): Boolean
+
+        /** Called when draft emptiness toggles (for highlighting the Send button). */
+        fun onHasTextChanged(hasText: Boolean)
+
+        /** Called when the user focuses/taps the draft box directly. */
+        fun onFocused()
     }
 
     var listener: Listener? = null
     private val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
-    private var conn: SinkConnection? = null
+    private var lastImeSubmitMs = 0L
 
     init {
-        isFocusable = true
-        isFocusableInTouchMode = true
-    }
-
-    override fun onCheckIsTextEditor(): Boolean = true
-
-    override fun onCreateInputConnection(outAttrs: EditorInfo): InputConnection {
-        // No suggestions so English letters are committed one by one instead of word by word.
-        // Plain text class keeps Chinese input methods available (a password type would not).
-        outAttrs.inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
-        // No full-screen extract editor in landscape: the PC picture must stay visible.
-        outAttrs.imeOptions = EditorInfo.IME_ACTION_NONE or
+        background = null
+        setTextColor(Color.WHITE)
+        setHintTextColor(0x8CFFFFFF.toInt())
+        hint = "Type to send…"
+        setTextSize(TypedValue.COMPLEX_UNIT_SP, 13.5f)
+        setSingleLine(true)
+        maxLines = 1
+        gravity = Gravity.CENTER_VERTICAL or Gravity.START
+        setPadding(0, 0, 0, 0)
+        isHorizontalFadingEdgeEnabled = true
+        inputType = InputType.TYPE_CLASS_TEXT
+        imeOptions = EditorInfo.IME_ACTION_SEND or
             EditorInfo.IME_FLAG_NO_EXTRACT_UI or
-            EditorInfo.IME_FLAG_NO_FULLSCREEN or
-            EditorInfo.IME_FLAG_NO_ENTER_ACTION
-        outAttrs.initialSelStart = 0
-        outAttrs.initialSelEnd = 0
-        return SinkConnection().also { conn = it }
+            EditorInfo.IME_FLAG_NO_FULLSCREEN
+
+        addTextChangedListener(
+            object : TextWatcher {
+                override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) = Unit
+                override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) = Unit
+                override fun afterTextChanged(s: Editable?) {
+                    listener?.onHasTextChanged(!s.isNullOrEmpty())
+                }
+            },
+        )
+
+        setOnFocusChangeListener { _, hasFocus ->
+            if (hasFocus) listener?.onFocused()
+        }
+
+        setOnClickListener {
+            listener?.onFocused()
+        }
+
+        setOnEditorActionListener { _, actionId, event ->
+            val isAction = actionId == EditorInfo.IME_ACTION_SEND ||
+                actionId == EditorInfo.IME_ACTION_DONE ||
+                actionId == EditorInfo.IME_ACTION_GO ||
+                actionId == EditorInfo.IME_ACTION_NEXT ||
+                (actionId == EditorInfo.IME_NULL && (event == null || event.action == KeyEvent.ACTION_DOWN))
+            if (isAction) {
+                submitDraft(withEnter = false, sendEnterWhenEmpty = true, fromIme = true)
+                true
+            } else {
+                false
+            }
+        }
     }
 
-    /** Drops any half-typed composition and tells the keyboard to start fresh. */
-    fun reset() {
-        conn?.editable?.clear()
-        listener?.onComposing("")
-        imm.restartInput(this)
+    fun setCompactStyle(compact: Boolean) {
+        setTextSize(TypedValue.COMPLEX_UNIT_SP, if (compact) 13f else 14f)
+    }
+
+    fun submitDraft(withEnter: Boolean, sendEnterWhenEmpty: Boolean = withEnter, fromIme: Boolean = false) {
+        if (fromIme) {
+            val now = SystemClock.uptimeMillis()
+            if (now - lastImeSubmitMs < 70L) return
+            lastImeSubmitMs = now
+        }
+        val content = text?.toString().orEmpty()
+        if (content.isNotEmpty()) {
+            setText("")
+            imm.restartInput(this)
+            listener?.onSendDraft(content, withEnter)
+        } else if (sendEnterWhenEmpty) {
+            listener?.onKey(Scan.ENTER)
+        }
+    }
+
+    fun clearDraft() {
+        if (!text.isNullOrEmpty()) {
+            setText("")
+            imm.restartInput(this)
+        }
     }
 
     fun showKeyboard() {
@@ -135,108 +194,108 @@ internal class RemoteImeSinkView(context: Context) : View(context) {
 
     fun hideKeyboard() {
         imm.hideSoftInputFromWindow(windowToken, 0)
-        conn?.editable?.clear()
-        listener?.onComposing("")
         clearFocus()
     }
 
-    private inner class SinkConnection : BaseInputConnection(this@RemoteImeSinkView, true) {
-        override fun commitText(text: CharSequence?, newCursorPosition: Int): Boolean {
-            super.commitText(text, newCursorPosition)
-            flush()
-            return true
-        }
-
-        override fun setComposingText(text: CharSequence?, newCursorPosition: Int): Boolean {
-            val l = listener
-            // With Ctrl armed, the first letter a Chinese keyboard starts composing is a shortcut key.
-            if (l != null && l.modifierActive() && text != null && text.length == 1 && text[0].code < 128) {
-                editable?.clear()
-                l.onComposing("")
-                l.onCommitText(text.toString())
-                post { imm.restartInput(this@RemoteImeSinkView) }
+    override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
+        when (keyCode) {
+            KeyEvent.KEYCODE_ENTER, KeyEvent.KEYCODE_NUMPAD_ENTER -> {
+                submitDraft(withEnter = false, sendEnterWhenEmpty = true, fromIme = true)
                 return true
             }
-            super.setComposingText(text, newCursorPosition)
-            flush()
-            return true
-        }
-
-        override fun finishComposingText(): Boolean {
-            super.finishComposingText()
-            flush()
-            return true
-        }
-
-        override fun deleteSurroundingText(beforeLength: Int, afterLength: Int): Boolean {
-            if (editable.isNullOrEmpty()) {
-                repeat(beforeLength.coerceIn(0, 64)) { listener?.onKey(Scan.BACKSPACE) }
-                repeat(afterLength.coerceIn(0, 64)) { listener?.onKey(Scan.DELETE) }
+            KeyEvent.KEYCODE_DEL -> if (text.isNullOrEmpty()) {
+                listener?.onKey(Scan.BACKSPACE)
                 return true
             }
-            super.deleteSurroundingText(beforeLength, afterLength)
-            flush()
-            return true
-        }
-
-        override fun deleteSurroundingTextInCodePoints(beforeLength: Int, afterLength: Int): Boolean =
-            deleteSurroundingText(beforeLength, afterLength)
-
-        override fun sendKeyEvent(event: KeyEvent): Boolean {
-            if (event.action != KeyEvent.ACTION_DOWN) return true
-            val scan = when (event.keyCode) {
-                KeyEvent.KEYCODE_DEL -> Scan.BACKSPACE
-                KeyEvent.KEYCODE_FORWARD_DEL -> Scan.DELETE
-                KeyEvent.KEYCODE_ENTER, KeyEvent.KEYCODE_NUMPAD_ENTER -> Scan.ENTER
-                KeyEvent.KEYCODE_TAB -> Scan.TAB
-                KeyEvent.KEYCODE_ESCAPE -> Scan.ESC
-                KeyEvent.KEYCODE_DPAD_LEFT -> Scan.LEFT
-                KeyEvent.KEYCODE_DPAD_RIGHT -> Scan.RIGHT
-                KeyEvent.KEYCODE_DPAD_UP -> Scan.UP
-                KeyEvent.KEYCODE_DPAD_DOWN -> Scan.DOWN
-                KeyEvent.KEYCODE_MOVE_HOME -> Scan.HOME
-                KeyEvent.KEYCODE_MOVE_END -> Scan.END
-                KeyEvent.KEYCODE_PAGE_UP -> Scan.PGUP
-                KeyEvent.KEYCODE_PAGE_DOWN -> Scan.PGDN
-                else -> 0
+            KeyEvent.KEYCODE_FORWARD_DEL -> if (text.isNullOrEmpty()) {
+                listener?.onKey(Scan.DELETE)
+                return true
             }
-            if (scan != 0) {
-                listener?.onKey(scan)
-            } else {
-                val ch = event.unicodeChar
-                if (ch > 0) listener?.onCommitText(String(Character.toChars(ch)))
+            KeyEvent.KEYCODE_ESCAPE -> {
+                listener?.onKey(Scan.ESC)
+                return true
             }
-            return true
-        }
-
-        override fun performEditorAction(actionCode: Int): Boolean {
-            listener?.onKey(Scan.ENTER)
-            return true
-        }
-
-        /** Sends everything outside the composing region and keeps only the composition locally. */
-        private fun flush() {
-            val e = editable ?: return
-            val cs = getComposingSpanStart(e)
-            val ce = getComposingSpanEnd(e)
-            val committed: String
-            if (cs < 0 || ce < 0 || cs == ce) {
-                committed = e.toString()
-                e.clear()
-            } else {
-                val a = minOf(cs, ce)
-                val b = maxOf(cs, ce)
-                committed = e.substring(0, a) + e.substring(b)
-                if (b < e.length) e.delete(b, e.length)
-                if (a > 0) e.delete(0, a)
+            KeyEvent.KEYCODE_TAB -> {
+                listener?.onKey(Scan.TAB)
+                return true
             }
-            Selection.setSelection(e, e.length)
-            val composing = e.toString()
-            if (committed.isNotEmpty()) listener?.onCommitText(committed)
-            listener?.onComposing(composing)
-            val start = if (composing.isEmpty()) -1 else 0
-            val end = if (composing.isEmpty()) -1 else composing.length
-            imm.updateSelection(this@RemoteImeSinkView, e.length, e.length, start, end)
+        }
+        return super.onKeyDown(keyCode, event)
+    }
+
+    override fun onCreateInputConnection(outAttrs: EditorInfo): InputConnection? {
+        val base = super.onCreateInputConnection(outAttrs) ?: return null
+        // Keep IME action label crisp ("Send") without allowing full-screen extract takeover.
+        outAttrs.imeOptions = (outAttrs.imeOptions and EditorInfo.IME_MASK_ACTION.inv()) or
+            EditorInfo.IME_ACTION_SEND or
+            EditorInfo.IME_FLAG_NO_EXTRACT_UI or
+            EditorInfo.IME_FLAG_NO_FULLSCREEN
+        return object : InputConnectionWrapper(base, true) {
+            override fun deleteSurroundingText(beforeLength: Int, afterLength: Int): Boolean {
+                if (text.isNullOrEmpty()) {
+                    repeat(beforeLength.coerceIn(0, 64)) { listener?.onKey(Scan.BACKSPACE) }
+                    repeat(afterLength.coerceIn(0, 64)) { listener?.onKey(Scan.DELETE) }
+                    return true
+                }
+                return super.deleteSurroundingText(beforeLength, afterLength)
+            }
+
+            override fun deleteSurroundingTextInCodePoints(beforeLength: Int, afterLength: Int): Boolean {
+                if (text.isNullOrEmpty()) {
+                    repeat(beforeLength.coerceIn(0, 64)) { listener?.onKey(Scan.BACKSPACE) }
+                    repeat(afterLength.coerceIn(0, 64)) { listener?.onKey(Scan.DELETE) }
+                    return true
+                }
+                return super.deleteSurroundingTextInCodePoints(beforeLength, afterLength)
+            }
+
+            override fun commitText(txt: CharSequence?, newCursorPosition: Int): Boolean {
+                val l = listener
+                if (l != null && l.modifierActive() && text.isNullOrEmpty() && !txt.isNullOrEmpty()) {
+                    l.onModifierChordText(txt.toString())
+                    post { imm.restartInput(this@RemoteDraftEditText) }
+                    return true
+                }
+                return super.commitText(txt, newCursorPosition)
+            }
+
+            override fun setComposingText(txt: CharSequence?, newCursorPosition: Int): Boolean {
+                val l = listener
+                if (l != null && l.modifierActive() && text.isNullOrEmpty() && txt != null && txt.length == 1 && txt[0].code < 128) {
+                    l.onModifierChordText(txt.toString())
+                    post { imm.restartInput(this@RemoteDraftEditText) }
+                    return true
+                }
+                return super.setComposingText(txt, newCursorPosition)
+            }
+
+            override fun sendKeyEvent(event: KeyEvent): Boolean {
+                if (event.action == KeyEvent.ACTION_DOWN) {
+                    when (event.keyCode) {
+                        KeyEvent.KEYCODE_DEL -> if (text.isNullOrEmpty()) {
+                            listener?.onKey(Scan.BACKSPACE)
+                            return true
+                        }
+                        KeyEvent.KEYCODE_FORWARD_DEL -> if (text.isNullOrEmpty()) {
+                            listener?.onKey(Scan.DELETE)
+                            return true
+                        }
+                        KeyEvent.KEYCODE_ENTER, KeyEvent.KEYCODE_NUMPAD_ENTER -> {
+                            submitDraft(withEnter = false, sendEnterWhenEmpty = true, fromIme = true)
+                            return true
+                        }
+                        KeyEvent.KEYCODE_ESCAPE -> {
+                            listener?.onKey(Scan.ESC)
+                            return true
+                        }
+                        KeyEvent.KEYCODE_TAB -> {
+                            listener?.onKey(Scan.TAB)
+                            return true
+                        }
+                    }
+                }
+                return super.sendKeyEvent(event)
+            }
         }
     }
 }

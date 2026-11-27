@@ -35,6 +35,8 @@ fun VideoSurface(
     panY: Float = 0f,
     cornerRadius: Dp = 0.dp,
     outsideColor: Color = Color.Black,
+    ambient: Boolean = false,
+    onAmbientColors: ((top: Int, right: Int, bottom: Int, left: Int) -> Unit)? = null,
 ) {
     val density = LocalDensity.current
     val cornerRadiusPx = with(density) { cornerRadius.toPx() }
@@ -55,6 +57,8 @@ fun VideoSurface(
                     context = ctx,
                     onDecoderSurfaceReady = onSurfaceReady,
                     onDecoderSurfaceDestroyed = onSurfaceDestroyed,
+                    ambient = ambient,
+                    onAmbientColors = onAmbientColors,
                 ).also { view ->
                     glViewRef = view
                     view.updateRenderParams(
@@ -67,6 +71,8 @@ fun VideoSurface(
                         outsideR = outsideColor.red,
                         outsideG = outsideColor.green,
                         outsideB = outsideColor.blue,
+                        ambient = ambient,
+                        onAmbientColors = onAmbientColors,
                     )
                 }
             },
@@ -81,6 +87,8 @@ fun VideoSurface(
                     outsideR = outsideColor.red,
                     outsideG = outsideColor.green,
                     outsideB = outsideColor.blue,
+                    ambient = ambient,
+                    onAmbientColors = onAmbientColors,
                 )
             },
         )

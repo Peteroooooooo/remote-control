@@ -1,9 +1,22 @@
 package com.rc.android.ui
 
+import android.graphics.Bitmap
 import android.graphics.BlurMaskFilter
 import android.graphics.Matrix
 import android.graphics.Paint
+import android.graphics.Path as NativePath
+import android.graphics.RectF
 import android.graphics.SweepGradient
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.Stable
+import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.withFrameNanos
+import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.geometry.Rect
+import androidx.compose.ui.graphics.drawscope.DrawScope
+import kotlin.math.ceil
+import kotlinx.coroutines.delay
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -84,12 +97,21 @@ fun FloatingGlass(
     cornerRadius: Dp = 20.dp,
     darkOverlay: Boolean = false,
     elevation: Dp = 12.dp,
+    backdrop: GlassBackdrop? = null,
     content: @Composable BoxScope.() -> Unit,
 ) {
     val c = RcThemeColors.current
     val shape = RoundedCornerShape(cornerRadius)
     val isDarkGlass = darkOverlay || c.isDark
+    val frosted = backdrop != null && supportsBackdropBlur
     val glassFill = when {
+        // Over a real blur the tint can be light, so the frosted content shows through.
+        frosted && isDarkGlass -> Brush.verticalGradient(
+            listOf(Color(0x6B2C2D34), Color(0x5C17181C)),
+        )
+        frosted -> Brush.verticalGradient(
+            listOf(Color(0x8CFFFFFF), Color(0x73F4F4F9)),
+        )
         darkOverlay -> Brush.verticalGradient(
             listOf(Color(0xC224242A), Color(0xB3151519)),
         )
@@ -125,6 +147,7 @@ fun FloatingGlass(
                 spotColor = shadowAmbient,
             )
             .clip(shape)
+            .then(if (frosted) Modifier.glassBackdropBlur(backdrop!!, pageColor = c.bg) else Modifier)
             .background(glassFill)
             .drawWithContent {
                 drawContent()
@@ -151,106 +174,127 @@ private val AmbientSweepColors = intArrayOf(
     0xFF5AC8FA.toInt(),
 )
 
-private class AmbientShaderCache {
-    var size: Size = Size.Zero
+/** One blurred stroke of the halo: stroke width, blur radius (dp) and opacity. */
+private class HaloStroke(val strokeDp: Float, val blurDp: Float, val alpha: Float)
+
+// Four blurred strokes on the frame edge, from tight to very wide. Each is a Gaussian that
+// peaks at the edge, so together the light fades from the frame outward with no visible line.
+private val HaloStrokes = listOf(
+    HaloStroke(strokeDp = 4f, blurDp = 8f, alpha = 0.55f),
+    HaloStroke(strokeDp = 10f, blurDp = 24f, alpha = 0.36f),
+    HaloStroke(strokeDp = 18f, blurDp = 52f, alpha = 0.26f),
+    HaloStroke(strokeDp = 28f, blurDp = 90f, alpha = 0.16f),
+)
+
+/** How far the light reaches past the frame (the widest blur fades out by about 1.7x its radius). */
+private const val HALO_REACH_DP = 170f
+
+/** The mask is very soft, so half the screen's pixels are plenty. */
+private const val HALO_MASK_SCALE = 0.5f
+
+private const val HALO_TURN_MS = 7000L
+
+/** About 30 frames a second: the slow turn looks the same, at a quarter of a 120 Hz screen's redraws. */
+private const val HALO_FRAME_MS = 28L
+
+/**
+ * The halo's shape, blurred once for a frame size: an alpha-only bitmap. Each frame draws it
+ * once, coloured by the rotating sweep gradient, instead of blurring four strokes again.
+ */
+internal class HaloCache {
+    private var w = 0f
+    private var h = 0f
+    var mask: Bitmap? = null
+        private set
+    val dst = RectF()
+    val frame = NativePath()
+    val matrix = Matrix()
     var shader: SweepGradient? = null
+        private set
+    val paint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
+
+    fun release() {
+        mask?.recycle()
+        mask = null
+    }
+
+    fun update(w: Float, h: Float, cornerPx: Float, density: Float) {
+        if (mask != null && w == this.w && h == this.h) return
+        this.w = w
+        this.h = h
+        val padPx = HALO_REACH_DP * density
+        val bw = ceil((w + 2 * padPx) * HALO_MASK_SCALE).toInt()
+        val bh = ceil((h + 2 * padPx) * HALO_MASK_SCALE).toInt()
+        mask?.recycle()
+        val bmp = Bitmap.createBitmap(bw, bh, Bitmap.Config.ALPHA_8)
+        val cv = android.graphics.Canvas(bmp)
+        cv.scale(HALO_MASK_SCALE, HALO_MASK_SCALE)
+        cv.translate(padPx, padPx)
+        val p = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE }
+        for (s in HaloStrokes) {
+            p.strokeWidth = s.strokeDp * density
+            p.alpha = (s.alpha * 255f).toInt()
+            p.maskFilter = BlurMaskFilter(s.blurDp * density, BlurMaskFilter.Blur.NORMAL)
+            cv.drawRoundRect(0f, 0f, w, h, cornerPx, cornerPx, p)
+        }
+        mask = bmp
+        dst.set(-padPx, -padPx, w + padPx, h + padPx)
+        frame.reset()
+        frame.addRoundRect(0f, 0f, w, h, cornerPx, cornerPx, NativePath.Direction.CW)
+        shader = SweepGradient(w / 2f, h / 2f, AmbientSweepColors, null)
+        paint.shader = shader
+    }
 }
 
 /**
- * Subtle Apple Intelligence / Siri inspired rotating multi-color edge border:
- * draws a soft 3.dp outer ambient aura (~20% alpha) behind content and a crisp
- * 1.5.dp inner edge (~78% alpha) over the monitor frame without overlapping video.
- * Must be placed on an unclipped outer container wrapping the clipped monitor box.
+ * Apple Intelligence / visionOS style rotating colour halo: soft light that fades out from a
+ * frame's edge with no hard outline. One per screen; draw it with [drawHalo] or [ambientHalo].
  */
-fun Modifier.ambientIntelligenceBorder(
-    enabled: Boolean,
-    cornerRadius: Dp,
-): Modifier = composed {
-    if (!enabled) return@composed this
-
-    val inf = rememberInfiniteTransition(label = "ambientEdge")
-    val angleState = inf.animateFloat(
-        initialValue = 0f,
-        targetValue = 360f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(durationMillis = 7000, easing = LinearEasing),
-            repeatMode = RepeatMode.Restart,
-        ),
-        label = "ambientSweepAngle",
-    )
-    val matrix = remember { Matrix() }
-    val shaderCache = remember { AmbientShaderCache() }
-    val auraPaint = remember {
-        Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            style = Paint.Style.STROKE
-            alpha = (0.20f * 255f).toInt()
-        }
-    }
-    val crispPaint = remember {
-        Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            style = Paint.Style.STROKE
-            alpha = (0.78f * 255f).toInt()
-        }
-    }
-
-    drawWithContent {
-        val w = size.width
-        val h = size.height
-        if (w > 0f && h > 0f) {
-            val cx = w / 2f
-            val cy = h / 2f
-            val shader = if (shaderCache.shader == null || shaderCache.size != size) {
-                SweepGradient(cx, cy, AmbientSweepColors, null).also {
-                    shaderCache.shader = it
-                    shaderCache.size = size
-                }
-            } else {
-                shaderCache.shader!!
-            }
-            matrix.setRotate(angleState.value, cx, cy)
-            shader.setLocalMatrix(matrix)
-
-            val cornerPx = cornerRadius.toPx()
-            val auraWidthPx = 3.dp.toPx()
-            val crispWidthPx = 1.5.dp.toPx()
-
-            auraPaint.shader = shader
-            auraPaint.strokeWidth = auraWidthPx
-            if (auraPaint.maskFilter == null) {
-                auraPaint.maskFilter = BlurMaskFilter(auraWidthPx, BlurMaskFilter.Blur.NORMAL)
-            }
-            val auraInset = -auraWidthPx * 0.25f
-            val auraRadius = (cornerPx + auraWidthPx * 0.25f).coerceAtLeast(0f)
-            drawContext.canvas.nativeCanvas.drawRoundRect(
-                auraInset,
-                auraInset,
-                w - auraInset,
-                h - auraInset,
-                auraRadius,
-                auraRadius,
-                auraPaint,
-            )
-
-            drawContent()
-
-            crispPaint.shader = shader
-            crispPaint.strokeWidth = crispWidthPx
-            val crispInset = crispWidthPx / 2f
-            val crispRadius = (cornerPx - crispInset).coerceAtLeast(0.5.dp.toPx())
-            drawContext.canvas.nativeCanvas.drawRoundRect(
-                crispInset,
-                crispInset,
-                w - crispInset,
-                h - crispInset,
-                crispRadius,
-                crispRadius,
-                crispPaint,
-            )
-        } else {
-            drawContent()
-        }
-    }
+@Stable
+class HaloState internal constructor() {
+    internal val angle = mutableFloatStateOf(0f)
+    internal val cache = HaloCache()
 }
+
+@Composable
+fun rememberHalo(): HaloState {
+    val halo = remember { HaloState() }
+    LaunchedEffect(halo) {
+        val start = withFrameNanos { it }
+        while (true) {
+            withFrameNanos { now ->
+                val ms = (now - start) / 1_000_000L
+                halo.angle.floatValue = (ms % HALO_TURN_MS) * 360f / HALO_TURN_MS
+            }
+            delay(HALO_FRAME_MS)
+        }
+    }
+    DisposableEffect(halo) { onDispose { halo.cache.release() } }
+    return halo
+}
+
+/**
+ * Draws [halo] around [frame] (in this scope's coordinates), never inside it, so a live
+ * picture there stays untouched. Reads the angle, so the caller redraws as it turns.
+ */
+fun DrawScope.drawHalo(halo: HaloState, frame: Rect, cornerRadius: Dp) {
+    if (frame.width <= 0f || frame.height <= 0f) return
+    val cache = halo.cache
+    cache.update(frame.width, frame.height, cornerRadius.toPx(), density)
+    val mask = cache.mask ?: return
+    cache.matrix.setRotate(halo.angle.floatValue, frame.width / 2f, frame.height / 2f)
+    cache.shader?.setLocalMatrix(cache.matrix)
+    val canvas = drawContext.canvas.nativeCanvas
+    canvas.save()
+    canvas.translate(frame.left, frame.top)
+    canvas.clipOutPath(cache.frame)
+    // An alpha-only bitmap is drawn in the paint's shader colours.
+    canvas.drawBitmap(mask, null, cache.dst, cache.paint)
+    canvas.restore()
+}
+
+fun Modifier.ambientHalo(halo: HaloState, frame: () -> Rect, cornerRadius: Dp): Modifier =
+    drawBehind { drawHalo(halo, frame(), cornerRadius) }
 
 /**
  * Minimalist WeChat / iOS navigation left chevron (`<`).

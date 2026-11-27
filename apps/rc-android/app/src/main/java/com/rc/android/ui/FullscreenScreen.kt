@@ -99,6 +99,7 @@ import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.scale
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.FilterQuality
@@ -130,7 +131,6 @@ import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.compose.ui.viewinterop.AndroidView
 import com.rc.android.model.MonitorInfo
 import com.rc.android.model.QualityPrefs
 import com.rc.android.model.RcUiState
@@ -146,17 +146,14 @@ import kotlin.math.roundToInt
 
 private enum class PadGesture {
     Pending,
-    EdgeScroll,
     TrackpadMove,
     Dragging,
     LongPressed,
     LongPressDragging,
     TwoPending,
-    TwoScroll,
     TwoPinchRemote,
     TwoPinchLocal,
     ThreePending,
-    ThreePanZoomLocal,
     Done,
 }
 
@@ -166,11 +163,16 @@ private enum class DirectGesture {
     Pan,
     Hold,
     HoldDrag,
-    TwoPending,
-    TwoScroll,
     TwoPinch,
     Three,
     Done,
+}
+
+private enum class ScrollWheelDir {
+    Up,
+    Down,
+    Left,
+    Right,
 }
 
 private typealias ModState = KeyBarModState
@@ -234,9 +236,7 @@ fun FullscreenScreen(
             imeWanted = !hasHardwareKeyboard
         }
     }
-    var composingText by remember { mutableStateOf("") }
     var imeEverShownForBar by remember { mutableStateOf(false) }
-    var sinkView by remember { mutableStateOf<RemoteImeSinkView?>(null) }
     var keyBarBottomPx by remember { mutableIntStateOf(0) }
     // Where the user last tapped in direct-touch mode (stream coords), so the picture can be
     // pushed up to keep that spot above the keyboard.
@@ -295,48 +295,35 @@ fun FullscreenScreen(
 
     val currentOnSendText by rememberUpdatedState(onSendText)
     val currentOnTapKey by rememberUpdatedState(onTapKey)
-    val imeListener = remember {
-        object : RemoteImeSinkView.Listener {
-            override fun modifierActive(): Boolean = modStates.values.any { it != ModState.Off }
 
-            override fun onComposing(text: String) {
-                composingText = text
+    fun sendDraftToRemote(text: String, withEnter: Boolean) {
+        // Newlines and tabs go as real Enter / Tab keys, everything else as text.
+        val run = StringBuilder()
+        for (ch in text) {
+            val key = when (ch) {
+                '\n' -> Scan.ENTER
+                '\t' -> Scan.TAB
+                else -> 0
             }
-
-            override fun onKey(scan: Int) {
-                currentOnTapKey(scan)
-                releaseArmedModifiers()
-            }
-
-            override fun onCommitText(text: String) {
-                if (modifierActive()) {
-                    // Ctrl/Alt/Win/Shift are held down on the PC: send real keys so shortcuts work.
-                    for (ch in text) {
-                        val scan = charToScan(ch)
-                        if (scan != 0) currentOnTapKey(scan) else currentOnSendText(ch.toString())
-                    }
-                    releaseArmedModifiers()
-                    return
-                }
-                // Newlines and tabs go as real Enter / Tab keys, everything else as text.
-                val run = StringBuilder()
-                for (ch in text) {
-                    val key = when (ch) {
-                        '\n' -> Scan.ENTER
-                        '\t' -> Scan.TAB
-                        else -> 0
-                    }
-                    if (key == 0) {
-                        run.append(ch)
-                    } else {
-                        if (run.isNotEmpty()) currentOnSendText(run.toString())
-                        run.clear()
-                        currentOnTapKey(key)
-                    }
-                }
+            if (key == 0) {
+                run.append(ch)
+            } else {
                 if (run.isNotEmpty()) currentOnSendText(run.toString())
+                run.clear()
+                currentOnTapKey(key)
             }
         }
+        if (run.isNotEmpty()) currentOnSendText(run.toString())
+        if (withEnter) currentOnTapKey(Scan.ENTER)
+        releaseArmedModifiers()
+    }
+
+    fun sendModifierChordText(text: String) {
+        for (ch in text) {
+            val scan = charToScan(ch)
+            if (scan != 0) currentOnTapKey(scan) else currentOnSendText(ch.toString())
+        }
+        releaseArmedModifiers()
     }
 
     var videoContainerSize by remember { mutableStateOf(IntSize.Zero) }
@@ -463,20 +450,16 @@ fun FullscreenScreen(
         }
     }
 
-    // Three independent pieces: the shortcut bar (under the capsule), the phone keyboard
+    // Three independent pieces: the shortcut + draft bar (under the capsule), the phone keyboard
     // (bottom) and the PC keyboard (unfolds under the shortcut bar). Closing one never closes
     // another; the phone keyboard and the PC keyboard are never shown together.
-    LaunchedEffect(inputBarOpen, imeWanted, pcKeyboardOpen, sinkView) {
-        val sink = sinkView ?: return@LaunchedEffect
+    LaunchedEffect(inputBarOpen, imeWanted, pcKeyboardOpen) {
         if (inputBarOpen && imeWanted && !pcKeyboardOpen) {
             imeEverShownForBar = false
-            focusManager.clearFocus()
-            if (hasHardwareKeyboard) sink.requestFocus() else sink.showKeyboard()
-        } else {
-            sink.hideKeyboard()
         }
         if (!inputBarOpen) {
             pcKeyboardOpen = false
+            focusManager.clearFocus()
             releaseAllModifiers()
         }
     }
@@ -503,8 +486,8 @@ fun FullscreenScreen(
         if (pcKeyboardOpen) pcKeyboardOpen = false else inputBarOpen = false
     }
 
-    LaunchedEffect(lastCapsuleTouchMs, menuExpanded) {
-        if (menuExpanded) {
+    LaunchedEffect(lastCapsuleTouchMs, menuExpanded, inputBarOpen) {
+        if (menuExpanded || inputBarOpen) {
             capsuleDimmed = false
         } else {
             // Wake only for a fresh capsule tap; closing the menu by tapping outside keeps it away.
@@ -515,7 +498,7 @@ fun FullscreenScreen(
     }
 
     val capsuleAlpha by animateFloatAsState(
-        targetValue = if (capsuleDimmed && !menuExpanded) 0.34f else 1f,
+        targetValue = if (capsuleDimmed && !menuExpanded && !inputBarOpen) 0.34f else 1f,
         animationSpec = tween(260),
         label = "capsuleAlpha",
     )
@@ -583,7 +566,6 @@ fun FullscreenScreen(
     val doubleTapMaxDistPx = with(density) { 44.dp.toPx() }
     val pinchSlopPx = with(density) { 18.dp.toPx() }
     val autoPanMarginPx = with(density) { 28.dp.toPx() }
-    val edgeScrollWidthPx = with(density) { 26.dp.toPx() }
 
     fun liveStreamToScreen(nx: Float, ny: Float): Offset? = mapStreamToScreen(
         nx = nx,
@@ -740,10 +722,8 @@ fun FullscreenScreen(
     }
 
     fun Modifier.trackpadGestureInput(
-        surfaceWidthPxProvider: () -> Float,
-        allowEdgeScroll: Boolean,
         allowDirectMultiTouch: Boolean,
-    ): Modifier = this.pointerInput(allowEdgeScroll, allowDirectMultiTouch) {
+    ): Modifier = this.pointerInput(allowDirectMultiTouch) {
         val touchSlop = viewConfiguration.touchSlop
         val longPressTimeoutMs = 380L
         val doubleTapWindowMs = 260L
@@ -810,8 +790,8 @@ fun FullscreenScreen(
             //   1-finger drag = move the zoomed picture (any direction)
             //   hold still, buzz, then drag = left-button drag (select text, drag files/windows)
             //   hold still, buzz, lift = right click
-            //   2-finger drag = scroll the PC content (precision touchpad, both axes)
-            //   2-finger pinch = zoom the picture; 3-finger tap = keyboard
+            //   2-finger pinch / drag = zoom & pan the picture (scrolling uses the bottom-right wheel)
+            //   3-finger tap = keyboard
             // Nothing is sent until the gesture is known, so a pan or a hold never leaves a
             // half-made touch on the PC.
             if (useDirect && !currentState.virtualDisplay.active) {
@@ -822,11 +802,8 @@ fun FullscreenScreen(
                 var prevPos = startPos
                 var lastDragPos = startPos
                 var edgeJob: Job? = null
-                var multiStartCentroid = Offset.Zero
-                var multiStartSpan = 0f
                 var prevCentroid: Offset? = null
                 var prevSpan = 0f
-                var scrollAxis = 0
                 var threeDownMs = 0L
 
                 fun mouseTo(pos: Offset) {
@@ -876,7 +853,6 @@ fun FullscreenScreen(
                                     currentOnMouseButton(0, false)
                                     releaseArmedModifiers()
                                 }
-                                DirectGesture.TwoScroll -> currentOnTouchpad(2, 0, 0, 1000)
                                 DirectGesture.Three -> if (upMs - threeDownMs <= 300L) {
                                     haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
                                     toggleKeyboard()
@@ -910,7 +886,6 @@ fun FullscreenScreen(
                         }
 
                         if (pressed.size >= 3) {
-                            if (mode == DirectGesture.TwoScroll) currentOnTouchpad(2, 0, 0, 1000)
                             if (mode != DirectGesture.Three && mode != DirectGesture.Done) {
                                 mode = DirectGesture.Three
                                 threeDownMs = SystemClock.uptimeMillis()
@@ -926,43 +901,9 @@ fun FullscreenScreen(
                             val span = (pressed[0].position - pressed[1].position).getDistance()
                             when (mode) {
                                 DirectGesture.Pending, DirectGesture.Pan -> {
-                                    mode = DirectGesture.TwoPending
-                                    multiStartCentroid = centroid
-                                    multiStartSpan = span
+                                    mode = DirectGesture.TwoPinch
                                     prevCentroid = centroid
                                     prevSpan = span
-                                }
-                                DirectGesture.TwoPending -> {
-                                    val spanDiff = abs(span - multiStartSpan)
-                                    val moveDist = (centroid - multiStartCentroid).getDistance()
-                                    if (spanDiff > pinchSlopPx && spanDiff > moveDist * 0.7f) {
-                                        mode = DirectGesture.TwoPinch
-                                        prevCentroid = centroid
-                                        prevSpan = span
-                                    } else if (moveDist > touchSlop) {
-                                        mode = DirectGesture.TwoScroll
-                                        val adx = abs(centroid.x - multiStartCentroid.x)
-                                        val ady = abs(centroid.y - multiStartCentroid.y)
-                                        scrollAxis = when {
-                                            ady > adx * 1.6f -> 1
-                                            adx > ady * 1.6f -> 2
-                                            else -> 0
-                                        }
-                                        // Touchpad scrolling goes to the window under the cursor.
-                                        mouseTo(multiStartCentroid)
-                                        currentOnTouchpad(0, 0, 0, 1000)
-                                        prevCentroid = centroid
-                                    }
-                                }
-                                DirectGesture.TwoScroll -> {
-                                    val prev = prevCentroid ?: centroid
-                                    var dxDp10 = ((centroid.x - prev.x) / density.density * 10f).roundToInt()
-                                    var dyDp10 = ((centroid.y - prev.y) / density.density * 10f).roundToInt()
-                                    if (scrollAxis == 1) dxDp10 = 0 else if (scrollAxis == 2) dyDp10 = 0
-                                    if (dxDp10 != 0 || dyDp10 != 0) {
-                                        currentOnTouchpad(1, dxDp10, dyDp10, 1000)
-                                        prevCentroid = centroid
-                                    }
                                 }
                                 DirectGesture.TwoPinch -> {
                                     applyLocalPinchPan(centroid, prevCentroid, span, prevSpan, recenterCursor = false)
@@ -985,20 +926,14 @@ fun FullscreenScreen(
                                 applyLocalPinchPan(p.position, prevPos, 1f, 1f, recenterCursor = false)
                                 prevPos = p.position
                             }
-                            DirectGesture.TwoScroll -> {
-                                // Lifting one of two fingers ends the scroll; the other finger does nothing.
-                                currentOnTouchpad(2, 0, 0, 1000)
-                                mode = DirectGesture.Done
-                            }
-                            DirectGesture.TwoPending, DirectGesture.TwoPinch -> mode = DirectGesture.Done
+                            DirectGesture.TwoPinch -> mode = DirectGesture.Done
                             else -> {}
                         }
                     }
                 } finally {
                     edgeJob?.cancel()
-                    // Cancelled mid-gesture (e.g. the screen went away): never leave a button or a scroll held.
+                    // Cancelled mid-gesture (e.g. the screen went away): never leave a button held.
                     if (mode == DirectGesture.HoldDrag) currentOnMouseButton(0, false)
-                    if (mode == DirectGesture.TwoScroll) currentOnTouchpad(2, 0, 0, 1000)
                 }
                 return@awaitEachGesture
             }
@@ -1171,12 +1106,10 @@ fun FullscreenScreen(
                 return@awaitEachGesture
             }
 
-            // 3. Precision Trackpad Mode (Vento curve + Hover Assist + Win11 PT_TOUCHPAD scroll/pinch)
+            // 3. Precision Trackpad Mode (Vento curve + Hover Assist; 2-finger pinch/pan canvas; bottom-right wheel scrolls)
             val startPos = firstDown.position
             val downTime = SystemClock.uptimeMillis()
-            val padW = surfaceWidthPxProvider().coerceAtLeast(1f)
-            val startedOnRightEdge = allowEdgeScroll && startPos.x >= padW - edgeScrollWidthPx
-            val isDoubleTapCandidate = !startedOnRightEdge &&
+            val isDoubleTapCandidate =
                 (downTime - lastTapUpMs) <= doubleTapWindowMs &&
                 (startPos - lastTapUpPos).getDistance() <= doubleTapMaxDistPx
 
@@ -1185,7 +1118,6 @@ fun FullscreenScreen(
             var prevMoveMs = downTime
             var lastMouseSentMs = 0L
             var leftButtonDown = false
-            var ptpScrollActive = false
             var ptpPinchActive = false
 
             var velPxPerMsX = 0f
@@ -1196,7 +1128,6 @@ fun FullscreenScreen(
             var multiStartSpan = 0f
             var prevCentroid: Offset? = null
             var prevPinchSpan = 0f
-            var scrollAxis = 0 // 0 free/undecided, 1 vertical, 2 horizontal
 
             fun sendMouseMoveThrottled(nx: Float, ny: Float, force: Boolean = false) {
                 val now = SystemClock.uptimeMillis()
@@ -1226,10 +1157,6 @@ fun FullscreenScreen(
             }
 
             fun endPtpIfActive() {
-                if (ptpScrollActive) {
-                    currentOnTouchpad(2, 0, 0, 1000)
-                    ptpScrollActive = false
-                }
                 if (ptpPinchActive) {
                     currentOnTouchpad(5, 0, 0, 1000)
                     ptpPinchActive = false
@@ -1277,10 +1204,6 @@ fun FullscreenScreen(
                                 startCursorFling(upMs)
                                 lastTapUpMs = 0L
                             }
-                            PadGesture.EdgeScroll, PadGesture.TwoScroll -> {
-                                endPtpIfActive()
-                                lastTapUpMs = 0L
-                            }
                             PadGesture.TwoPinchRemote -> {
                                 endPtpIfActive()
                                 lastTapUpMs = 0L
@@ -1321,7 +1244,7 @@ fun FullscreenScreen(
                                 }
                                 lastTapUpMs = 0L
                             }
-                            PadGesture.TwoPinchLocal, PadGesture.ThreePanZoomLocal, PadGesture.Done -> {
+                            PadGesture.TwoPinchLocal, PadGesture.Done -> {
                                 endPtpIfActive()
                                 lastTapUpMs = 0L
                             }
@@ -1329,7 +1252,7 @@ fun FullscreenScreen(
                         break
                     }
 
-                    // 3+ fingers: 3-finger tap = keyboard; 3-finger drag = local canvas pan/zoom
+                    // 3+ fingers: quick 3-finger tap = toggle keyboard
                     if (pressed.size >= 3) {
                         if (leftButtonDown) {
                             currentOnMouseButton(0, false)
@@ -1341,32 +1264,20 @@ fun FullscreenScreen(
                         val cx = pressed.sumOf { it.position.x.toDouble() }.toFloat() / pressed.size
                         val cy = pressed.sumOf { it.position.y.toDouble() }.toFloat() / pressed.size
                         val centroid = Offset(cx, cy)
-                        val span = (pressed[0].position - pressed[2].position).getDistance()
 
-                        if (mode != PadGesture.ThreePending && mode != PadGesture.ThreePanZoomLocal) {
+                        if (mode != PadGesture.ThreePending && mode != PadGesture.Done) {
                             mode = PadGesture.ThreePending
                             multiDownMs = nowMs
                             multiStartCentroid = centroid
-                            multiStartSpan = span
-                            prevCentroid = centroid
-                            prevPinchSpan = span
-                        } else if (mode == PadGesture.ThreePending) {
-                            if ((centroid - multiStartCentroid).getDistance() > touchSlop * 1.1f ||
-                                abs(span - multiStartSpan) > pinchSlopPx
-                            ) {
-                                mode = PadGesture.ThreePanZoomLocal
-                                prevCentroid = centroid
-                                prevPinchSpan = span
-                            }
-                        } else if (!currentState.virtualDisplay.active) {
-                            applyLocalPinchPan(centroid, prevCentroid, span, prevPinchSpan)
-                            prevCentroid = centroid
-                            prevPinchSpan = span
+                        } else if (mode == PadGesture.ThreePending &&
+                            (centroid - multiStartCentroid).getDistance() > touchSlop * 1.2f
+                        ) {
+                            mode = PadGesture.Done
                         }
                         continue
                     }
 
-                    // 2 fingers: parallel slide ALWAYS scrolls (PT_TOUCHPAD); pinch zooms (remote on VD, local on physical)
+                    // 2 fingers: quick tap = right click; pinch/drag = zoom & pan canvas
                     if (pressed.size == 2) {
                         if (leftButtonDown) {
                             currentOnMouseButton(0, false)
@@ -1382,7 +1293,6 @@ fun FullscreenScreen(
 
                         when (mode) {
                             PadGesture.Pending,
-                            PadGesture.EdgeScroll,
                             PadGesture.TrackpadMove,
                             PadGesture.LongPressed,
                             PadGesture.Dragging,
@@ -1394,50 +1304,23 @@ fun FullscreenScreen(
                                 multiStartSpan = span
                                 prevCentroid = centroid
                                 prevPinchSpan = span
-                                scrollAxis = 0
                             }
                             PadGesture.TwoPending -> {
                                 val spanDiff = abs(span - multiStartSpan)
                                 val moveDist = (centroid - multiStartCentroid).getDistance()
-                                if (zoomScale > 1.02f && (moveDist > touchSlop || spanDiff > pinchSlopPx)) {
-                                    // When zoomed in, 2-finger drag/pinch directly pans & zooms the viewport
-                                    mode = PadGesture.TwoPinchLocal
-                                    prevCentroid = centroid
-                                    prevPinchSpan = span
-                                } else if (spanDiff > pinchSlopPx && spanDiff > moveDist * 0.7f) {
-                                    if (currentState.virtualDisplay.active) {
+                                if (spanDiff > pinchSlopPx || moveDist > touchSlop) {
+                                    if (currentState.virtualDisplay.active &&
+                                        spanDiff > pinchSlopPx && spanDiff > moveDist * 0.7f
+                                    ) {
                                         mode = PadGesture.TwoPinchRemote
                                         currentOnTouchpad(3, 0, 0, 1000)
                                         ptpPinchActive = true
                                     } else {
                                         mode = PadGesture.TwoPinchLocal
+                                        applyLocalPinchPan(centroid, prevCentroid, span, prevPinchSpan)
                                     }
                                     prevCentroid = centroid
                                     prevPinchSpan = span
-                                } else if (moveDist > touchSlop * 1.1f) {
-                                    // At 1x zoom, 2-finger parallel slide scrolls smoothly via Windows PTP
-                                    mode = PadGesture.TwoScroll
-                                    val adx = abs(centroid.x - multiStartCentroid.x)
-                                    val ady = abs(centroid.y - multiStartCentroid.y)
-                                    scrollAxis = when {
-                                        ady > adx * 1.6f -> 1
-                                        adx > ady * 1.6f -> 2
-                                        else -> 0
-                                    }
-                                    currentOnTouchpad(0, 0, 0, 1000)
-                                    ptpScrollActive = true
-                                    prevCentroid = centroid
-                                }
-                            }
-                            PadGesture.TwoScroll -> {
-                                val prev = prevCentroid ?: centroid
-                                var dxDp10 = ((centroid.x - prev.x) / density.density * 10f).roundToInt()
-                                var dyDp10 = ((centroid.y - prev.y) / density.density * 10f).roundToInt()
-                                if (scrollAxis == 1) dxDp10 = 0
-                                else if (scrollAxis == 2) dyDp10 = 0
-                                if (dxDp10 != 0 || dyDp10 != 0) {
-                                    currentOnTouchpad(1, dxDp10, dyDp10, 1000)
-                                    prevCentroid = centroid
                                 }
                             }
                             PadGesture.TwoPinchRemote -> {
@@ -1455,7 +1338,7 @@ fun FullscreenScreen(
                                 prevCentroid = centroid
                                 prevPinchSpan = span
                             }
-                            PadGesture.ThreePending, PadGesture.ThreePanZoomLocal, PadGesture.Done -> {}
+                            PadGesture.ThreePending, PadGesture.Done -> {}
                         }
                         continue
                     }
@@ -1467,22 +1350,17 @@ fun FullscreenScreen(
                         PadGesture.TwoPending, PadGesture.ThreePending -> {
                             // Let the last finger lift cleanly so tap-count completes accurately
                         }
-                        PadGesture.TwoScroll, PadGesture.TwoPinchRemote -> {
+                        PadGesture.TwoPinchRemote -> {
                             endPtpIfActive()
                             mode = PadGesture.Done
                         }
-                        PadGesture.TwoPinchLocal, PadGesture.ThreePanZoomLocal -> {
+                        PadGesture.TwoPinchLocal -> {
                             mode = PadGesture.Done
                         }
                         PadGesture.Done -> {}
                         PadGesture.Pending -> {
                             if ((p.position - startPos).getDistance() > touchSlop) {
-                                if (startedOnRightEdge && abs(p.position.y - startPos.y) >= abs(p.position.x - startPos.x)) {
-                                    mode = PadGesture.EdgeScroll
-                                    currentOnTouchpad(0, 0, 0, 1000)
-                                    ptpScrollActive = true
-                                    prevSinglePos = p.position
-                                } else if (isDoubleTapCandidate) {
+                                if (isDoubleTapCandidate) {
                                     mode = PadGesture.Dragging
                                     currentOnMouseMove(cursorNormX, cursorNormY)
                                     currentOnMouseButton(0, true)
@@ -1505,13 +1383,6 @@ fun FullscreenScreen(
                                         (nowMs - downTime).coerceAtLeast(1L).toFloat(),
                                     ) { nx, ny -> sendMouseMoveThrottled(nx, ny) }
                                 }
-                            }
-                        }
-                        PadGesture.EdgeScroll -> {
-                            val dyDp10 = ((p.position.y - prevSinglePos.y) / density.density * 14f).roundToInt()
-                            if (dyDp10 != 0) {
-                                currentOnTouchpad(1, 0, dyDp10, 1000)
-                                prevSinglePos = p.position
                             }
                         }
                         PadGesture.TrackpadMove -> {
@@ -1684,8 +1555,6 @@ fun FullscreenScreen(
                 modifier = Modifier
                     .fillMaxSize()
                     .trackpadGestureInput(
-                        surfaceWidthPxProvider = { videoContainerSize.width.toFloat() },
-                        allowEdgeScroll = false,
                         allowDirectMultiTouch = true,
                     ),
             )
@@ -1746,9 +1615,9 @@ fun FullscreenScreen(
                         onSetTouchMode(next)
                         onShowToast(
                             if (next == TouchMode.Trackpad) {
-                                "触控板：单指移动光标，轻点单击，双指滚动"
+                                "触控板：单指移光标，双指缩放拖动，右下轮盘滚动"
                             } else {
-                                "直触：点哪里就是哪里，单指拖动画面，长按选字"
+                                "直触：点哪按哪，双指缩放拖动，右下轮盘滚动"
                             },
                         )
                     }) {
@@ -1946,12 +1815,15 @@ fun FullscreenScreen(
             }
         }
 
-        // Ultra-clean Left-Thumb Pan Joystick when zoomed in:
+        // Ultra-clean Left-Thumb Pan Joystick (Trackpad mode only, when zoomed in):
         // Moves the zoomed viewport smoothly AND keeps the mouse cursor riding cleanly in the
-        // center of the visible screen so touching the screen never jumps back to an old corner.
+        // visible screen so touching the screen never jumps back to an old corner.
         val isLandscape = LocalConfiguration.current.orientation == Configuration.ORIENTATION_LANDSCAPE
+        val wheelSizeDp = if (isLandscape) 104f else 96f
+        val wheelSidePad = if (isLandscape) 22.dp else 16.dp
+        val wheelBottomPad = if (isLandscape) 24.dp else 32.dp
         AnimatedVisibility(
-            visible = zoomScale > 1.05f && !inputBarOpen && !imeVisible,
+            visible = state.touchMode == TouchMode.Trackpad && zoomScale > 1.05f && !inputBarOpen && !imeVisible && !menuExpanded,
             enter = fadeIn(tween(150)) + scaleIn(
                 initialScale = 0.82f,
                 animationSpec = spring(
@@ -1964,14 +1836,11 @@ fun FullscreenScreen(
                 .align(Alignment.BottomStart)
                 .displayCutoutPadding()
                 .navigationBarsPadding()
-                .padding(
-                    start = if (isLandscape) 22.dp else 16.dp,
-                    bottom = if (isLandscape) 24.dp else 32.dp,
-                ),
+                .padding(start = wheelSidePad, bottom = wheelBottomPad),
         ) {
             var lastJoyMouseSyncMs by remember { mutableLongStateOf(0L) }
             VirtualPanJoystick(
-                outerSizeDp = if (isLandscape) 104f else 96f,
+                outerSizeDp = wheelSizeDp,
                 onPanVelocity = { nx, ny, dtSec ->
                     val cw = videoContainerSize.width.toFloat().coerceAtLeast(1f)
                     val ch = videoContainerSize.height.toFloat().coerceAtLeast(1f)
@@ -2013,23 +1882,41 @@ fun FullscreenScreen(
             )
         }
 
-        // Invisible editor that owns input focus while typing: the phone keyboard writes into it
-        // and everything is forwarded to the PC as it is typed.
-        AndroidView(
-            factory = { ctx ->
-                RemoteImeSinkView(ctx).also {
-                    it.listener = imeListener
-                    sinkView = it
-                }
-            },
+        // Hollow Concentric Scroll Wheel (Click-Wheel style) anchored at Bottom-Right in both modes:
+        // Tap = 1 scroll step, hold = steady constant-speed continuous scroll (up/down/left/right).
+        AnimatedVisibility(
+            visible = !inputBarOpen && !imeVisible && !menuExpanded,
+            enter = fadeIn(tween(150)) + scaleIn(
+                initialScale = 0.84f,
+                animationSpec = spring(
+                    dampingRatio = Spring.DampingRatioNoBouncy,
+                    stiffness = Spring.StiffnessMedium,
+                ),
+            ),
+            exit = fadeOut(tween(120)) + scaleOut(targetScale = 0.86f),
             modifier = Modifier
-                .align(Alignment.TopStart)
-                .size(1.dp)
-                .alpha(0f),
-        )
+                .align(Alignment.BottomEnd)
+                .displayCutoutPadding()
+                .navigationBarsPadding()
+                .padding(end = wheelSidePad, bottom = wheelBottomPad),
+        ) {
+            VirtualScrollWheel(
+                outerSizeDp = wheelSizeDp,
+                onScrollStart = {
+                    // In direct touch mode, align the remote cursor with the last tapped pane
+                    // so Windows routes wheel events to that exact scrollable region.
+                    if (currentState.touchMode == TouchMode.Direct) {
+                        currentOnMouseMove(lastTapNormX, lastTapNormY)
+                    }
+                },
+                onWheelStep = { delta, horizontal ->
+                    currentOnWheel(delta, horizontal)
+                },
+            )
+        }
 
-        // Shortcut bar just under the capsule; the PC keyboard unfolds from it. Neither touches
-        // the bottom of the screen, so they never fight the phone keyboard for space.
+        // Shortcut + visible draft bar just under the capsule; the PC keyboard unfolds from it.
+        // Neither touches the bottom of the screen, so they never fight the phone keyboard for space.
         val screenHDp = config.screenHeightDp.toFloat()
         val capsuleBottomDp = 8f + grow(38f, 42f) + 6f
         val compactKeys = screenHDp < 480f
@@ -2047,7 +1934,7 @@ fun FullscreenScreen(
                 compact = compactKeys,
                 phoneKeyboardOn = imeWanted && !pcKeyboardOpen,
                 pcKeyboardOpen = pcKeyboardOpen,
-                composing = composingText,
+                hasHardwareKeyboard = hasHardwareKeyboard,
                 modStates = modStates,
                 onToggleModifier = { toggleStickyModifier(it) },
                 onKey = { scan ->
@@ -2057,6 +1944,16 @@ fun FullscreenScreen(
                 onChord = { mod, key ->
                     onTapChord(mod, key)
                     releaseArmedModifiers()
+                },
+                onSendDraft = { text, withEnter ->
+                    sendDraftToRemote(text, withEnter)
+                },
+                onModifierChordText = { text ->
+                    sendModifierChordText(text)
+                },
+                onDraftFocused = {
+                    pcKeyboardOpen = false
+                    imeWanted = true
                 },
                 onTogglePhoneKeyboard = {
                     if (imeWanted && !pcKeyboardOpen) {
@@ -2214,6 +2111,195 @@ private fun VirtualPanJoystick(
                 .clip(CircleShape)
                 .background(if (active) Color(0xEBFFFFFF) else Color(0xBDFFFFFF)),
         )
+    }
+}
+
+/**
+ * Hollow concentric 4-way scroll wheel (Click-Wheel style, bottom-right).
+ * Center stays completely hollow so the remote desktop shows through; tapping any arc sends
+ * one mouse-wheel notch and holding scrolls at a steady constant speed in ↑ / ↓ / ← / →.
+ */
+@Composable
+private fun VirtualScrollWheel(
+    outerSizeDp: Float,
+    onScrollStart: () -> Unit,
+    onWheelStep: (delta: Int, horizontal: Boolean) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val currentOnScrollStart by rememberUpdatedState(onScrollStart)
+    val currentOnWheelStep by rememberUpdatedState(onWheelStep)
+    val haptics = LocalHapticFeedback.current
+
+    var activeDir by remember { mutableStateOf<ScrollWheelDir?>(null) }
+
+    val wheelAlpha by animateFloatAsState(
+        targetValue = if (activeDir != null) 0.95f else 0.62f,
+        animationSpec = tween(140),
+        label = "scrollWheelAlpha",
+    )
+
+    fun emitStep(dir: ScrollWheelDir) {
+        when (dir) {
+            ScrollWheelDir.Up -> currentOnWheelStep(120, false)
+            ScrollWheelDir.Down -> currentOnWheelStep(-120, false)
+            ScrollWheelDir.Left -> currentOnWheelStep(-120, true)
+            ScrollWheelDir.Right -> currentOnWheelStep(120, true)
+        }
+    }
+
+    LaunchedEffect(activeDir) {
+        val dir = activeDir ?: return@LaunchedEffect
+        emitStep(dir)
+        delay(230L)
+        while (true) {
+            emitStep(dir)
+            delay(75L)
+        }
+    }
+
+    Canvas(
+        modifier = modifier
+            .size(outerSizeDp.dp)
+            .alpha(wheelAlpha)
+            .semantics { contentDescription = "Scroll wheel" }
+            .pointerInput(Unit) {
+                awaitEachGesture {
+                    val down = awaitFirstDown(requireUnconsumed = false)
+                    val cx = size.width * 0.5f
+                    val cy = size.height * 0.5f
+                    val outerR = minOf(cx, cy)
+                    val innerR = outerR * 0.45f
+
+                    fun resolveDir(pos: Offset): ScrollWheelDir? {
+                        val dx = pos.x - cx
+                        val dy = pos.y - cy
+                        val dist = hypot(dx.toDouble(), dy.toDouble()).toFloat()
+                        if (dist < innerR * 0.60f || dist > outerR * 1.18f) return null
+                        return if (abs(dy) >= abs(dx)) {
+                            if (dy < 0f) ScrollWheelDir.Up else ScrollWheelDir.Down
+                        } else {
+                            if (dx < 0f) ScrollWheelDir.Left else ScrollWheelDir.Right
+                        }
+                    }
+
+                    val initialDir = resolveDir(down.position)
+                    if (initialDir == null) {
+                        // Touch landed inside the hollow center or outside the ring; ignore cleanly.
+                        down.consume()
+                        do {
+                            val ev = awaitPointerEvent()
+                            ev.changes.forEach { it.consume() }
+                        } while (ev.changes.any { it.pressed })
+                        return@awaitEachGesture
+                    }
+
+                    down.consume()
+                    currentOnScrollStart()
+                    haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                    activeDir = initialDir
+
+                    val pointerId = down.id
+                    try {
+                        while (true) {
+                            val event = awaitPointerEvent()
+                            val change = event.changes.firstOrNull { it.id == pointerId } ?: break
+                            change.consume()
+                            if (!change.pressed) break
+                            val nextDir = resolveDir(change.position)
+                            if (nextDir != activeDir) {
+                                if (nextDir != null) {
+                                    haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                }
+                                activeDir = nextDir
+                            }
+                        }
+                    } finally {
+                        activeDir = null
+                    }
+                }
+            },
+    ) {
+        val cx = size.width * 0.5f
+        val cy = size.height * 0.5f
+        val strokePx = 1.dp.toPx()
+        val outerR = minOf(cx, cy) - strokePx
+        val innerR = outerR * 0.45f
+        val outerRect = Rect(cx - outerR, cy - outerR, cx + outerR, cy + outerR)
+        val innerRect = Rect(cx - innerR, cy - innerR, cx + innerR, cy + innerR)
+        val gapDeg = 2.0f
+        val sweepDeg = 90f - gapDeg * 2f
+
+        val idleFill = Color(0x570E1014)
+        val idleStroke = Color(0x3DFFFFFF)
+        val activeFill = Color(0x5C0A84FF)
+        val activeStroke = Color(0xBF78BEFF)
+
+        val sectors = listOf(
+            ScrollWheelDir.Up to (-135f + gapDeg),
+            ScrollWheelDir.Right to (-45f + gapDeg),
+            ScrollWheelDir.Down to (45f + gapDeg),
+            ScrollWheelDir.Left to (135f + gapDeg),
+        )
+
+        for ((dir, startDeg) in sectors) {
+            val pressed = activeDir == dir
+            val arcPath = Path().apply {
+                arcTo(outerRect, startDeg, sweepDeg, forceMoveTo = true)
+                arcTo(innerRect, startDeg + sweepDeg, -sweepDeg, forceMoveTo = false)
+                close()
+            }
+            drawPath(path = arcPath, color = if (pressed) activeFill else idleFill)
+            drawPath(
+                path = arcPath,
+                color = if (pressed) activeStroke else idleStroke,
+                style = Stroke(width = if (pressed) 1.25.dp.toPx() else strokePx, join = StrokeJoin.Round),
+            )
+        }
+
+        // Crisp directional triangles centered in each ring arc
+        val midR = (outerR + innerR) * 0.5f
+        val ringW = outerR - innerR
+        val triHalfBase = ringW * 0.21f
+        val triHalfH = ringW * 0.16f
+
+        fun drawTriangle(dir: ScrollWheelDir) {
+            val tint = if (activeDir == dir) Color.White else Color(0xD1FFFFFF)
+            val tri = Path().apply {
+                when (dir) {
+                    ScrollWheelDir.Up -> {
+                        val y = cy - midR
+                        moveTo(cx, y - triHalfH)
+                        lineTo(cx - triHalfBase, y + triHalfH)
+                        lineTo(cx + triHalfBase, y + triHalfH)
+                    }
+                    ScrollWheelDir.Down -> {
+                        val y = cy + midR
+                        moveTo(cx, y + triHalfH)
+                        lineTo(cx - triHalfBase, y - triHalfH)
+                        lineTo(cx + triHalfBase, y - triHalfH)
+                    }
+                    ScrollWheelDir.Left -> {
+                        val x = cx - midR
+                        moveTo(x - triHalfH, cy)
+                        lineTo(x + triHalfH, cy - triHalfBase)
+                        lineTo(x + triHalfH, cy + triHalfBase)
+                    }
+                    ScrollWheelDir.Right -> {
+                        val x = cx + midR
+                        moveTo(x + triHalfH, cy)
+                        lineTo(x - triHalfH, cy - triHalfBase)
+                        lineTo(x - triHalfH, cy + triHalfBase)
+                    }
+                }
+                close()
+            }
+            drawPath(path = tri, color = tint)
+        }
+
+        drawTriangle(ScrollWheelDir.Up)
+        drawTriangle(ScrollWheelDir.Down)
+        drawTriangle(ScrollWheelDir.Left)
+        drawTriangle(ScrollWheelDir.Right)
     }
 }
 

@@ -18,15 +18,16 @@ use anyhow::{Context, Result, bail};
 use iroh::EndpointId;
 use windows::{
     Win32::{
-        Foundation::{CloseHandle, HANDLE},
+        Foundation::{CloseHandle, ERROR_INSUFFICIENT_BUFFER, HANDLE},
         Security::{GetTokenInformation, IsWellKnownSid, TOKEN_QUERY, TOKEN_USER, TokenUser, WinLocalSystemSid},
         System::{
             Diagnostics::ToolHelp::{
                 CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
             },
             Threading::{
-                OpenProcess, OpenProcessToken, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
-                PROCESS_TERMINATE, QueryFullProcessImageNameW, TerminateProcess, WaitForSingleObject,
+                GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_NAME_WIN32,
+                PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE, QueryFullProcessImageNameW, TerminateProcess,
+                WaitForSingleObject,
             },
         },
     },
@@ -53,9 +54,9 @@ const POLICY_VALUE: &str = "SoftwareSASGeneration";
 const BACKUP_KEY: &str = r"SOFTWARE\remote-control";
 const FIREWALL_RULE: &str = "remote-control-service";
 /// Interactive users may start and stop the service (the lobby starts it,
-/// its tray menu stops it), only administrators change or remove it.
+/// its tray menu stops it), only SYSTEM and administrators change or remove it.
 const SERVICE_SDDL: &str =
-    "D:(A;;CCLCSWRPWPDTLOCRRC;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)(A;;CCLCSWRPWPLOCRRC;;;IU)(A;;CCLCSWLOCRRC;;;SU)";
+    "D:(A;;CCDCLCSWRPWPDTLOCRRC;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)(A;;CCLCSWRPWPLOCRRC;;;IU)(A;;CCLCSWLOCRRC;;;SU)";
 /// The lobby, hidden in the tray, at logon while the service is installed.
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const RUN_VALUE: &str = "remote-control";
@@ -117,6 +118,31 @@ fn exe_of(command: &str) -> PathBuf {
     }
 }
 
+/// Current executable path as tracked by the Windows kernel. Unlike
+/// `std::env::current_exe()` (which reads the PEB snapshot taken at process
+/// launch), this reflects renames and same-volume moves while running.
+pub fn live_exe() -> std::io::Result<PathBuf> {
+    let mut buf = vec![0u16; 1024];
+    loop {
+        let mut len = buf.len() as u32;
+        let r = unsafe {
+            QueryFullProcessImageNameW(
+                GetCurrentProcess(),
+                PROCESS_NAME_WIN32,
+                PWSTR(buf.as_mut_ptr()),
+                &mut len,
+            )
+        };
+        match r {
+            Ok(()) if len > 0 => return Ok(PathBuf::from(String::from_utf16_lossy(&buf[..len as usize]))),
+            Err(e) if e.code() == ERROR_INSUFFICIENT_BUFFER.to_hresult() && buf.len() < 32_768 => {
+                buf.resize(buf.len() * 2, 0);
+            }
+            _ => return std::env::current_exe(),
+        }
+    }
+}
+
 /// The exe the installed service runs (`None`: no service).
 pub fn service_exe() -> Option<PathBuf> {
     let mgr = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT).ok()?;
@@ -131,12 +157,52 @@ pub fn same_file(a: &Path, b: &Path) -> bool {
     }
 }
 
-/// The exe the service runs when it is not this one (moved, another build,
-/// or a copy an older version made).
-pub fn service_elsewhere() -> Option<PathBuf> {
-    let theirs = service_exe()?;
-    let me = std::env::current_exe().ok()?;
-    (!same_file(&me, &theirs)).then_some(theirs)
+/// Whether a running service should silently update SCM from `configured` to
+/// `live`: only when the exe was renamed or moved to another `.exe` path and
+/// the old configured path no longer exists (so we never overwrite an explicit
+/// switch to another copy or an in-place self-update that moved the old file
+/// to `.old`).
+pub fn should_self_heal_service_exe(live: &Path, configured: &Path) -> bool {
+    if same_file(live, configured) {
+        return false;
+    }
+    live.extension().is_some_and(|e| e.eq_ignore_ascii_case("exe"))
+        && live.is_file()
+        && !configured.exists()
+}
+
+/// Updates the installed service's binary path and firewall rule in place
+/// (leaving start type and other settings untouched). Called by the running
+/// service when its own executable is renamed or moved.
+pub fn update_service_exe(exe: &Path, user_key: &Path) -> Result<()> {
+    use windows::Win32::System::Services::{
+        ChangeServiceConfigW, ENUM_SERVICE_TYPE, SC_HANDLE, SERVICE_ERROR, SERVICE_NO_CHANGE, SERVICE_START_TYPE,
+    };
+    use windows::core::{HSTRING, PCWSTR};
+
+    let cmd = HSTRING::from(format!("\"{}\" service --key \"{}\"", exe.display(), user_key.display()));
+    let mgr = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
+    let svc = mgr.open_service(SERVICE_NAME, ServiceAccess::CHANGE_CONFIG)?;
+    unsafe {
+        ChangeServiceConfigW(
+            SC_HANDLE(svc.raw_handle() as *mut _),
+            ENUM_SERVICE_TYPE(SERVICE_NO_CHANGE),
+            SERVICE_START_TYPE(SERVICE_NO_CHANGE),
+            SERVICE_ERROR(SERVICE_NO_CHANGE),
+            PCWSTR(cmd.as_ptr()),
+            PCWSTR::null(),
+            None,
+            PCWSTR::null(),
+            PCWSTR::null(),
+            PCWSTR::null(),
+            PCWSTR::null(),
+        )
+    }
+    .context("update service executable path")?;
+    if let Err(e) = add_firewall_rule(exe) {
+        crate::log!("service path updated, but firewall rule update failed: {e:#}");
+    }
+    Ok(())
 }
 
 fn is_system(process: HANDLE) -> bool {
@@ -380,7 +446,7 @@ fn move_old_copies_back(user_key: &Path) -> Result<()> {
         }
         println!("  device list and settings back in {}", user_key.parent().unwrap_or(user_key).display());
     }
-    let me = std::env::current_exe()?;
+    let me = live_exe()?;
     for dir in [old_install_dir(), old_data_dir()] {
         if !dir.exists() || me.starts_with(&dir) {
             continue;
@@ -400,10 +466,13 @@ fn move_old_copies_back(user_key: &Path) -> Result<()> {
     Ok(())
 }
 
-/// The exes a service's helpers may run from: the service's own and an
-/// older version's copy.
+/// The exes a service's helpers may run from: the service's own, this exe (in
+/// case it was renamed while running) and an older version's copy.
 fn helper_exes() -> Vec<PathBuf> {
     let mut v: Vec<PathBuf> = service_exe().into_iter().collect();
+    if let Ok(me) = live_exe() {
+        v.push(me);
+    }
     v.push(old_install_dir().join("remote-control.exe"));
     v
 }
@@ -425,7 +494,7 @@ pub fn install(allow: &[EndpointId], user_key: Option<&Path>, lobby: Option<u32>
         s.save()?;
     }
     set_sas_policy()?;
-    let exe = std::env::current_exe()?;
+    let exe = live_exe()?;
     add_firewall_rule(&exe)?;
 
     let info = ServiceInfo {
@@ -520,7 +589,7 @@ pub fn status() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::exe_of;
+    use super::{exe_of, live_exe, should_self_heal_service_exe};
     use std::path::PathBuf;
 
     #[test]
@@ -530,7 +599,50 @@ mod tests {
             exe_of(r#""D:\a b\remote-control.exe" service --key "C:\Users\x\device.key""#),
             p(r"D:\a b\remote-control.exe")
         );
+        assert_eq!(
+            exe_of(r#""C:\Users\x\Downloads\remote-control (1).exe" service --key "C:\Users\x\device.key""#),
+            p(r"C:\Users\x\Downloads\remote-control (1).exe")
+        );
         assert_eq!(exe_of(r"C:\Program Files\remote-control\remote-control.exe service"), p(r"C:\Program Files\remote-control\remote-control.exe"));
         assert_eq!(exe_of(r"C:\x\rc.EXE"), p(r"C:\x\rc.EXE"));
+    }
+
+    #[test]
+    fn live_exe_matches_running_file() {
+        let live = live_exe().expect("live_exe");
+        assert!(live.is_file());
+        assert_eq!(
+            live.canonicalize().unwrap(),
+            std::env::current_exe().unwrap().canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn self_heal_guards() {
+        let root = std::env::temp_dir().join(format!("rc-self-heal-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        let renamed = root.join("remote-control.exe");
+        let missing_old = root.join("remote-control (1).exe");
+        let existing_other = root.join("remote-control-v2.exe");
+        let update_backup = root.join("remote-control.exe.old");
+        let update_backup_n = root.join("remote-control.exe.old.1");
+        std::fs::write(&renamed, b"exe").unwrap();
+        std::fs::write(&existing_other, b"exe").unwrap();
+        std::fs::write(&update_backup, b"exe").unwrap();
+        std::fs::write(&update_backup_n, b"exe").unwrap();
+
+        // Renamed/moved while old configured path is gone -> should self-heal.
+        assert!(should_self_heal_service_exe(&renamed, &missing_old));
+        // Already pointing to the same file -> no-op.
+        assert!(!should_self_heal_service_exe(&renamed, &renamed));
+        // Another copy still exists at the configured path -> do not overwrite.
+        assert!(!should_self_heal_service_exe(&renamed, &existing_other));
+        // Self-update moved old exe aside to `.old` / `.old.1` -> never self-heal.
+        assert!(!should_self_heal_service_exe(&update_backup, &missing_old));
+        assert!(!should_self_heal_service_exe(&update_backup_n, &missing_old));
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

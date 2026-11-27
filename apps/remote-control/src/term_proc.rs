@@ -446,7 +446,7 @@ pub fn exec(service: bool, command: &str, cwd: Option<&Path>) -> Result<Exec> {
 /// signed in), with pipes for its standard handles.
 pub fn self_piped(args: &str) -> Result<Exec> {
     let who = who(true)?;
-    let cmd = format!("\"{}\" {args}", std::env::current_exe()?.display());
+    let cmd = format!("\"{}\" {args}", crate::install::live_exe()?.display());
     let (in_r, in_w) = pipe()?;
     let (out_r, out_w) = pipe()?;
     let (err_r, err_w) = pipe()?;

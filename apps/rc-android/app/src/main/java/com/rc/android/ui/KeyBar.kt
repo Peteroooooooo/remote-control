@@ -16,6 +16,7 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.RowScope
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
@@ -24,12 +25,15 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.rounded.KeyboardReturn
 import androidx.compose.material.icons.rounded.Keyboard
 import androidx.compose.material.icons.rounded.KeyboardArrowDown
 import androidx.compose.material.icons.rounded.KeyboardArrowUp
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -44,10 +48,13 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.viewinterop.AndroidView
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -66,8 +73,6 @@ private data class K(
 )
 
 private val Shortcuts = listOf(
-    K("Esc", Scan.ESC),
-    K("Tab", Scan.TAB),
     K("Copy", 0x2E, chordWith = Scan.CTRL),
     K("Paste", 0x2F, chordWith = Scan.CTRL),
     K("Undo", 0x2C, chordWith = Scan.CTRL),
@@ -110,99 +115,287 @@ private val PcRows: List<List<K>> = listOf(
 )
 
 /**
- * Shortcut bar under the capsule. The `⌨` button shows/hides the phone keyboard; the arrow
- * unfolds a full PC keyboard right under the bar (which puts the phone keyboard away).
+ * Shortcut bar + visible draft input box under the capsule.
+ * The `⌨` button shows/hides the phone keyboard; the arrow unfolds a full PC keyboard
+ * right under the bar (which puts the phone keyboard and draft box away).
  */
 @Composable
 internal fun RemoteKeyBar(
     compact: Boolean,
     phoneKeyboardOn: Boolean,
     pcKeyboardOpen: Boolean,
-    composing: String,
+    hasHardwareKeyboard: Boolean,
     modStates: Map<Int, KeyBarModState>,
     onToggleModifier: (Int) -> Unit,
     onKey: (Int) -> Unit,
     onChord: (Int, Int) -> Unit,
+    onSendDraft: (text: String, withEnter: Boolean) -> Unit,
+    onModifierChordText: (String) -> Unit,
+    onDraftFocused: () -> Unit,
     onTogglePhoneKeyboard: () -> Unit,
     onTogglePcKeyboard: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    val barH = if (compact) 32.dp else 40.dp
-    val pcH = if (compact) 28.dp else 40.dp
-    val gap = if (compact) 4.dp else 5.dp
-    val shape = RoundedCornerShape(18.dp)
+    val barH = if (compact) 30.dp else 34.dp
+    val draftH = if (compact) 32.dp else 36.dp
+    val pcH = if (compact) 28.dp else 38.dp
+    val gap = 5.dp
     val shift = (modStates[Scan.SHIFT] ?: KeyBarModState.Off) != KeyBarModState.Off
-    Column(
+
+    var draftView by remember { mutableStateOf<RemoteDraftEditText?>(null) }
+    var hasDraftText by remember { mutableStateOf(false) }
+
+    val currentOnKey by rememberUpdatedState(onKey)
+    val currentOnSendDraft by rememberUpdatedState(onSendDraft)
+    val currentOnModifierChordText by rememberUpdatedState(onModifierChordText)
+    val currentOnDraftFocused by rememberUpdatedState(onDraftFocused)
+    val currentModStates by rememberUpdatedState(modStates)
+
+    val draftListener = remember {
+        object : RemoteDraftEditText.Listener {
+            override fun onSendDraft(text: String, withEnter: Boolean) {
+                currentOnSendDraft(text, withEnter)
+            }
+
+            override fun onKey(scan: Int) {
+                currentOnKey(scan)
+            }
+
+            override fun onModifierChordText(text: String) {
+                currentOnModifierChordText(text)
+            }
+
+            override fun modifierActive(): Boolean = currentModStates.values.any { it != KeyBarModState.Off }
+
+            override fun onHasTextChanged(hasText: Boolean) {
+                hasDraftText = hasText
+            }
+
+            override fun onFocused() {
+                currentOnDraftFocused()
+            }
+        }
+    }
+
+    LaunchedEffect(phoneKeyboardOn, pcKeyboardOpen, hasHardwareKeyboard, draftView) {
+        val view = draftView ?: return@LaunchedEffect
+        if (phoneKeyboardOn && !pcKeyboardOpen) {
+            if (hasHardwareKeyboard) view.requestFocus() else view.showKeyboard()
+        } else {
+            view.hideKeyboard()
+        }
+    }
+
+    DisposableEffect(draftView) {
+        val view = draftView
+        onDispose {
+            view?.hideKeyboard()
+            view?.clearDraft()
+        }
+    }
+
+    // Match the top capsule's translucent Liquid Glass material and keep a compact width (~420dp)
+    // unless the full 14-column PC keyboard is unfolded (up to 740dp).
+    FloatingGlass(
+        cornerRadius = 18.dp,
+        darkOverlay = true,
+        elevation = 12.dp,
         modifier = modifier
-            .widthIn(max = 760.dp)
+            .widthIn(max = if (pcKeyboardOpen) 740.dp else 420.dp)
             .fillMaxWidth()
-            .clip(shape)
-            .background(Color(0xEB1C1C1E))
-            .border(0.5.dp, Color(0x1FFFFFFF), shape)
             .pointerInput(Unit) {
                 // Swallow touches between keys so they never reach the remote screen underneath.
                 awaitEachGesture { awaitFirstDown(requireUnconsumed = false).consume() }
-            }
-            .padding(6.dp),
-        verticalArrangement = Arrangement.spacedBy(gap),
+            },
     ) {
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(gap),
-            verticalAlignment = Alignment.CenterVertically,
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(6.dp),
+            verticalArrangement = Arrangement.spacedBy(gap),
         ) {
-            Shortcuts.forEach { k ->
-                KeyCap(k.label, barH, KeyBarModState.Off, false, Modifier.weight(1f)) {
-                    val m = k.chordWith
-                    if (m != null) onChord(m, k.scan) else onKey(k.scan)
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(gap),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Shortcuts.forEach { k ->
+                    val keyMod = if (pcKeyboardOpen) Modifier.width(66.dp) else Modifier.weight(1f)
+                    KeyCap(k.label, barH, KeyBarModState.Off, false, keyMod) {
+                        val m = k.chordWith
+                        if (m != null) onChord(m, k.scan) else onKey(k.scan)
+                    }
                 }
-            }
-            Box(
-                modifier = Modifier
-                    .width(0.5.dp)
-                    .height(barH * 0.6f)
-                    .background(Color(0x33FFFFFF)),
-            )
-            IconCap(Icons.Rounded.Keyboard, "Phone keyboard", barH, phoneKeyboardOn, onTogglePhoneKeyboard)
-            IconCap(
-                if (pcKeyboardOpen) Icons.Rounded.KeyboardArrowUp else Icons.Rounded.KeyboardArrowDown,
-                "PC keyboard",
-                barH,
-                pcKeyboardOpen,
-                onTogglePcKeyboard,
-            )
-        }
-        AnimatedVisibility(
-            visible = pcKeyboardOpen,
-            enter = expandVertically(tween(160)) + fadeIn(tween(160)),
-            exit = shrinkVertically(tween(120)) + fadeOut(tween(100)),
-        ) {
-            Column(verticalArrangement = Arrangement.spacedBy(gap)) {
+                if (pcKeyboardOpen) {
+                    Spacer(Modifier.weight(1f))
+                }
                 Box(
                     modifier = Modifier
-                        .fillMaxWidth()
-                        .height(0.5.dp)
-                        .background(Color(0x22FFFFFF)),
+                        .width(0.5.dp)
+                        .height(barH * 0.56f)
+                        .background(Color(0x2EFFFFFF)),
                 )
-                PcRows.forEach { row ->
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(gap),
+                IconCap(Icons.Rounded.Keyboard, "Phone keyboard", barH, phoneKeyboardOn, onTogglePhoneKeyboard)
+                IconCap(
+                    if (pcKeyboardOpen) Icons.Rounded.KeyboardArrowUp else Icons.Rounded.KeyboardArrowDown,
+                    "PC keyboard",
+                    barH,
+                    pcKeyboardOpen,
+                    onTogglePcKeyboard,
+                )
+            }
+            AnimatedVisibility(
+                visible = !pcKeyboardOpen,
+                enter = expandVertically(tween(140)) + fadeIn(tween(140)),
+                exit = shrinkVertically(tween(100)) + fadeOut(tween(90)),
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(gap),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    val inputShape = RoundedCornerShape(10.dp)
+                    Box(
+                        modifier = Modifier
+                            .weight(1f)
+                            .height(draftH)
+                            .clip(inputShape)
+                            .background(Color(0x18FFFFFF))
+                            .border(
+                                width = 0.75.dp,
+                                color = if (phoneKeyboardOn) Color(0x800A84FF) else Color(0x22FFFFFF),
+                                shape = inputShape,
+                            )
+                            .padding(horizontal = 10.dp),
+                        contentAlignment = Alignment.CenterStart,
                     ) {
-                        row.forEach { k -> PcKey(k, pcH, shift, modStates, onToggleModifier, onKey) }
+                        AndroidView(
+                            factory = { ctx ->
+                                RemoteDraftEditText(ctx).also {
+                                    it.setCompactStyle(compact)
+                                    it.listener = draftListener
+                                    draftView = it
+                                }
+                            },
+                            update = { view ->
+                                view.setCompactStyle(compact)
+                                view.listener = draftListener
+                            },
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(draftH),
+                        )
+                    }
+                    DraftActionButton(
+                        contentDescription = "Send text",
+                        height = draftH,
+                        accent = hasDraftText,
+                        horizontalPadding = 12.dp,
+                        onPress = { draftView?.submitDraft(withEnter = false, sendEnterWhenEmpty = false) },
+                    ) {
+                        Text(
+                            text = "Send",
+                            color = Color.White,
+                            fontSize = 12.5.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            maxLines = 1,
+                            softWrap = false,
+                        )
+                    }
+                    DraftActionButton(
+                        contentDescription = "Send with Enter",
+                        height = draftH,
+                        accent = false,
+                        minWidth = 36.dp,
+                        onPress = { draftView?.submitDraft(withEnter = true, sendEnterWhenEmpty = true) },
+                    ) {
+                        Icon(
+                            imageVector = Icons.AutoMirrored.Rounded.KeyboardReturn,
+                            contentDescription = null,
+                            tint = Color(0xE6FFFFFF),
+                            modifier = Modifier.size(16.dp),
+                        )
+                    }
+                }
+            }
+            AnimatedVisibility(
+                visible = pcKeyboardOpen,
+                enter = expandVertically(tween(160)) + fadeIn(tween(160)),
+                exit = shrinkVertically(tween(120)) + fadeOut(tween(100)),
+            ) {
+                Column(verticalArrangement = Arrangement.spacedBy(gap)) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(0.5.dp)
+                            .background(Color(0x22FFFFFF)),
+                    )
+                    PcRows.forEach { row ->
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(gap),
+                        ) {
+                            row.forEach { k -> PcKey(k, pcH, shift, modStates, onToggleModifier, onKey) }
+                        }
                     }
                 }
             }
         }
-        if (composing.isNotEmpty()) {
-            Text(
-                text = composing,
-                color = Color(0xFF0A84FF),
-                fontSize = 12.sp,
-                maxLines = 1,
-                modifier = Modifier.padding(start = 4.dp),
+    }
+}
+
+/**
+ * Action button next to the draft box (`Send` / Enter). Never takes input focus so tapping it
+ * keeps the phone keyboard open for continuous typing.
+ */
+@Composable
+private fun DraftActionButton(
+    contentDescription: String,
+    height: Dp,
+    accent: Boolean,
+    horizontalPadding: Dp = 0.dp,
+    minWidth: Dp = 0.dp,
+    onPress: () -> Unit,
+    content: @Composable () -> Unit,
+) {
+    val haptics = LocalHapticFeedback.current
+    val currentOnPress by rememberUpdatedState(onPress)
+    var pressed by remember { mutableStateOf(false) }
+    val shape = RoundedCornerShape(10.dp)
+    val bg = when {
+        pressed && accent -> Color(0xCC0A84FF)
+        pressed -> Color(0x3DFFFFFF)
+        accent -> Color(0xE60A84FF)
+        else -> Color(0x1AFFFFFF)
+    }
+    Box(
+        modifier = Modifier
+            .height(height)
+            .widthIn(min = minWidth)
+            .clip(shape)
+            .background(bg)
+            .border(
+                width = 0.5.dp,
+                color = if (accent) Color.Transparent else Color(0x22FFFFFF),
+                shape = shape,
             )
-        }
+            .semantics { this.contentDescription = contentDescription }
+            .pointerInput(Unit) {
+                awaitEachGesture {
+                    awaitFirstDown(requireUnconsumed = false).consume()
+                    pressed = true
+                    val up = waitForUpOrCancellation()
+                    pressed = false
+                    if (up != null) {
+                        haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                        currentOnPress()
+                    }
+                }
+            }
+            .padding(horizontal = horizontalPadding),
+        contentAlignment = Alignment.Center,
+    ) {
+        content()
     }
 }
 
@@ -240,10 +433,10 @@ private fun KeyCap(
     val currentOnPress by rememberUpdatedState(onPress)
     var pressed by remember { mutableStateOf(false) }
     val bg = when {
-        highlight == KeyBarModState.Locked -> Color(0xFF0A84FF)
+        highlight == KeyBarModState.Locked -> Color(0xE60A84FF)
         highlight == KeyBarModState.Armed -> Color(0x660A84FF)
-        pressed -> Color(0x47FFFFFF)
-        else -> Color(0x21FFFFFF)
+        pressed -> Color(0x3DFFFFFF)
+        else -> Color(0x1AFFFFFF)
     }
     Box(
         modifier = modifier
@@ -276,7 +469,7 @@ private fun KeyCap(
         Text(
             text = label,
             color = Color.White,
-            fontSize = if (height < 34.dp) 11.sp else 13.5.sp,
+            fontSize = if (height < 30.dp) 11.sp else 12.5.sp,
             fontWeight = if (highlight != KeyBarModState.Off) FontWeight.SemiBold else FontWeight.Medium,
             maxLines = 1,
             softWrap = false,
@@ -297,14 +490,14 @@ private fun IconCap(
     var pressed by remember { mutableStateOf(false) }
     Box(
         modifier = Modifier
-            .width(46.dp)
+            .width(38.dp)
             .height(height)
             .clip(RoundedCornerShape(9.dp))
             .background(
                 when {
-                    pressed -> Color(0x47FFFFFF)
-                    active -> Color(0x330A84FF)
-                    else -> Color(0x21FFFFFF)
+                    pressed -> Color(0x3DFFFFFF)
+                    active -> Color(0x380A84FF)
+                    else -> Color(0x1AFFFFFF)
                 },
             )
             .pointerInput(Unit) {
@@ -324,8 +517,8 @@ private fun IconCap(
         Icon(
             imageVector = icon,
             contentDescription = description,
-            tint = if (active) Color(0xFF0A84FF) else Color(0xD9FFFFFF),
-            modifier = Modifier.size(20.dp),
+            tint = if (active) Color(0xFF4DA6FF) else Color(0xD9FFFFFF),
+            modifier = Modifier.size(18.dp),
         )
     }
 }

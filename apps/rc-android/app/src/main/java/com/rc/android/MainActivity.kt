@@ -100,6 +100,12 @@ class MainActivity : ComponentActivity() {
             var fullscreenMenuOpen by remember { mutableStateOf(false) }
             var lastHubBackMs by remember { mutableLongStateOf(0L) }
 
+            LaunchedEffect(state.layer) {
+                if (state.layer == AppLayer.Devices) {
+                    requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+                }
+            }
+
             LaunchedEffect(state.layer, config.orientation, config.smallestScreenWidthDp, isDark) {
                 applySystemBars(state.layer, isDark)
                 if (state.layer != AppLayer.Fullscreen) {

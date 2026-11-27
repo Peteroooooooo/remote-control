@@ -1055,7 +1055,7 @@ fn install_skill_in(home: &Path, exe: &Path) -> Result<String> {
 /// Writes the skill for Claude Code (`~/.claude/skills`) and Codex (`~/.agents/skills`); where it went.
 pub fn install_skill() -> Result<String> {
     let home = skill_home()?;
-    let exe = std::env::current_exe()?;
+    let exe = crate::install::live_exe()?;
     install_skill_in(&home, &exe)
 }
 
@@ -1096,7 +1096,7 @@ fn skill_state_in(home: &Path, exe: &Path) -> SkillState {
 /// and Codex and matches this executable's path and current template.
 pub fn skill_state() -> SkillState {
     let Ok(home) = skill_home() else { return SkillState::NotInstalled };
-    let Ok(exe) = std::env::current_exe() else { return SkillState::NotInstalled };
+    let Ok(exe) = crate::install::live_exe() else { return SkillState::NotInstalled };
     skill_state_in(&home, &exe)
 }
 
@@ -1137,7 +1137,7 @@ pub fn open_for_session() {
 pub fn open_window(id: iroh::EndpointId, _name: &str) -> Result<()> {
     use std::os::windows::process::CommandExt;
     const CREATE_NEW_CONSOLE: u32 = 0x10;
-    let exe = std::env::current_exe()?;
+    let exe = crate::install::live_exe()?;
     let id = id.to_string();
     // Pass a fixed title to wt.exe because wt parses `;` in `--title` as a subcommand separator;
     // `shell_inner` sets the sanitized `{name} · 终端` title via OSC 0 once connected.

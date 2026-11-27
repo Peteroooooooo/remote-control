@@ -220,6 +220,37 @@ impl StopEvents {
     }
 }
 
+/// Keeps SCM's service binary path and firewall rule in sync if the user
+/// renames or moves the running executable on the same volume.
+fn sync_service_exe(last_exe: &mut Option<PathBuf>, next_try: &mut Instant) {
+    let Ok(live) = crate::install::live_exe() else { return };
+    if last_exe.as_ref() == Some(&live) || Instant::now() < *next_try {
+        return;
+    }
+    let Some(configured) = crate::install::service_exe() else {
+        *last_exe = Some(live);
+        return;
+    };
+    if !crate::install::should_self_heal_service_exe(&live, &configured) {
+        if crate::install::same_file(&live, &configured) {
+            *last_exe = Some(live);
+        } else {
+            *next_try = Instant::now() + Duration::from_secs(5);
+        }
+        return;
+    }
+    match crate::install::update_service_exe(&live, &key_path()) {
+        Ok(()) => {
+            log!("service executable moved/renamed: updated service path to {}", live.display());
+            *last_exe = Some(live);
+        }
+        Err(e) => {
+            log!("updating service executable path to {} failed: {e:#}", live.display());
+            *next_try = Instant::now() + Duration::from_secs(10);
+        }
+    }
+}
+
 /// Keeps a helper running in the active console session until `stop`. A user
 /// switch or a remote desktop session takes the console to another session;
 /// the helper follows it. A helper that keeps dying is restarted more slowly.
@@ -235,7 +266,10 @@ fn supervise(stop: &AtomicU8) {
     let mut quick_deaths = 0u32;
     let mut next_try = Instant::now();
     let mut last_err = String::new();
+    let mut last_exe: Option<PathBuf> = None;
+    let mut next_path_heal = Instant::now();
     while stop.load(Ordering::SeqCst) == RUN {
+        sync_service_exe(&mut last_exe, &mut next_path_heal);
         let console = unsafe { WTSGetActiveConsoleSessionId() };
         if let Some(h) = helper.take() {
             if let Some(code) = h.exit_code() {
@@ -288,7 +322,7 @@ impl Helper {
     /// Starts `remote-control helper` in `session` with a copy of the
     /// service's SYSTEM token, on the interactive window station.
     fn spawn(session: u32) -> Result<Helper> {
-        let exe = std::env::current_exe()?;
+        let exe = crate::install::live_exe()?;
         let cmd = format!("\"{}\" helper --key \"{}\"", exe.display(), key_path().display());
         let mut cmd: Vec<u16> = cmd.encode_utf16().chain([0]).collect();
         let mut desktop: Vec<u16> = "winsta0\\default".encode_utf16().chain([0]).collect();

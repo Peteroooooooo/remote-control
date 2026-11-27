@@ -234,7 +234,7 @@ pub async fn download_and_stage(
     mut on_progress: impl FnMut(u64, Option<u64>),
 ) -> Result<PathBuf> {
     verify_manifest(manifest)?;
-    let exe = std::env::current_exe().context("locate current executable")?;
+    let exe = crate::install::live_exe().context("locate current executable")?;
     let stage = with_suffix(&exe, ".new");
     let client = http_client(DOWNLOAD_TIMEOUT)?;
 
@@ -287,14 +287,14 @@ pub fn service_uses_current_exe() -> bool {
     let Some(svc_exe) = crate::install::service_exe() else {
         return false;
     };
-    let Ok(me) = std::env::current_exe() else {
+    let Ok(me) = crate::install::live_exe() else {
         return false;
     };
     crate::install::same_file(&me, &svc_exe)
 }
 
 pub fn launch_apply_and_exit(stage: &Path, service: bool, open_lobby: bool) -> Result<()> {
-    let target = std::env::current_exe().context("locate current executable")?;
+    let target = crate::install::live_exe().context("locate current executable")?;
     let pid = std::process::id();
     let mut cmd = Command::new(stage);
     cmd.arg("apply-update").arg("--target").arg(&target).arg("--pid").arg(pid.to_string());
@@ -350,7 +350,7 @@ fn run_elevated_apply(target: &Path, service: bool) -> Result<()> {
         },
         core::{HSTRING, w},
     };
-    let self_exe = std::env::current_exe()?;
+    let self_exe = crate::install::live_exe()?;
     let mut params = format!("apply-update --target \"{}\" --pid 0 --elevated", target.display());
     if service {
         params.push_str(" --service");
@@ -398,7 +398,7 @@ pub fn apply_update(args: ApplyUpdateArgs) -> Result<()> {
         }
     }
 
-    let self_exe = std::env::current_exe().context("locate staged executable")?;
+    let self_exe = crate::install::live_exe().context("locate staged executable")?;
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut moved = false;
     let mut last_err = None;
@@ -458,7 +458,7 @@ pub fn apply_update(args: ApplyUpdateArgs) -> Result<()> {
 }
 
 pub fn cleanup_stale_files() {
-    let Ok(exe) = std::env::current_exe() else {
+    let Ok(exe) = crate::install::live_exe() else {
         return;
     };
     let name = exe.file_name().and_then(|s| s.to_str()).unwrap_or("");
@@ -516,7 +516,7 @@ pub fn run_cli(args: UpdateArgs) -> Result<()> {
             }))?;
 
             let service = service_uses_current_exe();
-            let target = std::env::current_exe()?;
+            let target = crate::install::live_exe()?;
             println!("Applying update...");
             let mut cmd = Command::new(&stage);
             cmd.arg("apply-update").arg("--target").arg(&target).arg("--pid").arg("0");

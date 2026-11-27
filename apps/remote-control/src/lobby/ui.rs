@@ -135,6 +135,7 @@ enum Page {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SettingsTarget {
     SelfName,
+    NetCheck,
     Relays,
 }
 
@@ -314,6 +315,92 @@ impl RelayProbe {
     }
 }
 
+#[derive(Default)]
+struct NetCheckShared {
+    gen_id: u64,
+    running: bool,
+    fixing: Option<String>,
+    report: Option<crate::doctor::DoctorReport>,
+    fix_done: Option<Result<String, String>>,
+}
+
+#[derive(Clone, Default)]
+struct NetCheck {
+    shared: Arc<Mutex<NetCheckShared>>,
+    show_raw: bool,
+}
+
+impl NetCheck {
+    fn snapshot(&self) -> (bool, Option<String>, Option<crate::doctor::DoctorReport>) {
+        let sh = self.shared.lock().unwrap();
+        (sh.running, sh.fixing.clone(), sh.report.clone())
+    }
+
+    fn take_fix_done(&self) -> Option<Result<String, String>> {
+        self.shared.lock().unwrap().fix_done.take()
+    }
+
+    fn start(&self, ctx: &egui::Context, input: crate::doctor::DoctorInput) {
+        let gen_id = {
+            let mut sh = self.shared.lock().unwrap();
+            sh.gen_id += 1;
+            sh.running = true;
+            sh.gen_id
+        };
+        let shared = self.shared.clone();
+        let thread_ctx = ctx.clone();
+        let spawned = std::thread::Builder::new().name("net-doctor".into()).spawn(move || {
+            let Ok(rt) = tokio::runtime::Builder::new_multi_thread().enable_all().build() else {
+                let mut sh = shared.lock().unwrap();
+                if sh.gen_id == gen_id {
+                    sh.running = false;
+                }
+                thread_ctx.request_repaint();
+                return;
+            };
+            let report = rt.block_on(crate::doctor::diagnose(input));
+            let mut sh = shared.lock().unwrap();
+            if sh.gen_id == gen_id {
+                sh.report = Some(report);
+                sh.running = false;
+            }
+            thread_ctx.request_repaint();
+        });
+        if spawned.is_err() {
+            let mut sh = self.shared.lock().unwrap();
+            if sh.gen_id == gen_id {
+                sh.running = false;
+            }
+        }
+        ctx.request_repaint();
+    }
+
+    fn start_fix(&self, ctx: &egui::Context, action: crate::doctor::FixAction, label: String) {
+        {
+            let mut sh = self.shared.lock().unwrap();
+            if sh.fixing.is_some() {
+                return;
+            }
+            sh.fixing = Some(label);
+        }
+        let shared = self.shared.clone();
+        let thread_ctx = ctx.clone();
+        let spawned = std::thread::Builder::new().name("net-fix".into()).spawn(move || {
+            let res = crate::doctor::run_fix_elevated(&action).map_err(|e| format!("{e:#}"));
+            let mut sh = shared.lock().unwrap();
+            sh.fixing = None;
+            sh.fix_done = Some(res);
+            thread_ctx.request_repaint();
+        });
+        if spawned.is_err() {
+            let mut sh = self.shared.lock().unwrap();
+            sh.fixing = None;
+            sh.fix_done = Some(Err(tr("无法启动修复线程", "Failed to start fix thread").into()));
+        }
+        ctx.request_repaint();
+    }
+}
+
 #[derive(Clone, Default)]
 enum UpdatePhase {
     #[default]
@@ -449,6 +536,7 @@ pub struct App {
     focus_name: bool,
     skill_state: crate::term::SkillState,
     self_update: SelfUpdate,
+    net_check: NetCheck,
     /// 只被控 in this frame's snapshot: no way of controlling other devices.
     host_only: bool,
 }
@@ -494,6 +582,7 @@ pub fn run(b: Backend, hidden: bool) -> anyhow::Result<()> {
                 focus_name: false,
                 skill_state: crate::term::skill_state(),
                 self_update: SelfUpdate::default(),
+                net_check: NetCheck::default(),
                 host_only: false,
             }
         },
@@ -1220,6 +1309,17 @@ impl host::LobbyApp for App {
         let snap = self.b.snap();
         self.host_only = snap.host_only;
         self.take_notices(&snap);
+        if let Some(res) = self.net_check.take_fix_done() {
+            match res {
+                Ok(msg) => {
+                    self.toast(Tone::Ok, msg);
+                    self.start_net_check(&ctx, &snap, None, None);
+                }
+                Err(err) => {
+                    self.toast(Tone::Warn, err);
+                }
+            }
+        }
         if let Some(stage) = self.self_update.take_ready() {
             let active = !self.b.sessions().is_empty() || snap.hosting.is_some() || snap.asking.is_some();
             if active {
@@ -1678,16 +1778,25 @@ impl App {
         });
 
         let other = self.b.service_other() && !self.update_later;
+        let missing = self.b.service_missing();
         let mut later = false;
         reveal(ui, Id::new("card-update"), other, GAP, |ui| {
+            let msg = if missing {
+                tr(
+                    "后台服务找不到原程序（可能已被重命名或移动），改用这个",
+                    "The background service cannot find its original executable (renamed or moved) — switch to this one",
+                )
+            } else {
+                tr(
+                    "后台服务用的是另一个位置的程序，改用这个",
+                    "The background service points to a different executable — switch to this one",
+                )
+            };
             banner(
                 ui,
                 Tint::Blue,
                 Lead::Icon(ic::SERVICE),
-                tr(
-                    "后台服务用的是另一个位置的程序，改用这个",
-                    "The background service points to a different executable — switch to this one",
-                ),
+                msg,
                 |ui| {
                     if Btn::new(tr("改用这个", "Use This Version"))
                         .icon(ic::SHIELD)
@@ -2063,6 +2172,7 @@ impl App {
 
         let b = self.b.clone();
         let mut to_settings = false;
+        let mut to_net_check = false;
         reveal(ui, Id::new(("why", d.id)), why_open, 0.0, |ui| {
             Frame::new().inner_margin(Margin { left: ROW_TEXT as i8, right: 14, top: 0, bottom: 14 }).show(ui, |ui| {
                 ui.set_width(ui.available_width());
@@ -2084,11 +2194,16 @@ impl App {
                     if Btn::new(tr("重试", "Retry")).show(ui).clicked() {
                         b.act(&format!("retry\t{}", d.id));
                     }
+                    to_net_check = Btn::new(tr("检测网络", "Check Network")).icon(ic::BOLT).look(Look::Primary).show(ui).clicked();
                     to_settings = Btn::new(tr("去设置", "Go to Settings")).show(ui).clicked();
                 });
             });
         });
-        if to_settings {
+        if to_net_check {
+            let snap = self.b.snap();
+            self.jump_settings(SettingsTarget::NetCheck);
+            self.start_net_check(ui.ctx(), &snap, None, None);
+        } else if to_settings {
             self.jump_settings(SettingsTarget::Relays);
         }
     }
@@ -2293,7 +2408,12 @@ impl App {
 
         ui.add_space(12.0);
         section_head(ui, tr("网络与发现", "Network & Discovery"), None);
-        group(ui, |ui| {
+        let net_hi = self.settings_highlight(ui.ctx(), SettingsTarget::NetCheck);
+        let (check_running, check_fixing, check_report) = self.net_check.snapshot();
+        let mut start_check = false;
+        let mut pending_action: Option<crate::doctor::FixAction> = None;
+        let mut copy_report_text: Option<String> = None;
+        let net_resp = group_highlighted(ui, net_hi, |ui| {
             let mut public = snap.public;
             let public_title = tr("公网辅助连接", "Public Relay Assist");
             Item::new(Lead::Icon(ic::GLOBE), public_title)
@@ -2316,18 +2436,82 @@ impl App {
                         b.act(&format!("set\tlan\t{}", lan as u8));
                     }
                 });
+            let check_desc = if let Some(what) = &check_fixing {
+                if is_en() {
+                    format!("Applying fix: {what}…")
+                } else {
+                    format!("正在执行修复：{what}…")
+                }
+            } else if check_running {
+                tr(
+                    "正在检测 UDP 打洞资格、IPv6、代理/TUN、防火墙与中转…",
+                    "Testing NAT hole-punching, IPv6, proxy/TUN, firewall & relays…",
+                )
+                .into()
+            } else {
+                tr(
+                    "一键检测打洞资格、IPv6、代理/TUN 与防火墙，并给出对应解决方案",
+                    "One-click check for NAT P2P, IPv6, proxy/TUN, firewall & relays with guided fixes",
+                )
+                .into()
+            };
+            let lead = if check_running || check_fixing.is_some() {
+                Lead::Spin
+            } else {
+                Lead::Icon(ic::BOLT)
+            };
+            Item::new(lead, tr("网络检测", "Network Check"))
+                .desc(&check_desc)
+                .right_width(170.0)
+                .show(ui, |ui| {
+                    if check_fixing.is_some() {
+                        Btn::new(tr("修复中…", "Fixing…")).enabled(false).show(ui);
+                    } else if check_running {
+                        Btn::new(tr("检测中…", "Checking…")).enabled(false).show(ui);
+                    } else if check_report.is_some() {
+                        if Btn::new(tr("重新检测", "Re-test")).icon(ic::REFRESH).show(ui).clicked() {
+                            start_check = true;
+                        }
+                    } else if Btn::new(tr("开始检测", "Run Check")).look(Look::Primary).show(ui).clicked() {
+                        start_check = true;
+                    }
+                });
+
+            if let Some(rep) = &check_report {
+                let busy = check_running || check_fixing.is_some();
+                self.net_check_panel(ui, rep, busy, &mut pending_action, &mut copy_report_text);
+            }
         });
+        if self.scroll_to_settings == Some(SettingsTarget::NetCheck) {
+            self.scroll_to_settings = None;
+            ui.scroll_to_rect(net_resp.rect, Some(Align::TOP));
+        }
+        if start_check {
+            self.start_net_check(ui.ctx(), snap, None, None);
+        }
+        if let Some(text) = copy_report_text {
+            ui.ctx().copy_text(text);
+            self.toast(Tone::Ok, tr("诊断报告已复制", "Diagnostic report copied"));
+        }
+        if let Some(act) = pending_action {
+            self.handle_doctor_action(ui.ctx(), snap, act);
+        }
 
         ui.add_space(12.0);
         self.relays(ui, snap);
 
         ui.add_space(12.0);
         let other = self.b.service_other();
+        let missing = self.b.service_missing();
         section_head(ui, tr("后台服务", "Background Service"), None);
         group(ui, |ui| {
             let installed = b.service_installed();
             let busy = b.busy();
             let (title, desc) = match (installed, snap.service) {
+                (true, true) if missing => (
+                    tr("运行中（原程序已被重命名或移动）", "Running (original executable renamed or moved)"),
+                    tr("点击「改用这个」以更新后台服务路径", "Click \"Use This Version\" to update the background service path"),
+                ),
                 (true, true) if other => (
                     tr("运行中（程序路径不一致）", "Running (different executable path)"),
                     tr("点击「改用这个」以使用当前版本", "Click \"Use This Version\" to switch to this executable"),
@@ -2335,6 +2519,14 @@ impl App {
                 (true, true) => (
                     tr("运行中", "Running"),
                     tr("关闭窗口后仍保持在线", "Keeps this PC online after closing the window"),
+                ),
+                (true, false) if missing => (
+                    tr("已安装（找不到原程序）", "Installed (original executable not found)"),
+                    tr("原程序可能已被重命名或移动，点击「改用这个」恢复", "The original executable may have been renamed or moved — click \"Use This Version\" to restore"),
+                ),
+                (true, false) if other => (
+                    tr("已安装（未运行，程序路径不一致）", "Installed (not running, different path)"),
+                    tr("点击「改用这个」以使用当前版本", "Click \"Use This Version\" to switch to this executable"),
                 ),
                 (true, false) => (
                     tr("已安装（未运行）", "Installed (not running)"),
@@ -2569,6 +2761,253 @@ impl App {
                     }
                 }
             });
+        });
+    }
+
+    fn start_net_check(&self, ctx: &egui::Context, snap: &Snap, public_override: Option<bool>, lan_override: Option<bool>) {
+        let own_relays = snap
+            .relays
+            .iter()
+            .map(|r| crate::store::relay_urls(&r.url))
+            .filter(|v| !v.is_empty())
+            .collect();
+        let input = crate::doctor::DoctorInput {
+            public_relays: public_override.unwrap_or(snap.public),
+            lan_visible: lan_override.unwrap_or(snap.lan),
+            own_relays,
+        };
+        self.net_check.start(ctx, input);
+    }
+
+    fn handle_doctor_action(&mut self, ctx: &egui::Context, snap: &Snap, action: crate::doctor::FixAction) {
+        use crate::doctor::FixAction;
+        match action {
+            FixAction::EnablePublicRelays => {
+                self.b.act("set\tpublic\t1");
+                self.toast(Tone::Ok, tr("已开启公网辅助连接，正在重新检测…", "Enabled Public Assist, re-testing…"));
+                self.start_net_check(ctx, snap, Some(true), None);
+            }
+            FixAction::EnableLanDiscovery => {
+                self.b.act("set\tlan\t1");
+                self.toast(Tone::Ok, tr("已开启局域网发现，正在重新检测…", "Enabled LAN Discovery, re-testing…"));
+                self.start_net_check(ctx, snap, None, Some(true));
+            }
+            FixAction::EnableIpv6 { .. } | FixAction::AllowFirewall | FixAction::SetPrivateNetwork => {
+                let label = action.label().to_string();
+                self.net_check.start_fix(ctx, action, label);
+            }
+            FixAction::CopyText { text, .. } => {
+                ctx.copy_text(text.clone());
+                self.toast(
+                    Tone::Ok,
+                    if is_en() {
+                        format!("Copied: {text}")
+                    } else {
+                        format!("已复制：{text}")
+                    },
+                );
+            }
+            FixAction::OpenUrl { url, .. } => {
+                if let Err(e) = crate::doctor::open_shell_target(&url) {
+                    self.toast(Tone::Err, format!("{e:#}"));
+                }
+            }
+            FixAction::OpenNetworkAdapters => {
+                if let Err(e) = crate::doctor::open_shell_target("ncpa.cpl") {
+                    self.toast(Tone::Err, format!("{e:#}"));
+                }
+            }
+            FixAction::OpenNetworkSettings => {
+                if let Err(e) = crate::doctor::open_shell_target("ms-settings:network-status") {
+                    self.toast(Tone::Err, format!("{e:#}"));
+                }
+            }
+            FixAction::JumpRelays => {
+                self.jump_settings(SettingsTarget::Relays);
+            }
+        }
+    }
+
+    fn net_check_panel(
+        &mut self,
+        ui: &mut egui::Ui,
+        rep: &crate::doctor::DoctorReport,
+        busy: bool,
+        pending_action: &mut Option<crate::doctor::FixAction>,
+        copy_report: &mut Option<String>,
+    ) {
+        use crate::doctor::{FixAction, Level};
+
+        // Subtle separator from the Network Check item row above.
+        let sep = ui.allocate_exact_size(vec2(ui.available_width(), 1.0), Sense::hover()).0;
+        ui.painter().line_segment([sep.left_center(), sep.right_center()], Stroke::new(1.0, veil(14)));
+
+        Frame::new().inner_margin(Margin { left: 16, right: 16, top: 12, bottom: 14 }).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.spacing_mut().item_spacing.y = 8.0;
+
+            // 1. Overall verdict banner
+            let (v_base, v_fg, v_icon) = match rep.level {
+                Level::Ok => (GREEN, GREEN, ic::OK),
+                Level::Warn => (AMBER, AMBER_TEXT, ic::WARN),
+                Level::Err => (RED, DANGER, ic::ERR),
+                Level::Info => (ACCENT, LINK, ic::INFO),
+            };
+            Frame::new()
+                .fill(v_base.gamma_multiply(0.10))
+                .stroke(Stroke::new(1.0, v_base.gamma_multiply(0.24)))
+                .corner_radius(8)
+                .inner_margin(Margin { left: 12, right: 10, top: 9, bottom: 9 })
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        let icon_r = ui.allocate_exact_size(vec2(18.0, 22.0), Sense::hover()).0;
+                        glyph(ui.painter(), icon_r.center(), v_icon, 16.0, v_fg);
+                        ui.add_space(4.0);
+                        ui.vertical(|ui| {
+                            ui.spacing_mut().item_spacing.y = 2.0;
+                            ui.add(egui::Label::new(RichText::new(&rep.headline).font(bold(13.5)).color(TEXT)).wrap());
+                            if !rep.summary.is_empty() {
+                                ui.add(egui::Label::new(RichText::new(&rep.summary).size(12.0).color(DIM)).wrap());
+                            }
+                        });
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if Btn::new(tr("复制报告", "Copy Report")).icon(ic::COPY).look(Look::Ghost).show(ui).clicked() {
+                                *copy_report = Some(rep.to_plain_text());
+                            }
+                        });
+                    });
+                });
+
+            // 2. Expanded cards for Err / Warn (and Info items that have guidance/actions)
+            let expanded: Vec<_> = rep
+                .items
+                .iter()
+                .filter(|it| matches!(it.level, Level::Err | Level::Warn) || (it.level == Level::Info && (!it.guidance.is_empty() || !it.actions.is_empty())))
+                .collect();
+            for item in expanded {
+                let (base, fg, icon) = match item.level {
+                    Level::Err => (RED, DANGER, ic::ERR),
+                    Level::Warn => (AMBER, AMBER_TEXT, ic::WARN),
+                    Level::Info => (ACCENT, LINK, ic::INFO),
+                    Level::Ok => (GREEN, GREEN, ic::OK),
+                };
+                Frame::new()
+                    .fill(veil(5))
+                    .stroke(Stroke::new(1.0, base.gamma_multiply(0.26)))
+                    .corner_radius(8)
+                    .inner_margin(Margin { left: 12, right: 12, top: 9, bottom: 10 })
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.spacing_mut().item_spacing.y = 4.0;
+                        ui.horizontal(|ui| {
+                            let ir = ui.allocate_exact_size(vec2(16.0, 18.0), Sense::hover()).0;
+                            glyph(ui.painter(), ir.center(), icon, 14.0, fg);
+                            ui.add_space(3.0);
+                            ui.add(egui::Label::new(RichText::new(&item.title).font(bold(13.0)).color(TEXT)).wrap());
+                        });
+                        if !item.detail.is_empty() {
+                            ui.add(egui::Label::new(RichText::new(&item.detail).size(12.0).color(DIM)).wrap());
+                        }
+                        if !item.guidance.is_empty() {
+                            ui.add(egui::Label::new(RichText::new(&item.guidance).size(12.5).color(TEXT.gamma_multiply(0.92))).wrap());
+                        }
+                        if !item.actions.is_empty() {
+                            ui.add_space(3.0);
+                            ui.horizontal_wrapped(|ui| {
+                                ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
+                                for act in &item.actions {
+                                    let is_direct_fix = matches!(
+                                        act,
+                                        FixAction::EnablePublicRelays
+                                            | FixAction::EnableLanDiscovery
+                                            | FixAction::EnableIpv6 { .. }
+                                            | FixAction::AllowFirewall
+                                            | FixAction::SetPrivateNetwork
+                                    );
+                                    let mut btn = Btn::new(act.label());
+                                    if is_direct_fix {
+                                        btn = btn.look(Look::Primary).enabled(!busy);
+                                        if act.needs_admin() {
+                                            btn = btn.icon(ic::SHIELD);
+                                        }
+                                    } else if matches!(act, FixAction::CopyText { .. }) {
+                                        btn = btn.icon(ic::COPY);
+                                    } else if matches!(
+                                        act,
+                                        FixAction::OpenUrl { .. } | FixAction::OpenNetworkAdapters | FixAction::OpenNetworkSettings
+                                    ) {
+                                        btn = btn.icon(ic::LINK);
+                                    }
+                                    if btn.show(ui).clicked() {
+                                        *pending_action = Some(act.clone());
+                                    }
+                                }
+                            });
+                        }
+                    });
+            }
+
+            // 3. Compact passed rows (Ok & plain Info)
+            let compact: Vec<_> = rep
+                .items
+                .iter()
+                .filter(|it| it.level == Level::Ok || (it.level == Level::Info && it.guidance.is_empty() && it.actions.is_empty()))
+                .collect();
+            if !compact.is_empty() {
+                Frame::new()
+                    .fill(veil(4))
+                    .stroke(Stroke::new(1.0, veil(12)))
+                    .corner_radius(8)
+                    .inner_margin(Margin { left: 12, right: 12, top: 8, bottom: 8 })
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.spacing_mut().item_spacing.y = 5.0;
+                        for item in compact {
+                            ui.horizontal(|ui| {
+                                let (icon, col) = if item.level == Level::Ok { (ic::CHECK, GREEN) } else { (ic::INFO, LINK) };
+                                let ir = ui.allocate_exact_size(vec2(14.0, 16.0), Sense::hover()).0;
+                                glyph(ui.painter(), ir.center(), icon, 11.5, col);
+                                ui.add_space(3.0);
+                                let line = if item.detail.is_empty() {
+                                    item.title.clone()
+                                } else {
+                                    format!("{}  ·  {}", item.title, item.detail)
+                                };
+                                ui.add(egui::Label::new(RichText::new(line).size(12.5).color(DIM)).wrap());
+                            });
+                        }
+                    });
+            }
+
+            // 4. Optional collapsible technical details
+            ui.horizontal(|ui| {
+                let label = if self.net_check.show_raw {
+                    tr("收起技术详情", "Hide Technical Details")
+                } else {
+                    tr("查看技术详情", "Show Technical Details")
+                };
+                if Btn::new(label).look(Look::Ghost).show(ui).clicked() {
+                    self.net_check.show_raw = !self.net_check.show_raw;
+                }
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let ms = rep.elapsed_ms;
+                    let note = if is_en() { format!("Completed in {ms} ms") } else { format!("耗时 {ms} ms") };
+                    ui.label(RichText::new(note).size(11.5).color(FAINT));
+                });
+            });
+            if self.net_check.show_raw && !rep.raw_lines.is_empty() {
+                Frame::new()
+                    .fill(veil(4))
+                    .stroke(Stroke::new(1.0, veil(12)))
+                    .corner_radius(6)
+                    .inner_margin(Margin::symmetric(10, 8))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        let text = rep.raw_lines.join("\n");
+                        ui.add(egui::Label::new(RichText::new(text).monospace().size(11.5).color(DIM)).wrap());
+                    });
+            }
         });
     }
 

@@ -265,6 +265,10 @@ const START_WAIT: Duration = Duration::from_secs(5);
 const TEXTURE: u32 = 1; // a: the shared handle in the agent, b: width | height << 32
 const FRAME: u32 = 2; // a: when it was captured (QPC)
 const RESIZED: u32 = 3; // the display changed size; the agent ends
+const FAILED: u32 = 4; // the new target could not be captured; the agent ends
+
+/// How long the agent waits for a frame before looking for a new target.
+const COMMAND_POLL_MS: u32 = 30;
 
 #[derive(Clone, Copy)]
 struct Msg {
@@ -303,8 +307,9 @@ fn acquire(km: &IDXGIKeyedMutex, key: u64, ms: u32) -> bool {
     unsafe { (Interface::vtable(km).AcquireSync)(Interface::as_raw(km), key, ms) == S_OK }
 }
 
-/// The display named `device` (`\\.\DISPLAY1`) and a device on its adapter.
-fn find_output(device: &str) -> Result<(Gpu, IDXGIOutput1)> {
+/// The display named `device` (`\\.\DISPLAY1`). `gpu` is kept when it is
+/// already on that display's adapter, else replaced by a device on it.
+fn find_output(device: &str, gpu: &mut Option<Gpu>) -> Result<IDXGIOutput1> {
     unsafe {
         let factory: IDXGIFactory1 = CreateDXGIFactory1()?;
         let mut i = 0;
@@ -315,7 +320,14 @@ fn find_output(device: &str) -> Result<(Gpu, IDXGIOutput1)> {
                 j += 1;
                 let output: IDXGIOutput1 = output.cast()?;
                 if crate::capture::device_name(&output)? == device {
-                    return Ok((Gpu::new(adapter)?, output));
+                    let luid = adapter.GetDesc1()?.AdapterLuid;
+                    let same = gpu
+                        .as_ref()
+                        .is_some_and(|g| g.luid.LowPart == luid.LowPart && g.luid.HighPart == luid.HighPart);
+                    if !same {
+                        *gpu = Some(Gpu::new(adapter)?);
+                    }
+                    return Ok(output);
                 }
             }
         }
@@ -323,50 +335,88 @@ fn find_output(device: &str) -> Result<(Gpu, IDXGIOutput1)> {
     bail!("no display {device}")
 }
 
-/// `remote-control capture-agent <device>`, started by the helper as the
-/// console user: captures the display into the shared ring and tells the
-/// helper about each frame on stdout. Ends when the helper closes stdin.
-pub fn serve(device: &str) -> Result<()> {
+/// Starts WGC on `target`: a display (`\\.\DISPLAY1`) or `window:<hwnd>|<display>`.
+fn open_target(target: &str, gpu: &mut Option<Gpu>) -> Result<Wgc> {
+    if let Some(rest) = target.strip_prefix("window:") {
+        let (hwnd_str, disp) = rest.split_once('|').context("invalid window target")?;
+        let hwnd_raw: u64 = hwnd_str.parse().context("invalid window hwnd")?;
+        find_output(disp, gpu)?;
+        Wgc::start_window(gpu.as_ref().expect("set by find_output"), HWND(hwnd_raw as usize as *mut _))
+    } else {
+        let output = find_output(target, gpu)?;
+        let hdr_info = crate::hdr::query_display_hdr(target);
+        let monitor = unsafe { output.GetDesc()? }.Monitor;
+        Wgc::start(gpu.as_ref().expect("set by find_output"), monitor, hdr_info.hdr_enabled)
+    }
+}
+
+/// `remote-control capture-agent <target>`, started by the helper as the
+/// console user: captures the target into the shared ring and tells the
+/// helper about each frame on stdout. A line `open <target>` on stdin moves
+/// it to another display or window (new ring textures follow), so switching
+/// displays skips starting a process and a graphics device. Ends when the
+/// helper closes stdin.
+pub fn serve(first: &str) -> Result<()> {
     // stdout carries the frames.
     crate::stats::QUIET.store(true, std::sync::atomic::Ordering::Relaxed);
     let _boost = crate::pipeline::StreamingBoost::enter();
     unsafe { RoInitialize(RO_INIT_MULTITHREADED) }.context("RoInitialize")?;
-    std::thread::spawn(|| {
-        let _ = std::io::stdin().read_to_end(&mut Vec::new());
+    let (cmd_tx, cmd_rx) = mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        for line in BufReader::new(std::io::stdin()).lines().map_while(Result::ok) {
+            if let Some(t) = line.strip_prefix("open ")
+                && cmd_tx.send(t.trim().to_string()).is_err()
+            {
+                break;
+            }
+        }
         std::process::exit(0);
     });
-    let (gpu, wgc) = if let Some(rest) = device.strip_prefix("window:") {
-        let (hwnd_str, disp) = rest.split_once('|').context("invalid window target")?;
-        let hwnd_raw: u64 = hwnd_str.parse().context("invalid window hwnd")?;
-        let (gpu, _output) = find_output(disp)?;
-        let wgc = Wgc::start_window(&gpu, HWND(hwnd_raw as usize as *mut _))?;
-        (gpu, wgc)
-    } else {
-        let (gpu, output) = find_output(device)?;
-        let hdr_info = crate::hdr::query_display_hdr(device);
-        let wgc = Wgc::start(&gpu, unsafe { output.GetDesc()? }.Monitor, hdr_info.hdr_enabled)?;
-        (gpu, wgc)
-    };
     let mut out = std::io::stdout().lock();
+    let mut gpu: Option<Gpu> = None;
+    let mut target = first.to_string();
+    loop {
+        let wgc = match open_target(&target, &mut gpu) {
+            Ok(w) => w,
+            Err(e) => {
+                let _ = Msg { kind: FAILED, slot: 0, a: 0, b: 0 }.write(&mut out);
+                return Err(e);
+            }
+        };
+        let gpu = gpu.as_ref().expect("set by open_target");
+        match serve_target(gpu, &wgc, &mut out, &cmd_rx)? {
+            Some(next) => target = next,
+            None => return Ok(()),
+        }
+    }
+}
+
+/// Streams one target until the helper names another (returned) or the
+/// capture or the helper is gone (`None`).
+fn serve_target(gpu: &Gpu, wgc: &Wgc, out: &mut impl Write, cmds: &mpsc::Receiver<String>) -> Result<Option<String>> {
     let mut ring = Vec::new();
     for slot in 0..RING {
         let misc = (D3D11_RESOURCE_MISC_SHARED_NTHANDLE.0 | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX.0) as u32;
         let t = if wgc.fp16 {
-            crate::capture::fp16_texture(&gpu, wgc.width, wgc.height, misc)?
+            crate::capture::fp16_texture(gpu, wgc.width, wgc.height, misc)?
         } else {
-            crate::capture::bgra_texture(&gpu, wgc.width, wgc.height, misc)?
+            crate::capture::bgra_texture(gpu, wgc.width, wgc.height, misc)?
         };
         let access = DXGI_SHARED_RESOURCE_READ.0 | DXGI_SHARED_RESOURCE_WRITE.0;
         let h = unsafe { t.cast::<IDXGIResource1>()?.CreateSharedHandle(None, access, PCWSTR::null())? };
         let size = wgc.width as u64 | (wgc.height as u64) << 32;
-        Msg { kind: TEXTURE, slot: slot as u32, a: h.0 as u64, b: size }.write(&mut out)?;
+        Msg { kind: TEXTURE, slot: slot as u32, a: h.0 as u64, b: size }.write(out)?;
         let km = t.cast::<IDXGIKeyedMutex>()?;
         ring.push((t, km));
     }
     let mut next = 0;
     loop {
+        // The newest target asked for, if any.
+        if let Some(t) = cmds.try_iter().last() {
+            return Ok(Some(t));
+        }
         let mut sent_slot = None;
-        let at = match wgc.grab_with(1000, |tex| {
+        let at = match wgc.grab_with(COMMAND_POLL_MS, |tex| {
             // A slot the helper is done with; none: it is behind, skip this frame.
             if let Some(slot) = (0..RING).map(|k| (next + k) % RING).find(|&s| acquire(&ring[s].1, 0, 0)) {
                 unsafe {
@@ -380,14 +430,14 @@ pub fn serve(device: &str) -> Result<()> {
             Grab::New { present_qpc } => present_qpc,
             Grab::Timeout => continue,
             Grab::Lost => {
-                let _ = Msg { kind: RESIZED, slot: 0, a: 0, b: 0 }.write(&mut out);
-                return Ok(());
+                let _ = Msg { kind: RESIZED, slot: 0, a: 0, b: 0 }.write(out);
+                return Ok(None);
             }
         };
         let Some(slot) = sent_slot else { continue };
         next = (slot + 1) % RING;
-        if (Msg { kind: FRAME, slot: slot as u32, a: at as u64, b: 0 }).write(&mut out).is_err() {
-            return Ok(());
+        if (Msg { kind: FRAME, slot: slot as u32, a: at as u64, b: 0 }).write(out).is_err() {
+            return Ok(None);
         }
     }
 }
@@ -395,7 +445,7 @@ pub fn serve(device: &str) -> Result<()> {
 /// The helper's end: the agent process and the textures it fills.
 pub struct Agent {
     /// Its job is killed when dropped; closing its stdin ends it too.
-    _exec: term_proc::Exec,
+    exec: term_proc::Exec,
     rx: mpsc::Receiver<Msg>,
     ring: Vec<(ID3D11Texture2D, IDXGIKeyedMutex)>,
     /// The slot consumed last (see `again_with`).
@@ -406,11 +456,42 @@ pub struct Agent {
 }
 
 impl Agent {
-    /// Starts the agent as the console user on display `device` and opens
-    /// its textures on `gpu` (the adapter that drives that display).
-    pub fn start(gpu: &Gpu, device: &str) -> Result<Agent> {
+    /// The agent on `target` (see `serve`): `prev` moved there when given and
+    /// still running, else a new one.
+    pub fn open(gpu: &Gpu, target: &str, prev: Option<Agent>) -> Result<Agent> {
+        if let Some(p) = prev {
+            match p.retarget(gpu, target) {
+                Ok(a) => return Ok(a),
+                Err(e) => log!("capture agent: {e:#}; starting a new one"),
+            }
+        }
+        Self::start(gpu, target)
+    }
+
+    /// Moves the running agent to `target`: no new process, and its graphics
+    /// device stays when the display is on the same adapter.
+    fn retarget(mut self, gpu: &Gpu, target: &str) -> Result<Agent> {
         let t0 = Instant::now();
-        let exec = term_proc::self_piped(&format!("capture-agent \"{device}\""))?;
+        (&self.exec.stdin)
+            .write_all(format!("open {target}\n").as_bytes())
+            .and_then(|()| (&self.exec.stdin).flush())
+            .context("the capture agent is gone")?;
+        self.ring.clear();
+        self.last.set(None);
+        self.receive_ring(gpu, true)?;
+        log!(
+            "capture agent moved to {target} in {} ms{}",
+            t0.elapsed().as_millis(),
+            if self.fp16 { " (HDR FP16)" } else { "" }
+        );
+        Ok(self)
+    }
+
+    /// Starts the agent as the console user on `target` and opens its
+    /// textures on `gpu` (the adapter that drives that display).
+    pub fn start(gpu: &Gpu, target: &str) -> Result<Agent> {
+        let t0 = Instant::now();
+        let exec = term_proc::self_piped(&format!("capture-agent \"{target}\""))?;
         let err = exec.stderr.try_clone()?;
         std::thread::Builder::new().name("capture-agent-err".into()).spawn(move || {
             for line in BufReader::new(err).lines().map_while(Result::ok) {
@@ -426,22 +507,40 @@ impl Agent {
                 }
             }
         })?;
+        let mut a = Agent { exec, rx, ring: Vec::new(), last: std::cell::Cell::new(None), width: 0, height: 0, fp16: false };
+        a.receive_ring(gpu, false)?;
+        log!("capture agent ready in {} ms{}", t0.elapsed().as_millis(), if a.fp16 { " (HDR FP16)" } else { "" });
+        Ok(a)
+    }
+
+    /// Opens the agent's new ring textures. `skip_old`: frames and the end of
+    /// the last target may come first.
+    fn receive_ring(&mut self, gpu: &Gpu, skip_old: bool) -> Result<()> {
         let dev1: ID3D11Device1 = gpu.device.cast()?;
         let mut ring = Vec::new();
         let (mut width, mut height) = (0, 0);
         while ring.len() < RING {
-            let m = match rx.recv_timeout(START_WAIT) {
+            let m = match self.rx.recv_timeout(START_WAIT) {
                 Ok(m) => m,
                 Err(RecvTimeoutError::Timeout) => bail!("the capture agent did not start within {} s", START_WAIT.as_secs()),
                 Err(RecvTimeoutError::Disconnected) => bail!("the capture agent ended"),
             };
-            if m.kind != TEXTURE || m.slot as usize != ring.len() {
+            if m.kind == FAILED {
+                bail!("the capture agent could not capture the target");
+            }
+            if m.kind != TEXTURE {
+                if skip_old && ring.is_empty() {
+                    continue;
+                }
                 bail!("the capture agent sent {} before its textures", m.kind);
+            }
+            if m.slot as usize != ring.len() {
+                bail!("the capture agent sent texture {} out of order", m.slot);
             }
             let tex: ID3D11Texture2D = unsafe {
                 let mut mine = HANDLE::default();
                 let theirs = HANDLE(m.a as usize as *mut _);
-                DuplicateHandle(exec.proc.handle(), theirs, GetCurrentProcess(), &mut mine, 0, false, DUPLICATE_SAME_ACCESS)
+                DuplicateHandle(self.exec.proc.handle(), theirs, GetCurrentProcess(), &mut mine, 0, false, DUPLICATE_SAME_ACCESS)
                     .context("DuplicateHandle")?;
                 let t = dev1.OpenSharedResource1(mine);
                 let _ = CloseHandle(mine);
@@ -457,8 +556,9 @@ impl Agent {
             unsafe { first_tex.GetDesc(&mut desc) };
             fp16 = desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT;
         }
-        log!("capture agent ready in {} ms{}", t0.elapsed().as_millis(), if fp16 { " (HDR FP16)" } else { "" });
-        Ok(Agent { _exec: exec, rx, ring, last: std::cell::Cell::new(None), width, height, fp16 })
+        self.ring = ring;
+        (self.width, self.height, self.fp16) = (width, height, fp16);
+        Ok(())
     }
 
     /// Returns the shared ring textures opened on the helper's D3D11 device so

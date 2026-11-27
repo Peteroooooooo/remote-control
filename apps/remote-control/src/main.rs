@@ -19,6 +19,7 @@ mod cursor;
 mod decode;
 mod desktop;
 mod discovery;
+mod doctor;
 mod encode;
 mod gdi;
 mod enctest;
@@ -164,6 +165,11 @@ enum Cmd {
     ServiceStatus,
     /// Check for a newer release and optionally download and install it.
     Update(update::UpdateArgs),
+    /// Diagnose P2P hole-punching, IPv6, proxy/TUN, firewall and relay connectivity.
+    Doctor(doctor::DoctorArgs),
+    /// Elevated network fix helper invoked by the lobby.
+    #[command(hide = true)]
+    FixNet(doctor::FixNetArgs),
     #[command(hide = true)]
     ApplyUpdate(update::ApplyUpdateArgs),
     /// Started by the service manager.
@@ -196,7 +202,7 @@ fn needs_parent_console() -> bool {
     };
     let is_gui_or_bg = matches!(
         first.to_str(),
-        Some("lobby" | "service" | "helper" | "capture-agent" | "clip-files" | "audio-agent" | "apply-update")
+        Some("lobby" | "service" | "helper" | "capture-agent" | "clip-files" | "audio-agent" | "apply-update" | "fix-net")
     );
     if !is_gui_or_bg {
         return true;
@@ -296,6 +302,8 @@ fn main() -> Result<()> {
         }
         Cmd::ServiceStatus => install::status(),
         Cmd::Update(a) => update::run_cli(a),
+        Cmd::Doctor(a) => doctor::run_cli(a),
+        Cmd::FixNet(a) => doctor::run_fix_net(a),
         Cmd::ApplyUpdate(a) => update::apply_update(a),
         Cmd::Service { key } => service::run(key),
         Cmd::Helper(mut a) => {

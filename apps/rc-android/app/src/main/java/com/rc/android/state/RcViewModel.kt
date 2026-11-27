@@ -255,7 +255,10 @@ class RcViewModel : ViewModel(), NativeCallback {
         val initRelayOnly = _ui.value.quality.relayOnly
         ioExecutor.execute {
             val err = RcNative.nativeConnect(device.id, initFitW, initFitH, 60, initRelayOnly)
-            if (err.isNotEmpty()) {
+            if (err.isEmpty()) {
+                // Before the handshake goes out: the Hub preview starts at its low preset.
+                sendHostQualityNow()
+            } else {
                 _ui.update {
                     it.copy(
                         sessionPhase = SessionPhase.Error,
@@ -284,6 +287,7 @@ class RcViewModel : ViewModel(), NativeCallback {
                     touchMode = physicalTouchMode,
                 )
             }
+            syncHostQuality()
         }
     }
 
@@ -304,6 +308,7 @@ class RcViewModel : ViewModel(), NativeCallback {
                     virtualDisplay = VirtualDisplayState(),
                 )
             }
+            syncHostQuality()
         }
     }
 
@@ -392,6 +397,7 @@ class RcViewModel : ViewModel(), NativeCallback {
                 touchMode = physicalTouchMode,
             )
         }
+        syncHostQuality()
     }
 
     fun requestKeyframe() {
@@ -412,20 +418,37 @@ class RcViewModel : ViewModel(), NativeCallback {
             next.mbpsPreset != prev.mbpsPreset ||
             next.sharpText != prev.sharpText
         ) {
-            applyQualityToHost(next)
+            syncHostQuality()
         }
     }
 
-    private fun applyQualityToHost(q: QualityPrefs) {
-        val (fitW, fitH, shortSide) = when (q.resPreset) {
-            0 -> Triple(3840, 2160, 0) // 自动：默认原生清晰度（上限 4K），弱网时电脑自动降档
-            1 -> Triple(0, 0, 0)       // 原生：锁定原始分辨率不降档
-            else -> Triple(0, 0, q.resPreset.coerceIn(480, 2160))
-        }
-        val autoFps = q.fpsPreset == 0
-        val fps = if (autoFps) 60 else q.fpsPreset.coerceIn(15, 240)
-        val kbps = if (q.mbpsPreset <= 0) 0 else q.mbpsPreset * 1000
-        ioExecutor.execute {
+    private val hostQualityLock = Any()
+
+    /**
+     * Tells the host which picture to stream for the current layer: the Hub's small live
+     * preview gets a fixed low preset, Fullscreen gets the user's choice. Reads the state
+     * when it runs (under a lock) so quick Hub/Fullscreen toggles always end on the latest.
+     */
+    private fun syncHostQuality() {
+        ioExecutor.execute { sendHostQualityNow() }
+    }
+
+    private fun sendHostQualityNow() {
+        synchronized(hostQualityLock) {
+            val st = _ui.value
+            if (st.layer == AppLayer.Hub) {
+                RcNative.nativeSetQuality(0, 0, HUB_PREVIEW_SHORT, HUB_PREVIEW_FPS, HUB_PREVIEW_KBPS, false, false)
+                return
+            }
+            val q = st.quality
+            val (fitW, fitH, shortSide) = when (q.resPreset) {
+                0 -> Triple(3840, 2160, 0) // 自动：默认原生清晰度（上限 4K），弱网时电脑自动降档
+                1 -> Triple(0, 0, 0)       // 原生：锁定原始分辨率不降档
+                else -> Triple(0, 0, q.resPreset.coerceIn(480, 2160))
+            }
+            val autoFps = q.fpsPreset == 0
+            val fps = if (autoFps) 60 else q.fpsPreset.coerceIn(15, 240)
+            val kbps = if (q.mbpsPreset <= 0) 0 else q.mbpsPreset * 1000
             RcNative.nativeSetQuality(fitW, fitH, shortSide, fps, kbps, false, autoFps)
         }
     }
@@ -601,10 +624,7 @@ class RcViewModel : ViewModel(), NativeCallback {
             )
         }
         if (phase == SessionPhase.Connected) {
-            val q = _ui.value.quality
-            if (q.resPreset != 0 || q.fpsPreset != 0 || q.mbpsPreset != 0) {
-                applyQualityToHost(q)
-            }
+            syncHostQuality()
         }
     }
 
@@ -890,5 +910,11 @@ class RcViewModel : ViewModel(), NativeCallback {
         private const val TAG = "RcViewModel"
         private const val SETTINGS_PREFS = "rc_settings"
         const val MAX_NAME_LEN = 32
+
+        // Hub live preview: about the size the TV frame shows it at, kept cheap on the
+        // phone's WiFi and battery. Fullscreen switches back to the user's choice.
+        private const val HUB_PREVIEW_SHORT = 720
+        private const val HUB_PREVIEW_FPS = 15
+        private const val HUB_PREVIEW_KBPS = 1500
     }
 }

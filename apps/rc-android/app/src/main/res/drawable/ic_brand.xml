@@ -1,0 +1,70 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
+    android:width="26dp"
+    android:height="26dp"
+    android:viewportWidth="256"
+    android:viewportHeight="256">
+
+    <!-- 1:1 match of Windows remote-control assets/icon.svg (full bleed, no adaptive safe-zone padding) -->
+    <group
+        android:scaleX="1.0909"
+        android:scaleY="1.0909"
+        android:translateX="-11.636"
+        android:translateY="-10.545">
+
+        <!-- Back window (top-right) -->
+        <path
+            android:fillColor="#7DB8FF"
+            android:pathData="M112,30 H218 A20,20 0 0,1 238,50 V124 A20,20 0 0,1 218,144 H112 A20,20 0 0,1 92,124 V50 A20,20 0 0,1 112,30 Z" />
+
+        <!-- Back window inner pane -->
+        <path
+            android:fillAlpha="0.45"
+            android:fillColor="#FFFFFF"
+            android:pathData="M112,60 H218 A8,8 0 0,1 226,68 V124 A8,8 0 0,1 218,132 H112 A8,8 0 0,1 104,124 V68 A8,8 0 0,1 112,60 Z" />
+
+        <!-- Front window (bottom-left) with exact Windows icon diagonal gradient -->
+        <path android:pathData="M40,92 H160 A22,22 0 0,1 182,114 V202 A22,22 0 0,1 160,224 H40 A22,22 0 0,1 18,202 V114 A22,22 0 0,1 40,92 Z">
+            <aapt:attr name="android:fillColor">
+                <gradient
+                    android:endX="182"
+                    android:endY="224"
+                    android:startX="18"
+                    android:startY="92"
+                    android:type="linear">
+                    <item
+                        android:color="#2563C9"
+                        android:offset="0" />
+                    <item
+                        android:color="#153B80"
+                        android:offset="1" />
+                </gradient>
+            </aapt:attr>
+        </path>
+
+        <!-- Front window dark screen interior -->
+        <path
+            android:fillColor="#0B1A36"
+            android:pathData="M40,124 H160 A10,10 0 0,1 170,134 V202 A10,10 0 0,1 160,212 H40 A10,10 0 0,1 30,202 V134 A10,10 0 0,1 40,124 Z" />
+
+        <!-- Front window top-left accent pill -->
+        <path
+            android:fillColor="#7DB8FF"
+            android:pathData="M35,103 H47 A3,3 0 0,1 50,106 V111 A3,3 0 0,1 47,114 H35 A3,3 0 0,1 32,111 V106 A3,3 0 0,1 35,103 Z" />
+
+        <!-- Crisp white cursor bridging the two windows -->
+        <group
+            android:scaleX="0.76"
+            android:scaleY="0.76"
+            android:translateX="150"
+            android:translateY="70">
+            <path
+                android:fillColor="#FFFFFF"
+                android:pathData="M0,0 L0,92 L24,70 L40,106 L58,98 L42,63 L74,63 Z"
+                android:strokeColor="#0B1A36"
+                android:strokeLineJoin="round"
+                android:strokeWidth="12" />
+        </group>
+    </group>
+</vector>

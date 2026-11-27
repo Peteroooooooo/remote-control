@@ -117,7 +117,20 @@ struct Consts {
 
 const _: () = assert!(std::mem::size_of::<Consts>() == 32);
 
-fn compile(entry: PCSTR) -> Result<ID3DBlob> {
+/// The compiled shader: compiled once per process, not for every new picture.
+fn compile(entry: PCSTR) -> Result<Vec<u8>> {
+    static CACHE: std::sync::Mutex<Vec<(String, Vec<u8>)>> = std::sync::Mutex::new(Vec::new());
+    let key = unsafe { entry.display() }.to_string();
+    if let Some((_, code)) = CACHE.lock().unwrap().iter().find(|(k, _)| *k == key) {
+        return Ok(code.clone());
+    }
+    let code = compile_now(entry)?;
+    let bytes = unsafe { std::slice::from_raw_parts(code.GetBufferPointer() as *const u8, code.GetBufferSize()) }.to_vec();
+    CACHE.lock().unwrap().push((key, bytes.clone()));
+    Ok(bytes)
+}
+
+fn compile_now(entry: PCSTR) -> Result<ID3DBlob> {
     unsafe {
         let mut code: Option<ID3DBlob> = None;
         let mut errors: Option<ID3DBlob> = None;
@@ -184,10 +197,9 @@ impl ToAyuv {
         }
         unsafe {
             let create_cs = |entry: PCSTR, label: &str| -> Result<ID3D11ComputeShader> {
-                let code = compile(entry)?;
-                let bytes = std::slice::from_raw_parts(code.GetBufferPointer() as *const u8, code.GetBufferSize());
+                let bytes = compile(entry)?;
                 let mut cs = None;
-                gpu.device.CreateComputeShader(bytes, None, Some(&mut cs))?;
+                gpu.device.CreateComputeShader(&bytes, None, Some(&mut cs))?;
                 cs.with_context(|| format!("no {label}"))
             };
             let cs = create_cs(s!("main"), "shader")?;
@@ -322,7 +334,7 @@ mod tests {
     fn hlsl_444_sdr_and_hdr_shaders_compile() {
         for entry in [s!("main"), s!("main_down"), s!("main_hdr"), s!("main_down_hdr")] {
             let blob = compile(entry).expect("yuv444 HLSL compile failed");
-            assert!(unsafe { blob.GetBufferSize() } > 0);
+            assert!(!blob.is_empty());
         }
     }
 }

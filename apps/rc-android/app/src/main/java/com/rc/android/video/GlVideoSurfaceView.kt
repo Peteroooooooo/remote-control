@@ -10,6 +10,9 @@ import android.opengl.EGLExt
 import android.opengl.EGLSurface
 import android.opengl.GLES11Ext
 import android.opengl.GLES20
+import android.os.Handler
+import android.os.Looper
+import android.os.SystemClock
 import android.util.Log
 import android.view.Surface
 import android.view.SurfaceHolder
@@ -18,6 +21,8 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.FloatBuffer
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.math.abs
+import kotlin.math.roundToInt
 
 /**
  * Hardware zero-copy MediaCodec -> SurfaceTexture (OES) -> EGL/GLES 2.0 -> SurfaceView renderer.
@@ -32,6 +37,8 @@ class GlVideoSurfaceView(
     context: Context,
     private val onDecoderSurfaceReady: (Surface) -> Unit,
     private val onDecoderSurfaceDestroyed: (Surface) -> Unit,
+    ambient: Boolean = false,
+    onAmbientColors: ((top: Int, right: Int, bottom: Int, left: Int) -> Unit)? = null,
 ) : SurfaceView(context), SurfaceHolder.Callback {
 
     @Volatile private var streamWidth: Int = 1920
@@ -43,7 +50,11 @@ class GlVideoSurfaceView(
     @Volatile private var bgR: Float = 0f
     @Volatile private var bgG: Float = 0f
     @Volatile private var bgB: Float = 0f
+    @Volatile private var ambientEnabled: Boolean = ambient
+    @Volatile private var ambientColorsCallback: ((top: Int, right: Int, bottom: Int, left: Int) -> Unit)? =
+        onAmbientColors
 
+    private val mainHandler = Handler(Looper.getMainLooper())
     private var renderThread: RenderThread? = null
 
     init {
@@ -60,6 +71,8 @@ class GlVideoSurfaceView(
         outsideR: Float = 0f,
         outsideG: Float = 0f,
         outsideB: Float = 0f,
+        ambient: Boolean = ambientEnabled,
+        onAmbientColors: ((top: Int, right: Int, bottom: Int, left: Int) -> Unit)? = ambientColorsCallback,
     ) {
         val changed = streamWidth != streamW ||
             streamHeight != streamH ||
@@ -69,7 +82,8 @@ class GlVideoSurfaceView(
             cornerRadiusPx != cornerRadius ||
             bgR != outsideR ||
             bgG != outsideG ||
-            bgB != outsideB
+            bgB != outsideB ||
+            ambientEnabled != ambient
         streamWidth = streamW.coerceAtLeast(1)
         streamHeight = streamH.coerceAtLeast(1)
         zoomScale = zoom.coerceIn(1f, 6f)
@@ -79,6 +93,8 @@ class GlVideoSurfaceView(
         bgR = outsideR.coerceIn(0f, 1f)
         bgG = outsideG.coerceIn(0f, 1f)
         bgB = outsideB.coerceIn(0f, 1f)
+        ambientEnabled = ambient
+        ambientColorsCallback = onAmbientColors
         if (changed) {
             renderThread?.requestRender()
         }
@@ -107,6 +123,7 @@ class GlVideoSurfaceView(
         val rt = renderThread
         renderThread = null
         rt?.shutdownAndJoin()
+        mainHandler.removeCallbacksAndMessages(null)
     }
 
     private inner class RenderThread(
@@ -138,8 +155,30 @@ class GlVideoSurfaceView(
         private var uTexSizeLoc = -1
         private var uTexelsPerPxLoc = -1
         private var uBgColorLoc = -1
+        private var uAmbientEnabledLoc = -1
+        private var uAmbientTexelSizeLoc = -1
+        private var uAmbientCoverScaleLoc = -1
         private var aPosLoc = -1
         private var aTexLoc = -1
+
+        // Lazily initialized only when ambient mode is enabled
+        private var ambientProgram = 0
+        private var ambAPosLoc = -1
+        private var ambATexLoc = -1
+        private var ambUStMatrixLoc = -1
+        private var ambUTexelSizeLoc = -1
+        private var ambientFboId = 0
+        private var ambientTexId = 0
+        private var ambientFboW = 0
+        private var ambientFboH = 0
+        private var ambientReadBuffer: ByteBuffer? = null
+        private var ambientInitFailed = false
+        private var lastAmbientSampleMs = 0L
+        private var hasLastAmbientColors = false
+        private var lastTopColor = 0
+        private var lastRightColor = 0
+        private var lastBottomColor = 0
+        private var lastLeftColor = 0
 
         private val quadBuffer: FloatBuffer = ByteBuffer
             .allocateDirect(4 * 4 * 4)
@@ -282,11 +321,15 @@ class GlVideoSurfaceView(
             latchedW: Int,
             latchedH: Int,
         ) {
-            GLES20.glViewport(0, 0, vw, vh)
-            GLES20.glClearColor(0f, 0f, 0f, 1f)
-            GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
-
+            val useAmbient = ambientEnabled
             if (!hasFrame) {
+                GLES20.glViewport(0, 0, vw, vh)
+                if (useAmbient) {
+                    GLES20.glClearColor(bgR, bgG, bgB, 1f)
+                } else {
+                    GLES20.glClearColor(0f, 0f, 0f, 1f)
+                }
+                GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
                 EGL14.eglSwapBuffers(eglDisplay, eglSurface)
                 return
             }
@@ -317,10 +360,52 @@ class GlVideoSurfaceView(
             val left = cw * 0.5f + panX - scaledW * 0.5f
             val top = ch * 0.5f + panY - scaledH * 0.5f
 
+            var ambientReady = false
+            var coverScaleX = 1f
+            var coverScaleY = 1f
+            if (useAmbient) {
+                val targetW: Int
+                val targetH: Int
+                if (sw >= sh) {
+                    targetW = AMBIENT_LONG_EDGE
+                    targetH = (AMBIENT_LONG_EDGE / streamAspect).roundToInt().coerceIn(8, AMBIENT_LONG_EDGE)
+                } else {
+                    targetH = AMBIENT_LONG_EDGE
+                    targetW = (AMBIENT_LONG_EDGE * streamAspect).roundToInt().coerceIn(8, AMBIENT_LONG_EDGE)
+                }
+                ambientReady = renderAmbientPass(targetW, targetH)
+                if (viewAspect > streamAspect) {
+                    coverScaleX = 1f
+                    coverScaleY = streamAspect / viewAspect
+                } else {
+                    coverScaleX = viewAspect / streamAspect
+                    coverScaleY = 1f
+                }
+            } else {
+                hasLastAmbientColors = false
+                lastAmbientSampleMs = 0L
+            }
+
+            GLES20.glViewport(0, 0, vw, vh)
+            GLES20.glClearColor(0f, 0f, 0f, 1f)
+            GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
+
             GLES20.glUseProgram(program)
 
             GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
             GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, oesTexId)
+
+            if (ambientReady) {
+                GLES20.glActiveTexture(GLES20.GL_TEXTURE1)
+                GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, ambientTexId)
+                GLES20.glUniform1f(uAmbientEnabledLoc, 1f)
+                GLES20.glUniform2f(uAmbientTexelSizeLoc, 1f / ambientFboW.toFloat(), 1f / ambientFboH.toFloat())
+                GLES20.glUniform2f(uAmbientCoverScaleLoc, coverScaleX, coverScaleY)
+            } else if (useAmbient) {
+                GLES20.glUniform1f(uAmbientEnabledLoc, 2f)
+            } else {
+                GLES20.glUniform1f(uAmbientEnabledLoc, 0f)
+            }
 
             GLES20.glUniformMatrix4fv(uStMatrixLoc, 1, false, stMatrix, 0)
             GLES20.glUniform2f(uViewSizeLoc, cw, ch)
@@ -343,9 +428,235 @@ class GlVideoSurfaceView(
 
             GLES20.glDisableVertexAttribArray(aPosLoc)
             GLES20.glDisableVertexAttribArray(aTexLoc)
+            if (ambientReady) {
+                GLES20.glActiveTexture(GLES20.GL_TEXTURE1)
+                GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, 0)
+            }
+            GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
             GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, 0)
 
             EGL14.eglSwapBuffers(eglDisplay, eglSurface)
+        }
+
+        private fun ensureAmbientGl(targetW: Int, targetH: Int): Boolean {
+            if (ambientInitFailed) return false
+            if (ambientProgram == 0) {
+                val prog = buildProgram(AMBIENT_VERTEX_SHADER, AMBIENT_FRAGMENT_SHADER)
+                if (prog == 0) {
+                    ambientInitFailed = true
+                    return false
+                }
+                ambientProgram = prog
+                ambAPosLoc = GLES20.glGetAttribLocation(prog, "aPos")
+                ambATexLoc = GLES20.glGetAttribLocation(prog, "aTex")
+                ambUStMatrixLoc = GLES20.glGetUniformLocation(prog, "uStMatrix")
+                ambUTexelSizeLoc = GLES20.glGetUniformLocation(prog, "uTexelSize")
+                val ambUTexLoc = GLES20.glGetUniformLocation(prog, "uTex")
+                if (ambUTexLoc >= 0) {
+                    GLES20.glUseProgram(prog)
+                    GLES20.glUniform1i(ambUTexLoc, 0)
+                    GLES20.glUseProgram(0)
+                }
+            }
+            if (ambientTexId == 0) {
+                val tex = IntArray(1)
+                GLES20.glGenTextures(1, tex, 0)
+                ambientTexId = tex[0]
+                if (ambientTexId == 0) {
+                    ambientInitFailed = true
+                    return false
+                }
+                GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, ambientTexId)
+                GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
+                GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
+                GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
+                GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
+                GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, 0)
+            }
+            if (ambientFboId == 0) {
+                val fbo = IntArray(1)
+                GLES20.glGenFramebuffers(1, fbo, 0)
+                ambientFboId = fbo[0]
+                if (ambientFboId == 0) {
+                    ambientInitFailed = true
+                    return false
+                }
+            }
+            if (ambientFboW != targetW || ambientFboH != targetH) {
+                GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, ambientTexId)
+                GLES20.glTexImage2D(
+                    GLES20.GL_TEXTURE_2D,
+                    0,
+                    GLES20.GL_RGBA,
+                    targetW,
+                    targetH,
+                    0,
+                    GLES20.GL_RGBA,
+                    GLES20.GL_UNSIGNED_BYTE,
+                    null,
+                )
+                GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, 0)
+
+                GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, ambientFboId)
+                GLES20.glFramebufferTexture2D(
+                    GLES20.GL_FRAMEBUFFER,
+                    GLES20.GL_COLOR_ATTACHMENT0,
+                    GLES20.GL_TEXTURE_2D,
+                    ambientTexId,
+                    0,
+                )
+                val status = GLES20.glCheckFramebufferStatus(GLES20.GL_FRAMEBUFFER)
+                GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
+                if (status != GLES20.GL_FRAMEBUFFER_COMPLETE) {
+                    Log.w(TAG, "Ambient FBO incomplete: 0x${status.toString(16)}")
+                    ambientInitFailed = true
+                    return false
+                }
+                ambientFboW = targetW
+                ambientFboH = targetH
+                ambientReadBuffer = ByteBuffer.allocateDirect(targetW * targetH * 4).order(ByteOrder.nativeOrder())
+            }
+            return true
+        }
+
+        private fun renderAmbientPass(targetW: Int, targetH: Int): Boolean {
+            if (!ensureAmbientGl(targetW, targetH)) return false
+
+            GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, ambientFboId)
+            GLES20.glViewport(0, 0, targetW, targetH)
+
+            GLES20.glUseProgram(ambientProgram)
+            GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+            GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, oesTexId)
+
+            GLES20.glUniformMatrix4fv(ambUStMatrixLoc, 1, false, stMatrix, 0)
+            GLES20.glUniform2f(ambUTexelSizeLoc, 1f / targetW.toFloat(), 1f / targetH.toFloat())
+
+            quadBuffer.position(0)
+            GLES20.glEnableVertexAttribArray(ambAPosLoc)
+            GLES20.glVertexAttribPointer(ambAPosLoc, 2, GLES20.GL_FLOAT, false, 16, quadBuffer)
+
+            quadBuffer.position(2)
+            GLES20.glEnableVertexAttribArray(ambATexLoc)
+            GLES20.glVertexAttribPointer(ambATexLoc, 2, GLES20.GL_FLOAT, false, 16, quadBuffer)
+
+            GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
+
+            GLES20.glDisableVertexAttribArray(ambAPosLoc)
+            GLES20.glDisableVertexAttribArray(ambATexLoc)
+            GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, 0)
+
+            maybeSampleAmbientEdges(targetW, targetH)
+
+            GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
+            return true
+        }
+
+        private fun maybeSampleAmbientEdges(w: Int, h: Int) {
+            if (ambientColorsCallback == null) {
+                hasLastAmbientColors = false
+                return
+            }
+            val now = SystemClock.uptimeMillis()
+            if (hasLastAmbientColors && now - lastAmbientSampleMs < AMBIENT_SAMPLE_INTERVAL_MS) {
+                return
+            }
+            val buf = ambientReadBuffer ?: return
+            buf.position(0)
+            GLES20.glReadPixels(0, 0, w, h, GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, buf)
+            lastAmbientSampleMs = now
+
+            val bandY = AMBIENT_EDGE_BAND.coerceAtMost(h)
+            val bandX = AMBIENT_EDGE_BAND.coerceAtMost(w)
+
+            // FBO is OpenGL bottom-left origin: y = 0 is video bottom, y = h - 1 is video top.
+            val topColor = averageRegionColor(buf, w, 0, w, h - bandY, h)
+            val bottomColor = averageRegionColor(buf, w, 0, w, 0, bandY)
+            val leftColor = averageRegionColor(buf, w, 0, bandX, 0, h)
+            val rightColor = averageRegionColor(buf, w, w - bandX, w, 0, h)
+
+            val changed = !hasLastAmbientColors ||
+                colorChangedNoticeably(topColor, lastTopColor) ||
+                colorChangedNoticeably(rightColor, lastRightColor) ||
+                colorChangedNoticeably(bottomColor, lastBottomColor) ||
+                colorChangedNoticeably(leftColor, lastLeftColor)
+            if (!changed) return
+
+            lastTopColor = topColor
+            lastRightColor = rightColor
+            lastBottomColor = bottomColor
+            lastLeftColor = leftColor
+            hasLastAmbientColors = true
+
+            mainHandler.post {
+                ambientColorsCallback?.invoke(topColor, rightColor, bottomColor, leftColor)
+            }
+        }
+
+        private fun averageRegionColor(
+            buf: ByteBuffer,
+            strideW: Int,
+            x0: Int,
+            x1: Int,
+            y0: Int,
+            y1: Int,
+        ): Int {
+            var sumR = 0L
+            var sumG = 0L
+            var sumB = 0L
+            var count = 0
+            for (y in y0 until y1) {
+                var off = (y * strideW + x0) * 4
+                for (x in x0 until x1) {
+                    sumR += (buf.get(off).toInt() and 0xFF)
+                    sumG += (buf.get(off + 1).toInt() and 0xFF)
+                    sumB += (buf.get(off + 2).toInt() and 0xFF)
+                    off += 4
+                    count++
+                }
+            }
+            if (count == 0) return 0xFF000000.toInt()
+            val inv = 1f / (count * 255f)
+            return boostSaturationToArgb(sumR * inv, sumG * inv, sumB * inv)
+        }
+
+        private fun boostSaturationToArgb(rIn: Float, gIn: Float, bIn: Float): Int {
+            val luma = 0.2126f * rIn + 0.7152f * gIn + 0.0722f * bIn
+            val r = (luma + (rIn - luma) * AMBIENT_SATURATION).coerceIn(0f, 1f)
+            val g = (luma + (gIn - luma) * AMBIENT_SATURATION).coerceIn(0f, 1f)
+            val b = (luma + (bIn - luma) * AMBIENT_SATURATION).coerceIn(0f, 1f)
+            val ri = (r * 255f + 0.5f).toInt().coerceIn(0, 255)
+            val gi = (g * 255f + 0.5f).toInt().coerceIn(0, 255)
+            val bi = (b * 255f + 0.5f).toInt().coerceIn(0, 255)
+            return (0xFF shl 24) or (ri shl 16) or (gi shl 8) or bi
+        }
+
+        private fun colorChangedNoticeably(a: Int, b: Int): Boolean {
+            val dr = abs(((a ushr 16) and 0xFF) - ((b ushr 16) and 0xFF))
+            val dg = abs(((a ushr 8) and 0xFF) - ((b ushr 8) and 0xFF))
+            val db = abs((a and 0xFF) - (b and 0xFF))
+            return dr >= 6 || dg >= 6 || db >= 6 || (dr + dg + db) >= 12
+        }
+
+        private fun releaseAmbientGl() {
+            if (ambientFboId != 0) {
+                GLES20.glDeleteFramebuffers(1, intArrayOf(ambientFboId), 0)
+                ambientFboId = 0
+            }
+            if (ambientTexId != 0) {
+                GLES20.glDeleteTextures(1, intArrayOf(ambientTexId), 0)
+                ambientTexId = 0
+            }
+            if (ambientProgram != 0) {
+                GLES20.glDeleteProgram(ambientProgram)
+                ambientProgram = 0
+            }
+            ambientFboW = 0
+            ambientFboH = 0
+            ambientReadBuffer = null
+            ambientInitFailed = false
+            hasLastAmbientColors = false
+            lastAmbientSampleMs = 0L
         }
 
         private fun initGl(): Boolean {
@@ -393,6 +704,17 @@ class GlVideoSurfaceView(
             uTexSizeLoc = GLES20.glGetUniformLocation(program, "uTexSize")
             uTexelsPerPxLoc = GLES20.glGetUniformLocation(program, "uTexelsPerPx")
             uBgColorLoc = GLES20.glGetUniformLocation(program, "uBgColor")
+            uAmbientEnabledLoc = GLES20.glGetUniformLocation(program, "uAmbientEnabled")
+            uAmbientTexelSizeLoc = GLES20.glGetUniformLocation(program, "uAmbientTexelSize")
+            uAmbientCoverScaleLoc = GLES20.glGetUniformLocation(program, "uAmbientCoverScale")
+
+            // Bind distinct texture units for samplerExternalOES (0) and sampler2D (1)
+            GLES20.glUseProgram(program)
+            val uTexLoc = GLES20.glGetUniformLocation(program, "uTex")
+            if (uTexLoc >= 0) GLES20.glUniform1i(uTexLoc, 0)
+            val uAmbientTexLoc = GLES20.glGetUniformLocation(program, "uAmbientTex")
+            if (uAmbientTexLoc >= 0) GLES20.glUniform1i(uAmbientTexLoc, 1)
+            GLES20.glUseProgram(0)
 
             val tex = IntArray(1)
             GLES20.glGenTextures(1, tex, 0)
@@ -421,6 +743,8 @@ class GlVideoSurfaceView(
             }
             surfaceTexture = null
 
+            releaseAmbientGl()
+
             if (oesTexId != 0) {
                 GLES20.glDeleteTextures(1, intArrayOf(oesTexId), 0)
                 oesTexId = 0
@@ -447,6 +771,49 @@ class GlVideoSurfaceView(
 
     companion object {
         private const val TAG = "GlVideoSurfaceView"
+        private const val AMBIENT_LONG_EDGE = 32
+        private const val AMBIENT_EDGE_BAND = 3
+        private const val AMBIENT_SAMPLE_INTERVAL_MS = 300L
+        private const val AMBIENT_SATURATION = 1.4f
+
+        private const val AMBIENT_VERTEX_SHADER = """
+            precision mediump float;
+            attribute vec2 aPos;
+            attribute vec2 aTex;
+            varying vec2 vUv;
+            void main() {
+                gl_Position = vec4(aPos, 0.0, 1.0);
+                vUv = aTex;
+            }
+        """
+
+        private const val AMBIENT_FRAGMENT_SHADER = """
+            #extension GL_OES_EGL_image_external : require
+            precision mediump float;
+
+            uniform samplerExternalOES uTex;
+            uniform mat4 uStMatrix;
+            uniform vec2 uTexelSize;
+
+            varying vec2 vUv;
+
+            vec3 sampleOes(vec2 p) {
+                vec2 c = clamp(p, vec2(0.001), vec2(0.999));
+                vec2 uv = (uStMatrix * vec4(c, 0.0, 1.0)).xy;
+                return texture2D(uTex, uv).rgb;
+            }
+
+            void main() {
+                vec2 q = uTexelSize * 0.25;
+                vec3 col = 0.25 * (
+                    sampleOes(vUv + vec2(-q.x, -q.y)) +
+                    sampleOes(vUv + vec2( q.x, -q.y)) +
+                    sampleOes(vUv + vec2(-q.x,  q.y)) +
+                    sampleOes(vUv + vec2( q.x,  q.y))
+                );
+                gl_FragColor = vec4(col, 1.0);
+            }
+        """
 
         private const val VERTEX_SHADER = """
             precision highp float;
@@ -464,7 +831,10 @@ class GlVideoSurfaceView(
             #extension GL_OES_EGL_image_external : require
             precision highp float;
 
+            const vec3 LUMA_W = vec3(0.2126, 0.7152, 0.0722);
+
             uniform samplerExternalOES uTex;
+            uniform sampler2D uAmbientTex;
             uniform mat4 uStMatrix;
             uniform vec2 uViewSize;
             uniform vec4 uVideoRect; // left, top, width, height in top-left px
@@ -472,6 +842,9 @@ class GlVideoSurfaceView(
             uniform vec2 uTexSize;
             uniform float uTexelsPerPx;
             uniform vec3 uBgColor;
+            uniform float uAmbientEnabled;
+            uniform vec2 uAmbientTexelSize;
+            uniform vec2 uAmbientCoverScale;
 
             varying vec2 vScreenUv;
 
@@ -487,11 +860,25 @@ class GlVideoSurfaceView(
                 return texture2D(uTex, uv).rgb;
             }
 
+            vec3 sampleAmbient(vec2 uv) {
+                vec2 t = uAmbientTexelSize;
+                vec3 acc =
+                    texture2D(uAmbientTex, uv + vec2(-t.x, -t.y)).rgb * 1.0 +
+                    texture2D(uAmbientTex, uv + vec2( 0.0, -t.y)).rgb * 2.0 +
+                    texture2D(uAmbientTex, uv + vec2( t.x, -t.y)).rgb * 1.0 +
+                    texture2D(uAmbientTex, uv + vec2(-t.x,  0.0)).rgb * 2.0 +
+                    texture2D(uAmbientTex, uv                   ).rgb * 4.0 +
+                    texture2D(uAmbientTex, uv + vec2( t.x,  0.0)).rgb * 2.0 +
+                    texture2D(uAmbientTex, uv + vec2(-t.x,  t.y)).rgb * 1.0 +
+                    texture2D(uAmbientTex, uv + vec2( 0.0,  t.y)).rgb * 2.0 +
+                    texture2D(uAmbientTex, uv + vec2( t.x,  t.y)).rgb * 1.0;
+                return acc * 0.0625;
+            }
+
             // 5-tap Catmull-Rom cubic luma resampling matching the Windows viewer (torgb.rs):
             // keeps chroma purely smooth bilinear while sharpening luma curves with zero overshoot
             // and zero hue shift on colored text.
             vec3 sampleCatmullRomLuma(vec2 stNorm) {
-                const vec3 LUMA_W = vec3(0.2126, 0.7152, 0.0722);
                 vec3 base = sampleVideo(stNorm);
                 float yBase = dot(base, LUMA_W);
 
@@ -595,7 +982,23 @@ class GlVideoSurfaceView(
                 // Map screen pixel into video normalized [0..1] (top-left origin)
                 vec2 vidUv = (px - uVideoRect.xy) / uVideoRect.zw;
                 if (vidUv.x < 0.0 || vidUv.x > 1.0 || vidUv.y < 0.0 || vidUv.y > 1.0) {
-                    vec3 barCol = vec3(0.0);
+                    vec3 barCol;
+                    if (uAmbientEnabled > 1.5) {
+                        barCol = uBgColor;
+                    } else if (uAmbientEnabled > 0.5) {
+                        vec2 covUv = (vScreenUv - 0.5) * uAmbientCoverScale + 0.5;
+                        vec2 ambUv = vec2(covUv.x, 1.0 - covUv.y);
+                        vec3 amb = sampleAmbient(ambUv);
+                        float luma = dot(amb, LUMA_W);
+                        amb = clamp(mix(vec3(luma), amb, 1.4), 0.0, 1.0) * 0.5;
+
+                        vec2 clampedPx = clamp(px, uVideoRect.xy, uVideoRect.xy + uVideoRect.zw);
+                        float distToVideo = length(px - clampedPx);
+                        float shadow = mix(0.55, 1.0, smoothstep(0.0, 14.0, distToVideo));
+                        barCol = amb * shadow;
+                    } else {
+                        barCol = vec3(0.0);
+                    }
                     if (uCornerRadius > 0.5) {
                         vec2 halfView = uViewSize * 0.5;
                         float d = sdRoundedBox(px - halfView, halfView, uCornerRadius);

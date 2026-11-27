@@ -156,10 +156,11 @@ impl Capture {
     }
 
     /// WGC in an agent running as the console user (for the service's helper).
-    pub fn agent(gpu: &Gpu, output: &IDXGIOutput1) -> Result<Capture> {
+    /// `prev`: the last capture's agent, moved to this display when it still runs.
+    pub fn agent(gpu: &Gpu, output: &IDXGIOutput1, prev: Option<Agent>) -> Result<Capture> {
         let dev = device_name(output)?;
         let hdr_info = crate::hdr::query_display_hdr(&dev);
-        let a = Agent::start(gpu, &dev)?;
+        let a = Agent::open(gpu, &dev, prev)?;
         let (width, height, fp16) = (a.width, a.height, a.fp16);
         Ok(Capture {
             src: Source::Agent(a),
@@ -191,10 +192,10 @@ impl Capture {
     }
 
     /// Single-window WGC in the console-user capture agent (for the service's helper).
-    pub fn agent_window(gpu: &Gpu, output: &IDXGIOutput1, hwnd_raw: u64) -> Result<Capture> {
+    pub fn agent_window(gpu: &Gpu, output: &IDXGIOutput1, hwnd_raw: u64, prev: Option<Agent>) -> Result<Capture> {
         let dev = device_name(output)?;
         let target = format!("window:{hwnd_raw}|{dev}");
-        let a = Agent::start(gpu, &target)?;
+        let a = Agent::open(gpu, &target, prev)?;
         let (width, height, fp16) = (a.width, a.height, a.fp16);
         Ok(Capture {
             src: Source::Agent(a),
@@ -220,6 +221,14 @@ impl Capture {
             self.image = Some(tex);
         }
         Ok(self.image.as_ref().expect("created above"))
+    }
+
+    /// The agent behind this capture, kept for the next one (see `Agent::open`).
+    pub fn into_agent(self) -> Option<Agent> {
+        match self.src {
+            Source::Agent(a) => Some(a),
+            _ => None,
+        }
     }
 
     /// Whether the image comes from WGC (without the pointer).

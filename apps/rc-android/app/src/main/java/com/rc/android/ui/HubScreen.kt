@@ -1,11 +1,15 @@
 package com.rc.android.ui
 
-import android.content.res.Configuration
+import android.graphics.BlurMaskFilter
+import android.graphics.LinearGradient
+import android.graphics.Shader
 import android.view.Surface
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.Spring
+import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.animateDpAsState
+import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
@@ -19,6 +23,7 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
@@ -83,15 +88,23 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.draw.scale
 import androidx.compose.ui.draw.shadow
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Rect
+import androidx.compose.ui.layout.boundsInRoot
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.positionInRoot
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.TransformOrigin
+import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
+import androidx.compose.ui.graphics.nativeCanvas
+import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalConfiguration
@@ -110,12 +123,6 @@ import com.rc.android.model.QualityPrefs
 import com.rc.android.model.RcUiState
 import com.rc.android.model.RunningWindowItem
 import com.rc.android.model.SessionPhase
-
-private enum class HubForm {
-    PhonePortrait,
-    PhoneLandscape,
-    Tablet,
-}
 
 private data class DockAppGroup(
     val appKey: String,
@@ -138,14 +145,6 @@ fun HubScreen(
 ) {
     val c = RcThemeColors.current
     val config = LocalConfiguration.current
-    val isTablet = config.smallestScreenWidthDp >= 600
-    val isLandscape = config.orientation == Configuration.ORIENTATION_LANDSCAPE
-
-    val form = when {
-        isTablet -> HubForm.Tablet
-        isLandscape -> HubForm.PhoneLandscape
-        else -> HubForm.PhonePortrait
-    }
 
     // Tapping a Dock app floats that app's windows smoothly to the top (zero extra header row / layout jump)
     var dockPinnedApp by remember { mutableStateOf<String?>(null) }
@@ -181,68 +180,128 @@ fun HubScreen(
 
     val showFloatingDock = appGroups.size >= 2
 
-    val rootPaddingModifier = when (form) {
-        HubForm.PhonePortrait -> Modifier
-            .statusBarsPadding()
-            .navigationBarsPadding()
-        HubForm.PhoneLandscape -> Modifier
-            .displayCutoutPadding()
-            .navigationBarsPadding()
-        HubForm.Tablet -> Modifier
-            .statusBarsPadding()
-            .navigationBarsPadding()
+    // The layout follows the PC's main monitor only, so switching monitors never moves anything.
+    val mainRatio = remember(state.monitors, state.streamMeta.width, state.streamMeta.height) {
+        val m = state.monitors.firstOrNull { it.primary } ?: state.monitors.firstOrNull()
+        if (m != null && m.width > 0 && m.height > 0) {
+            m.width.toFloat() / m.height
+        } else if (state.streamMeta.width > 0 && state.streamMeta.height > 0) {
+            state.streamMeta.width.toFloat() / state.streamMeta.height
+        } else {
+            16f / 9f
+        }
     }
+    val glassBackdrop = rememberGlassBackdrop()
+    val halo = rememberHalo()
+    var tvBounds by remember { mutableStateOf(Rect.Zero) }
+    var haloOrigin by remember { mutableStateOf(Offset.Zero) }
+    val bottomClearance = if (showFloatingDock) 82.dp else 16.dp
+    val dockRoom = bottomClearance.value + 4f
 
-    Box(
+    BoxWithConstraints(
         modifier = Modifier
             .fillMaxSize()
             .background(c.bg)
-            .then(rootPaddingModifier),
+            .statusBarsPadding()
+            .navigationBarsPadding()
+            .displayCutoutPadding(),
     ) {
-        when (form) {
-            HubForm.PhonePortrait -> {
-                PhonePortraitHub(
+        // First pass on the whole area decides the arrangement, which picks the top bar;
+        // the second pass below sizes everything in the space that is really left.
+        val sideBySide = HubLayout.compute(
+            w = maxWidth.value - HUB_PAD_H * 2,
+            h = maxHeight.value - 58f,
+            pcRatio = mainRatio,
+            dockRoom = dockRoom,
+        ).sideBySide
+        val compactBar = sideBySide && maxHeight < 520.dp
+
+        Column(modifier = Modifier.fillMaxSize().glassBackdropSource(glassBackdrop)) {
+            if (sideBySide) {
+                WideHubTopBar(
                     state = state,
-                    dockPinnedApp = dockPinnedApp,
-                    dockPulseToken = dockPulseToken,
-                    appWindowCounts = appWindowCounts,
-                    visibleWindows = orderedWindows,
-                    showFloatingDock = showFloatingDock,
+                    compact = compactBar,
                     qualityPopoverOpen = qualityPopoverOpen,
                     onToggleQualityPopover = { qualityPopoverOpen = !qualityPopoverOpen },
                     onBackToDevices = onBackToDevices,
-                    onEnterFullscreen = onEnterFullscreen,
-                    onFocusWindow = onFocusWindow,
                     onSelectMonitor = onSelectMonitor,
-                    onReconnect = onReconnect,
                     onToggleOrientation = onToggleOrientation,
-                    onSurfaceReady = onSurfaceReady,
-                    onSurfaceDestroyed = onSurfaceDestroyed,
                 )
+            } else {
+                PortraitHubTopBar(
+                    state = state,
+                    qualityPopoverOpen = qualityPopoverOpen,
+                    onToggleQualityPopover = { qualityPopoverOpen = !qualityPopoverOpen },
+                    onBackToDevices = onBackToDevices,
+                    onToggleOrientation = onToggleOrientation,
+                )
+                if (state.monitors.size > 1) {
+                    Box(Modifier.fillMaxWidth().padding(top = 2.dp, bottom = 6.dp), contentAlignment = Alignment.Center) {
+                        MonitorSpacesPill(
+                            monitors = state.monitors,
+                            currentIndex = state.currentMonitorIndex,
+                            onSelect = onSelectMonitor,
+                        )
+                    }
+                }
             }
 
-            HubForm.PhoneLandscape, HubForm.Tablet -> {
-                WideHub(
-                    state = state,
-                    compact = form == HubForm.PhoneLandscape,
-                    dockPinnedApp = dockPinnedApp,
-                    dockPulseToken = dockPulseToken,
+            BoxWithConstraints(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .weight(1f)
+                    .padding(start = HUB_PAD_H.dp, end = HUB_PAD_H.dp, top = 4.dp),
+            ) {
+                val layout = HubLayout.compute(
+                    w = maxWidth.value,
+                    h = maxHeight.value,
+                    pcRatio = mainRatio,
+                    dockRoom = dockRoom,
+                    forceSide = sideBySide,
+                )
+                val tvRadius = HUB_TV_RADIUS
+                // Layers, bottom to top: window cards, desktop preview, colour halo (drawn
+                // above the page, so the cards never hide it). Stacked cards scroll up
+                // underneath the preview.
+                val listBox = if (layout.sideBySide) layout.list else DpBox(0f, 0f, layout.list.w, layout.list.y + layout.list.h)
+                MissionControlWindowsSection(
+                    windows = orderedWindows,
+                    appIcons = state.appIcons,
+                    windowThumbs = state.windowThumbs,
                     appWindowCounts = appWindowCounts,
-                    visibleWindows = orderedWindows,
-                    showFloatingDock = showFloatingDock,
-                    qualityPopoverOpen = qualityPopoverOpen,
-                    onToggleQualityPopover = { qualityPopoverOpen = !qualityPopoverOpen },
-                    onBackToDevices = onBackToDevices,
+                    pinnedAppKey = dockPinnedApp,
+                    pulseToken = dockPulseToken,
+                    columns = layout.columns,
+                    topClearance = if (layout.sideBySide) 4.dp else (layout.list.y + 4f).dp,
+                    bottomClearance = bottomClearance,
+                    onTapWindow = onFocusWindow,
+                    modifier = Modifier
+                        .offset(listBox.x.dp, listBox.y.dp)
+                        .size(listBox.w.dp, listBox.h.dp),
+                )
+                HubLiveDesktop(
+                    state = state,
+                    cornerRadius = tvRadius,
                     onEnterFullscreen = onEnterFullscreen,
-                    onFocusWindow = onFocusWindow,
-                    onSelectMonitor = onSelectMonitor,
                     onReconnect = onReconnect,
-                    onToggleOrientation = onToggleOrientation,
                     onSurfaceReady = onSurfaceReady,
                     onSurfaceDestroyed = onSurfaceDestroyed,
+                    modifier = Modifier
+                        .offset(layout.tv.x.dp, layout.tv.y.dp)
+                        .size(layout.tv.w.dp, layout.tv.h.dp)
+                        .onGloballyPositioned { tvBounds = it.boundsInRoot() },
                 )
             }
         }
+
+        // The halo sits outside the page the dock's glass blurs, so its turning doesn't
+        // make the dock blur the whole page again every frame.
+        Box(
+            Modifier
+                .matchParentSize()
+                .onGloballyPositioned { haloOrigin = it.positionInRoot() }
+                .ambientHalo(halo, { tvBounds.translate(-haloOrigin) }, HUB_TV_RADIUS),
+        )
 
         // True floating Liquid Glass Dock overlay in BOTH Portrait and Landscape/Tablet
         if (showFloatingDock) {
@@ -250,7 +309,8 @@ fun HubScreen(
                 appGroups = appGroups,
                 appIcons = state.appIcons,
                 selectedAppKey = dockPinnedApp,
-                compact = form != HubForm.Tablet,
+                backdrop = glassBackdrop,
+                compact = compactBar || !sideBySide,
                 onSelectAll = { dockPinnedApp = null },
                 onTapApp = { key ->
                     if (dockPinnedApp == key) {
@@ -263,7 +323,7 @@ fun HubScreen(
                 modifier = Modifier
                     .align(Alignment.BottomCenter)
                     .padding(horizontal = 12.dp)
-                    .padding(bottom = if (form == HubForm.PhoneLandscape) 8.dp else 10.dp),
+                    .padding(bottom = if (compactBar) 8.dp else 10.dp),
             )
         }
 
@@ -295,12 +355,12 @@ fun HubScreen(
             ),
             modifier = Modifier
                 .align(Alignment.TopCenter)
-                .padding(top = if (form == HubForm.PhoneLandscape) 48.dp else 62.dp)
+                .padding(top = if (compactBar) 48.dp else 62.dp)
                 .padding(horizontal = 12.dp, vertical = 4.dp),
         ) {
             val showRouteOption = state.ownRelayCount > 0 || state.activeDevice?.hasSelfHostedRelay == true
             val compactPopover = config.screenHeightDp < 480
-            val maxPopoverH = (config.screenHeightDp.dp - if (form == HubForm.PhoneLandscape) 64.dp else 96.dp).coerceAtLeast(160.dp)
+            val maxPopoverH = (config.screenHeightDp.dp - if (compactBar) 64.dp else 96.dp).coerceAtLeast(160.dp)
             val maxPopoverW = (config.screenWidthDp.dp - 24.dp).coerceAtLeast(220.dp)
             FloatingGlass(
                 cornerRadius = 20.dp,
@@ -334,160 +394,8 @@ fun HubScreen(
     }
 }
 
-@Composable
-private fun PhonePortraitHub(
-    state: RcUiState,
-    dockPinnedApp: String?,
-    dockPulseToken: Int,
-    appWindowCounts: Map<String, Int>,
-    visibleWindows: List<RunningWindowItem>,
-    showFloatingDock: Boolean,
-    qualityPopoverOpen: Boolean,
-    onToggleQualityPopover: () -> Unit,
-    onBackToDevices: () -> Unit,
-    onEnterFullscreen: () -> Unit,
-    onFocusWindow: (RunningWindowItem) -> Unit,
-    onSelectMonitor: (Int) -> Unit,
-    onReconnect: () -> Unit,
-    onToggleOrientation: () -> Unit,
-    onSurfaceReady: (Surface) -> Unit,
-    onSurfaceDestroyed: (Surface) -> Unit,
-) {
-    Column(modifier = Modifier.fillMaxSize()) {
-        PortraitHubTopBar(
-            state = state,
-            qualityPopoverOpen = qualityPopoverOpen,
-            onToggleQualityPopover = onToggleQualityPopover,
-            onBackToDevices = onBackToDevices,
-            onToggleOrientation = onToggleOrientation,
-        )
-
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(start = 14.dp, end = 14.dp, top = 6.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp),
-        ) {
-            Column(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalAlignment = Alignment.CenterHorizontally,
-                verticalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                if (state.monitors.size > 1) {
-                    MonitorSpacesPill(
-                        monitors = state.monitors,
-                        currentIndex = state.currentMonitorIndex,
-                        onSelect = onSelectMonitor,
-                    )
-                }
-
-                HubLiveDesktop(
-                    state = state,
-                    cornerRadius = 12.dp,
-                    onEnterFullscreen = onEnterFullscreen,
-                    onReconnect = onReconnect,
-                    onSurfaceReady = onSurfaceReady,
-                    onSurfaceDestroyed = onSurfaceDestroyed,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .aspectRatio(16f / 10f),
-                )
-            }
-
-            MissionControlWindowsSection(
-                windows = visibleWindows,
-                appIcons = state.appIcons,
-                windowThumbs = state.windowThumbs,
-                appWindowCounts = appWindowCounts,
-                pinnedAppKey = dockPinnedApp,
-                pulseToken = dockPulseToken,
-                compact = false,
-                bottomClearance = if (showFloatingDock) 82.dp else 20.dp,
-                onTapWindow = onFocusWindow,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .weight(1f),
-            )
-        }
-    }
-}
-
-@Composable
-private fun WideHub(
-    state: RcUiState,
-    compact: Boolean,
-    dockPinnedApp: String?,
-    dockPulseToken: Int,
-    appWindowCounts: Map<String, Int>,
-    visibleWindows: List<RunningWindowItem>,
-    showFloatingDock: Boolean,
-    qualityPopoverOpen: Boolean,
-    onToggleQualityPopover: () -> Unit,
-    onBackToDevices: () -> Unit,
-    onEnterFullscreen: () -> Unit,
-    onFocusWindow: (RunningWindowItem) -> Unit,
-    onSelectMonitor: (Int) -> Unit,
-    onReconnect: () -> Unit,
-    onToggleOrientation: () -> Unit,
-    onSurfaceReady: (Surface) -> Unit,
-    onSurfaceDestroyed: (Surface) -> Unit,
-) {
-    Column(modifier = Modifier.fillMaxSize()) {
-        WideHubTopBar(
-            state = state,
-            compact = compact,
-            qualityPopoverOpen = qualityPopoverOpen,
-            onToggleQualityPopover = onToggleQualityPopover,
-            onBackToDevices = onBackToDevices,
-            onSelectMonitor = onSelectMonitor,
-            onToggleOrientation = onToggleOrientation,
-        )
-
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .weight(1f)
-                .padding(
-                    start = if (compact) 16.dp else 18.dp,
-                    end = if (compact) 16.dp else 18.dp,
-                    top = if (compact) 4.dp else 6.dp,
-                    bottom = if (compact) 8.dp else 12.dp,
-                ),
-            horizontalArrangement = Arrangement.spacedBy(if (compact) 12.dp else 14.dp),
-        ) {
-            HubLiveDesktop(
-                state = state,
-                cornerRadius = 12.dp,
-                onEnterFullscreen = onEnterFullscreen,
-                onReconnect = onReconnect,
-                onSurfaceReady = onSurfaceReady,
-                onSurfaceDestroyed = onSurfaceDestroyed,
-                modifier = Modifier
-                    .weight(if (compact) 1.32f else 1.48f)
-                    .fillMaxHeight(),
-            )
-
-            MissionControlWindowsSection(
-                windows = visibleWindows,
-                appIcons = state.appIcons,
-                windowThumbs = state.windowThumbs,
-                appWindowCounts = appWindowCounts,
-                pinnedAppKey = dockPinnedApp,
-                pulseToken = dockPulseToken,
-                compact = compact,
-                bottomClearance = when {
-                    !showFloatingDock -> 12.dp
-                    compact -> 68.dp
-                    else -> 84.dp
-                },
-                onTapWindow = onFocusWindow,
-                modifier = Modifier
-                    .weight(if (compact) 0.92f else 0.95f)
-                    .fillMaxHeight(),
-            )
-        }
-    }
-}
+private const val HUB_PAD_H = 14f
+private val HUB_TV_RADIUS = 12.dp
 
 @Composable
 private fun HubTelemetryPill(
@@ -773,7 +681,6 @@ private fun HubLiveDesktop(
 ) {
     val c = RcThemeColors.current
     val isLive = state.sessionPhase == SessionPhase.Connected
-    val showAmbientBorder = false
     val shape = RoundedCornerShape(cornerRadius)
 
     Box(
@@ -783,23 +690,13 @@ private fun HubLiveDesktop(
                 pressedScale = 0.99f,
                 onClick = onEnterFullscreen,
             )
-            .ambientIntelligenceBorder(
-                enabled = showAmbientBorder,
-                cornerRadius = cornerRadius,
-            ),
+
     ) {
         Box(
             modifier = Modifier
                 .fillMaxSize()
                 .clip(shape)
-                .background(Color(0xFF111215))
-                .then(
-                    if (!showAmbientBorder) {
-                        Modifier.border(0.5.dp, Color(0x2EFFFFFF), shape)
-                    } else {
-                        Modifier
-                    },
-                ),
+                .background(Color(0xFF111215)),
         ) {
             VideoSurface(
                 streamWidth = state.streamMeta.width,
@@ -808,6 +705,7 @@ private fun HubLiveDesktop(
                 onSurfaceDestroyed = onSurfaceDestroyed,
                 cornerRadius = cornerRadius,
                 outsideColor = c.bg,
+                ambient = true,
                 modifier = Modifier.fillMaxSize(),
             )
 
@@ -948,13 +846,15 @@ private fun MissionControlWindowsSection(
     appWindowCounts: Map<String, Int>,
     pinnedAppKey: String?,
     pulseToken: Int,
-    compact: Boolean,
+    columns: Int,
+    topClearance: Dp,
     bottomClearance: Dp,
     onTapWindow: (RunningWindowItem) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val c = RcThemeColors.current
     val gridState = rememberLazyGridState()
+    val compact = false
 
     LaunchedEffect(pinnedAppKey, pulseToken) {
         if (windows.isNotEmpty()) {
@@ -966,6 +866,7 @@ private fun MissionControlWindowsSection(
         if (windows.isEmpty()) {
             Box(
                 modifier = Modifier
+                    .padding(top = topClearance)
                     .fillMaxWidth()
                     .clip(RoundedCornerShape(15.dp))
                     .background(c.bgCard)
@@ -980,14 +881,14 @@ private fun MissionControlWindowsSection(
                 )
             }
         } else {
-            val columns = if (windows.size == 1) 1 else 2
             LazyVerticalGrid(
                 state = gridState,
                 columns = GridCells.Fixed(columns),
-                modifier = Modifier.fillMaxSize(),
-                contentPadding = PaddingValues(top = 4.dp, bottom = bottomClearance),
-                horizontalArrangement = Arrangement.spacedBy(if (compact) 8.dp else 10.dp),
-                verticalArrangement = Arrangement.spacedBy(if (compact) 8.dp else 10.dp),
+                modifier = Modifier
+                    .fillMaxSize(),
+                contentPadding = PaddingValues(top = topClearance, bottom = bottomClearance),
+                horizontalArrangement = Arrangement.spacedBy(HubLayout.CARD_GAP.dp),
+                verticalArrangement = Arrangement.spacedBy(HubLayout.CARD_GAP.dp),
             ) {
                 items(windows, key = { it.id }) { win ->
                     val isPinned = pinnedAppKey != null && win.appKey == pinnedAppKey
@@ -1040,7 +941,6 @@ private fun cleanWindowSubtitle(rawTitle: String, appName: String): String {
 /**
  * A2+ Pure Apple Thumbnail Card:
  * - Zero solid black footer; full-bleed 16:10.5 rounded window thumbnail
- * - Subtle top stacked peek-lip when the same app has multiple open windows
  * - Soft app-tinted radial glow backdrop when minimized / no thumbnail yet
  * - Bottom progressive scrim + floating frosted glass pill `[icon] AppName · shortTitle`
  */
@@ -1060,7 +960,6 @@ private fun WindowThumbCard(
     val style = remember(window.appKey) { appVisualFor(window.appKey) }
     val cardRadius = if (compact) 13.dp else 15.dp
     val cardShape = RoundedCornerShape(cardRadius)
-    val hasStack = appWindowCount > 1
     val subtitle = remember(window.title, window.appName) {
         cleanWindowSubtitle(window.title, window.appName)
     }
@@ -1120,27 +1019,10 @@ private fun WindowThumbCard(
             .liquidPress(pressedScale = 0.965f, onClick = onClick),
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
-        // Subtle macOS Stage Manager / iOS Switcher stacked peek-lip for multi-window apps
-        if (hasStack) {
-            Box(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 10.dp)
-                    .height(4.dp)
-                    .clip(RoundedCornerShape(topStart = 9.dp, topEnd = 9.dp))
-                    .background(if (c.isDark) Color(0x28FFFFFF) else Color(0x18000000))
-                    .border(
-                        width = 0.5.dp,
-                        color = if (c.isDark) Color(0x30FFFFFF) else Color(0x1C000000),
-                        shape = RoundedCornerShape(topStart = 9.dp, topEnd = 9.dp),
-                    ),
-            )
-        }
-
         Box(
             modifier = Modifier
                 .fillMaxWidth()
-                .aspectRatio(if (compact) 16f / 10.2f else 16f / 10.8f)
+                .aspectRatio(16f / 10.8f)
                 .clip(cardShape)
                 .background(if (c.isDark) Color(0xFF15171E) else Color(0xFFE9EBEF))
                 .border(
@@ -1155,6 +1037,7 @@ private fun WindowThumbCard(
                     bitmap = thumb,
                     contentDescription = window.title,
                     contentScale = ContentScale.Crop,
+                    alignment = Alignment.TopCenter,
                     modifier = Modifier
                         .fillMaxSize()
                         .alpha(if (window.minimized) 0.62f else 1f),
@@ -1252,12 +1135,11 @@ private fun WindowThumbCard(
                 modifier = Modifier
                     .align(Alignment.BottomCenter)
                     .fillMaxWidth()
-                    .fillMaxHeight(0.46f)
+                    .fillMaxHeight(0.32f)
                     .background(
                         Brush.verticalGradient(
                             0.0f to Color.Transparent,
-                            0.55f to Color(0x52000000),
-                            1.0f to Color(0xB3000000),
+                            1.0f to Color(0x38000000),
                         ),
                     ),
             )
@@ -1335,6 +1217,7 @@ private fun MacOsFloatingDock(
     appGroups: List<DockAppGroup>,
     appIcons: Map<String, ImageBitmap>,
     selectedAppKey: String?,
+    backdrop: GlassBackdrop?,
     compact: Boolean,
     onSelectAll: () -> Unit,
     onTapApp: (String) -> Unit,
@@ -1348,7 +1231,8 @@ private fun MacOsFloatingDock(
     FloatingGlass(
         cornerRadius = dockRadius,
         darkOverlay = false,
-        elevation = 20.dp,
+        elevation = 12.dp,
+        backdrop = backdrop,
         modifier = modifier,
     ) {
         Row(
@@ -1425,8 +1309,9 @@ private fun DockItemTile(
     onClick: () -> Unit,
 ) {
     val c = RcThemeColors.current
-    val liftY by animateDpAsState(targetValue = if (selected) (-2).dp else 0.dp, label = "dockLift")
-    val dotWidth by animateDpAsState(targetValue = if (selected) 10.dp else 4.dp, label = "dockDotW")
+    // macOS Dock feel: the chosen app lifts a little and its dot lights up; no outlines, no counters.
+    val liftY by animateDpAsState(targetValue = if (selected) (-3).dp else 0.dp, label = "dockLift")
+    val dotAlpha by animateFloatAsState(targetValue = if (selected) 0.95f else 0.32f, label = "dockDotA")
     val shape = RoundedCornerShape(radius)
     val squircleBacking = if (c.isDark) Color(0x14FFFFFF) else Color(0x0F000000)
 
@@ -1451,7 +1336,6 @@ private fun DockItemTile(
                 }
                 .then(
                     when {
-                        selected -> Modifier.border(width = 2.dp, color = c.accent, shape = shape)
                         realIcon != null && !isAllButton -> Modifier
                         else -> Modifier.border(
                             width = 0.5.dp,
@@ -1483,36 +1367,13 @@ private fun DockItemTile(
                     )
                 }
             }
-
-            if (badgeCount > 1) {
-                Box(
-                    modifier = Modifier
-                        .align(Alignment.TopEnd)
-                        .offset(x = 3.dp, y = (-3).dp)
-                        .widthIn(min = 15.dp)
-                        .height(15.dp)
-                        .clip(CircleShape)
-                        .background(Color(0xE6121216))
-                        .border(0.5.dp, Color(0x3DFFFFFF), CircleShape)
-                        .padding(horizontal = 4.dp),
-                    contentAlignment = Alignment.Center,
-                ) {
-                    Text(
-                        text = badgeCount.toString(),
-                        color = Color.White,
-                        fontSize = 9.5.sp,
-                        fontWeight = FontWeight.SemiBold,
-                    )
-                }
-            }
         }
 
         Box(
             modifier = Modifier
-                .width(dotWidth)
-                .height(4.dp)
+                .size(4.dp)
                 .clip(CircleShape)
-                .background(if (selected) c.accent else c.dockDot),
+                .background(c.label.copy(alpha = dotAlpha)),
         )
     }
 }

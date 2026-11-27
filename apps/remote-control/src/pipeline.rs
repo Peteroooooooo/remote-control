@@ -406,11 +406,15 @@ pub fn run(cfg: PipeConfig, tx: Arc<VideoTx>, sh: Arc<PipeShared>, info: Unbound
     let mut quirks = RateQuirks::default();
     let mut auto = AutoSize::default();
     let mut cached_gpu: Option<Gpu> = None;
+    // The capture agent between captures, moved to the next target instead of
+    // starting a new one (another display: about 0.2 s sooner).
+    let mut parked: Option<crate::wgc::Agent> = None;
     while !sh.stop.load(Ordering::Relaxed) {
-        match run_once(cfg, &tx, &sh, &info, &mut quirks, &mut auto, &mut cached_gpu) {
+        match run_once(cfg, &tx, &sh, &info, &mut quirks, &mut auto, &mut cached_gpu, &mut parked) {
             Ok(()) => last_err.clear(),
             Err(e) => {
                 cached_gpu = None;
+                parked = None;
                 let s = format!("{e:#}");
                 sh.no_display.store(s.contains(crate::monitors::NO_DISPLAY), Ordering::Relaxed);
                 if s != last_err {
@@ -448,10 +452,16 @@ const WGC_RETRY: Duration = Duration::from_secs(30);
 /// duplication on the Winlogon desktop and for a while after WGC failed.
 /// `desktop` is the input desktop the service's helper follows: there WGC
 /// runs in an agent as the console user (see `wgc`).
-fn open_capture(gpu: &Gpu, output: &IDXGIOutput1, desktop: Option<&str>, wgc_after: &mut Option<Instant>) -> Result<Capture> {
+fn open_capture(
+    gpu: &Gpu,
+    output: &IDXGIOutput1,
+    desktop: Option<&str>,
+    wgc_after: &mut Option<Instant>,
+    prev: Option<crate::wgc::Agent>,
+) -> Result<Capture> {
     let users_desktop = desktop.is_none_or(|d| d.eq_ignore_ascii_case("Default"));
     if users_desktop && wgc_after.is_none_or(|t| Instant::now() >= t) {
-        let r = if desktop.is_some() { Capture::agent(gpu, output) } else { Capture::wgc(gpu, output) };
+        let r = if desktop.is_some() { Capture::agent(gpu, output, prev) } else { Capture::wgc(gpu, output) };
         match r {
             Ok(c) => return Ok(c),
             Err(e) => {
@@ -615,6 +625,7 @@ fn run_once(
     quirks: &mut RateQuirks,
     auto: &mut AutoSize,
     cached_gpu: &mut Option<Gpu>,
+    parked: &mut Option<crate::wgc::Agent>,
 ) -> Result<()> {
     // Service mode: capture the desktop that is shown now (see desktop.rs).
     let desktop = crate::desktop::follow()?;
@@ -628,7 +639,7 @@ fn run_once(
     let mut cap = if target_hwnd != 0 && desktop.as_deref().is_none_or(|d| d.eq_ignore_ascii_case("Default")) {
         if crate::winlist::is_window_capturable(target_hwnd) {
             let win_cap = if desktop.is_some() {
-                Capture::agent_window(gpu, &output, target_hwnd)
+                Capture::agent_window(gpu, &output, target_hwnd, parked.take())
             } else {
                 Capture::wgc_window(gpu, target_hwnd)
             };
@@ -643,22 +654,23 @@ fn run_once(
                 Err(e) => {
                     log!("single-window WGC 0x{target_hwnd:x} failed: {e:#}; falling back to full display");
                     sh.target_window.store(0, Ordering::Release);
-                    open_capture(gpu, &output, desktop.as_deref(), &mut quirks.wgc_after)?
+                    open_capture(gpu, &output, desktop.as_deref(), &mut quirks.wgc_after, parked.take())?
                 }
             }
         } else {
             log!("target window 0x{target_hwnd:x} is no longer capturable; falling back to full display");
             sh.target_window.store(0, Ordering::Release);
-            open_capture(gpu, &output, desktop.as_deref(), &mut quirks.wgc_after)?
+            open_capture(gpu, &output, desktop.as_deref(), &mut quirks.wgc_after, parked.take())?
         }
     } else {
-        open_capture(gpu, &output, desktop.as_deref(), &mut quirks.wgc_after)?
+        open_capture(gpu, &output, desktop.as_deref(), &mut quirks.wgc_after, parked.take())?
     };
     while !sh.stop.load(Ordering::Relaxed) {
         if let Next::Capture = stream(cfg, tx, sh, info, quirks, auto, gpu, &mut cap, desktop.as_deref())? {
             break;
         }
     }
+    *parked = cap.into_agent();
     Ok(())
 }
 
@@ -711,6 +723,7 @@ fn stream(
         // HEVC encoder was unavailable or refused on this adapter; don't advertise 4:4:4 HEVC.
         can444 = false;
     }
+    let setup_t0 = Instant::now();
     let (pic_w, pic_h) = if yuv444 { (w, h) } else { enc.preferred_input_size().unwrap_or((w, h)) };
     let pic = yuv_texture(gpu, pic_w, pic_h, yuv444)?;
     let inv_sdr_white = cap.hdr_info.inv_sdr_white();
@@ -770,6 +783,7 @@ fn stream(
         let views = vp.make_views(img, 0, &pic)?;
         Convert::Vp(vp, views)
     };
+    log!("picture setup took {} ms", setup_t0.elapsed().as_millis());
     let hdr_tag = if cap.fp16 {
         format!(" [HDR FP16, SDR white {:.2}x]", cap.hdr_info.sdr_white_scale)
     } else {
@@ -835,6 +849,10 @@ fn stream(
     let mut frames = 0u64;
     let mut desktop_checked = Instant::now();
     while !sh.stop.load(Ordering::Relaxed) {
+        // The viewer picked another display: at once, not at the next 200 ms check.
+        if crate::monitors::switch_pending(&sh.monitors) {
+            return Ok(Next::Capture);
+        }
         if sh.target_window_changed.swap(false, Ordering::AcqRel) {
             log!("switching capture target (single-window / full-display)");
             return Ok(Next::Capture);
