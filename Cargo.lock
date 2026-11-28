@@ -1577,7 +1577,6 @@ dependencies = [
  "bytemuck",
  "ecolor",
  "emath",
- "epaint_default_fonts",
  "font-types",
  "harfrust",
  "log",
@@ -1591,12 +1590,6 @@ dependencies = [
  "unicode-segmentation",
  "vello_cpu",
 ]
-
-[[package]]
-name = "epaint_default_fonts"
-version = "0.35.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "13ee4e1f553a3584c301f3a56ff1a775f1384781396cea301c8d952e9b93f560"
 
 [[package]]
 name = "equivalent"
@@ -3203,7 +3196,7 @@ dependencies = [
 
 [[package]]
 name = "netshape"
-version = "0.3.8"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -3213,7 +3206,7 @@ dependencies = [
 
 [[package]]
 name = "nettest"
-version = "0.3.8"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -4368,7 +4361,7 @@ checksum = "20675572f6f24e9e76ef639bc5552774ed45f1c30e2951e1e99c59888861c539"
 
 [[package]]
 name = "rc-android"
-version = "0.3.8"
+version = "0.5.0"
 dependencies = [
  "android_logger",
  "anyhow",
@@ -4389,7 +4382,7 @@ dependencies = [
 
 [[package]]
 name = "rc-ident"
-version = "0.3.8"
+version = "0.5.0"
 dependencies = [
  "blake3",
  "bs58",
@@ -4398,7 +4391,7 @@ dependencies = [
 
 [[package]]
 name = "rc-proto"
-version = "0.3.8"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "iroh",
@@ -4409,7 +4402,7 @@ dependencies = [
 
 [[package]]
 name = "rc-relay"
-version = "0.3.8"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "blake3",
@@ -4439,7 +4432,7 @@ dependencies = [
 
 [[package]]
 name = "rc-stream"
-version = "0.3.8"
+version = "0.5.0"
 dependencies = [
  "reed-solomon-simd",
 ]
@@ -4561,7 +4554,7 @@ dependencies = [
 
 [[package]]
 name = "remote-control"
-version = "0.3.8"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -5377,7 +5370,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.6",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -6901,9 +6894,9 @@ dependencies = [
 
 [[package]]
 name = "zcheapstr"
-version = "1.2.0"
+version = "1.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "939f186d9ecebe044315a5cb6d6f78568bbc21152adc954d5a0c2f58bdbc9920"
+checksum = "2da34e7164b75d803c3197b86e6cf61b874106fbd472c5082575a8bc5fbd0907"
 dependencies = [
  "serde",
 ]

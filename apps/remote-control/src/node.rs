@@ -991,9 +991,9 @@ impl Shared {
                 if st.store.remove(id) {
                     self.save(st);
                     let msg = if crate::i18n::is_en() {
-                        format!("\"{name}\" removed this computer")
+                        format!("\"{name}\" removed this PC")
                     } else {
-                        format!("「{name}」把这台电脑删除了")
+                        format!("「{name}」已将本机从设备列表移除")
                     };
                     self.notice(st, msg);
                 }
@@ -2074,7 +2074,8 @@ fn row(st: &St, id: &EndpointId, listed: bool, auto: bool, name: &str) -> String
         Ask::In => "in",
         Ask::None => "-",
     };
-    format!("dev\t{id}\t{}\t{}\t{met}\t{status}\t{rtt:.1}\t{path}\t{lan}\t{name}\t{ask}\n", listed as u8, auto as u8)
+    let phone = (st.store.get(id).is_some_and(|d| d.phone) || p.is_some_and(|p| p.phone)) as u8;
+    format!("dev\t{id}\t{}\t{}\t{met}\t{status}\t{rtt:.1}\t{path}\t{lan}\t{name}\t{ask}\t{phone}\n", listed as u8, auto as u8)
 }
 
 /// Keeps a meet connection to `id` while it should have a card (see the module comment).

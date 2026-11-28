@@ -342,6 +342,23 @@ pub fn open_shell_target(target: &str) -> Result<()> {
         )
     };
     if (r.0 as isize) <= 32 {
+        if target == "ncpa.cpl" {
+            let status = Command::new("control.exe")
+                .creation_flags(CREATE_NO_WINDOW)
+                .arg("ncpa.cpl")
+                .spawn();
+            if status.is_ok() {
+                return Ok(());
+            }
+        } else if target == "ms-settings:network-status" {
+            let status = Command::new("control.exe")
+                .creation_flags(CREATE_NO_WINDOW)
+                .args(["/name", "Microsoft.NetworkAndSharingCenter"])
+                .spawn();
+            if status.is_ok() {
+                return Ok(());
+            }
+        }
         return Err(anyhow!("ShellExecuteW failed ({})", r.0 as isize));
     }
     Ok(())
@@ -393,6 +410,7 @@ struct LocalEnv {
     system_proxy: Option<String>,
     firewall: FirewallState,
     net_profile: NetProfileState,
+    router_url: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -411,7 +429,7 @@ struct OwnRelayProbe {
 /// Runs the full local + network diagnostic suite.
 pub async fn diagnose(input: DoctorInput) -> DoctorReport {
     let started = Instant::now();
-    let local = tokio::task::spawn_blocking(inspect_local_env)
+    let mut local = tokio::task::spawn_blocking(inspect_local_env)
         .await
         .unwrap_or_else(|_| LocalEnv {
             egress_v4: None,
@@ -426,6 +444,7 @@ pub async fn diagnose(input: DoctorInput) -> DoctorReport {
             system_proxy: None,
             firewall: FirewallState::Unknown,
             net_profile: NetProfileState::Unknown,
+            router_url: None,
         });
 
     // Build probe URLs strictly honoring `input.public_relays`.
@@ -456,7 +475,8 @@ pub async fn diagnose(input: DoctorInput) -> DoctorReport {
         .collect();
     let distinct_host_count = distinct_hosts.len();
 
-    let (fake_ip, net_report) = tokio::join!(
+    let gw_v4 = local.primary_physical.as_ref().and_then(|a| a.gateway_v4);
+    let (fake_ip, net_report, router_url) = tokio::join!(
         check_fake_ip(&all_probe_urls),
         async {
             if !all_probe_urls.is_empty() {
@@ -464,8 +484,10 @@ pub async fn diagnose(input: DoctorInput) -> DoctorReport {
             } else {
                 None
             }
-        }
+        },
+        probe_router_url(gw_v4),
     );
+    local.router_url = router_url;
 
     // Per-own-relay detailed status (combining net_report latencies + direct /ping error diagnosis).
     let mut own_probes: Vec<OwnRelayProbe> = Vec::new();
@@ -647,15 +669,46 @@ async fn check_fake_ip(urls: &[RelayUrl]) -> Option<(String, Ipv4Addr)> {
     None
 }
 
+async fn probe_router_url(gateway: Option<Ipv4Addr>) -> Option<String> {
+    let ip = gateway.filter(|ip| ip.is_private())?;
+    let (http_ok, https_ok) = tokio::join!(
+        async {
+            tokio::time::timeout(
+                Duration::from_millis(450),
+                tokio::net::TcpStream::connect((ip, 80)),
+            )
+            .await
+            .is_ok_and(|r| r.is_ok())
+        },
+        async {
+            tokio::time::timeout(
+                Duration::from_millis(450),
+                tokio::net::TcpStream::connect((ip, 443)),
+            )
+            .await
+            .is_ok_and(|r| r.is_ok())
+        },
+    );
+    if http_ok {
+        Some(format!("http://{ip}"))
+    } else if https_ok {
+        Some(format!("https://{ip}"))
+    } else {
+        None
+    }
+}
+
 async fn probe_own_relay_https(urls: &[RelayUrl]) -> Result<u64, String> {
-    let ca = rc_relay::tls::ca();
+    let tls = rc_relay::tls::ca()
+        .client_config(iroh_relay::tls::default_provider())
+        .map_err(|e| format!("{e}"))?;
     let client = reqwest::Client::builder()
-        .tls_backend_preconfigured(ca)
+        .tls_backend_preconfigured(tls)
         .no_proxy()
         .connect_timeout(Duration::from_secs(3))
         .timeout(Duration::from_secs(4))
         .build()
-        .map_err(|e| format!("{e}"))?;
+        .map_err(|e| format!("{e:#}"))?;
     let mut last_err = String::new();
     for u in urls {
         let mut target = u.to_string();
@@ -691,7 +744,7 @@ fn classify_reqwest_error(e: &reqwest::Error) -> String {
     } else if s.contains("refused") || s.contains("10061") {
         tr("端口拒绝连接（检查 rc-relay 容器是否在运行及 7843/TCP 端口）", "Connection refused (check rc-relay container & port 7843/TCP)").into()
     } else {
-        format!("{e}")
+        format!("{e:#}")
     }
 }
 
@@ -833,16 +886,13 @@ fn inspect_local_env() -> LocalEnv {
         system_proxy: read_system_proxy(),
         firewall: check_firewall_state(),
         net_profile: check_network_profile_state(),
+        router_url: None,
     }
 }
 
 fn is_fake_ip(ip: Ipv4Addr) -> bool {
     let o = ip.octets();
     o[0] == 198 && (o[1] & 0xfe) == 18 // 198.18.0.0/15
-}
-
-fn is_private_v4(ip: Ipv4Addr) -> bool {
-    ip.is_private() || (ip.octets()[0] == 100 && (ip.octets()[1] & 0xc0) == 64)
 }
 
 fn is_public_v6(ip: Ipv6Addr) -> bool {
@@ -1019,7 +1069,7 @@ fn check_firewall_state() -> FirewallState {
         let Ok(active_profiles) = policy.CurrentProfileTypes() else {
             return FirewallState::Unknown;
         };
-        let mut any_enabled = false;
+        let mut enabled_profiles = 0i32;
         for prof in [
             NET_FW_PROFILE2_DOMAIN,
             NET_FW_PROFILE2_PRIVATE,
@@ -1030,10 +1080,10 @@ fn check_firewall_state() -> FirewallState {
                     .get_FirewallEnabled(NET_FW_PROFILE_TYPE2(prof.0))
                     .is_ok_and(|v| v.as_bool())
             {
-                any_enabled = true;
+                enabled_profiles |= prof.0;
             }
         }
-        if !any_enabled {
+        if enabled_profiles == 0 {
             return FirewallState::Disabled;
         }
 
@@ -1047,7 +1097,7 @@ fn check_firewall_state() -> FirewallState {
             return FirewallState::Unknown;
         };
 
-        let mut allowed = false;
+        let mut allowed_profiles = 0i32;
         let mut blocked = false;
         let mut batch: [VARIANT; 32] = std::array::from_fn(|_| VARIANT::default());
         loop {
@@ -1060,7 +1110,8 @@ fn check_firewall_state() -> FirewallState {
                 if let Some(rule) = variant_to_fw_rule(&*item)
                     && rule.Enabled().is_ok_and(|v| v.as_bool())
                     && rule.Direction().is_ok_and(|d| d == NET_FW_RULE_DIR_IN)
-                    && rule.Profiles().is_ok_and(|p| (p & active_profiles) != 0)
+                    && let Ok(rule_profs) = rule.Profiles()
+                    && (rule_profs & enabled_profiles) != 0
                     && let Ok(app) = rule.ApplicationName()
                 {
                     let app_str = app.to_string();
@@ -1069,7 +1120,9 @@ fn check_firewall_state() -> FirewallState {
                         if proto == NET_FW_IP_PROTOCOL_ANY.0 || proto == NET_FW_IP_PROTOCOL_UDP.0 {
                             match rule.Action() {
                                 Ok(a) if a == NET_FW_ACTION_BLOCK => blocked = true,
-                                Ok(a) if a == NET_FW_ACTION_ALLOW => allowed = true,
+                                Ok(a) if a == NET_FW_ACTION_ALLOW => {
+                                    allowed_profiles |= rule_profs & enabled_profiles;
+                                }
                                 _ => {}
                             }
                         }
@@ -1084,7 +1137,7 @@ fn check_firewall_state() -> FirewallState {
 
         if blocked {
             FirewallState::Blocked
-        } else if allowed {
+        } else if (allowed_profiles & enabled_profiles) == enabled_profiles {
             FirewallState::Allowed
         } else {
             FirewallState::MissingAllow
@@ -1270,15 +1323,21 @@ fn fix_enable_ipv6(adapter: Option<&str>, fix_registry: bool) -> Result<String> 
     if let Some(name) = adapter.filter(|s| !s.trim().is_empty()) {
         let escaped = name.replace('\'', "''");
         let ps_cmd = format!(
-            "$ErrorActionPreference='Stop'; Enable-NetAdapterBinding -Name '{escaped}' -ComponentID ms_tcpip6"
+            "$ErrorActionPreference='Stop'; [Console]::OutputEncoding=[Text.Encoding]::UTF8; $b = Get-NetAdapterBinding -ComponentID ms_tcpip6 -IncludeHidden | Where-Object {{ $_.Name -eq '{escaped}' }} | Select-Object -First 1; if (-not $b) {{ throw 'Adapter not found' }}; $b | Enable-NetAdapterBinding"
         );
-        let out = Command::new("powershell.exe")
+        let ps_exe = std::env::var_os("SystemRoot")
+            .map(|r| PathBuf::from(r).join(r"System32\WindowsPowerShell\v1.0\powershell.exe"))
+            .filter(|p| p.exists())
+            .unwrap_or_else(|| PathBuf::from("powershell.exe"));
+        let out = Command::new(&ps_exe)
             .creation_flags(CREATE_NO_WINDOW)
             .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", &ps_cmd])
             .output()
             .context("run powershell Enable-NetAdapterBinding")?;
         if !out.status.success() {
-            let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            let err = if !stderr.is_empty() { stderr } else { stdout };
             return Err(anyhow!(
                 "{}",
                 if err.is_empty() {
@@ -1312,6 +1371,7 @@ fn fix_set_private_network() -> Result<String> {
     };
     let _com = ComGuard::init();
     let mut changed = 0usize;
+    let mut last_err: Option<anyhow::Error> = None;
     unsafe {
         let mgr: INetworkListManager = CoCreateInstance(&NetworkListManager, None, CLSCTX_ALL)
             .context("open NetworkListManager")?;
@@ -1337,9 +1397,10 @@ fn fix_set_private_network() -> Result<String> {
                     || is_vm_adapter(&name)
                     || is_virtual_lan_adapter(&name);
                 if !is_unidentified_virtual {
-                    net.SetCategory(NLM_NETWORK_CATEGORY_PRIVATE)
-                        .context("set network category to Private")?;
-                    changed += 1;
+                    match net.SetCategory(NLM_NETWORK_CATEGORY_PRIVATE) {
+                        Ok(()) => changed += 1,
+                        Err(e) => last_err = Some(anyhow::Error::from(e).context("set network category to Private")),
+                    }
                 }
             }
             if hr.is_err() {
@@ -1348,6 +1409,9 @@ fn fix_set_private_network() -> Result<String> {
         }
     }
     if changed == 0 {
+        if let Some(e) = last_err {
+            return Err(e);
+        }
         return Err(anyhow!(
             "{}",
             tr("未找到需要切换的公用网络", "No Public network found to switch")
@@ -1373,12 +1437,7 @@ fn build_report(
     elapsed_ms: u64,
 ) -> DoctorReport {
     let mut items: Vec<CheckItem> = Vec::new();
-    let router_url = local
-        .primary_physical
-        .as_ref()
-        .and_then(|a| a.gateway_v4)
-        .filter(|ip| is_private_v4(*ip))
-        .map(|ip| format!("http://{ip}"));
+    let router_url = local.router_url.clone();
     let remote_configured = input.public_relays || !own_probes.is_empty();
     let has_working_own_relay = own_probes.iter().any(|p| p.https_ms.is_some());
     let has_working_pub_relay = pub_https_best.is_some() || pub_qad_best.is_some();
@@ -1400,11 +1459,11 @@ fn build_report(
             id: "portal",
             level: Level::Err,
             title: tr(
-                "网络被上网认证页拦截（校园网 / 酒店 Wi-Fi）",
+                "网络需要网页登录认证（校园网 / 酒店 Wi-Fi）",
                 "Captive portal detected (campus / hotel Wi-Fi)",
             )
             .into(),
-            detail: tr("外网 HTTP 探测被重定向到了登录页", "Outbound HTTP probe was intercepted by a login portal").into(),
+            detail: tr("外网 HTTP 探测被重定向至认证页面", "Outbound HTTP probe was intercepted by a login portal").into(),
             guidance: tr(
                 "请先在浏览器完成网络登录认证，再点击重新检测。",
                 "Complete the Wi-Fi web login in your browser, then re-test.",
@@ -1445,7 +1504,7 @@ fn build_report(
             .into(),
             detail: detail_parts.join(if is_en() { "; " } else { "；" }),
             guidance: tr(
-                "本软件默认不走系统代理，但 TUN 虚拟网卡会劫持 UDP 打洞和中转流量，导致打洞失败或延迟暴增。请在代理软件中把 remote-control.exe 设为直连（Clash/Mihomo 可直接点下方复制规则；v2rayN 在「设置 → 路由设置」添加进程直连）。",
+                "本程序默认绕过系统代理，但 TUN 虚拟网卡会接管 UDP 穿透与中转流量，导致 P2P 直连失败或延迟升高。请在代理软件中将 remote-control.exe 设为直连（Clash/Mihomo 可点击下方复制规则；v2rayN 请在「设置 → 路由设置」添加进程直连）。",
                 "Remote Control ignores system HTTP proxies, but TUN mode hijacks UDP hole-punching and relay traffic. Exclude remote-control.exe in your proxy app (copy the Clash/Mihomo rule below, or add a process bypass rule in v2rayN).",
             )
             .into(),
@@ -1554,24 +1613,24 @@ fn build_report(
                 id: "nat",
                 level: if has_working_own_relay { Level::Warn } else { Level::Err },
                 title: tr(
-                    "UDP 出网被拦截，无法 P2P 打洞直连",
+                    "出站 UDP 被拦截，无法建立 P2P 直连",
                     "Outbound UDP is blocked — P2P hole-punching unavailable",
                 )
                 .into(),
                 detail: tr(
-                    "HTTPS 节点可通，但所有 UDP 探测均无回包",
+                    "HTTPS 节点可连通，但所有 UDP 探测均无响应",
                     "HTTPS reachable, but all UDP probes timed out",
                 )
                 .into(),
                 guidance: if has_working_own_relay {
                     tr(
-                        "这是运营商或企业防火墙对 UDP 的硬限制，修改本机设置通常无效。你已配置可用的自建中转，软件会自动走 TCP 7843 端口中转连接。",
+                        "此为运营商或企业防火墙对 UDP 的硬性限制，调整本机设置通常无效。当前已配置可用的自建中转，程序将自动通过 TCP 7843 端口进行中转连接。",
                         "Your network firewall blocks UDP — local PC tweaks cannot bypass it. Your private relay is reachable and will automatically relay over TCP 7843.",
                     )
                     .into()
                 } else {
                     tr(
-                        "这是运营商或企业防火墙对 UDP 的硬限制，任何打洞软件都无法在此网络直连。唯一稳定解法是部署自建中转（软件会自动走 TCP 7843 端口）。",
+                        "此为运营商或企业防火墙对 UDP 的硬性限制，P2P 直连在此网络下无法生效。建议部署自建中转（程序将自动通过 TCP 7843 端口连接）。",
                         "Your network firewall blocks all UDP, so P2P cannot work here. Deploy a private relay (automatically uses TCP 7843).",
                     )
                     .into()
@@ -1593,7 +1652,7 @@ fn build_report(
                 )
                 .into(),
                 guidance: tr(
-                    "请检查电脑是否能正常上网、是否被代理规则拦截，或自建中转服务器是否在线。",
+                    "请检查本机网络连接是否正常、是否被代理规则拦截，或自建中转服务器是否在线。",
                     "Check internet access, proxy rules, or whether your private relay is online.",
                 )
                 .into(),
@@ -1607,7 +1666,7 @@ fn build_report(
                     id: "nat",
                     level: Level::Ok,
                     title: tr(
-                        "圆锥型 NAT（具备 P2P 打洞资格）",
+                        "圆锥型 NAT（具备 P2P 穿透条件）",
                         "Cone NAT (eligible for P2P hole-punching)",
                     )
                     .into(),
@@ -1632,12 +1691,12 @@ fn build_report(
                 }
                 let guidance = if udp_v6 {
                     tr(
-                        "IPv4 为对称 NAT，遇到同样严格的网络时无法靠 IPv4 打洞。好消息是本机 IPv6 可直连：只要对方也有 IPv6 即可绕过此限制；若对方无 IPv6，需借助自建中转。",
-                        "IPv4 is Symmetric NAT, which fails against another strict NAT. Good news: your IPv6 works, so you can connect directly if the peer also has IPv6; otherwise use a private relay.",
+                        "IPv4 为对称 NAT，对端同为严格网络时无法通过 IPv4 建立 P2P 直连。本机 IPv6 当前可用，若对端同样具备 IPv6 即可直接连接；否则需借助自建中转。",
+                        "IPv4 is Symmetric NAT, which fails against another strict NAT. Your IPv6 works, so you can connect directly if the peer also has IPv6; otherwise use a private relay.",
                     )
                 } else {
                     tr(
-                        "这是路由器或运营商 NAT 策略限制，本机软件改不了。家宽可尝试在路由器开 IPv6 或光猫改桥接；公司/校园网通常无法修改，建议另一端开 IPv6、组 Tailscale/EasyTier，或配置自建中转。",
+                        "此为路由器或运营商 NAT 策略限制，本地软件无法修改。家庭宽带可在路由器开启 IPv6 或将光猫改为桥接模式；企业或校园网通常无法调整策略，建议在对端启用 IPv6、使用虚拟局域网（Tailscale/EasyTier）或配置自建中转。",
                         "Controlled by your router/ISP NAT — local tweaks cannot change it. On home broadband, enable IPv6 or router bridge mode; on corporate/campus networks, use IPv6 on both ends, Tailscale/EasyTier, or a private relay.",
                     )
                 };
@@ -1645,7 +1704,7 @@ fn build_report(
                     id: "nat",
                     level: Level::Warn,
                     title: tr(
-                        "对称型 NAT（IPv4 打洞受限）",
+                        "对称型 NAT（IPv4 穿透受限）",
                         "Symmetric NAT (IPv4 P2P limited)",
                     )
                     .into(),
@@ -1668,7 +1727,7 @@ fn build_report(
                         id: "nat",
                         level: Level::Info,
                         title: tr(
-                            "IPv4 UDP 正常，但跳过 NAT 类型判断",
+                            "IPv4 UDP 正常，已跳过 NAT 类型检测",
                             "IPv4 UDP works (NAT type skipped)",
                         )
                         .into(),
@@ -1676,7 +1735,7 @@ fn build_report(
                             .map(|g| if is_en() { format!("Mapped external address: {g}") } else { format!("外网映射：{g}") })
                             .unwrap_or_default(),
                         guidance: tr(
-                            "判断圆锥/对称 NAT 需要对比至少 2 个不同服务器；当前只配了 1 个自建中转且已关闭「公网辅助连接」，本工具不会私自访问公网节点。如需测出 NAT 类型，可临时开启公网辅助或添加第 2 个中转后重测。",
+                            "判断圆锥/对称 NAT 需要对比至少 2 个不同服务器；当前仅配置了 1 个自建中转且已关闭「公网辅助连接」，程序不会未经允许访问公网节点。如需检测 NAT 类型，可临时开启公网辅助或添加第 2 个中转后重试。",
                             "Detecting Cone vs Symmetric NAT requires comparing at least 2 distinct servers. With only 1 private relay and Public Assist turned off, no public server is contacted. Enable Public Assist temporarily or add a 2nd relay to test NAT type.",
                         )
                         .into(),
@@ -1687,7 +1746,7 @@ fn build_report(
                         id: "nat",
                         level: Level::Warn,
                         title: tr(
-                            "仅 1 个节点收到 UDP 回包，未能判断 NAT 类型",
+                            "仅 1 个节点收到 UDP 响应，未能判断 NAT 类型",
                             "Only 1 server replied over UDP — NAT type undetermined",
                         )
                         .into(),
@@ -1749,7 +1808,7 @@ fn build_report(
             .into(),
             detail,
             guidance: tr(
-                "很多家宽、校园网和手机热点本身都提供公网 IPv6；开启后两端有 IPv6 就能绕过 IPv4 NAT 直接连通。点下方一键开启即可（也可在「网络连接 → 网卡属性」中手动勾选）。",
+                "多数家庭宽带、校园网及手机热点均提供公网 IPv6；开启后两端具备 IPv6 即可绕过 IPv4 NAT 直接连接。点击下方一键开启（也可在「网络连接 → 网卡属性」中手动勾选）。",
                 "Most home broadband, campus Wi-Fi, and mobile hotspots provide public IPv6. Enabling it lets peers bypass IPv4 NAT directly.",
             )
             .into(),
@@ -1821,7 +1880,7 @@ fn build_report(
                     format!("本机公网地址：{local_v6}，但外网 IPv6 UDP 探测未收到回包")
                 },
                 guidance: tr(
-                    "常见原因：1) Windows 防火墙拦截；2) 光猫/路由器 IPv6 防火墙拦截；3) 部分网卡驱动的「IPv6 校验和卸载」异常（可在「网络连接 → 网卡属性 → 配置 → 高级」里排查）。若上游限制改不了，IPv4 圆锥 NAT 仍可正常直连。",
+                    "常见原因：1) Windows 防火墙拦截；2) 光猫或路由器 IPv6 防火墙拦截；3) 部分网卡驱动的「IPv6 校验和卸载」异常（可在「网络连接 → 网卡属性 → 配置 → 高级」中排查）。若上游策略无法调整，IPv4 圆锥型 NAT 仍可正常建立直连。",
                     "Common causes: Windows Firewall, router/ONT IPv6 firewall, or NIC IPv6 checksum offload bug (check Adapter Properties → Configure → Advanced). If IPv4 Cone NAT works, direct P2P still works.",
                 )
                 .into(),
@@ -1860,7 +1919,7 @@ fn build_report(
             )
             .into(),
             guidance: tr(
-                "电脑本身无需改动。家庭宽带可在路由器后台开启 IPv6（原生/DHCPv6）或光猫改桥接；公司内网通常未开 IPv6，属正常现象，IPv4 打洞或自建中转一样可用。",
+                "本机网络配置无需修改。家庭宽带可在路由器后台开启 IPv6（原生/DHCPv6）或将光猫改为桥接模式；企业内网通常未启用 IPv6，属正常现象，仍可通过 IPv4 P2P 直连或自建中转正常使用。",
                 "Your PC is fine. On home Wi-Fi, enable IPv6 in your router; corporate networks rarely offer IPv6 — IPv4 P2P or a private relay works just fine.",
             )
             .into(),
@@ -1880,7 +1939,7 @@ fn build_report(
                 )
                 .into(),
                 detail: tr(
-                    "存在针对当前 exe 的入站阻止规则（常见于首次弹窗误点取消）",
+                    "存在针对当前 exe 的入站阻止规则（通常因首次防火墙授权提示时点击了取消所致）",
                     "An inbound Block rule exists for this executable",
                 )
                 .into(),
@@ -2002,10 +2061,10 @@ fn build_report(
                     detail: if is_en() {
                         format!("HTTPS {h} ms, UDP(7842) timed out")
                     } else {
-                        format!("HTTPS 延迟 {h} ms，但 UDP 7842 无回包")
+                        format!("HTTPS 延迟 {h} ms，UDP 7842 无响应")
                     },
                     guidance: tr(
-                        "当前只能走 TCP 中转，且无法借助它协助打洞。请在云服务器安全组和系统防火墙放行 7842/UDP（若服务端主动设置了 enable_quic_addr_discovery = false 则属正常，可忽略）。",
+                        "当前仅支持通过 TCP 中转，且无法借助该节点协助 UDP 穿透。请在云服务器安全组和系统防火墙放行 7842/UDP（若服务端主动设置了 enable_quic_addr_discovery = false 则属正常，可忽略）。",
                         "TCP relay works, but UDP hole-punching assist via this relay does not. Open 7842/UDP in your server firewall & cloud security group (ignore if enable_quic_addr_discovery = false on purpose).",
                     )
                     .into(),
@@ -2076,13 +2135,13 @@ fn build_report(
                 .into(),
                 guidance: if has_working_own_relay {
                     tr(
-                        "你已有可用的自建中转，不影响正常使用；可在设置里关闭「公网辅助连接」。",
+                        "当前已有可用的自建中转，不影响正常连接；可在设置中关闭「公网辅助连接」。",
                         "Your private relay works fine — you can safely turn off Public Relay Assist.",
                     )
                     .into()
                 } else {
                     tr(
-                        "当前网络访问海外辅助节点受阻。建议部署国内/近地自建中转（不依赖公共节点）。",
+                        "当前网络访问海外辅助节点受阻，建议部署国内或近地自建中转（不依赖公共节点）。",
                         "Outbound access to public relays is blocked or unstable. Deploying a private relay is recommended.",
                     )
                     .into()
@@ -2125,7 +2184,7 @@ fn build_report(
             )
             .into(),
             guidance: tr(
-                "如果是自家或信任的办公网络，建议点下方一键切为「专用网络」；如果在咖啡厅/酒店等公共 Wi-Fi，请保持公用不要切换。",
+                "若当前处于家庭或可信办公网络，建议切换为「专用网络」；若连接的是咖啡厅、酒店等公共 Wi-Fi，请保持「公用网络」切勿切换。",
                 "Switch to Private on trusted home/office networks; keep Public on cafe/hotel Wi-Fi.",
             )
             .into(),
@@ -2192,7 +2251,7 @@ fn build_report(
             }
         } else if mapping_varies_v4 == Some(true) && !udp_v6 && !has_working_own_relay {
             tr(
-                "打洞条件受限（对称 NAT 且无 IPv6），建议配置自建中转",
+                "P2P 穿透条件受限（对称 NAT 且无 IPv6），建议配置自建中转",
                 "P2P limited (Symmetric NAT without IPv6) — private relay recommended",
             )
             .into()
@@ -2206,7 +2265,7 @@ fn build_report(
         (
             Level::Ok,
             tr(
-                "网络良好，具备 P2P 打洞直连资格",
+                "网络状态良好，支持 P2P 直连",
                 "Network looks great — ready for direct P2P",
             )
             .into(),
@@ -2343,6 +2402,7 @@ mod tests {
             system_proxy: None,
             firewall: FirewallState::Allowed,
             net_profile: NetProfileState::PrivateOrDomain,
+            router_url: None,
         };
         let mut nr = NetReport::default();
         nr.udp_v4 = true;
@@ -2405,6 +2465,7 @@ mod tests {
             system_proxy: None,
             firewall: FirewallState::Blocked,
             net_profile: NetProfileState::Public,
+            router_url: None,
         };
         let input = DoctorInput {
             public_relays: true,
@@ -2442,5 +2503,16 @@ mod tests {
         let lan = rep.items.iter().find(|i| i.id == "lan").unwrap();
         assert_eq!(lan.level, Level::Warn);
         assert!(lan.actions.contains(&FixAction::SetPrivateNetwork));
+    }
+
+    #[test]
+    fn probe_own_relay_https_reports_real_error_never_builder_error() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let url: RelayUrl = format!("https://127.0.0.1:{port}/?rc-cert=11111111111111111111111111111111").parse().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let err = rt.block_on(probe_own_relay_https(&[url])).expect_err("closed port must fail");
+        assert!(!err.contains("builder error"), "unexpected builder error: {err}");
     }
 }

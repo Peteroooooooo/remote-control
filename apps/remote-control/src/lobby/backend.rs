@@ -94,6 +94,7 @@ pub struct Dev {
     pub on_lan: bool,
     pub name: String,
     pub ask: Ask,
+    pub phone: bool,
 }
 
 /// A request to remember each other, while it waits for an answer.
@@ -162,6 +163,7 @@ fn parse_snap(text: &str) -> (Snap, bool) {
                         "in" => Ask::In,
                         _ => Ask::None,
                     },
+                    phone: g(11) == "1",
                 });
             }
             _ => {}
@@ -676,7 +678,7 @@ impl Backend {
                 let msg = if crate::i18n::is_en() {
                     format!("Could not control \"{name}\": {e:#}")
                 } else {
-                    format!("没能控制「{name}」：{e:#}")
+                    format!("无法控制「{name}」：{e:#}")
                 };
                 sh.note(Tone::Err, msg);
             }
@@ -717,12 +719,12 @@ impl Backend {
         *self.sh.busy.lock().unwrap() = Some(
             if install {
                 crate::i18n::tr(
-                    "正在安装后台服务，请在弹窗里点「是」",
+                    "正在安装后台服务，请在系统授权弹窗中点击「是」",
                     "Installing background service — click \"Yes\" in the UAC prompt",
                 )
             } else {
                 crate::i18n::tr(
-                    "正在卸载后台服务，请在弹窗里点「是」",
+                    "正在卸载后台服务，请在系统授权弹窗中点击「是」",
                     "Uninstalling background service — click \"Yes\" in the UAC prompt",
                 )
             }
@@ -741,7 +743,7 @@ impl Backend {
             match r {
                 Ok(_) if update => sh.note(
                     Tone::Ok,
-                    crate::i18n::tr("后台服务已改用这个程序", "Background service updated to use this executable"),
+                    crate::i18n::tr("后台服务已切换至此版本", "Background service updated to use this executable"),
                 ),
                 Ok(t) => sh.note(Tone::Ok, t),
                 Err(e) => {
@@ -1028,7 +1030,7 @@ fn run_elevated(install: bool, key: &Path) -> Result<String> {
     let code = unsafe {
         ShellExecuteExW(&mut info).map_err(|e: windows::core::Error| {
             if e.code().0 as u32 == 0x8007_04C7 {
-                anyhow!("{}", crate::i18n::tr("管理员确认被取消了", "Administrator prompt was cancelled"))
+                anyhow!("{}", crate::i18n::tr("已取消管理员授权", "Administrator prompt was cancelled"))
             } else {
                 anyhow!("{e}")
             }
@@ -1050,8 +1052,30 @@ fn run_elevated(install: bool, key: &Path) -> Result<String> {
         return Err(anyhow!("{why}"));
     }
     Ok(if install {
-        crate::i18n::tr("后台服务已装好", "Background service installed").into()
+        crate::i18n::tr("后台服务安装成功", "Background service installed").into()
     } else {
         crate::i18n::tr("后台服务已卸载", "Background service uninstalled").into()
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_snap_reads_phone_flag_and_defaults_false_for_older_helpers() {
+        let id_phone = SecretKey::from_bytes(&[1u8; 32]).public();
+        let id_pc = SecretKey::from_bytes(&[2u8; 32]).public();
+        let id_legacy = SecretKey::from_bytes(&[3u8; 32]).public();
+        let text = format!(
+            "dev\t{id_phone}\t1\t1\t-\tonline\t7.0\t1\t1\tPFEM10\t-\t1\n\
+             dev\t{id_pc}\t1\t0\tlan\tonline\t2.0\t1\t1\tLaptop\t-\t0\n\
+             dev\t{id_legacy}\t0\t0\tcode\toffline\t0.0\t0\t0\tOldPC\t-\n"
+        );
+        let snap = parse(&text);
+        assert_eq!(snap.devs.len(), 3);
+        assert!(snap.devs[0].phone);
+        assert!(!snap.devs[1].phone);
+        assert!(!snap.devs[2].phone);
+    }
 }

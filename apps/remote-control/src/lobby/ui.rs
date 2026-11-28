@@ -124,6 +124,9 @@ mod ic {
     pub const BOLT: char = '\u{E945}';
     pub const ERR: char = '\u{EA39}';
     pub const REFRESH: char = '\u{E72C}';
+    pub const PHONE: char = '\u{E8EA}';
+    pub const CHEVRON_UP: char = '\u{E70E}';
+    pub const CHEVRON_DOWN: char = '\u{E70D}';
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -322,6 +325,7 @@ struct NetCheckShared {
     fixing: Option<String>,
     report: Option<crate::doctor::DoctorReport>,
     fix_done: Option<Result<String, String>>,
+    collapsed: bool,
 }
 
 #[derive(Clone, Default)]
@@ -331,9 +335,14 @@ struct NetCheck {
 }
 
 impl NetCheck {
-    fn snapshot(&self) -> (bool, Option<String>, Option<crate::doctor::DoctorReport>) {
+    fn snapshot(&self) -> (bool, Option<String>, Option<crate::doctor::DoctorReport>, bool) {
         let sh = self.shared.lock().unwrap();
-        (sh.running, sh.fixing.clone(), sh.report.clone())
+        (sh.running, sh.fixing.clone(), sh.report.clone(), sh.collapsed)
+    }
+
+    fn toggle_collapsed(&self) {
+        let mut sh = self.shared.lock().unwrap();
+        sh.collapsed = !sh.collapsed;
     }
 
     fn take_fix_done(&self) -> Option<Result<String, String>> {
@@ -345,6 +354,7 @@ impl NetCheck {
             let mut sh = self.shared.lock().unwrap();
             sh.gen_id += 1;
             sh.running = true;
+            sh.collapsed = false;
             sh.gen_id
         };
         let shared = self.shared.clone();
@@ -590,15 +600,26 @@ pub fn run(b: Backend, hidden: bool) -> anyhow::Result<()> {
     .map_err(|e| anyhow::anyhow!("lobby window: {e}"))
 }
 
-/// egui draws its own text and has no CJK glyphs: Microsoft YaHei from the
-/// system goes first (its bold face for `BOLD`), egui's fonts stay as the
-/// fallback; the system's icon font for `ICONS`.
+/// egui draws its own text; `default_fonts` is disabled to keep the binary
+/// lean, so we load system fonts directly (Microsoft YaHei, Consolas, and
+/// Windows' UI icon font for `ICONS`).
 fn setup(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
     let read = |paths: &[&str]| paths.iter().find_map(|p| std::fs::read(p).ok());
-    if let Some(bytes) = read(&[r"C:\Windows\Fonts\msyh.ttc", r"C:\Windows\Fonts\msyh.ttf", r"C:\Windows\Fonts\simsun.ttc"]) {
+    if let Some(bytes) = read(&[
+        r"C:\Windows\Fonts\msyh.ttc",
+        r"C:\Windows\Fonts\msyh.ttf",
+        r"C:\Windows\Fonts\simsun.ttc",
+        r"C:\Windows\Fonts\segoeui.ttf",
+    ]) {
         fonts.font_data.insert("cjk".into(), Arc::new(FontData::from_owned(bytes)));
         fonts.families.entry(FontFamily::Proportional).or_default().insert(0, "cjk".into());
+    }
+    if let Some(bytes) = read(&[r"C:\Windows\Fonts\consola.ttf", r"C:\Windows\Fonts\lucon.ttf"]) {
+        fonts.font_data.insert("mono".into(), Arc::new(FontData::from_owned(bytes)));
+        fonts.families.entry(FontFamily::Monospace).or_default().insert(0, "mono".into());
+    }
+    if fonts.font_data.contains_key("cjk") {
         fonts.families.entry(FontFamily::Monospace).or_default().push("cjk".into());
     }
     let regular = fonts.families.get(&FontFamily::Proportional).cloned().unwrap_or_default();
@@ -1205,8 +1226,8 @@ fn sub_line(d: &Dev, session: Option<SessionInfo>) -> (String, Color32, bool) {
     if d.ask == Ask::In {
         return (
             tr(
-                "想记住你。同意后互相记住，以后随时能连",
-                "Wants to remember you. Agree so both sides can connect anytime",
+                "请求添加为信任设备，同意后双方可随时连接",
+                "Requests to connect as a trusted device. Agree so both sides can connect anytime",
             )
             .into(),
             AMBER_TEXT,
@@ -1224,9 +1245,9 @@ fn sub_line(d: &Dev, session: Option<SessionInfo>) -> (String, Color32, bool) {
                     "Waiting for approval".into()
                 }
             } else if left > 0 {
-                format!("等对方允许 · {left} 秒")
+                format!("等待对方确认 · {left} 秒")
             } else {
-                "等对方允许".into()
+                "等待对方确认".into()
             };
             return (s, DIM, true);
         }
@@ -1237,7 +1258,7 @@ fn sub_line(d: &Dev, session: Option<SessionInfo>) -> (String, Color32, bool) {
         None => {}
     }
     if d.ask == Ask::Out {
-        return (tr("等对方同意", "Waiting for acceptance").into(), DIM, true);
+        return (tr("等待对方确认", "Waiting for acceptance").into(), DIM, true);
     }
     let via = match d.met.as_str() {
         _ if d.listed => "",
@@ -1250,7 +1271,7 @@ fn sub_line(d: &Dev, session: Option<SessionInfo>) -> (String, Color32, bool) {
             let way = match path {
                 PathKind::Direct => tr(" · 直连", " · Direct"),
                 PathKind::Relay => tr(" · 经自建中转", " · Private Relay"),
-                PathKind::Public => tr(" · 正在找直连", " · Finding Direct"),
+                PathKind::Public => tr(" · 正在尝试直连", " · Finding Direct"),
                 PathKind::None => "",
             };
             let label = if is_en() {
@@ -1265,7 +1286,8 @@ fn sub_line(d: &Dev, session: Option<SessionInfo>) -> (String, Color32, bool) {
         Status::Unreachable => (tr("无法连接", "Unable to connect").into(), AMBER_TEXT, false),
         Status::Refused(r) => (meet::refusal_text(r).into(), AMBER_TEXT, false),
     };
-    (format!("{s}{via}"), color, busy)
+    let prefix = if d.phone { tr("移动端 · ", "Mobile · ") } else { "" };
+    (format!("{prefix}{s}{via}"), color, busy)
 }
 
 fn tone_look(t: Tone) -> (char, Color32) {
@@ -1468,7 +1490,7 @@ impl App {
             };
             format!("Removed \"{}\"; {there}", c.name)
         } else {
-            let there = if c.there { "对方那边也删掉了本机" } else { "对方上线时也会删掉本机" };
+            let there = if c.there { "已同步从对端移除本机" } else { "对端上线后将自动移除本机" };
             format!("已删除「{}」，{there}", c.name)
         };
         self.toast(Tone::Ok, msg);
@@ -1540,11 +1562,11 @@ impl App {
             self.b.act(&format!("dismiss\t{n}"));
             let remembered = text.contains("互相记住") || text.contains("remembered each other");
             let tone = if remembered { Tone::Ok } else { Tone::Warn };
-            let msg = if remembered && !text.contains("我的电脑") && !text.contains("My Devices") {
+            let msg = if remembered && !text.contains("我的设备") && !text.contains("My Devices") {
                 if is_en() {
-                    format!("{text}; if this is your own PC, set it as \"My Devices\" via ···")
+                    format!("{text}; if this is your own device, set it as \"My Devices\" via ···")
                 } else {
-                    format!("{text}；若为自己的电脑，可在 ··· 设为「我的电脑」")
+                    format!("{text}；若为本人设备，可在 ··· 设为「我的设备」")
                 }
             } else {
                 text.clone()
@@ -1685,9 +1707,9 @@ impl App {
             for relay in &relays {
                 let row_rect = Rect::from_min_size(pos2(card.left(), ry), vec2(card.width(), 22.0));
                 let (color, state) = match relay.state.as_str() {
-                    "home" => (GREEN, tr("已连", "Connected")),
+                    "home" => (GREEN, tr("已连接", "Connected")),
                     "temp" => (GREEN, tr("临时接管", "Fallback")),
-                    "fail" => (AMBER, tr("连不上", "Unreachable")),
+                    "fail" => (AMBER, tr("连接失败", "Unreachable")),
                     "idle" => (GONE, tr("备用", "Standby")),
                     _ => (GONE, "…"),
                 };
@@ -1749,7 +1771,7 @@ impl App {
             self.cards.asking = if is_en() {
                 format!("\"{n}\" wants to control this PC — allow or decline in the prompt")
             } else {
-                format!("「{n}」请求控制本机，在弹窗里允许或拒绝")
+                format!("「{n}」请求控制本机，请在确认弹窗中处理")
             };
         }
         let text = self.cards.asking.clone();
@@ -1764,7 +1786,7 @@ impl App {
                 ui,
                 Tint::Blue,
                 Lead::Icon(ic::SERVICE),
-                tr("装上后台服务，锁屏时也能被控制", "Install the background service to allow control on the lock screen"),
+                tr("安装后台服务，可在锁屏界面接受控制", "Install the background service to allow control on the lock screen"),
                 |ui| {
                     if Btn::new(tr("安装", "Install")).icon(ic::SHIELD).look(Look::Primary).enabled(idle).show(ui).clicked() {
                         b.act("unsuggest");
@@ -1783,12 +1805,12 @@ impl App {
         reveal(ui, Id::new("card-update"), other, GAP, |ui| {
             let msg = if missing {
                 tr(
-                    "后台服务找不到原程序（可能已被重命名或移动），改用这个",
+                    "后台服务原程序路径无效（可能已被重命名或移动），建议切换至此版本",
                     "The background service cannot find its original executable (renamed or moved) — switch to this one",
                 )
             } else {
                 tr(
-                    "后台服务用的是另一个位置的程序，改用这个",
+                    "后台服务当前指向其他路径的程序，建议切换至此版本",
                     "The background service points to a different executable — switch to this one",
                 )
             };
@@ -1798,7 +1820,7 @@ impl App {
                 Lead::Icon(ic::SERVICE),
                 msg,
                 |ui| {
-                    if Btn::new(tr("改用这个", "Use This Version"))
+                    if Btn::new(tr("切换至此版本", "Use This Version"))
                         .icon(ic::SHIELD)
                         .look(Look::Primary)
                         .enabled(idle)
@@ -1859,7 +1881,7 @@ impl App {
                 ui.spacing_mut().interact_size.y = 26.0;
                 ui.label(
                     RichText::new(tr(
-                        "还没用掉的连接码（连入时会先问你）",
+                        "未使用的连接码（对端连入时需确认）",
                         "Unused connection codes (you'll be asked before connecting)",
                     ))
                     .size(12.0)
@@ -1881,7 +1903,7 @@ impl App {
                             let r = Btn::new(tr("撤销", "Revoke")).look(Look::Ghost).small().name(acc).show(ui);
                             if r.clicked() {
                                 self.b.act(&format!("revoke\t{}", c.token));
-                                self.toast(Tone::Info, tr("已撤销，这个连接码不能再用了", "Revoked — this connection code can no longer be used"));
+                                self.toast(Tone::Info, tr("已撤销，该连接码已失效", "Revoked — this connection code can no longer be used"));
                             }
                         });
                     });
@@ -1895,9 +1917,9 @@ impl App {
         let at_own_relay = snap.relays.iter().any(|r| r.state == "home");
         type Kind = (&'static str, &'static str, fn(&Dev) -> bool);
         let kinds: [Kind; 3] = [
-            (tr("我的电脑", "My Devices"), tr("连入本机免确认", "Auto-accept connections"), |d| d.listed && d.auto),
+            (tr("我的设备", "My Devices"), tr("连入本机免确认", "Auto-accept connections"), |d| d.listed && d.auto),
             (tr("信任设备", "Trusted Devices"), tr("连入本机需确认", "Ask before connecting"), |d| d.listed && !d.auto),
-            (tr("临时设备", "Temporary Devices"), tr("关窗口后移除", "Removed when window closes"), |d| !d.listed),
+            (tr("临时设备", "Temporary Devices"), tr("关闭窗口后移除", "Removed when window closes"), |d| !d.listed),
         ];
         let mut any = false;
         for (title, note, is) in kinds {
@@ -2044,7 +2066,7 @@ impl App {
             (hex(0x8b7cf6).gamma_multiply(0.16), hex(0xb6a8ff))
         };
         p.rect_filled(av, 9.0, fill);
-        glyph(&p, av.center(), ic::DESKTOP, 18.0, fg);
+        glyph(&p, av.center(), if d.phone { ic::PHONE } else { ic::DESKTOP }, 18.0, fg);
         let dot = av.right_bottom() - vec2(3.0, 3.0);
         p.circle_filled(dot, 6.0, CARD);
         let dot_color = if session.is_some() { ACCENT } else if online { GREEN } else if unreachable { AMBER } else { GONE };
@@ -2063,9 +2085,9 @@ impl App {
                         self.scroll_to_dev = Some(d.id);
                         self.highlight_dev = Some((d.id, Instant::now()));
                         let msg = if is_en() {
-                            format!("Remembered \"{}\" mutually; if this is your own PC, set it as \"My Devices\" via ···", d.name)
+                            format!("Remembered \"{}\" mutually; if this is your own device, set it as \"My Devices\" via ···", d.name)
                         } else {
-                            format!("已和「{}」互相记住；若为自己的电脑，可在 ··· 设为「我的电脑」", d.name)
+                            format!("已和「{}」互相记住；若为本人设备，可在 ··· 设为「我的设备」", d.name)
                         };
                         self.toast(Tone::Ok, msg);
                     }
@@ -2091,7 +2113,7 @@ impl App {
                         self.why = if self.why == Some(d.id) { None } else { Some(d.id) };
                     }
                 }
-                None if self.host_only => {}
+                None if self.host_only || d.phone => {}
                 None => {
                     let acc = if is_en() { format!("Control {}", d.name) } else { format!("控制 {}", d.name) };
                     let r = Btn::new(tr("控制", "Control")).look(Look::Soft).enabled(online).name(acc).show(&mut acts);
@@ -2109,9 +2131,9 @@ impl App {
                             self.scroll_to_dev = Some(d.id);
                             self.highlight_dev = Some((d.id, Instant::now()));
                             let msg = if is_en() {
-                                format!("Remembered \"{}\" mutually; if this is your own PC, set it as \"My Devices\" via ···", d.name)
+                                format!("Remembered \"{}\" mutually; if this is your own device, set it as \"My Devices\" via ···", d.name)
                             } else {
-                                format!("已和「{}」互相记住；若为自己的电脑，可在 ··· 设为「我的电脑」", d.name)
+                                format!("已和「{}」互相记住；若为本人设备，可在 ··· 设为「我的设备」", d.name)
                             };
                             self.toast(Tone::Ok, msg);
                         }
@@ -2128,7 +2150,7 @@ impl App {
         }
         let acts_used = acts.min_rect();
         let on_acts = ui.input(|i| i.pointer.latest_pos().is_some_and(|pos| acts_used.contains(pos)));
-        if online && !self.host_only && session.is_none() && !asked && self.renaming.is_none() && !on_acts && row.double_clicked() {
+        if online && !self.host_only && !d.phone && session.is_none() && !asked && self.renaming.is_none() && !on_acts && row.double_clicked() {
             self.b.control(d.id, &d.name);
         }
         let text_right = acts_used.left() - 12.0;
@@ -2179,12 +2201,12 @@ impl App {
                 ui.spacing_mut().item_spacing.y = 8.0;
                 let why = if at_own_relay {
                     tr(
-                        "对方连不上你的自建中转，也无法建立直连。可能是它那边的网络连不到中转服务器。",
+                        "对端无法连接至您的自建中转，也无法建立直连，可能是对端网络无法连接至中转服务器。",
                         "The remote device cannot reach your private relay or establish a direct connection. Its network may be blocking access to the relay.",
                     )
                 } else {
                     tr(
-                        "两台电脑之间无法直连，通常是网络限制。可开启路由器 IPv6，或在设置中添加自建中转。",
+                        "两台设备之间无法直连，通常由网络限制所致。可尝试启用路由器 IPv6，或在设置中配置自建中转。",
                         "Cannot establish a direct connection, usually due to NAT/firewall restrictions. Try enabling IPv6 on your router or adding a private relay in Settings.",
                     )
                 };
@@ -2212,13 +2234,14 @@ impl App {
         let online = matches!(d.status, Status::Online { .. });
         let more_label = if is_en() { format!("More for {}", d.name) } else { format!("更多 {}", d.name) };
         let more = icon_button(ui, ic::MORE, 32.0, 16.0, &more_label, false);
+        let can_term = !self.host_only && !d.phone;
         egui::Popup::menu(&more).align(RectAlign::BOTTOM_END).gap(4.0).show(|ui| {
             ui.set_width(MENU_WIDTH);
             ui.spacing_mut().item_spacing.y = 0.0;
-            if !self.host_only && menu_item_enabled(ui, Some(ic::TERM), tr("终端", "Terminal"), None, false, false, online).clicked() {
+            if can_term && menu_item_enabled(ui, Some(ic::TERM), tr("终端", "Terminal"), None, false, false, online).clicked() {
                 ui.close();
                 if let Err(e) = crate::term::open_window(d.id, &d.name) {
-                    let msg = if is_en() { format!("Could not open terminal: {e:#}") } else { format!("打不开终端：{e:#}") };
+                    let msg = if is_en() { format!("Could not open terminal: {e:#}") } else { format!("无法打开终端：{e:#}") };
                     self.toast(Tone::Err, msg);
                 }
             }
@@ -2228,9 +2251,9 @@ impl App {
                     ui.close();
                 }
                 menu_sep(ui);
-                menu_head(ui, tr("它控制本机时", "When controlling this PC"));
+                menu_head(ui, tr("该设备连入本机时", "When controlling this PC"));
                 for (auto, title, sub) in [
-                    (true, tr("我的电脑", "My Devices"), tr("免确认", "Auto-accept")),
+                    (true, tr("我的设备", "My Devices"), tr("免确认", "Auto-accept")),
                     (false, tr("信任设备", "Trusted Devices"), tr("需确认", "Ask first")),
                 ] {
                     if menu_item(ui, None, title, Some(sub), d.auto == auto, false).clicked() {
@@ -2242,11 +2265,13 @@ impl App {
                             let msg = if auto {
                                 if is_en() {
                                     format!(
-                                        "\"{}\" can now connect without confirmation (set it on the other PC too for two-way auto-accept)",
+                                        "\"{}\" can now connect without confirmation (set it on the other device too for two-way auto-accept)",
                                         d.name
                                     )
+                                } else if d.phone {
+                                    format!("「{}」以后连入本机免确认", d.name)
                                 } else {
-                                    format!("「{}」以后连入本机免确认（如需双向免确认，请在对方电脑同样设置）", d.name)
+                                    format!("「{}」以后连入本机免确认（如需双向免确认，请在对方设备同样设置）", d.name)
                                 }
                             } else if is_en() {
                                 format!("\"{}\" will now ask before connecting to this PC", d.name)
@@ -2258,7 +2283,7 @@ impl App {
                     }
                 }
             }
-            if d.listed || !self.host_only {
+            if d.listed || can_term {
                 menu_sep(ui);
             }
             if menu_item(ui, Some(ic::DEL), tr("删除", "Remove"), None, false, true).clicked() {
@@ -2299,8 +2324,8 @@ impl App {
                             ui.add(
                                 egui::Label::new(
                                     RichText::new(tr(
-                                        "两台电脑都会忘掉对方，本机中转马上停止为它转发。以后要再连，重新发连接码。",
-                                        "Both PCs will forget each other, and this PC's relay will stop forwarding for it immediately. To reconnect later, share a new connection code.",
+                                        "双方设备列表将互相移除，本机中转也会立即停止为其转发；后续如需连接请重新发送连接码。",
+                                        "Both devices will forget each other, and this PC's relay will stop forwarding for it immediately. To reconnect later, share a new connection code.",
                                     ))
                                     .size(13.0)
                                     .color(DIM),
@@ -2374,7 +2399,7 @@ impl App {
             let cur_lang = i18n::pref();
             Item::new(Lead::Icon(ic::GLOBE), tr("语言", "Language"))
                 .desc(tr(
-                    "界面显示语言（跟随系统默认按 Windows 语言切换）",
+                    "界面显示语言（默认跟随 Windows 系统语言）",
                     "Interface language (Auto follows Windows UI language)",
                 ))
                 .right_width(276.0)
@@ -2409,8 +2434,9 @@ impl App {
         ui.add_space(12.0);
         section_head(ui, tr("网络与发现", "Network & Discovery"), None);
         let net_hi = self.settings_highlight(ui.ctx(), SettingsTarget::NetCheck);
-        let (check_running, check_fixing, check_report) = self.net_check.snapshot();
+        let (check_running, check_fixing, check_report, check_collapsed) = self.net_check.snapshot();
         let mut start_check = false;
+        let mut toggle_collapse = false;
         let mut pending_action: Option<crate::doctor::FixAction> = None;
         let mut copy_report_text: Option<String> = None;
         let net_resp = group_highlighted(ui, net_hi, |ui| {
@@ -2436,7 +2462,7 @@ impl App {
                         b.act(&format!("set\tlan\t{}", lan as u8));
                     }
                 });
-            let check_desc = if let Some(what) = &check_fixing {
+            let check_desc: String = if let Some(what) = &check_fixing {
                 if is_en() {
                     format!("Applying fix: {what}…")
                 } else {
@@ -2444,14 +2470,20 @@ impl App {
                 }
             } else if check_running {
                 tr(
-                    "正在检测 UDP 打洞资格、IPv6、代理/TUN、防火墙与中转…",
+                    "正在检测 NAT 穿透条件、IPv6、代理/TUN、防火墙与中转…",
                     "Testing NAT hole-punching, IPv6, proxy/TUN, firewall & relays…",
                 )
                 .into()
+            } else if let Some(rep) = check_report.as_ref().filter(|_| check_collapsed) {
+                if rep.summary.is_empty() {
+                    rep.headline.clone()
+                } else {
+                    format!("{} · {}", rep.headline, rep.summary)
+                }
             } else {
                 tr(
-                    "一键检测打洞资格、IPv6、代理/TUN 与防火墙，并给出对应解决方案",
-                    "One-click check for NAT P2P, IPv6, proxy/TUN, firewall & relays with guided fixes",
+                    "检测 NAT 穿透条件、IPv6、代理/TUN 与防火墙状态，并提供修复建议",
+                    "Check NAT P2P, IPv6, proxy/TUN, firewall & relays with guided fixes",
                 )
                 .into()
             };
@@ -2462,13 +2494,21 @@ impl App {
             };
             Item::new(lead, tr("网络检测", "Network Check"))
                 .desc(&check_desc)
-                .right_width(170.0)
+                .right_width(210.0)
                 .show(ui, |ui| {
                     if check_fixing.is_some() {
                         Btn::new(tr("修复中…", "Fixing…")).enabled(false).show(ui);
                     } else if check_running {
                         Btn::new(tr("检测中…", "Checking…")).enabled(false).show(ui);
                     } else if check_report.is_some() {
+                        let (lbl, icon) = if check_collapsed {
+                            (tr("展开", "Expand"), ic::CHEVRON_DOWN)
+                        } else {
+                            (tr("收起", "Collapse"), ic::CHEVRON_UP)
+                        };
+                        if Btn::new(lbl).icon(icon).look(Look::Ghost).show(ui).clicked() {
+                            toggle_collapse = true;
+                        }
                         if Btn::new(tr("重新检测", "Re-test")).icon(ic::REFRESH).show(ui).clicked() {
                             start_check = true;
                         }
@@ -2479,9 +2519,14 @@ impl App {
 
             if let Some(rep) = &check_report {
                 let busy = check_running || check_fixing.is_some();
-                self.net_check_panel(ui, rep, busy, &mut pending_action, &mut copy_report_text);
+                reveal(ui, Id::new("net-check-panel"), !check_collapsed, 0.0, |ui| {
+                    self.net_check_panel(ui, rep, busy, &mut pending_action, &mut copy_report_text);
+                });
             }
         });
+        if toggle_collapse {
+            self.net_check.toggle_collapsed();
+        }
         if self.scroll_to_settings == Some(SettingsTarget::NetCheck) {
             self.scroll_to_settings = None;
             ui.scroll_to_rect(net_resp.rect, Some(Align::TOP));
@@ -2510,31 +2555,31 @@ impl App {
             let (title, desc) = match (installed, snap.service) {
                 (true, true) if missing => (
                     tr("运行中（原程序已被重命名或移动）", "Running (original executable renamed or moved)"),
-                    tr("点击「改用这个」以更新后台服务路径", "Click \"Use This Version\" to update the background service path"),
+                    tr("点击「切换至此版本」以更新后台服务路径", "Click \"Use This Version\" to update the background service path"),
                 ),
                 (true, true) if other => (
                     tr("运行中（程序路径不一致）", "Running (different executable path)"),
-                    tr("点击「改用这个」以使用当前版本", "Click \"Use This Version\" to switch to this executable"),
+                    tr("点击「切换至此版本」以使用当前版本", "Click \"Use This Version\" to switch to this executable"),
                 ),
                 (true, true) => (
                     tr("运行中", "Running"),
                     tr("关闭窗口后仍保持在线", "Keeps this PC online after closing the window"),
                 ),
                 (true, false) if missing => (
-                    tr("已安装（找不到原程序）", "Installed (original executable not found)"),
-                    tr("原程序可能已被重命名或移动，点击「改用这个」恢复", "The original executable may have been renamed or moved — click \"Use This Version\" to restore"),
+                    tr("已安装（原程序路径无效）", "Installed (original executable not found)"),
+                    tr("原程序可能已被重命名或移动，点击「切换至此版本」恢复", "The original executable may have been renamed or moved — click \"Use This Version\" to restore"),
                 ),
                 (true, false) if other => (
                     tr("已安装（未运行，程序路径不一致）", "Installed (not running, different path)"),
-                    tr("点击「改用这个」以使用当前版本", "Click \"Use This Version\" to switch to this executable"),
+                    tr("点击「切换至此版本」以使用当前版本", "Click \"Use This Version\" to switch to this executable"),
                 ),
                 (true, false) => (
                     tr("已安装（未运行）", "Installed (not running)"),
-                    tr("安装后支持开机在线与锁屏控制（需要管理员权限）", "Enables online at boot & lock-screen control (requires admin)"),
+                    tr("安装后支持开机自启并允许锁屏界面控制（需管理员权限）", "Enables online at boot & lock-screen control (requires admin)"),
                 ),
                 _ => (
                     tr("未安装", "Not installed"),
-                    tr("安装后支持开机在线与锁屏控制（需要管理员权限）", "Enables online at boot & lock-screen control (requires admin)"),
+                    tr("安装后支持开机自启并允许锁屏界面控制（需管理员权限）", "Enables online at boot & lock-screen control (requires admin)"),
                 ),
             };
             Item::new(Lead::Icon(ic::SERVICE), title).desc(desc).first(true).right_width(280.0).show(ui, |ui| {
@@ -2550,7 +2595,7 @@ impl App {
                         b.service(true);
                     }
                 } else {
-                    if installed && other && Btn::new(tr("改用这个", "Use This Version")).icon(ic::SHIELD).look(Look::Primary).show(ui).clicked() {
+                    if installed && other && Btn::new(tr("切换至此版本", "Use This Version")).icon(ic::SHIELD).look(Look::Primary).show(ui).clicked() {
                         b.service(true);
                     }
                     if Btn::new(tr("卸载", "Uninstall")).icon(ic::SHIELD).show(ui).clicked() {
@@ -2571,7 +2616,7 @@ impl App {
                     "lock",
                     ic::LOCK,
                     tr("允许锁屏控制", "Allow Lock Screen Control"),
-                    tr("仅限「我的电脑」免确认连入", "Auto-accept connections from \"My Devices\" only"),
+                    tr("仅允许「我的设备」在锁屏状态下免确认连入", "Auto-accept connections from \"My Devices\" only"),
                     snap.lock,
                 ),
                 (
@@ -2608,7 +2653,7 @@ impl App {
                 "Install the remote-control Skill for Claude Code & Codex",
             ),
             crate::term::SkillState::Installed => tr("已安装 · 支持 Claude Code、Codex", "Installed · Claude Code & Codex"),
-            crate::term::SkillState::Outdated => tr("已安装（当前程序路径或版本有变化）", "Installed (executable path or version changed)"),
+            crate::term::SkillState::Outdated => tr("已安装（当前程序路径或版本已变更）", "Installed (executable path or version changed)"),
         };
         if !snap.host_only {
             section_head(ui, tr("AI 集成", "AI Integration"), None);
@@ -2646,7 +2691,7 @@ impl App {
                         let msg = if is_en() {
                             format!("Installed to {where_}; takes effect in new AI chats")
                         } else {
-                            format!("已写入 {where_}，新开的 AI 对话即生效")
+                            format!("已安装至 {where_}，将在新建 AI 对话中生效")
                         };
                         self.toast(Tone::Ok, msg);
                     }
@@ -2677,7 +2722,7 @@ impl App {
         let active_session = !self.b.sessions().is_empty() || snap.hosting.is_some() || snap.asking.is_some();
         let title = format!("Remote Control v{}", crate::update::APP_VERSION);
         let desc = match &phase {
-            UpdatePhase::Idle => tr("手动检查新版本，平时不会主动打扰", "Check for updates manually; never prompts in background").to_string(),
+            UpdatePhase::Idle => tr("仅支持手动检查更新，不在后台自动弹窗", "Check for updates manually; never prompts in background").to_string(),
             UpdatePhase::Checking => tr("正在检查更新…", "Checking for updates…").to_string(),
             UpdatePhase::UpToDate => tr("已是最新版本", "You are on the latest version").to_string(),
             UpdatePhase::Available(m) => {
@@ -2733,7 +2778,7 @@ impl App {
                     Btn::new(tr("检查中…", "Checking…")).enabled(false).show(ui);
                 }
                 UpdatePhase::UpToDate => {
-                    if Btn::new(tr("再次检查", "Check Again")).show(ui).clicked() {
+                    if Btn::new(tr("重新检查", "Check Again")).show(ui).clicked() {
                         self.self_update.start_check(ui.ctx());
                     }
                 }
@@ -2860,23 +2905,30 @@ impl App {
                 .inner_margin(Margin { left: 12, right: 10, top: 9, bottom: 9 })
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());
-                    ui.horizontal(|ui| {
-                        let icon_r = ui.allocate_exact_size(vec2(18.0, 22.0), Sense::hover()).0;
-                        glyph(ui.painter(), icon_r.center(), v_icon, 16.0, v_fg);
-                        ui.add_space(4.0);
-                        ui.vertical(|ui| {
-                            ui.spacing_mut().item_spacing.y = 2.0;
-                            ui.add(egui::Label::new(RichText::new(&rep.headline).font(bold(13.5)).color(TEXT)).wrap());
-                            if !rep.summary.is_empty() {
-                                ui.add(egui::Label::new(RichText::new(&rep.summary).size(12.0).color(DIM)).wrap());
-                            }
-                        });
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if Btn::new(tr("复制报告", "Copy Report")).icon(ic::COPY).look(Look::Ghost).show(ui).clicked() {
-                                *copy_report = Some(rep.to_plain_text());
-                            }
-                        });
-                    });
+                    let full = ui.available_rect_before_wrap();
+                    let mut acts = ui.new_child(
+                        UiBuilder::new()
+                            .max_rect(Rect::from_min_size(full.min, vec2(full.width(), 44.0)))
+                            .layout(Layout::right_to_left(Align::Center)),
+                    );
+                    if Btn::new(tr("复制报告", "Copy Report")).icon(ic::COPY).look(Look::Ghost).show(&mut acts).clicked() {
+                        *copy_report = Some(rep.to_plain_text());
+                    }
+                    let btn_left = if acts.min_rect().width() > 0.0 { acts.min_rect().left() - 8.0 } else { full.right() };
+                    let icon_r = Rect::from_min_size(full.min, vec2(18.0, 22.0));
+                    glyph(ui.painter(), icon_r.center(), v_icon, 16.0, v_fg);
+                    let text_x = full.left() + 22.0;
+                    let label_w = (btn_left - text_x).max(60.0);
+                    let mut left = ui.new_child(
+                        UiBuilder::new().max_rect(Rect::from_min_size(pos2(text_x, full.top()), vec2(label_w, f32::INFINITY))),
+                    );
+                    left.spacing_mut().item_spacing.y = 2.0;
+                    left.add(egui::Label::new(RichText::new(&rep.headline).font(bold(13.5)).color(TEXT)).wrap());
+                    if !rep.summary.is_empty() {
+                        left.add(egui::Label::new(RichText::new(&rep.summary).size(12.0).color(DIM)).wrap());
+                    }
+                    let total_h = left.min_rect().height().max(acts.min_rect().height()).max(22.0);
+                    ui.allocate_exact_size(vec2(full.width(), total_h), Sense::hover());
                 });
 
             // 2. Expanded cards for Err / Warn (and Info items that have guidance/actions)
@@ -3124,7 +3176,7 @@ impl App {
                             .look(Look::Ghost)
                             .name(pick_acc)
                             .show(ui)
-                            .on_hover_text(tr("以后优先使用这台中转", "Use this relay first"))
+                            .on_hover_text(tr("将此中转服务器设为首选", "Use this relay first"))
                             .clicked();
                     }
                 });
@@ -3141,7 +3193,7 @@ impl App {
                         let note = if snap.codes.is_empty() || r.state == "temp" {
                             ""
                         } else {
-                            "，没用掉的连接码已作废"
+                            "，未使用的连接码已失效"
                         };
                         format!("已将 {host} 设为首选{note}")
                     };
@@ -3194,7 +3246,7 @@ impl App {
                     pos2(rect.left() + 48.0, rect.top() + 50.0),
                     Align2::LEFT_TOP,
                     tr(
-                        "在自建服务器运行 rc-relay ui 获取中转码",
+                        "在自建中转服务器上运行 rc-relay ui 获取中转码",
                         "Run rc-relay ui on your relay server to get a relay code",
                     ),
                     font(11.5),

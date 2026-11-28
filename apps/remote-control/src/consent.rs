@@ -376,7 +376,7 @@ fn paint(hwnd: HWND, p: &Popup) {
     let heading = if is_en() {
         format!("{} wants to control this PC", p.name)
     } else {
-        format!("「{}」想控制这台电脑", p.name)
+        format!("「{}」请求控制本机", p.name)
     };
     c.text(&r(24, 20, WIDTH - 24, 48), &heading, title, gdi::TEXT, false);
     let what = match p.kind {
@@ -410,7 +410,7 @@ fn paint(hwnd: HWND, p: &Popup) {
     let countdown = if is_en() {
         format!("Auto-deny in {}s", p.left_s)
     } else {
-        format!("{} 秒没人点就算拒绝", p.left_s)
+        format!("{} 秒后自动拒绝", p.left_s)
     };
     c.text(&r(24, by, 206, by + 36), &countdown, small, gdi::DIM, false);
 }

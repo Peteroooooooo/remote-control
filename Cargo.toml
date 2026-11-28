@@ -6,13 +6,30 @@ exclude = ["vendor/iroh-relay", "vendor/iroh"]
 [workspace.package]
 edition = "2024"
 license = "AGPL-3.0-only"
-version = "0.3.8"
+version = "0.5.0"
 publish = false
 
 [profile.release]
-lto = "thin"
-codegen-units = 4
+lto = "fat"
+codegen-units = 1
 strip = true
+
+# Optimize third-party dependencies for binary size while keeping our own
+# capture / encode / render / transport crates at opt-level = 3.
+[profile.release.package."*"]
+opt-level = "s"
+
+[profile.release.package.remote-control]
+opt-level = 3
+
+[profile.release.package.rc-stream]
+opt-level = 3
+
+[profile.release.package.rc-proto]
+opt-level = 3
+
+[profile.release.package.rc-ident]
+opt-level = 3
 
 # Size-optimized profile for Android `librc_android.so` (leaves Windows release untouched).
 # Keep default `panic = "unwind"` because transitive Android TLS crates use `catch_unwind`
