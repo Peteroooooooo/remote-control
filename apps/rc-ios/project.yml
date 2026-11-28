@@ -58,6 +58,7 @@ targets:
         embed: false
       - sdk: Security.framework
       - sdk: SystemConfiguration.framework
+      - sdk: Network.framework
       - sdk: CoreFoundation.framework
       - sdk: VideoToolbox.framework
       - sdk: AVFoundation.framework
