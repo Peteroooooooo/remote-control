@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["apps/remote-control", "apps/rc-relay", "crates/rc-ident", "crates/rc-stream", "crates/rc-proto", "crates/rc-android", "spikes/nettest", "spikes/netshape"]
+members = ["apps/remote-control", "apps/rc-relay", "crates/rc-ident", "crates/rc-stream", "crates/rc-proto", "crates/rc-android", "crates/rc-ios", "spikes/nettest", "spikes/netshape"]
 exclude = ["vendor/iroh-relay", "vendor/iroh"]
 
 [workspace.package]
@@ -40,6 +40,15 @@ opt-level = "s"
 lto = "fat"
 codegen-units = 1
 strip = "symbols"
+
+# iOS static library `librc_ios.a` (apps/rc-ios). Xcode links and strips the app, so symbols
+# stay in the archive (`strip` on a static library would remove what the linker needs).
+[profile.ios-dist]
+inherits = "release"
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
+strip = "none"
 
 # Our relay needs hooks iroh-relay does not have (see vendor/iroh-relay/PATCHES.md).
 # iroh's client side uses the same crate, so everything builds against the patched copy.

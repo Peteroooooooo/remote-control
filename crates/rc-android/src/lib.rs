@@ -1,8 +1,8 @@
 //! JNI entrypoints for the Android controller app (`com.rc.android.nativebridge.RcNative`).
 
-mod engine;
+pub mod engine;
 mod net_util;
-mod session;
+pub mod session;
 mod store;
 
 use std::{

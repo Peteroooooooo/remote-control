@@ -1,0 +1,5 @@
+module RcCore {
+    header "rc_core.h"
+    link "rc_ios"
+    export *
+}

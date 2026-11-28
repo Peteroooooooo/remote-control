@@ -1,0 +1,71 @@
+name: iOS
+
+on:
+  push:
+    branches: ["**"]
+    paths:
+      - "apps/rc-ios/**"
+      - "crates/**"
+      - "apps/rc-relay/**"
+      - "vendor/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/ios.yml"
+  pull_request:
+    paths:
+      - "apps/rc-ios/**"
+      - "crates/**"
+      - ".github/workflows/ios.yml"
+  workflow_dispatch:
+
+jobs:
+  ios:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ios
+
+      - name: Build RcCore.xcframework (Rust engine)
+        run: apps/rc-ios/scripts/build-core.sh
+
+      - name: Generate Xcode project
+        run: |
+          brew install xcodegen
+          cd apps/rc-ios && xcodegen generate
+
+      - name: Logic tests (simulator)
+        run: |
+          cd apps/rc-ios
+          SIM=$(xcrun simctl list devices available -j | python3 -c 'import json,sys; d=json.load(sys.stdin)["devices"]; print(next(x["udid"] for k,v in d.items() if "iOS" in k for x in v if x["name"].startswith("iPad")))')
+          xcodebuild test -project RemoteControl.xcodeproj -scheme RemoteControl \
+            -destination "id=$SIM" -only-testing:RemoteControlTests -quiet
+
+      - name: Build unsigned IPA
+        env:
+          RC_BUILD_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}
+        run: |
+          cd apps/rc-ios
+          VERSION="${RC_BUILD_VERSION#v}"
+          xcodebuild build -project RemoteControl.xcodeproj -scheme RemoteControl \
+            -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' \
+            -derivedDataPath build/dd \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            ${VERSION:+MARKETING_VERSION=$VERSION} CURRENT_PROJECT_VERSION=${{ github.run_number }} -quiet
+          APP=build/dd/Build/Products/Release-iphoneos/RemoteControl.app
+          mkdir -p build/ipa/Payload
+          cp -R "$APP" build/ipa/Payload/
+          (cd build/ipa && zip -qry ../remote-control.ipa Payload)
+          ls -l build/remote-control.ipa
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: remote-control-ios-unsigned
+          path: apps/rc-ios/build/remote-control.ipa
+          if-no-files-found: error

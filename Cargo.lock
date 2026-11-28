@@ -4390,6 +4390,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rc-ios"
+version = "0.5.0"
+dependencies = [
+ "anyhow",
+ "rc-android",
+ "serde_json",
+]
+
+[[package]]
 name = "rc-proto"
 version = "0.5.0"
 dependencies = [

@@ -1,0 +1,15 @@
+[package]
+name = "rc-ios"
+description = "C ABI over the mobile controller engine for the iOS / iPadOS app"
+edition.workspace = true
+version.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+anyhow = "1.0.104"
+# The engine, session and store are platform independent; only the JNI shim is Android-specific.
+rc-android = { path = "../rc-android" }
+serde_json = "1"

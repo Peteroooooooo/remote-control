@@ -1,0 +1,85 @@
+# XcodeGen spec for the iOS / iPadOS controller. Generate the project on a Mac with:
+#   apps/rc-ios/scripts/build-core.sh   (Rust engine -> build/RcCore.xcframework)
+#   cd apps/rc-ios && xcodegen generate
+name: RemoteControl
+options:
+  bundleIdPrefix: com.rc
+  deploymentTarget:
+    iOS: "16.0"
+  createIntermediateGroups: true
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    ENABLE_USER_SCRIPT_SANDBOXING: YES
+targets:
+  RemoteControl:
+    type: application
+    platform: iOS
+    sources:
+      - path: RemoteControl
+    info:
+      path: RemoteControl/Info.plist
+      properties:
+        CFBundleDisplayName: Remote Control
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        LSRequiresIPhoneOS: true
+        UILaunchScreen: {}
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false
+        UIApplicationSupportsIndirectInputEvents: true
+        UIRequiresFullScreen: true
+        UIStatusBarHidden: false
+        UIViewControllerBasedStatusBarAppearance: true
+        NSLocalNetworkUsageDescription: 用于发现并连接同一局域网里运行 Remote Control 的电脑。
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        UISupportedInterfaceOrientations~ipad:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationPortraitUpsideDown
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        UIRequiredDeviceCapabilities:
+          - arm64
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.rc.ios
+        PRODUCT_NAME: RemoteControl
+        TARGETED_DEVICE_FAMILY: "1,2"
+        CODE_SIGN_STYLE: Automatic
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        DEAD_CODE_STRIPPING: YES
+    dependencies:
+      - framework: build/RcCore.xcframework
+        embed: false
+      - sdk: Security.framework
+      - sdk: SystemConfiguration.framework
+      - sdk: CoreFoundation.framework
+      - sdk: VideoToolbox.framework
+      - sdk: AVFoundation.framework
+      - sdk: CoreMedia.framework
+      - sdk: libresolv.tbd
+  RemoteControlTests:
+    type: bundle.unit-test
+    platform: iOS
+    # Plain logic tests: they compile the pure Swift files directly and need no app host
+    # and no Rust library.
+    sources:
+      - path: RemoteControlTests
+      - path: RemoteControl/Logic
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+        PRODUCT_BUNDLE_IDENTIFIER: com.rc.ios.tests
+schemes:
+  RemoteControl:
+    build:
+      targets:
+        RemoteControl: all
+    test:
+      targets:
+        - RemoteControlTests
