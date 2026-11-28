@@ -1,7 +1,7 @@
 [workspace]
 resolver = "3"
 members = ["apps/remote-control", "apps/rc-relay", "crates/rc-ident", "crates/rc-stream", "crates/rc-proto", "crates/rc-android", "crates/rc-ios", "spikes/nettest", "spikes/netshape"]
-exclude = ["vendor/iroh-relay", "vendor/iroh"]
+exclude = ["vendor/iroh-relay", "vendor/iroh", "vendor/netdev"]
 
 [workspace.package]
 edition = "2024"
@@ -57,3 +57,6 @@ iroh-relay = { path = "vendor/iroh-relay" }
 # A connection also gets paths through the other relays when its first one
 # is a relay (see vendor/iroh/PATCHES.md).
 iroh = { path = "vendor/iroh" }
+# netwatch's netdev uses `libc::in6_ifreq`, which libc only has on macOS; this copy builds for
+# iOS too (see vendor/netdev/PATCHES.md).
+netdev = { path = "vendor/netdev" }
