@@ -54,7 +54,7 @@ struct DevicesView: View {
             .refreshable { model.refreshLan() }
             .navigationTitle("Remote Control")
             .toolbar {
-                ToolbarItemGroup(placement: .topBarTrailing) {
+                ToolbarItemGroup(placement: .navigationBarTrailing) {
                     Button { model.refreshLan() } label: { Image(systemName: "arrow.clockwise") }
                         .accessibilityLabel("扫描局域网")
                     Button { showAdd = true } label: { Image(systemName: "plus") }
@@ -90,13 +90,13 @@ private struct DeviceRow: View {
             VStack(alignment: .leading, spacing: 3) {
                 Text(device.displayName)
                     .font(.body.weight(.medium))
-                    .foregroundStyle(device.isOnline || device.status == "checking" || askIn ? .primary : .secondary)
+                    .foregroundStyle(device.isOnline || device.status == "checking" || askIn ? Color.primary : Color.secondary)
                     .lineLimit(1)
                 HStack(spacing: 6) {
                     Circle().fill(dotColor).frame(width: 6, height: 6)
                     Text(subtitle)
                         .font(.caption)
-                        .foregroundStyle(warnText ? .orange : .secondary)
+                        .foregroundStyle(warnText ? Color.orange : Color.secondary)
                         .lineLimit(warnText ? 2 : 1)
                 }
             }

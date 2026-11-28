@@ -2,6 +2,7 @@ import SwiftUI
 import UIKit
 
 /// Lets SwiftUI controls reach the UIKit screen view (zoom reset, wheel, keyboard focus).
+@MainActor
 final class ScreenController: ObservableObject {
     @Published var zoomed = false
     weak var view: RemoteScreenView?

@@ -31,6 +31,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ios
+          cache-on-failure: true
 
       - name: Build RcCore.xcframework (Rust engine)
         run: bash apps/rc-ios/scripts/build-core.sh

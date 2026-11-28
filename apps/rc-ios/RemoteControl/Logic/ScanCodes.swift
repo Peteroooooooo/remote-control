@@ -34,7 +34,7 @@ enum Scan {
     /// US-layout key for a character typed while a sticky modifier is armed, so Ctrl + "c"
     /// becomes the real Ctrl+C. 0 when the character has no key.
     static func forChar(_ ch: Character) -> Int {
-        let c = Character(ch.lowercased())
+        let c = ch.lowercased().first ?? ch
         for (row, base) in letterRows {
             if let i = row.firstIndex(of: c) {
                 return base + row.distance(from: row.startIndex, to: i)
