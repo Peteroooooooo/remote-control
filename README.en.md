@@ -19,10 +19,11 @@
 
 - **Cross-Device Control for AI Agents**: One-click Skill install (`~/.claude/skills`, `~/.agents/skills`) lets Claude Code and Codex call `devices`, `exec`, and `cp` on your other Windows PCs, reusing the lobby's connections and device permissions.
 - **Remote Desktop**: GPU hardware encoding/decoding and DXGI rendering (up to 144 fps, 4:4:4 crisp text mode, FEC packet-loss recovery); supports multi-monitor switching, clipboard sync (text, images, files, folders), `Ctrl+Alt+Del`, and lock-screen control.
-- **Android Controller**: Control your PCs from a phone or tablet with trackpad and direct-touch modes, local zoom, and a full PC keyboard with modifier keys. See the [Android guide](docs/android.en.md).
+- **Android Controller (~5.6 MB)**: Control your PCs from a phone or tablet via a live desktop & running-windows hub, trackpad and direct-touch modes, scroll wheel, zoomed pan joystick, and full PC keyboard. See the [Android guide](docs/android.en.md).
 - **Remote Audio**: Supports Opus and lossless 24-bit PCM modes with independent volume control and one-click remote speaker mute.
 - **Remote Terminal & File Transfer**: Drop straight into remote PowerShell, run commands, or transfer files/folders via CLI without starting a desktop stream.
-- **Private Relay (Optional)**: Single Docker image with built-in self-signed TLS, no domain required, forwarding end-to-end encrypted traffic exclusively for your devices.
+- **Network Doctor & Private Relay (Optional)**: Built-in **Network Diagnostics** (`Settings → Network Diagnostics` or `remote-control doctor`) checks IPv6, NAT, firewall, and relay health with one-click fixes; single Docker image self-hosted relay with built-in self-signed TLS for restricted networks.
+- **Ultra-Lightweight & Quiet Updates**: ~21 MB single portable `.exe` on Windows; manual in-app update checks in **Settings** (GitHub & CNB mirrors) with zero background popups.
 
 ---
 
@@ -51,7 +52,7 @@
 | Firewall blocks all UDP                              | **Requires private relay** (via TCP) |
 
 - **Public Relay Assist**: Uses free public iroh nodes solely to exchange addresses for hole-punching — **never forwards screen video or input** (can be disabled in **Settings → Network & Discovery → Public Relay Assist**).
-- **Private Relay**: Forwards end-to-end encrypted traffic only when direct P2P fails. Try enabling IPv6 on your router first before deploying a relay (mobile hotspots and many campus networks have IPv6; most corporate LANs do not).
+- **Private Relay & Diagnostics**: Forwards end-to-end encrypted traffic only when direct P2P fails. Before deploying a relay, run **Settings → Network Diagnostics** (or `remote-control doctor`) to check IPv6, firewall rules, TUN adapters, and relay reachability, with one-click fixes and sanitized report export.
 
 ---
 
@@ -65,9 +66,16 @@ Run `remote-control.exe` on both PCs:
 - **Across Networks**: Have the other side click **Copy Connection Code** and paste it into the top input bar (or press `Ctrl+V`). Codes are single-use and valid for 1 hour.
 - **Frequent Devices**: Click **Remember** on a temporary device to add each other as **Trusted Devices**; set a device as **My Devices** in the `···` menu for prompt-free connections on double-click.
 
-### 2. Control a PC from Your Phone
+### 2. Control a PC from Your Phone / Tablet
 
-Install the latest `remote-control.apk` from [Releases](https://github.com/Peteroooooooo/remote-control/releases) (Android 10+, arm64). PCs on the same LAN appear automatically; tap one to connect. Across networks, tap **+** and paste the PC's connection code. Gestures, scroll wheel, and keyboard usage are explained in the [Android guide](docs/android.en.md).
+Install the latest `remote-control.apk` (~5.6 MB, Android 10+, arm64) from [Releases](https://github.com/Peteroooooooo/remote-control/releases) (or [CNB](https://cnb.cool/peteroooooooo/remote-control/-/releases)). PCs on the same LAN appear automatically; tap one to connect. Across networks, tap **+** and paste the PC's connection code.
+
+- After connecting, you land on the **PC Hub**: live desktop preview at the top and running window cards below — tap once to bring a window to the front, tap again to open full screen.
+- Full screen offers **Trackpad / Direct-Touch** modes, a bottom-right **scroll wheel**, zoomed pan **joystick**, and a **full PC keyboard**. See the [Android guide](docs/android.en.md) for gestures.
+
+<p align="center">
+  <img src="docs/images/android-hub.jpg" width="760" alt="Android PC Hub" />
+</p>
 
 ### 3. Background Service
 
@@ -102,6 +110,7 @@ All commands (`remote-control <command> --help` shows each one's options):
 | `set <setting> <value> …` | Change settings, see [section 6](#6-command-line-setup--batch-deployment) |
 | `install-service` / `uninstall-service` | Install / remove the background service (admin) |
 | `service-status` | Show whether the background service is running |
+| `doctor` | Diagnose network connectivity, IPv6, firewall, and relay status |
 | `update` | Check for and install a new version |
 | `id` | Show this device's ID |
 | `host` | Stay online without the window, waiting to be connected to |

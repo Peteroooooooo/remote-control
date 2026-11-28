@@ -27,6 +27,10 @@ You land on the PC's home page (hub): the top bar shows the PC name with connect
 - Tap a window card once to bring it to the front in the preview; tap it again (or double-tap) to open it full screen.
 - The system back gesture returns from full screen to the home page. On the home page, back once more shows a hint; swipe again to disconnect and return to the PC list.
 
+<p align="center">
+  <img src="images/android-hub.jpg" width="760" alt="Android PC Hub" />
+</p>
+
 ## 3. The capsule at the top of full screen
 
 | Button | Action |
