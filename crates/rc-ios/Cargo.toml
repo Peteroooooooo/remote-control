@@ -13,3 +13,9 @@ anyhow = "1.0.104"
 # The engine, session and store are platform independent; only the JNI shim is Android-specific.
 rc-android = { path = "../rc-android" }
 serde_json = "1"
+
+# libc 0.2.190 and later limit the net/route.h constants (RTM_*, RTAX_*) to macOS, and netwatch uses
+# them on iOS too. Pinning here holds the whole workspace on 0.2.189 until netwatch or libc
+# fixes that.
+[target.'cfg(target_os = "ios")'.dependencies]
+libc = "=0.2.189"
