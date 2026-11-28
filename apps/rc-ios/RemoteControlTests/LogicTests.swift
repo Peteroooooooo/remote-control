@@ -10,17 +10,28 @@ final class LogicTests: XCTestCase {
         let pps: [UInt8] = [0x68, 0xCE, 0x3C, 0x80]
         let aud: [UInt8] = [0x09, 0xF0]
         let idr: [UInt8] = [0x65, 0x88, 0x84, 0x00, 0x33]
-        var d = Data([0, 0, 0, 1] + sps + [0, 0, 1] + pps + [0, 0, 0, 1] + aud + [0, 0, 1] + idr)
+        let start4: [UInt8] = [0, 0, 0, 1]
+        let start3: [UInt8] = [0, 0, 1]
+        var bytes: [UInt8] = start4
+        bytes += sps
+        bytes += start3
+        bytes += pps
+        bytes += start4
+        bytes += aud
+        bytes += start3
+        bytes += idr
+        var d = Data(bytes)
         let s = AnnexB.split(d, hevc: false)
         XCTAssertEqual(s.parameterSets, [Data(sps), Data(pps)])
-        XCTAssertEqual(s.sample, Data([0, 0, 0, 5] + idr))
-        XCTAssertEqual(AnnexB.orderedParameterSets(s.parameterSets.reversed(), hevc: false), [Data(sps), Data(pps)])
+        let expected = Data([0, 0, 0, 5] as [UInt8] + idr)
+        XCTAssertEqual(s.sample, expected)
+        XCTAssertEqual(AnnexB.orderedParameterSets(Array(s.parameterSets.reversed()), hevc: false), [Data(sps), Data(pps)])
 
         // Works on a slice whose indices do not start at 0.
         d = Data([0xAA]) + d
         let sliced = d.dropFirst()
-        XCTAssertEqual(AnnexB.split(Data(sliced), hevc: false).sample, Data([0, 0, 0, 5] + idr))
-        XCTAssertEqual(AnnexB.split(sliced, hevc: false).sample, Data([0, 0, 0, 5] + idr))
+        XCTAssertEqual(AnnexB.split(Data(sliced), hevc: false).sample, expected)
+        XCTAssertEqual(AnnexB.split(sliced, hevc: false).sample, expected)
     }
 
     func testHevcParameterSetsNeedAllThree() {
