@@ -33,7 +33,7 @@ jobs:
           key: ios
 
       - name: Build RcCore.xcframework (Rust engine)
-        run: apps/rc-ios/scripts/build-core.sh
+        run: bash apps/rc-ios/scripts/build-core.sh
 
       - name: Generate Xcode project
         run: |
